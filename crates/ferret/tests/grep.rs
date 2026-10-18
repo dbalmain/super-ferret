@@ -440,7 +440,7 @@ fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     let fixture = Fixture::new("spill");
     fixture.write(
         "large",
-        &[vec![b'x'; 200_000], b"red\nred".to_vec()].concat(),
+        &[vec![b'x'; 400_000], b"red\nred".to_vec()].concat(),
     );
     fixture.compare(&["-n", "red", "large", "one.rs"], None);
 }
@@ -608,7 +608,7 @@ fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
 fn spill_failure_stops_before_the_next_matching_file() {
     let fixture = Fixture::new("spill-failure");
     fs::create_dir_all(fixture.tree().join("ordered")).unwrap();
-    fixture.write("ordered/big.txt", &b"red\n".repeat(20_000));
+    fixture.write("ordered/big.txt", &b"red\n".repeat(100_000));
     fixture.write("ordered/small.txt", b"red small\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let mut outcomes = Vec::new();
@@ -626,7 +626,9 @@ fn spill_failure_stops_before_the_next_matching_file() {
         command
             .arg("--index")
             .arg(fixture.base.join("index"))
+            // This guard asserts order across files: one thread preserves it (D92).
             .args(args)
+            .env("FERRET_SEARCH_THREADS", "1")
             .env("TMPDIR", fixture.base.join("unavailable-spill-directory"));
         let output = run(command, None);
         outcomes.push((
@@ -791,7 +793,7 @@ fn parallel_groups_preserve_whole_spilled_files_at_one_and_four_threads() {
     fs::create_dir_all(fixture.tree().join("groups")).unwrap();
     for file in 0..12 {
         let mut bytes = Vec::new();
-        for line in 0..4000 {
+        for line in 0..12000 {
             writeln!(bytes, "red file-{file:02} line-{line:04} payload").unwrap();
         }
         fixture.write(&format!("groups/part-{file:02}"), &bytes);
@@ -1701,6 +1703,9 @@ fn m5_before_context_spill_failure_stops_the_command() {
         .arg("--index")
         .arg(fixture.base.join("index"))
         .args(["grep", "-B25000", "red", "big.txt", "small.txt"])
+        // D92: asserting that the first file fails before the next one starts
+        // requires the sequential publication contract.
+        .env("FERRET_SEARCH_THREADS", "1")
         .env("TMPDIR", fixture.base.join("missing-spill-dir"));
     let output = run(command, None);
     assert_eq!(output.status.code(), Some(2), "{output:?}");

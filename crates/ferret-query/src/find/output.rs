@@ -14,8 +14,8 @@ use super::{Effects, WalkError};
 const MEMORY_LIMIT: usize = 64 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-/// Bounded output capture. Up to 64 KiB stays in memory; larger streams spill
-/// to a private, unlinked temporary file. Capture before locking the
+/// Bounded output capture. By default 64 KiB stays in memory; larger streams
+/// spill to a private, unlinked temporary file. Capture before locking the
 /// destination, then write the complete stream while holding that lock.
 #[derive(Default)]
 pub struct OutputBuffer {
@@ -174,7 +174,7 @@ impl OutputBuffer {
 }
 
 impl OutputBuffer {
-    /// Stage spill writes in the capture's existing 64 KiB allocation. Call
+    /// Stage spill writes in at most 64 KiB of the capture's allocation. Call
     /// `flush` before completing a capture to surface deferred spill faults
     /// before publication. Default captures retain immediate write faults.
     pub fn with_buffered_spill(mut self) -> Self {
@@ -588,7 +588,6 @@ mod spill_tests {
         pub(super) static WRITE: RefCell<Option<Box<SpillWrite>>> = RefCell::new(None);
     }
 
-    // Deferred faults must still name the spill, and must precede publication.
     // A larger capture must bound allocated capacity, including geometric
     // growth on uneven records, and poll while first copying it to disk.
     #[test]
@@ -613,6 +612,7 @@ mod spill_tests {
         assert!(output.memory_bytes() <= limit);
     }
 
+    // Deferred faults must still name the spill, and must precede publication.
     #[test]
     fn buffered_spill_faults_never_publish_a_prefix() {
         for zero in [false, true] {

@@ -71,6 +71,8 @@ impl Raw {
         // 0.880 s) on indexed `grep -F -a the` at 32 threads.
         // SAFETY: std never closes descriptor 1, and `ManuallyDrop` keeps
         // this `File` from closing it either, so it is borrowed, not owned.
+        // The grep host is its sole stdout writer; workers serialize all
+        // publication through that host and never replace descriptor 1.
         #[allow(unsafe_code)]
         let file = unsafe { File::from_raw_fd(fd) };
         Self(ManuallyDrop::new(file))

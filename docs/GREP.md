@@ -601,7 +601,8 @@ an accepted-difference class, with no such difference found in M5's covered
 profiles. With multiple threads, workers publish each file’s complete group
 as soon as its checked read finishes (D92 B); their groups never interleave.
 With one thread, groups retain walk order. Cross-file diagnostics follow
-completion order too, and cannot split another file’s group. Reuse find's bounded output/spill machinery where grouping needs it.
+completion order too, and cannot split another file’s group. Grep reuses find’s
+bounded output/spill machinery.
 
 **M2 output overrides (confirmed 2026-10-17):** the last `-l`/`-c` selects
 name or count output; `-q` independently overrides both, in either argv order.

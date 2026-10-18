@@ -1712,6 +1712,18 @@ pub fn file_groups<Task, State, Group: Send>(
     })
 }
 
+// A panicking file worker may still own a byte reservation. Stop and wake
+// its peers before the scope joins, rather than waiting on those leaked bytes.
+struct StopOnPanic<'p>(&'p Pool<GroupItem<()>>);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.halt();
+        }
+    }
+}
+
 /// Visits streaming file tasks on workers, publishing inside `work` in
 /// completion order. One thread keeps source order. The callback owns
 /// publication locking and returns `Break` to stop all workers; the producer
@@ -1733,6 +1745,7 @@ pub fn visit_files<Task, State>(
     let _stop = StopOnDrop(&pool);
     let source = Mutex::new(next);
     let run = || {
+        let _panic = StopOnPanic(&pool);
         let mut state = make();
         let stopped = || pool.halted() || cancelled.load(Ordering::Acquire);
         while !stopped() {
@@ -1751,7 +1764,7 @@ pub fn visit_files<Task, State>(
     };
     std::thread::scope(|scope| {
         let started = (0..threads)
-            .take_while(|&i| spawn(scope, i, &run).is_ok())
+            .take_while(|&i| spawn(scope, i, run).is_ok())
             .count();
         if started == 0 {
             run();
@@ -2342,6 +2355,65 @@ mod streamed {
 mod group_tests {
     use super::*;
     use std::sync::{Arc, Barrier, mpsc};
+
+    // A panicking worker can leave the entire input budget reserved. Its
+    // peers must wake before scope joins; isolate a regression's deadlock.
+    #[test]
+    fn completion_worker_panic_wakes_input_budget_waiters() {
+        const MARKER: &str = "FERRET_TEST_VISITOR_PANIC";
+        if std::env::var_os(MARKER).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "verify::group_tests::completion_worker_panic_wakes_input_budget_waiters",
+                ])
+                .env(MARKER, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("panicking worker left its budget waiter asleep");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let reached = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            let mut task = 0;
+            visit_files(
+                2,
+                &AtomicBool::new(false),
+                |_| {
+                    let current = task;
+                    task += 1;
+                    if current == 1 {
+                        reached.store(true, Ordering::Release);
+                    }
+                    (current < 2).then_some((IN_FLIGHT_BYTES, current))
+                },
+                || (),
+                |_, task, _| {
+                    assert_eq!(task, 0, "second task cannot reserve the occupied budget");
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !reached.load(Ordering::Acquire) && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    assert!(reached.load(Ordering::Acquire));
+                    panic!("injected worker panic with a live reservation");
+                },
+            );
+        });
+        assert!(result.is_err());
+    }
 
     #[test]
     fn groups_use_parallel_workers_and_preserve_each_payload() {

@@ -666,7 +666,6 @@ pub(super) fn run<'a, W: Write + Send>(
             }
         },
     );
-    drop(shared);
     host.matched |= hit.load(Ordering::Acquire);
     host.json_stats
         .merge(std::mem::take(&mut *lock(&quiet_stats)));
@@ -680,7 +679,7 @@ pub(super) fn run<'a, W: Write + Send>(
 #[cfg(test)]
 type OnEntry = dyn FnMut(&Path) + Send;
 
-/// The source is called by a worker while claiming its next ring position.
+/// Workers advance the source before reserving input bytes for their next file.
 /// It retains find's prune feedback and live fallback, without a path backlog.
 pub(super) struct Source<'a> {
     inputs: std::vec::IntoIter<Input>,
@@ -1104,6 +1103,55 @@ mod tests {
         assert_eq!(host.writer.bytes, b"fast:red\nslow:red\n");
     }
 
+    // Policy can diagnose while advancing a live source. It must use the same
+    // lock as real publication, including its final destination flush.
+    #[test]
+    fn live_source_diagnostics_wait_for_the_published_group() {
+        struct Publishing<'a>(&'a AtomicBool);
+        impl Write for Publishing<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.store(true, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+        let plan = plan(&["--live", "red"]);
+        let publishing = AtomicBool::new(false);
+        let mut host = host(&plan, Publishing(&publishing));
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                each(&mut &b"red\n"[..], 4).unwrap();
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        let mut jobs = (0..32).map(|n| Job::Checked(format!("file-{n}").into(), NameId(n), n));
+        run(
+            &mut host,
+            |_| {
+                // Advance slowly enough for an uncoordinated publisher to
+                // begin while policy is still loading this directory.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                assert!(
+                    !publishing.load(Ordering::Acquire),
+                    "live warning would split a group"
+                );
+                jobs.next().map(|job| (4, job))
+            },
+            &fork,
+            None,
+            8,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    }
+
     // Isolate RLIMIT_FSIZE in a child: the final four spill bytes must fail
     // inside the checked-read callback, even if the reader then reports an
     // input fault. Otherwise a deferred output failure becomes a read error.
@@ -1113,7 +1161,7 @@ mod tests {
         if std::env::var_os(MARKER).is_none() {
             const LAUNCH: &str = concat!(
                 "import os, resource, signal, sys; ",
-                "resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536)); ",
+                "resource.setrlimit(resource.RLIMIT_FSIZE, (262144, 262144)); ",
                 "signal.signal(signal.SIGXFSZ, signal.SIG_IGN); ",
                 "os.execv(sys.argv[1], [sys.argv[1], '--exact', ",
                 "'grep::groups::tests::late_spill_failure_remains_a_capture_fault', '--nocapture'])",
@@ -1592,7 +1640,9 @@ mod tests {
         let mut output = OutputBuffer::default()
             .with_memory_limit(GROUP_BYTES)
             .with_buffered_spill();
-        output.write_all(&vec![b'x'; 3 * CHUNK]).unwrap();
+        output
+            .write_all(&vec![b'x'; GROUP_BYTES + 3 * CHUNK])
+            .unwrap();
         let mut sink = Sink {
             flag: &flag,
             bytes: 0,

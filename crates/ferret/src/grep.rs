@@ -689,7 +689,7 @@ mod tests {
                 "ferret-context-retry-{}-{recursive}",
                 std::process::id()
             ));
-            let mut original = b"old context\n".repeat(20_000);
+            let mut original = b"old context\n".repeat(24_000);
             original.extend_from_slice(b"red\n");
             fs::write(&path, &original).unwrap();
             let writer = OpenOptions::new().write(true).open(&path).unwrap();
