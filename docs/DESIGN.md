@@ -66,10 +66,13 @@ completed groups through a bounded completion queue (D92 B); the calling host
 publishes each whole group. One thread keeps walk order. A publication mutex
 excludes live policy warnings from groups; per-file diagnostics share the host.
 For configured concurrency T, the queue holds at most T groups, workers one
-each, and the host one: capture allocation is bounded by (2T + 1) × 256 KiB. Spill staging reuses
-that allocation in 64 KiB blocks with cancellation polls. Find retains its
-ordered publication path. Bounded catalog-version line records
-are reused only after each alias's own stat; current-byte answers stay local.
+each, and the host one: rendered capture allocation is bounded by
+(2T + 1) × 256 KiB. Spill staging reuses that allocation in 64 KiB blocks with
+cancellation polls. Find retains its ordered publication path. The queue lets
+workers prepare ahead while the host waits on stdout; direct worker publication
+regressed pipe throughput in the D92 measurements, despite reducing caller CPU
+work. Bounded catalog-version line records are reused only after each alias's
+own stat; current-byte answers stay local.
 
 Grep M6 (2026-10-17) keeps the graph. Host namespace adapters choose find's
 catalog or physical live constructors; policy-preserving live search loads
