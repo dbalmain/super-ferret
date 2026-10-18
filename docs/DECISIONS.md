@@ -5382,3 +5382,40 @@ Recommendation was A, for the fixed order at a bounded memory cost.
 GREP.md already promised only that files finish in any order and their
 groups do not interleave. A sort-order flag (rg's `--sort path`, refused
 today) is a later feature.
+
+## D93 — Grep capture memory at high thread counts
+
+**Status: answered, 2026-10-18.**
+
+Question: how much memory may `ferret grep` use for captured output at 32
+threads?
+
+perf4 (`wt/grep-perf1` `d781f16`) held peak RSS under 263 MiB, a figure taken
+from rg at its default 12 threads. At 32 threads rg peaks at 500–615 MiB on
+indexed `-F -a the` (2.3 GB output), so the ceiling left ferret about 9 MiB of
+headroom and a 256 KiB per-capture spill limit.
+
+- **A — stay near 263 MiB.** About half rg's peak; ferret stays 2.5× behind on
+  `/dev/null` and 27% on a tmpfs file.
+- **B — up to rg's peak at the same thread count, about 500 MiB.** A 1 MiB
+  capture limit measured 0.56–0.60 s on `/dev/null` (against 0.75 s).
+- **C — no ceiling.** Never spilling: 0.56 s at 622 MiB, unbounded on larger
+  outputs.
+
+Recommendation: B.
+
+> Dave: Yes, option 2.
+
+**Answer: B.** Peak RSS at 32 threads may reach rg's at the same thread count,
+with the capture bound stated as a formula of threads and limit.
+
+## D94 — Grep on a broken pipe
+
+**Status: answered, 2026-10-18.**
+
+`ferret grep x | head` printed `writing stdout: Broken pipe` and exited 2; rg
+exits 0 silently. Nothing had decided ferret's behaviour; M9 inherited it.
+
+> Dave: make ferret match rg.
+
+**Answer:** a broken pipe on stdout ends `ferret grep` silently with exit 0.
