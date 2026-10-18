@@ -1,6 +1,6 @@
 //! File transactions, bounded record caching and worker-owned line rendering.
 //! The parent host supplies operands/policy; query's existing scheduler owns
-//! parallelism. Only its emission callback touches stdout.
+//! parallelism. Workers publish completed transactions under the host mutex.
 
 use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
@@ -10,6 +10,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+const GROUP_BYTES: usize = 256 << 10;
 const ENTRY_BYTES: usize = 64 << 10;
 const CACHE_BYTES: usize = 16 << 20;
 const CHUNK: usize = 64 << 10;
@@ -91,7 +92,7 @@ impl Render<'_> {
         line: line_grep::Line<'_>,
         previous: &mut Option<u64>,
     ) -> io::Result<()> {
-        let mut output = Cancellable {
+        let mut output = CaptureWriter {
             inner: output,
             stopped: self.stopped,
         };
@@ -207,13 +208,17 @@ pub(super) fn observe(
     read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
     cache: bool,
 ) -> io::Result<Observed> {
-    let mut output = OutputBuffer::default().with_buffered_spill();
+    let mut output = OutputBuffer::default()
+        .with_memory_limit(GROUP_BYTES)
+        .with_buffered_spill();
     let mut result = InputResult::default();
     let mut capture = Capture::new(cache);
     let mut output_failure = None;
     let outcome = ferret_query::retry_read(
         || {
-            output = OutputBuffer::default().with_buffered_spill();
+            output = OutputBuffer::default()
+                .with_memory_limit(GROUP_BYTES)
+                .with_buffered_spill();
             result = InputResult::default();
             capture = Capture::new(cache);
             let mut each = |input: &mut dyn Read, size| match render.scan(
@@ -360,6 +365,25 @@ impl<W: Write + ?Sized> Write for Cancellable<'_, W> {
     }
 }
 
+// Checked output must poll while moving a larger in-memory capture to disk,
+// as well as between ordinary render writes.
+struct CaptureWriter<'a> {
+    inner: &'a mut OutputBuffer,
+    stopped: &'a dyn Fn() -> bool,
+}
+impl Write for CaptureWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if (self.stopped)() {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        self.inner
+            .write_checked(&bytes[..bytes.len().min(CHUNK)], self.stopped)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn write_parts(mut output: impl Write, mut parts: &mut [IoSlice<'_>]) -> io::Result<()> {
     IoSlice::advance_slices(&mut parts, 0);
     while !parts.is_empty() {
@@ -473,7 +497,9 @@ impl Worker<'_> {
                 if let Some(cached) = cached {
                     match read(*name, ReadRequest::Stat) {
                         ReadOutcome::Stable(ReadVersion::Catalogued) => {
-                            let mut output = OutputBuffer::default().with_buffered_spill();
+                            let mut output = OutputBuffer::default()
+                                .with_memory_limit(GROUP_BYTES)
+                                .with_buffered_spill();
                             let mut previous = None;
                             for record in &cached.records {
                                 render.line(
@@ -529,7 +555,9 @@ impl Worker<'_> {
             )?,
             Job::Absent(_) => Observed::Ready(Group {
                 result: InputResult::empty(&self.plan),
-                output: OutputBuffer::default().with_buffered_spill(),
+                output: OutputBuffer::default()
+                    .with_memory_limit(GROUP_BYTES)
+                    .with_buffered_spill(),
                 version: ReadVersion::Catalogued,
                 records: None,
             }),
@@ -545,9 +573,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 type Fork<'a> = dyn Fn() -> Option<Box<CheckedReader<'a>>> + Sync + 'a;
 
-pub(super) fn run<'a, W: Write>(
+pub(super) fn run<'a, W: Write + Send>(
     host: &mut Host<'_, W>,
-    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Job)> + Send,
+    mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Job)> + Send,
     fork: &Fork<'a>,
     names: Option<&ferret_query::DocNames>,
     threads: usize,
@@ -559,10 +587,16 @@ pub(super) fn run<'a, W: Write>(
     let hit = AtomicBool::new(false);
     let quiet_stats = Mutex::new(json::Stats::default());
     let fatal = Mutex::new(None);
-    let result = ferret_query::file_groups(
+    let shared = Mutex::new(&mut *host);
+    ferret_query::visit_files(
         threads,
         cancelled,
-        next,
+        |stopped| {
+            // Live policy warnings are emitted while advancing the source.
+            // Hold the publication lock so none can split another file's group.
+            let _publication = plan.traversal.live.then(|| lock(&shared));
+            next(stopped)
+        },
         || Worker {
             plan: plan.clone(),
             buffer: Vec::new(),
@@ -574,7 +608,7 @@ pub(super) fn run<'a, W: Write>(
             if worker.buffer.capacity() > ferret_query::KEPT_BUFFER {
                 worker.buffer = Vec::new();
             }
-            match result {
+            let observed = match result {
                 Ok(observed) => {
                     if plan.quiet
                         && plan.json
@@ -588,7 +622,7 @@ pub(super) fn run<'a, W: Write>(
                         hit.store(true, Ordering::Release);
                         cancelled.store(true, Ordering::Release);
                     }
-                    (job, observed)
+                    observed
                 }
                 Err(error) => {
                     if !stopped() {
@@ -598,11 +632,15 @@ pub(super) fn run<'a, W: Write>(
                         }
                         cancelled.store(true, Ordering::Release);
                     }
-                    (job, Observed::Skipped)
+                    Observed::Skipped
                 }
+            };
+            let mut host = lock(&shared);
+            // Recheck under the same lock as failure and publication: a worker
+            // already waiting here must not publish after another group faults.
+            if stopped() {
+                return ControlFlow::Break(());
             }
-        },
-        |(job, observed)| {
             if let Job::Failed(_, message) = &job {
                 host.error(job.path(), message);
                 return ControlFlow::Continue(());
@@ -628,13 +666,14 @@ pub(super) fn run<'a, W: Write>(
             }
         },
     );
+    drop(shared);
     host.matched |= hit.load(Ordering::Acquire);
     host.json_stats
         .merge(std::mem::take(&mut *lock(&quiet_stats)));
     if let Some(error) = lock(&fatal).take() {
         Err(error)
     } else {
-        result
+        Ok(())
     }
 }
 
@@ -870,6 +909,201 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    fn host<W: Write>(plan: &Plan, writer: W) -> Host<'_, W> {
+        Host {
+            plan,
+            filename: true,
+            writer,
+            buffer: Vec::new(),
+            matched: false,
+            emitted_group: false,
+            json_stats: json::Stats::default(),
+            errors: false,
+            cancelled: None,
+        }
+    }
+
+    // Drive checked capture and real Host::commit with groups larger than
+    // capture, spill, stdout and replay buffers. Every file must remain whole.
+    #[test]
+    fn parallel_publication_keeps_large_groups_whole() {
+        let plan = plan(&["red"]);
+        let bytes = b"red payload\n".repeat(40_000);
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        let mut host = host(&plan, Vec::new());
+        let mut jobs = (0..64).map(|n| Job::Checked(format!("file-{n:02}").into(), NameId(n), n));
+        run(
+            &mut host,
+            |_| jobs.next().map(|job| (bytes.len() as u64, job)),
+            &fork,
+            None,
+            32,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut groups = host
+            .writer
+            .chunks_exact(20 * 40_000)
+            .map(|group| {
+                let prefix = &group[..8];
+                assert!(
+                    group
+                        .chunks_exact(20)
+                        .all(|line| &line[..8] == prefix && &line[8..] == b"red payload\n")
+                );
+                prefix.to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(host.writer.len(), 64 * 20 * 40_000);
+        groups.sort();
+        assert_eq!(
+            groups,
+            (0..64)
+                .map(|n| format!("file-{n:02}:").into_bytes())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // One thread must preserve producer order, even when it is not sorted.
+    #[test]
+    fn single_thread_publication_keeps_walk_order() {
+        let plan = plan(&["red"]);
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                each(&mut &b"red\n"[..], 4).unwrap();
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        let mut host = host(&plan, Vec::new());
+        let mut jobs = ["z", "a", "m"]
+            .into_iter()
+            .map(|p| Job::Checked(p.into(), NameId(0), 0));
+        run(
+            &mut host,
+            |_| jobs.next().map(|job| (4, job)),
+            &fork,
+            None,
+            1,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(host.writer, b"z:red\na:red\nm:red\n");
+    }
+
+    // The first publication fault must cancel while still holding the lock;
+    // workers already waiting with finished captures cannot write afterwards.
+    #[test]
+    fn publication_fault_stops_waiting_workers() {
+        #[derive(Default)]
+        struct Fault(usize);
+        impl Write for Fault {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let plan = plan(&["red"]);
+        let barrier = std::sync::Barrier::new(8);
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                each(&mut &b"red\n"[..], 4).unwrap();
+                barrier.wait();
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        let mut host = host(&plan, Fault::default());
+        let mut jobs = (0..8).map(|n| Job::Checked(format!("file-{n}").into(), NameId(n), n));
+        let cancelled = AtomicBool::new(false);
+        let error = run(
+            &mut host,
+            |_| jobs.next().map(|job| (4, job)),
+            &fork,
+            None,
+            8,
+            &cancelled,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(host.writer.0, 1);
+    }
+
+    // A slow first read cannot hold back another file's completed transaction.
+    #[test]
+    fn completed_group_publishes_before_a_slow_earlier_file() {
+        struct Signal<'a> {
+            bytes: Vec<u8>,
+            published: &'a AtomicBool,
+        }
+        impl Write for Signal<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                self.published.store(true, Ordering::Release);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let plan = plan(&["red"]);
+        let published = AtomicBool::new(false);
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|name, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                if name.0 == 0 {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while !published.load(Ordering::Acquire) && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+                each(&mut &b"red\n"[..], 4).unwrap();
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        let mut host = host(
+            &plan,
+            Signal {
+                bytes: Vec::new(),
+                published: &published,
+            },
+        );
+        let mut jobs = [
+            Job::Checked("slow".into(), NameId(0), 0),
+            Job::Checked("fast".into(), NameId(1), 1),
+        ]
+        .into_iter();
+        run(
+            &mut host,
+            |_| jobs.next().map(|job| (4, job)),
+            &fork,
+            None,
+            2,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(host.writer.bytes, b"fast:red\nslow:red\n");
+    }
+
     // Isolate RLIMIT_FSIZE in a child: the final four spill bytes must fail
     // inside the checked-read callback, even if the reader then reports an
     // input fault. Otherwise a deferred output failure becomes a read error.
@@ -904,7 +1138,7 @@ mod tests {
             stopped: &|| false,
         };
         let mut bytes = b"red ".to_vec();
-        bytes.resize(CHUNK - 1, b'x');
+        bytes.resize(GROUP_BYTES - 1, b'x');
         bytes.extend_from_slice(b"\nred\n");
         let error = observe(
             &render,
@@ -934,7 +1168,9 @@ mod tests {
     fn vectored_plain_records_replay_exactly_before_and_after_spilling() {
         for size in [0, 11, ENTRY_BYTES * 3 + 7] {
             let bytes = vec![b'x'; size];
-            let mut output = OutputBuffer::default().with_buffered_spill();
+            let mut output = OutputBuffer::default()
+                .with_memory_limit(GROUP_BYTES)
+                .with_buffered_spill();
             for _ in 0..3 {
                 let mut writer = Cancellable {
                     inner: &mut output,
@@ -1353,7 +1589,9 @@ mod tests {
             }
         }
         let flag = AtomicBool::new(false);
-        let mut output = OutputBuffer::default().with_buffered_spill();
+        let mut output = OutputBuffer::default()
+            .with_memory_limit(GROUP_BYTES)
+            .with_buffered_spill();
         output.write_all(&vec![b'x'; 3 * CHUNK]).unwrap();
         let mut sink = Sink {
             flag: &flag,

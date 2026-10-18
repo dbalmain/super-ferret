@@ -24,6 +24,7 @@ pub struct OutputBuffer {
     len: u64,
     checkpoint: u64,
     buffered_spill: bool,
+    memory_limit: usize,
 }
 
 struct Spill {
@@ -45,7 +46,43 @@ impl Spill {
 
 impl Write for OutputBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.file.is_none() && self.bytes.len() + bytes.len() > MEMORY_LIMIT {
+        self.write_checked(bytes, &|| false)
+    }
+    fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
+        if !self.buffered_spill
+            && let Some(spill) = &mut self.file
+        {
+            let written = spill_progress(spill.write_vectored(bytes), bytes, &spill.path)?;
+            self.len += written as u64;
+            Ok(written)
+        } else {
+            self.write(
+                bytes
+                    .iter()
+                    .find(|part| !part.is_empty())
+                    .map_or(&[], |part| &**part),
+            )
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.finish_spill()
+    }
+}
+
+impl OutputBuffer {
+    /// Raise the capture threshold, bounding its Vec capacity as well as
+    /// length. Spill staging and replay remain 64 KiB. Use `write_checked`
+    /// to poll cancellation while the initial capture is copied to its
+    /// spill file.
+    pub fn with_memory_limit(mut self, limit: usize) -> Self {
+        self.memory_limit = limit.max(MEMORY_LIMIT);
+        self
+    }
+
+    /// Append bytes, polling between at most 64 KiB initial spill-copy chunks.
+    pub fn write_checked(&mut self, bytes: &[u8], stopped: &dyn Fn() -> bool) -> io::Result<usize> {
+        let limit = self.memory_limit.max(MEMORY_LIMIT);
+        if self.file.is_none() && self.bytes.len() + bytes.len() > limit {
             loop {
                 let path = std::env::temp_dir().join(format!(
                     "ferret-output-{}-{}",
@@ -62,8 +99,18 @@ impl Write for OutputBuffer {
                     Ok(mut file) => {
                         std::fs::remove_file(&path)
                             .map_err(|error| spill_error("unlink", &path, error))?;
-                        file.write_all(&self.bytes)
-                            .map_err(|error| spill_error("write", &path, error))?;
+                        if self.memory_limit == 0 {
+                            file.write_all(&self.bytes)
+                                .map_err(|error| spill_error("write", &path, error))?;
+                        } else {
+                            for chunk in self.bytes.chunks(MEMORY_LIMIT) {
+                                if stopped() {
+                                    return Err(io::ErrorKind::ConnectionAborted.into());
+                                }
+                                file.write_all(chunk)
+                                    .map_err(|error| spill_error("write", &path, error))?;
+                            }
+                        }
                         self.bytes.clear();
                         self.file = Some(Spill { file, path });
                         break;
@@ -90,28 +137,19 @@ impl Write for OutputBuffer {
                 .write_all(bytes)
                 .map_err(|error| spill_error("write", &spill.path, error))?;
         } else {
+            let needed = self.bytes.len() + bytes.len();
+            if self.memory_limit > 0 && needed > self.bytes.capacity() {
+                let capacity = needed
+                    .max(self.bytes.capacity().saturating_mul(2))
+                    .min(limit);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
             self.bytes.extend_from_slice(bytes);
         }
         self.len += bytes.len() as u64;
         Ok(bytes.len())
     }
-    fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
-        if !self.buffered_spill
-            && let Some(spill) = &mut self.file
-        {
-            let written = spill_progress(spill.write_vectored(bytes), bytes, &spill.path)?;
-            self.len += written as u64;
-            Ok(written)
-        } else {
-            self.write(
-                bytes
-                    .iter()
-                    .find(|part| !part.is_empty())
-                    .map_or(&[], |part| &**part),
-            )
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
+    fn finish_spill(&mut self) -> io::Result<()> {
         if !self.buffered_spill {
             return Ok(());
         }
@@ -551,6 +589,30 @@ mod spill_tests {
     }
 
     // Deferred faults must still name the spill, and must precede publication.
+    // A larger capture must bound allocated capacity, including geometric
+    // growth on uneven records, and poll while first copying it to disk.
+    #[test]
+    fn larger_captures_bound_capacity_and_cancel_initial_spill() {
+        let limit = 256 << 10;
+        let mut output = OutputBuffer::default()
+            .with_memory_limit(limit)
+            .with_buffered_spill();
+        while output.len() < (limit - 1000) as u64 {
+            output.write_all(&[b'x'; 997]).unwrap();
+            assert!(output.memory_bytes() <= limit);
+        }
+        let calls = std::cell::Cell::new(0);
+        let error = output
+            .write_checked(&[b'y'; 2000], &|| {
+                calls.set(calls.get() + 1);
+                calls.get() > 1
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(calls.get(), 2);
+        assert!(output.memory_bytes() <= limit);
+    }
+
     #[test]
     fn buffered_spill_faults_never_publish_a_prefix() {
         for zero in [false, true] {

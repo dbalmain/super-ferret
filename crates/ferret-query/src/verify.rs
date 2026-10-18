@@ -1712,6 +1712,53 @@ pub fn file_groups<Task, State, Group: Send>(
     })
 }
 
+/// Visits streaming file tasks on workers, publishing inside `work` in
+/// completion order. One thread keeps source order. The callback owns
+/// publication locking and returns `Break` to stop all workers; the producer
+/// must poll its stop predicate during traversal. Input reservations match
+/// [`file_groups`], but no finished groups wait in the ordered ring.
+pub fn visit_files<Task, State>(
+    threads: usize,
+    cancelled: &AtomicBool,
+    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
+    make: impl Fn() -> State + Sync,
+    work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> ControlFlow<()> + Sync,
+) {
+    if threads <= 1 {
+        groups_alone(next, cancelled, &make, &work, &mut |flow| flow);
+        return;
+    }
+    let pool = Pool::<GroupItem<()>>::schedule(0, threads);
+    // Outside the scope: ordinary return joins workers before stopping them.
+    let _stop = StopOnDrop(&pool);
+    let source = Mutex::new(next);
+    let run = || {
+        let mut state = make();
+        let stopped = || pool.halted() || cancelled.load(Ordering::Acquire);
+        while !stopped() {
+            let Some((size, task)) = lock(&source)(&stopped) else {
+                break;
+            };
+            let Some(size) = pool.reserve(size.max(crate::scan::BUFFER as u64), &stopped) else {
+                break;
+            };
+            let flow = work(&mut state, task, &stopped);
+            pool.release(size);
+            if flow.is_break() {
+                pool.halt();
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        let started = (0..threads)
+            .take_while(|&i| spawn(scope, i, &run).is_ok())
+            .count();
+        if started == 0 {
+            run();
+        }
+    });
+}
+
 fn groups_alone<Task, State, Group>(
     mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
     cancelled: &AtomicBool,

@@ -61,8 +61,11 @@ core. Find exposes source constructors without requiring a parsed expression.
 
 Grep M2 (2026-10-17) keeps that graph: the existing query verification scheduler
 also carries bounded line-group payloads. Its streaming producer avoids a path
-backlog; workers own checked reads and line rendering, while the host publishes
-whole groups and propagates cancellation. Bounded catalog-version line records
+backlog; workers own checked reads and line rendering. Grep workers publish
+completed groups under a host mutex (D92 B); one thread keeps walk order.
+The mutex also protects per-file diagnostics and live policy warnings. Each
+worker holds at most one 256 KiB capture, spilling larger groups with 64 KiB
+staging and cancellation polls. Find retains its ordered publication path. Bounded catalog-version line records
 are reused only after each alias's own stat; current-byte answers stay local.
 
 Grep M6 (2026-10-17) keeps the graph. Host namespace adapters choose find's

@@ -175,8 +175,8 @@ preserving the original left haystack and four bytes of right context for
 LF/Unicode word assertions. An occurrence ending beyond the consuming window
 cannot select it. Actual spans, captures, replacement and JSON still use their
 original source-line bounds. Uncoloured, unnumbered plain records combine path,
-separator, data and LF through the capture's vectored writer. Grep stages spill
-writes in the same bounded 64 KiB allocation, finishing them inside the
+separator, data and LF through the capture's vectored writer. Grep holds up to 256 KiB per file capture, then stages spill
+writes in 64 KiB blocks, finishing them inside the
 checked-read callback before accepting a group. Find's default captures retain
 immediate spill-write faults. Redirected grep stdout uses a 64 KiB block buffer
 written to descriptor 1 itself, with no second descriptor (preserving shared
@@ -598,8 +598,10 @@ Owned tests compare these bytes exactly through pipes and real ptys, including
 NUL prefixes and heading/context groups. Other terminal capabilities, custom
 palettes and hyperlinks are outside this tier; exact escape placement remains
 an accepted-difference class, with no such difference found in M5's covered
-profiles. Files finish in any order; their groups do not
-interleave. Reuse find's bounded output/spill machinery where grouping needs it.
+profiles. With multiple threads, workers publish each file’s complete group
+as soon as its checked read finishes (D92 B); their groups never interleave.
+With one thread, groups retain walk order. Cross-file diagnostics follow
+completion order too, and cannot split another file’s group. Reuse find's bounded output/spill machinery where grouping needs it.
 
 **M2 output overrides (confirmed 2026-10-17):** the last `-l`/`-c` selects
 name or count output; `-q` independently overrides both, in either argv order.

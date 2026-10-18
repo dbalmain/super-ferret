@@ -3,7 +3,7 @@
 //! NUL name modes retain std's original line buffer and diagnostic ordering.
 
 use std::fs::File;
-use std::io::{self, BufWriter, IsTerminal, Stdout, StdoutLock, Write};
+use std::io::{self, BufWriter, IsTerminal, Stdout, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -13,7 +13,7 @@ const BLOCK: usize = 64 << 10;
 const EBADF: i32 = 9;
 
 pub(super) struct Writer<'a> {
-    line: StdoutLock<'a>,
+    line: &'a Stdout,
     block: Option<BufWriter<Raw>>,
 }
 
@@ -23,8 +23,12 @@ impl<'a> Writer<'a> {
         // Anything std still holds must go first. If it cannot, keep std's
         // destination, which will report the fault on the next write.
         let block = (block && !stdout.is_terminal() && line.flush().is_ok())
-            .then(|| BufWriter::with_capacity(BLOCK, Raw::stdout(&line)));
-        Self { line, block }
+            .then(|| BufWriter::with_capacity(BLOCK, Raw::stdout(stdout)));
+        drop(line);
+        Self {
+            line: stdout,
+            block,
+        }
     }
 }
 
@@ -32,14 +36,14 @@ impl Write for Writer<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match &mut self.block {
             Some(writer) => writer.write(bytes),
-            None => self.line.write(bytes),
+            None => self.line.lock().write(bytes),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.block {
             Some(writer) => writer.flush(),
-            None => self.line.flush(),
+            None => self.line.lock().flush(),
         }
     }
 }
@@ -54,15 +58,14 @@ impl Drop for Writer<'_> {
     }
 }
 
-/// Descriptor 1 itself, written while the `Writer` holds stdout's lock, so
-/// nothing else can write around it. Unlike std's stdout it has no line
-/// buffer to search each block for its last LF, and unlike a duplicate it
-/// takes no descriptor an input may need.
+/// Descriptor 1 itself, written while grep holds its publication mutex. Unlike
+/// std's stdout it has no line buffer to search each block for its last LF, and
+/// unlike a duplicate it takes no descriptor an input may need.
 struct Raw(ManuallyDrop<File>);
 
 impl Raw {
-    fn stdout(lock: &StdoutLock<'_>) -> Self {
-        let fd = lock.as_raw_fd();
+    fn stdout(stdout: &Stdout) -> Self {
+        let fd = stdout.as_raw_fd();
         // D11: std offers no safe way to write to descriptor 1 without a
         // second descriptor or its line writer, which cost 9% (0.961 s against
         // 0.880 s) on indexed `grep -F -a the` at 32 threads.
