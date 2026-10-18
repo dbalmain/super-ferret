@@ -5419,3 +5419,33 @@ exits 0 silently. Nothing had decided ferret's behaviour; M9 inherited it.
 > Dave: make ferret match rg.
 
 **Answer:** a broken pipe on stdout ends `ferret grep` silently with exit 0.
+
+## D95 — Grep output: one writer, or workers writing stdout
+
+**Status: answered, 2026-10-18.**
+
+Question: should `ferret grep` close its last gap to rg (dense output to
+`/dev/null` at 32 threads, about 358 ms against 285 ms) by letting workers
+write stdout themselves?
+
+Today workers render each file's group and pass it through a bounded queue;
+one thread writes every group (D92 B keeps completion order either way). That
+thread spends about 3.8 µs per group, so on `/dev/null`, where a write costs
+nothing, it is the bottleneck. On a pipe or a file the kernel's copy of the
+output dominates and the per-group cost overlaps it.
+
+- **A — keep the single writer.** Ahead of rg on a pipe (755 against 845 ms)
+  and a tmpfs file (999 against 1032 ms); about 70 ms behind on `/dev/null`.
+  Cut its per-group cost instead (batched handoffs).
+- **B — workers write directly.** perf4 measured it: `/dev/null` 0.74 → 0.69 s,
+  but pipe 1.09 → 1.21 s, because a worker blocked on a full pipe stops
+  searching.
+- **C — hybrid.** A worker writes its own group when stdout is free and nothing
+  is queued, else enqueues. Unmeasured; a second publication path.
+
+Recommendation: A. `/dev/null` measures handoff overhead, not a destination
+users have.
+
+> Dave: Ok, then I'm happy with option 1.
+
+**Answer: A.** One writer thread; reduce its per-group cost.
