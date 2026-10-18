@@ -995,8 +995,8 @@ mod tests {
         assert_eq!(host.writer, b"z:red\na:red\nm:red\n");
     }
 
-    // The first publication fault must cancel while still holding the lock;
-    // workers already waiting with finished captures cannot write afterwards.
+    // A publication fault must break the completion drain. Other finished
+    // captures already waiting in the queue cannot write afterwards.
     #[test]
     fn publication_fault_stops_waiting_workers() {
         #[derive(Default)]
@@ -1004,6 +1004,9 @@ mod tests {
         impl Write for Fault {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
                 self.0 += 1;
+                // Let the other prepared captures reach the real queue while
+                // this first publication is failing.
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 Err(io::ErrorKind::BrokenPipe.into())
             }
             fn flush(&mut self) -> io::Result<()> {

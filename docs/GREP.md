@@ -598,8 +598,9 @@ Owned tests compare these bytes exactly through pipes and real ptys, including
 NUL prefixes and heading/context groups. Other terminal capabilities, custom
 palettes and hyperlinks are outside this tier; exact escape placement remains
 an accepted-difference class, with no such difference found in M5's covered
-profiles. With multiple threads, workers publish each file’s complete group
-as soon as its checked read finishes (D92 B); their groups never interleave.
+profiles. With multiple threads, finished checked groups enter a bounded
+completion queue and are published as soon as the destination is available
+(D92 B); their groups never interleave.
 With one thread, groups retain walk order. Cross-file diagnostics follow
 completion order too, and cannot split another file’s group. Grep reuses find’s
 bounded output/spill machinery.

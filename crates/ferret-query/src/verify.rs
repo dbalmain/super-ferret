@@ -1791,7 +1791,7 @@ pub fn completion_groups<Task, State, Group: Send>(
         // The owning iterator drops the receiver on break, unblocking senders
         // before scope join. The stop guard also wakes input-budget waiters.
         for group in receiver {
-            if cancelled.load(Ordering::Acquire) || emit(group).is_break() {
+            if pool.halted() || cancelled.load(Ordering::Acquire) || emit(group).is_break() {
                 break;
             }
         }
@@ -2382,35 +2382,77 @@ mod group_tests {
     use super::*;
     use std::sync::{Arc, Barrier, mpsc};
 
+    fn completion_child(name: &str) -> bool {
+        const MARKER: &str = "FERRET_TEST_COMPLETION_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("verify::group_tests::{name}")])
+            .env(MARKER, name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("completion worker left a waiter asleep");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // A full queue must bound captures, and dropping its receiver on Break
+    // must unblock senders before scope join. Isolate a regression's deadlock.
+    #[test]
+    fn completion_queue_bounds_captures_and_releases_blocked_senders() {
+        if completion_child("completion_queue_bounds_captures_and_releases_blocked_senders") {
+            return;
+        }
+        let threads = 4;
+        let prepared = AtomicUsize::new(0);
+        let mut tasks = (0..256).map(|task| (1, task));
+        let mut emitted = 0;
+        completion_groups(
+            threads,
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                prepared.fetch_add(1, Ordering::Release);
+                task
+            },
+            |_| {
+                emitted += 1;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while prepared.load(Ordering::Acquire) < 2 * threads + 1
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                // Once saturated, another prepare cannot finish until the
+                // caller consumes a group, which it deliberately does not.
+                std::thread::sleep(Duration::from_millis(10));
+                assert_eq!(prepared.load(Ordering::Acquire), 2 * threads + 1);
+                ControlFlow::Break(())
+            },
+        );
+        assert_eq!(emitted, 1);
+    }
+
     // A panicking worker can leave the entire input budget reserved. Its
     // peers must wake before scope joins; isolate a regression's deadlock.
     #[test]
     fn completion_worker_panic_wakes_input_budget_waiters() {
-        const MARKER: &str = "FERRET_TEST_VISITOR_PANIC";
-        if std::env::var_os(MARKER).is_none() {
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "verify::group_tests::completion_worker_panic_wakes_input_budget_waiters",
-                ])
-                .env(MARKER, "1")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success());
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("panicking worker left its budget waiter asleep");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+        if completion_child("completion_worker_panic_wakes_input_budget_waiters") {
+            return;
         }
         let reached = AtomicBool::new(false);
         let result = std::panic::catch_unwind(|| {
