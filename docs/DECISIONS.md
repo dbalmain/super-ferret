@@ -5342,3 +5342,43 @@ quiet matrix and cross-line gap case pin the first-terminal, advanced-EOF and
 line-floor distinctions. A requirement that -q preserve event-span counts
 exactly, or a pinned oracle removing this separate counting path, would change
 the recommendation to A.
+
+## D92 — Grep output order across files
+
+**Status: answered, 2026-10-18.**
+
+Question: when several threads search, should `ferret grep` publish each
+file's output as soon as that file finishes, or keep today's fixed order?
+
+Measured at 32 threads on indexed `-F -a the` over the 4 GB corpus, which
+produces 2.3 GB of output from 56k files (`wt/grep-perf1` `4bc4eb3`):
+
+| Destination | rg | ferret | ferret, never spilling |
+| --- | ---: | ---: | ---: |
+| `/dev/null` | 0.22 s | 0.86 s | 0.56 s |
+| file on tmpfs | 0.95 s | 1.39 s | 1.14 s |
+| pipe to `cat` | 0.70 s | 1.12 s | 0.91 s |
+
+Peak memory: rg 263 MiB, ferret 254 MiB, the never-spilling build 622 MiB.
+Ordered publication holds finished groups until every earlier group is
+published, and each group over 64 KiB spills to a temp file and is read back.
+That costs about 0.28 s here, plus about 0.12 s for one thread copying every
+byte to stdout.
+
+- **A — a shared in-memory budget (256 MiB) for finished, unpublished
+  groups.** Keeps the fixed order; spills only past the budget. Peak memory
+  rises by up to the budget on dense queries.
+- **B — publish each file as soon as it finishes, as rg does.** Few groups
+  are held, so little spills and no single thread copies all output. Output
+  order across files varies between runs with more than one thread; groups
+  still never interleave, and one thread keeps walk order.
+- **C — keep 64 KiB per group.** No memory change; keeps the 0.28 s.
+
+Recommendation was A, for the fixed order at a bounded memory cost.
+
+> Dave: B, matching rg. A flag for sort order can come later.
+
+**Answer: B.** Multi-threaded grep publishes groups in completion order.
+GREP.md already promised only that files finish in any order and their
+groups do not interleave. A sort-order flag (rg's `--sort path`, refused
+today) is a later feature.
