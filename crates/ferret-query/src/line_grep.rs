@@ -766,6 +766,8 @@ pub struct Line<'a> {
     /// Whether the original line had LF; replacement omits advanced EOF
     /// empties.
     pub terminated: bool,
+    /// One-based line number. The line-local fast path counts lines only
+    /// when the plan prints numbers or JSON, so it is unspecified otherwise.
     pub number: u64,
     pub bytes: &'a [u8],
     pub kind: LineKind,
@@ -813,6 +815,9 @@ fn scan_records(
     let fast = !plan.invert && plan.before == 0 && plan.after == 0 && plan.grep.is_line_local();
     #[cfg(test)]
     let fast = fast && !plan.force_per_line;
+    // Counting every LF costs about 15% of a dense scan; skip it unless
+    // something reads the number.
+    let count_lines = !fast || plan.line_number || plan.json;
     let mut result = InputResult::empty(plan);
     if !result.searched {
         return Ok(result);
@@ -887,18 +892,22 @@ fn scan_records(
                         // numbers.
                         offset += remaining.len() as u64 + u64::from(terminated);
                         result.bytes_searched = offset;
-                        number += memchr::memchr_iter(b'\n', remaining).count() as u64
-                            + u64::from(
-                                terminated
-                                    || binary.is_some()
-                                    || (!remaining.is_empty() && !remaining.ends_with(b"\n")),
-                            );
+                        if count_lines {
+                            number += memchr::memchr_iter(b'\n', remaining).count() as u64
+                                + u64::from(
+                                    terminated
+                                        || binary.is_some()
+                                        || (!remaining.is_empty() && !remaining.ends_with(b"\n")),
+                                );
+                        }
                         break;
                     };
                     let first = memchr::memrchr(b'\n', &remaining[..hit]).map_or(0, |at| at + 1);
                     let end = memchr::memchr(b'\n', &remaining[hit..])
                         .map_or(remaining.len(), |at| hit + at);
-                    number += memchr::memchr_iter(b'\n', &remaining[..first]).count() as u64;
+                    if count_lines {
+                        number += memchr::memchr_iter(b'\n', &remaining[..first]).count() as u64;
+                    }
                     offset += first as u64;
                     if end < remaining.len() {
                         next = Some(start + end + 1);
@@ -1104,17 +1113,32 @@ mod tests {
             result.elapsed = std::time::Duration::ZERO;
             (output, result)
         };
-        let actual = scan(plan);
-        let mut slow = plan.clone();
-        slow.force_per_line = true;
-        let expected = scan(&slow);
-        assert_eq!(
-            actual,
-            expected,
-            "pattern {:?}, {} input bytes",
-            plan.grep.pattern(),
-            bytes.len()
-        );
+        // The fast path counts lines only when something prints them, so an
+        // unnumbered plan compares everything else; a numbered copy compares
+        // the numbers too.
+        let mut numbered = plan.clone();
+        numbered.line_number = true;
+        for (plan, masked) in [(plan, !plan.line_number && !plan.json), (&numbered, false)] {
+            let mask = |(mut output, result): (Vec<_>, _)| {
+                if masked {
+                    output
+                        .iter_mut()
+                        .for_each(|line: &mut (_, _, _, u64, _, _, _, _)| line.3 = 0);
+                }
+                (output, result)
+            };
+            let actual = mask(scan(plan));
+            let mut slow = plan.clone();
+            slow.force_per_line = true;
+            let expected = mask(scan(&slow));
+            assert_eq!(
+                actual,
+                expected,
+                "pattern {:?}, {} input bytes",
+                plan.grep.pattern(),
+                bytes.len()
+            );
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
 
-use ferret_catalog::{Catalog, Contents, InoId, Kind, Target};
+use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
 
 use super::{Follow, Options};
 
@@ -122,6 +122,7 @@ impl Entry {
                 metadata: OnceCell::new(),
                 target: None,
                 parent: None,
+                id: None,
                 catalog: None,
             },
         }
@@ -139,6 +140,12 @@ impl Entry {
     pub fn catalog_name(&self) -> Option<ferret_catalog::NameId> {
         let catalog = self.state.catalog.as_ref()?;
         let parent = self.state.parent?;
+        // A catalog listing already knows the id; looking it up again was most
+        // of the serial producer's time in a flat directory (grep-why P1).
+        if let Some(id) = self.state.id {
+            debug_assert_eq!(Some(id), catalog.lookup(parent, self.name()));
+            return Some(id);
+        }
         catalog.lookup(parent, self.name())
     }
 
@@ -542,6 +549,7 @@ struct Saved {
     metadata: OnceCell<Result<Metadata, Arc<io::Error>>>,
     target: Option<Target>,
     parent: Option<InoId>,
+    id: Option<NameId>,
     catalog: Option<Arc<Catalog>>,
 }
 
@@ -563,6 +571,7 @@ struct Child {
     kind: Option<FileKind>,
     target: Option<Target>,
     parent: Option<InoId>,
+    id: Option<NameId>,
 }
 
 /// An open directory. Its children occupy `start..end` of the walk's child
@@ -854,6 +863,7 @@ impl LiveWalk {
                     kind: Some(catalog_kind(child.kind)),
                     target: Some(child.target),
                     parent: Some(dir),
+                    id: Some(child.name),
                 });
             }
             // Nested roots have no name row in the outer crawl (D34).
@@ -884,6 +894,7 @@ impl LiveWalk {
                     kind: Some(FileKind::Directory),
                     target: Some(Target::Inode(*id)),
                     parent: Some(dir),
+                    id: None,
                 });
             }
             if cancelled() {
@@ -994,6 +1005,7 @@ impl LiveWalk {
                 kind,
                 target,
                 parent: None,
+                id: None,
             });
         }
         if cancelled() {
@@ -1086,6 +1098,7 @@ impl LiveWalk {
                 }
                 if let Some(catalog) = &self.catalog {
                     if self.options.delete {
+                        self.entry.state.id = None;
                         self.entry.state.parent =
                             std::path::absolute(self.entry.lookup_path().as_ref())
                                 .ok()
@@ -1167,6 +1180,7 @@ impl LiveWalk {
             entry.state.metadata = OnceCell::new();
             entry.state.target = child.target;
             entry.state.parent = child.parent;
+            entry.state.id = child.id;
             // Deletion accounting is walk-wide and stays in the reusable entry;
             // re-cloning its shared counter here contends across workers.
             if child.target.is_some() {

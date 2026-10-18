@@ -1046,43 +1046,58 @@ type WrittenPair = (SegmentEntry, Arc<Segment<File>>, Arc<Segment<File>>);
 type PairedSegments = (Vec<Arc<Segment<File>>>, Vec<Arc<Segment<File>>>);
 
 fn open_pairs(dir: &Path, manifest: &Manifest) -> Result<PairedSegments, Error> {
-    manifest
-        .segments
-        .iter()
-        .map(|entry| -> Result<OpenPair, Error> {
-            let open = |tri: bool| -> Result<_, Error> {
-                let name = if tri {
-                    entry.trigram_file_name()
-                } else {
-                    entry.file_name()
-                };
-                let file = File::open(dir.join(name))?;
-                let bytes = file.metadata()?.len();
-                let segment = Segment::open(file)?;
-                let matches = if tri {
-                    entry.matches_trigrams(
-                        &segment.info(),
-                        &segment.digest(),
-                        bytes,
-                        manifest.trigram_version,
-                    ) && segment.codec() == crate::segment::DICTIONARY_CODEC
-                } else {
-                    entry.matches(
-                        &segment.info(),
-                        &segment.digest(),
-                        bytes,
-                        manifest.tokenizer_version,
-                    )
-                };
-                if !matches {
-                    return Err(ReadError::Head.into());
-                }
-                Ok(Arc::new(segment))
+    let one = |entry: &SegmentEntry| -> Result<OpenPair, Error> {
+        let open = |tri: bool| -> Result<_, Error> {
+            let name = if tri {
+                entry.trigram_file_name()
+            } else {
+                entry.file_name()
             };
-            Ok((open(false)?, open(true)?))
+            let file = File::open(dir.join(name))?;
+            let bytes = file.metadata()?.len();
+            let segment = Segment::open(file)?;
+            let matches = if tri {
+                entry.matches_trigrams(
+                    &segment.info(),
+                    &segment.digest(),
+                    bytes,
+                    manifest.trigram_version,
+                ) && segment.codec() == crate::segment::DICTIONARY_CODEC
+            } else {
+                entry.matches(
+                    &segment.info(),
+                    &segment.digest(),
+                    bytes,
+                    manifest.tokenizer_version,
+                )
+            };
+            if !matches {
+                return Err(ReadError::Head.into());
+            }
+            Ok(Arc::new(segment))
+        };
+        Ok((open(false)?, open(true)?))
+    };
+    // Parsing each segment's block index is most of opening a view; segments
+    // open in parallel, at most one thread per core (grep-why P7).
+    let segments = &manifest.segments;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = segments.len().div_ceil(threads).max(1);
+    let pairs: Result<Vec<_>, Error> = if segments.len() <= 1 {
+        segments.iter().map(one).collect()
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = segments
+                .chunks(chunk)
+                .map(|entries| scope.spawn(|| entries.iter().map(one).collect::<Vec<_>>()))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|pairs| pairs.into_iter().unzip())
+    };
+    pairs.map(|pairs| pairs.into_iter().unzip())
 }
 
 /// Unlinks merged-away segments. Open views keep their descriptors (D32);
