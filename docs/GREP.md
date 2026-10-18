@@ -175,9 +175,10 @@ preserving the original left haystack and four bytes of right context for
 LF/Unicode word assertions. An occurrence ending beyond the consuming window
 cannot select it. Actual spans, captures, replacement and JSON still use their
 original source-line bounds. Uncoloured, unnumbered plain records combine path,
-separator, data and LF through the capture's vectored writer. Grep holds up to 256 KiB per file capture, then stages spill
+separator, data and LF through the capture's vectored writer. Grep holds up to 4 MiB per file capture (D93), then stages spill
 writes in 64 KiB blocks, finishing them inside the
-checked-read callback before accepting a group. Find's default captures retain
+checked-read callback before accepting a group. A broken pipe on stdout ends
+grep silently with exit 0, as rg does (D94). Find's default captures retain
 immediate spill-write faults. Redirected grep stdout uses a 64 KiB block buffer
 written to descriptor 1 itself, with no second descriptor (preserving shared
 stdout/stderr offsets); terminal stdout retains line buffering. NUL-terminated

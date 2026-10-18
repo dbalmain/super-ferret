@@ -117,11 +117,18 @@ fn execute(
                 writer.flush()
             }
         })
-        .map_err(|error| {
-            cancelled.store(true, Ordering::Release);
-            format!("writing stdout: {error}")
-        })?;
-        Ok(false)
+        .map_or_else(
+            |error| {
+                cancelled.store(true, Ordering::Release);
+                // D94: a closed pipe stops the listing quietly, as in rg.
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    Ok(true)
+                } else {
+                    Err(format!("writing stdout: {error}"))
+                }
+            },
+            |()| Ok(false),
+        )
     };
     for input in inputs {
         if cancelled.load(Ordering::Acquire) {
@@ -231,10 +238,13 @@ fn execute(
             }
         }
     }
-    writer.flush().map_err(|error| {
+    if let Err(error) = writer.flush() {
         cancelled.store(true, Ordering::Release);
-        format!("writing stdout: {error}")
-    })?;
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(Exit::Ok);
+        }
+        return Err(format!("writing stdout: {error}"));
+    }
     Ok(if errors {
         Exit::Usage
     } else if listed {

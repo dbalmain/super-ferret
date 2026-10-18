@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-const GROUP_BYTES: usize = 256 << 10;
+const GROUP_BYTES: usize = 4 << 20;
 const ENTRY_BYTES: usize = 64 << 10;
 const CACHE_BYTES: usize = 16 << 20;
 const CHUNK: usize = 64 << 10;
@@ -1157,17 +1157,18 @@ mod tests {
     fn late_spill_failure_remains_a_capture_fault() {
         const MARKER: &str = "FERRET_TEST_LATE_SPILL";
         if std::env::var_os(MARKER).is_none() {
-            const LAUNCH: &str = concat!(
-                "import os, resource, signal, sys; ",
-                "resource.setrlimit(resource.RLIMIT_FSIZE, (262144, 262144)); ",
-                "signal.signal(signal.SIGXFSZ, signal.SIG_IGN); ",
-                "os.execv(sys.argv[1], [sys.argv[1], '--exact', ",
-                "'grep::groups::tests::late_spill_failure_remains_a_capture_fault', '--nocapture'])",
+            // The limit is the capture size, so the final spill bytes fail.
+            let launch = format!(
+                "import os, resource, signal, sys; \
+                 resource.setrlimit(resource.RLIMIT_FSIZE, ({GROUP_BYTES}, {GROUP_BYTES})); \
+                 signal.signal(signal.SIGXFSZ, signal.SIG_IGN); \
+                 os.execv(sys.argv[1], [sys.argv[1], '--exact', \
+                 'grep::groups::tests::late_spill_failure_remains_a_capture_fault', '--nocapture'])"
             );
             let output = std::process::Command::new(
                 std::env::var_os("FERRET_PYTHON").expect("dev shell supplies Python"),
             )
-            .args(["-c", LAUNCH])
+            .args(["-c", &launch])
             .arg(std::env::current_exe().unwrap())
             .env(MARKER, "1")
             .output()

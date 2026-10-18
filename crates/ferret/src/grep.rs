@@ -282,7 +282,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 threads,
                 &cancelled,
             ) {
-                return failure(&format!("writing stdout: {error}"));
+                return output_failure(&error);
             }
             if plan.quiet && host.matched {
                 if !plan.json {
@@ -294,7 +294,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         if matches!(inputs.peek(), Some(Input::Stdin)) {
             inputs.next();
             if let Err(error) = host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX) {
-                return failure(&format!("writing stdout: {error}"));
+                return output_failure(&error);
             }
             if plan.quiet && host.matched {
                 if !plan.json {
@@ -307,10 +307,10 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     if plan.json
         && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start)
     {
-        return failure(&format!("writing stdout: {error}"));
+        return output_failure(&error);
     }
     if let Err(error) = host.writer.flush() {
-        return failure(&format!("writing stdout: {error}"));
+        return output_failure(&error);
     }
     if plan.quiet && host.matched {
         Exit::Ok
@@ -340,7 +340,17 @@ fn print(bytes: &[u8]) -> Exit {
     let mut writer = output::Writer::new(&stdout, true);
     match writer.write_all(bytes).and_then(|()| writer.flush()) {
         Ok(()) => Exit::Ok,
-        Err(error) => failure(&format!("writing stdout: {error}")),
+        Err(error) => output_failure(&error),
+    }
+}
+
+/// D94: a reader that closes the pipe ends grep quietly with success, as rg
+/// does. Every other output fault is reported.
+fn output_failure(error: &io::Error) -> Exit {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        Exit::Ok
+    } else {
+        failure(&format!("writing stdout: {error}"))
     }
 }
 

@@ -440,7 +440,7 @@ fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     let fixture = Fixture::new("spill");
     fixture.write(
         "large",
-        &[vec![b'x'; 400_000], b"red\nred".to_vec()].concat(),
+        &[vec![b'x'; 5_000_000], b"red\nred".to_vec()].concat(),
     );
     fixture.compare(&["-n", "red", "large", "one.rs"], None);
 }
@@ -608,7 +608,7 @@ fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
 fn spill_failure_stops_before_the_next_matching_file() {
     let fixture = Fixture::new("spill-failure");
     fs::create_dir_all(fixture.tree().join("ordered")).unwrap();
-    fixture.write("ordered/big.txt", &b"red\n".repeat(100_000));
+    fixture.write("ordered/big.txt", &b"red\n".repeat(1_200_000));
     fixture.write("ordered/small.txt", b"red small\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let mut outcomes = Vec::new();
@@ -793,8 +793,8 @@ fn parallel_groups_preserve_whole_spilled_files_at_one_and_four_threads() {
     fs::create_dir_all(fixture.tree().join("groups")).unwrap();
     for file in 0..12 {
         let mut bytes = Vec::new();
-        for line in 0..12000 {
-            writeln!(bytes, "red file-{file:02} line-{line:04} payload").unwrap();
+        for line in 0..120_000 {
+            writeln!(bytes, "red file-{file:02} line-{line:06} payload").unwrap();
         }
         fixture.write(&format!("groups/part-{file:02}"), &bytes);
     }
@@ -941,12 +941,9 @@ fn quiet_and_closed_stdout_stop_parallel_work_before_open_stdin() {
             if let Some(reader) = reader {
                 reader.join().unwrap();
             }
-            assert_eq!(
-                output.status.code(),
-                Some(if quiet { 0 } else { 2 }),
-                "{output:?}"
-            );
-            assert_eq!(output.stderr.is_empty(), quiet);
+            // D94: a closed stdout ends grep as quietly as a quiet match.
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
             assert!(output.stdout.is_empty());
         }
     }
@@ -1806,6 +1803,32 @@ fn buffered_stdout_read_only_descriptor_is_silent() {
     );
 }
 
+// D94 in the names-only path, which publishes outside file groups.
+#[test]
+fn names_listing_ends_quietly_on_a_broken_pipe() {
+    use std::io::Read;
+
+    let fixture = Fixture::new("names-broken-pipe");
+    fixture.write("listed", b"red\n");
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .args(["grep", "--files"])
+        .args(std::iter::repeat_n("listed", 50_000));
+    let mut child = command.spawn().unwrap();
+    let mut pipe = child.stdout.take().unwrap();
+    let mut prefix = [0; 16];
+    pipe.read_exact(&mut prefix).unwrap();
+    drop(pipe);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        (Some(0), "".into())
+    );
+}
+
 // Exercise the CLI destination after the consumer has accepted some output,
 // rather than only an injected writer that fails on its first call.
 #[test]
@@ -1823,10 +1846,13 @@ fn buffered_stdout_broken_pipe_mid_group_and_late_full_disk() {
     assert!(prefix.starts_with(b"red line\n"));
     drop(pipe);
     let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    // D94: rg ends silently with success when its reader goes away.
     assert_eq!(
-        output.stderr,
-        b"ferret: grep: writing stdout: Broken pipe (os error 32)\n"
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        (Some(0), "".into())
     );
 
     // This complete output fits in a block: the failure occurs on its final
@@ -4164,7 +4190,7 @@ fn m9_json_spills_complete_groups_and_base64_quantum_boundaries() {
     let fixture = Fixture::new("m9-json-spills");
     fixture.write("large-invalid", &vec![0xff; 3 * 8192 + 2]);
     fixture.compare_json(&[r"(?-u:.*)", "large-invalid"], None);
-    fixture.write("many", &b"red red\n".repeat(2500));
+    fixture.write("many", &b"red red\n".repeat(40_000));
     fixture.compare_json(&["red", "many", "one.rs", "many"], None);
     fixture.compare_json(&["-U", r"red|\n", "many"], None);
 }
