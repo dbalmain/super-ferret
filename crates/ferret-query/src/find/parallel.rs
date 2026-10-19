@@ -344,6 +344,7 @@ impl Plan {
             workers,
             starts: !sequential,
             quit: &quit,
+            on_panic: None,
         };
         let errors = schedule::run(
             &schedule,

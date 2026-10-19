@@ -69,7 +69,7 @@ use std::io::{self, Read};
 use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread::Scope;
+use std::thread::{Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
@@ -1574,16 +1574,16 @@ fn spawn<'scope>(
     i: usize,
     work: impl FnOnce() + Send + 'scope,
 ) -> std::io::Result<()> {
-    spawn_named(scope, i, "ferret-verify", work)
+    spawn_named(scope, i, "ferret-verify", work).map(drop)
 }
 
 /// Starts thread `i` on the scope, named so profiles can tell it apart.
-fn spawn_named<'scope>(
+pub(crate) fn spawn_named<'scope, R: Send + 'scope>(
     scope: &'scope Scope<'scope, '_>,
     i: usize,
     name: &str,
-    work: impl FnOnce() + Send + 'scope,
-) -> std::io::Result<()> {
+    work: impl FnOnce() -> R + Send + 'scope,
+) -> std::io::Result<ScopedJoinHandle<'scope, R>> {
     #[cfg(test)]
     if seam::Seams::current().fail_spawn_at == Some(i) {
         return Err(std::io::Error::other("injected spawn failure"));
@@ -1593,7 +1593,6 @@ fn spawn_named<'scope>(
     std::thread::Builder::new()
         .name(name.into())
         .spawn_scoped(scope, work)
-        .map(drop)
 }
 
 /// Stops the pool when the calling thread leaves the scope, by any path.
@@ -1892,11 +1891,11 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
                         let Some((size, task)) = feed.take() else {
                             break;
                         };
-                        let Some(size) = lane.reserve(size, &stopped) else {
+                        let Some(reservation) = lane.reserve(size, &stopped) else {
                             break;
                         };
                         let group = work(&mut state, task, &stopped);
-                        lane.release(size);
+                        drop(reservation);
                         if stopped() {
                             break;
                         }
@@ -1941,16 +1940,23 @@ pub struct Lane<'g, Group> {
     pool: &'g Pool<()>,
 }
 
-impl<Group> Lane<'_, Group> {
+impl<'g, Group> Lane<'g, Group> {
     /// Reserves the input bytes for a task of `size` (at least one read
-    /// buffer); `None` once the run stops.
-    pub fn reserve(&self, size: u64, stopped: &dyn Fn() -> bool) -> Option<u64> {
-        self.pool
-            .reserve(size.max(crate::scan::BUFFER as u64), stopped)
+    /// buffer) until the reservation drops; `None` once the run stops.
+    pub fn reserve(&self, size: u64, stopped: &dyn Fn() -> bool) -> Option<Reservation<'g>> {
+        let size = self
+            .pool
+            .reserve(size.max(crate::scan::BUFFER as u64), stopped)?;
+        Some(Reservation {
+            pool: self.pool,
+            size,
+        })
     }
 
-    pub fn release(&self, size: u64) {
-        self.pool.release(size);
+    /// Stops the run and wakes every lane waiting for bytes. For a walker
+    /// that panics: its siblings poll the stop, not the walker.
+    pub fn stop(&self) {
+        self.pool.halt();
     }
 
     /// Holds a completed group of `bytes`, or hands batches over now (see
@@ -1989,6 +1995,19 @@ impl<Group> Lane<'_, Group> {
         if !stopped && let Some(batch) = batch {
             let _ = self.sender.send(batch);
         }
+    }
+}
+
+/// Input bytes held by a [`Lane`]'s task, released when dropped, unwinding
+/// included, so a panicking reader cannot strand its siblings.
+pub struct Reservation<'g> {
+    pool: &'g Pool<()>,
+    size: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.pool.release(self.size);
     }
 }
 
@@ -2039,12 +2058,16 @@ fn collect<Group>(
 /// gets one [`Lane`] per worker and the stop predicate, starts its workers,
 /// and returns once they have all finished. The caller emits groups in
 /// completion order meanwhile, under the same handoff and input bounds.
+///
+/// `run` gets its own thread, as the caller is busy emitting; if that thread
+/// cannot start, nothing runs and the spawn's error is returned. A worker
+/// whose walk panics should [`Lane::stop`] the run before unwinding further.
 pub fn lane_groups<'g, Group: Send + 'g>(
     threads: usize,
     cancelled: &AtomicBool,
     run: impl FnOnce(Vec<Lane<'_, Group>>, &(dyn Fn() -> bool + Sync)) + Send,
     mut emit: impl FnMut(Group) -> ControlFlow<()>,
-) {
+) -> io::Result<()> {
     let threads = threads.max(1);
     let pool = Pool::<()>::schedule(0, threads);
     let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
@@ -2068,12 +2091,14 @@ pub fn lane_groups<'g, Group: Send + 'g>(
         let started = spawn_named(scope, threads, "ferret-walk", move || {
             let _panic = StopOnPanic(pool);
             run(lanes, &stopped);
-        });
+        })
+        .map(drop);
         if started.is_ok() {
             collect(&receiver, held, idle, &stopped, &mut emit);
         }
         drop(receiver);
-    });
+        started
+    })
 }
 
 /// Emits a handoff's groups in order until the run stops or `emit` breaks.
@@ -3108,5 +3133,196 @@ mod group_tests {
                 assert_eq!(on_caller, 0, "fail at {fail}");
             }
         }
+    }
+
+    // A refused walk-thread spawn must not pass for an empty search: the
+    // caller either runs the search or hears why it could not.
+    #[test]
+    fn a_refused_walk_spawn_is_reported() {
+        let threads = 2;
+        let _seams = seam::Seams {
+            fail_spawn_at: Some(threads),
+            ..Default::default()
+        }
+        .set();
+        let ran = AtomicBool::new(false);
+        let result = lane_groups(
+            threads,
+            &AtomicBool::new(false),
+            |_, _| ran.store(true, Ordering::Relaxed),
+            |(): ()| ControlFlow::Continue(()),
+        );
+        assert!(!ran.load(Ordering::Relaxed));
+        let error = result.expect_err("the search never ran, silently");
+        assert_eq!(error.to_string(), "injected spawn failure");
+    }
+
+    // A reservation taken by a task that panics is released as it unwinds,
+    // so a later reader is not left waiting on leaked bytes.
+    #[test]
+    fn a_panicking_reader_releases_its_reservation() {
+        if completion_child("a_panicking_reader_releases_its_reservation") {
+            return;
+        }
+        lane_groups(
+            1,
+            &AtomicBool::new(false),
+            |lanes, stopped| {
+                let lane = &lanes[0];
+                let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _held = lane.reserve(u64::MAX, stopped);
+                    panic!("reader fails mid-read");
+                }));
+                assert!(unwound.is_err());
+                assert!(lane.reserve(u64::MAX, stopped).is_some());
+            },
+            |(): ()| ControlFlow::Continue(()),
+        )
+        .unwrap();
+    }
+
+    /// A walk of [`Job`]s for the find scheduler. Its first step lends every
+    /// job but the next, so each job after it runs as its own task.
+    struct Jobs(Vec<Job>);
+
+    #[derive(Clone, Copy)]
+    enum Job {
+        /// Does nothing, so the walk splits.
+        Lend,
+        /// Reserves the whole input budget and panics once a sibling waits
+        /// for bytes.
+        Hog,
+        /// Waits for the hog's reservation, then reserves.
+        Wait,
+        /// Panics.
+        Panic,
+        /// Holds a reservation until the run stops, as a slow read does.
+        Poll,
+    }
+
+    impl crate::find::schedule::Split for Jobs {
+        fn split(&mut self, _: bool) -> Option<(Self, Option<std::sync::Arc<AtomicUsize>>)> {
+            (self.0.len() > 1).then(|| (Jobs(self.0.split_off(1)), None))
+        }
+        fn waiting(&self) -> bool {
+            false
+        }
+        fn suspended(&self) -> bool {
+            false
+        }
+    }
+
+    /// Runs [`Job`]s against its lane, as grep's walk workers search files.
+    struct Jobber<'l, 'g> {
+        lane: &'l Lane<'g, ()>,
+        stopped: &'l (dyn Fn() -> bool + Sync),
+        /// Both jobs of a run are on their own workers before either acts.
+        met: &'l Barrier,
+        hogged: &'l AtomicBool,
+        waiting: &'l AtomicBool,
+    }
+
+    impl crate::find::schedule::Visitor<Jobs, ()> for Jobber<'_, '_> {
+        fn step(&mut self, walk: &mut Jobs, (): &mut ()) -> crate::find::schedule::Step {
+            use crate::find::schedule::Step;
+            if walk.0.is_empty() {
+                return Step::Done;
+            }
+            let job = walk.0.remove(0);
+            if !matches!(job, Job::Lend) {
+                self.met.wait();
+            }
+            let until = |flag: &AtomicBool| {
+                while !flag.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            match job {
+                Job::Lend => {}
+                Job::Hog => {
+                    let _held = self.lane.reserve(u64::MAX, self.stopped);
+                    self.hogged.store(true, Ordering::SeqCst);
+                    until(self.waiting);
+                    panic!("hog fails holding the budget");
+                }
+                Job::Wait => {
+                    until(self.hogged);
+                    let _held = self.lane.reserve(1, self.stopped);
+                }
+                Job::Panic => panic!("walker fails"),
+                Job::Poll => {
+                    let _held = self.lane.reserve(1, self.stopped);
+                    while !(self.stopped)() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            Step::Next
+        }
+        fn lend(&mut self, (): &mut ()) {}
+        fn end(&mut self, (): &mut ()) -> u64 {
+            0
+        }
+    }
+
+    /// Walks `jobs` with two scheduler workers inside [`lane_groups`], as
+    /// grep's live walk does, and says whether the run ended by panicking.
+    fn walk_jobs(jobs: Vec<Job>) -> bool {
+        let waiting = std::sync::Arc::new(AtomicBool::new(false));
+        let _seams = seam::Seams {
+            on_budget_wait: Some({
+                let waiting = waiting.clone();
+                std::sync::Arc::new(move || waiting.store(true, Ordering::SeqCst))
+            }),
+            ..Default::default()
+        }
+        .set();
+        let met = Barrier::new(2);
+        let hogged = AtomicBool::new(false);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lane_groups(
+                2,
+                &AtomicBool::new(false),
+                |lanes, stopped| {
+                    let quit = AtomicBool::new(false);
+                    let stop = || lanes[0].stop();
+                    let schedule = crate::find::schedule::Schedule {
+                        workers: 2,
+                        starts: false,
+                        quit: &quit,
+                        on_panic: Some(&stop),
+                    };
+                    let jobber = |i: usize| Jobber {
+                        lane: &lanes[i],
+                        stopped,
+                        met: &met,
+                        hogged: &hogged,
+                        waiting: &waiting,
+                    };
+                    crate::find::schedule::run(
+                        &schedule,
+                        Jobs(jobs),
+                        (),
+                        &mut jobber(0),
+                        |_| true,
+                        jobber,
+                    );
+                },
+                |(): ()| ControlFlow::Continue(()),
+            )
+        }))
+        .is_err()
+    }
+
+    // P2 of the D105 review: a walker panicking inside the scheduler stops
+    // the lane pool, so a sibling waiting for bytes, or reading until the
+    // run stops, wakes and the panic reaches the caller.
+    #[test]
+    fn a_walker_panic_stops_sibling_walkers() {
+        if completion_child("a_walker_panic_stops_sibling_walkers") {
+            return;
+        }
+        assert!(walk_jobs(vec![Job::Lend, Job::Hog, Job::Wait]));
+        assert!(walk_jobs(vec![Job::Lend, Job::Panic, Job::Poll]));
     }
 }

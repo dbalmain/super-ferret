@@ -54,6 +54,9 @@ pub struct Schedule<'q> {
     pub starts: bool,
     /// Set to stop every worker; [`Step::Quit`] and a panic set it too.
     pub quit: &'q AtomicBool,
+    /// Called as a worker's panic unwinds, after `quit` is set: for a caller
+    /// whose visitors also wait on something `quit` does not wake.
+    pub on_panic: Option<&'q (dyn Fn() + Sync)>,
 }
 
 /// Lends work only while fewer than this many tasks per worker are queued or
@@ -148,13 +151,19 @@ struct Pool<'s, 'q, S, T> {
 
 // A worker panic must wake siblings before the scoped join can propagate it.
 // Taking the queue lock closes the check-then-condvar-wait lost-wakeup window.
+// The caller's hook runs outside that lock.
 struct PanicStop<'p, 's, 'q, S, T>(&'p Pool<'s, 'q, S, T>);
 impl<S, T> Drop for PanicStop<'_, '_, '_, S, T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            let _queue = self.0.lock();
-            self.0.schedule.quit.store(true, Ordering::Release);
-            self.0.changed.notify_all();
+            {
+                let _queue = self.0.lock();
+                self.0.schedule.quit.store(true, Ordering::Release);
+                self.0.changed.notify_all();
+            }
+            if let Some(on_panic) = self.0.schedule.on_panic {
+                on_panic();
+            }
         }
     }
 }
@@ -173,10 +182,18 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
     ) -> u64 {
         let errors = std::thread::scope(|scope| {
             let pool = &self;
+            // From here the caller's panic, even in `visitor`, wakes the
+            // workers already started.
+            let _panic = PanicStop(pool);
+            // A refused spawn leaves the walk to fewer workers: the caller is
+            // one, and any worker takes any queued task.
             let handles: Vec<_> = (1..self.schedule.workers)
-                .map(|i| {
+                .filter_map(|i| {
                     let mut visitor = visitor(i);
-                    scope.spawn(move || pool.worker(&mut visitor))
+                    crate::verify::spawn_named(scope, i, "ferret-walk", move || {
+                        pool.worker(&mut visitor)
+                    })
+                    .ok()
                 })
                 .collect();
             let mut errors = pool.worker(caller);

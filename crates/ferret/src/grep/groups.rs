@@ -784,6 +784,8 @@ impl<'s> Search<'s> {
 /// and handing groups to this thread in completion order, under the same
 /// handoff and input bounds as [`run`]. File operands are searched in order
 /// by the first worker. Sets `searched` if any walk selected a file (D99).
+/// Fails with [`Unstarted`], having searched nothing, if the walk's own
+/// thread cannot start.
 pub(super) fn walk<W: Write>(
     host: &mut Host<'_, W>,
     source: Source<'_>,
@@ -799,7 +801,7 @@ pub(super) fn walk<W: Write>(
         live,
         ..
     } = source;
-    ferret_query::lane_groups(
+    let started = ferret_query::lane_groups(
         threads,
         cancelled,
         |lanes, stopped| {
@@ -814,6 +816,9 @@ pub(super) fn walk<W: Write>(
                 buffer: Vec::new(),
             };
             let mut first = walker(0);
+            // A walker's panic stops the lanes too: a sibling may be waiting
+            // for input bytes, or reading until the run stops.
+            let stop = || lanes[0].stop();
             for input in inputs {
                 if stopped() {
                     break;
@@ -838,6 +843,7 @@ pub(super) fn walk<W: Write>(
                                     workers: threads,
                                     starts: false,
                                     quit: &quit,
+                                    on_panic: Some(&stop),
                                 };
                                 schedule::run(
                                     &schedule,
@@ -868,8 +874,29 @@ pub(super) fn walk<W: Write>(
         },
         |group| search.publish(host, group),
     );
+    if let Err(error) = started {
+        return Err(io::Error::other(Unstarted(error)));
+    }
     *searched |= found.load(Ordering::Acquire);
     search.finish(host)
+}
+
+/// A search thread the system refused to start, so that nothing of the
+/// operands was searched.
+#[derive(Debug)]
+pub(super) struct Unstarted(io::Error);
+
+impl std::fmt::Display for Unstarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "starting a search thread: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unstarted {}
+
+/// The refused spawn an error from [`walk`] carries, if it is one.
+pub(super) fn unstarted(error: &io::Error) -> Option<&Unstarted> {
+    error.get_ref()?.downcast_ref()
 }
 
 /// A walk task's own state: whether to enter the directory it last
@@ -899,7 +926,7 @@ impl Walker<'_, '_> {
         if matches!(job, Job::Failed(..)) {
             return self.lane.hand((job, Observed::Skipped), 0).is_continue();
         }
-        let Some(size) = self.lane.reserve(size, self.stopped) else {
+        let Some(reservation) = self.lane.reserve(size, self.stopped) else {
             return false;
         };
         let result = prepare(
@@ -916,7 +943,7 @@ impl Walker<'_, '_> {
             self.buffer = Vec::new();
         }
         let group = self.search.observed(job, result, self.stopped);
-        self.lane.release(size);
+        drop(reservation);
         if (self.stopped)() {
             return false;
         }

@@ -363,7 +363,8 @@ fn print(bytes: &[u8]) -> Exit {
 
 /// D94: a reader that closes the pipe ends grep quietly with success, as rg
 /// does. Every other output fault is reported; a spill fault names the
-/// temporary directory (`TMPDIR`) rather than stdout.
+/// temporary directory (`TMPDIR`) rather than stdout, and a search thread the
+/// system refused is named as that.
 fn output_failure(error: &io::Error) -> Exit {
     if let Some(spill) = ferret_query::find::spill_path(error) {
         let directory = spill.parent().unwrap_or(spill);
@@ -371,6 +372,8 @@ fn output_failure(error: &io::Error) -> Exit {
             "writing temporary output in {}: {error}",
             directory.display()
         ))
+    } else if let Some(unstarted) = groups::unstarted(error) {
+        failure(&unstarted.to_string())
     } else if error.kind() == io::ErrorKind::BrokenPipe {
         Exit::Ok
     } else {

@@ -679,6 +679,32 @@ fn no_path_and_nothing_searched_exits_two() {
 }
 
 #[test]
+fn a_refused_search_thread_is_an_error_not_an_empty_search() {
+    // The parallel live walk starts its own thread. With RLIMIT_NPROC at 1
+    // the system refuses it; grep once exited 1 with no output, as though
+    // nothing matched. bash's `ulimit` sets the limit without unsafe code.
+    // Root ignores the limit, so a full search is also accepted.
+    let fixture = Fixture::new("refused-thread");
+    let mut command = fixture.command(OsStr::new("bash"));
+    command
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("FERRET_SEARCH_THREADS", "2")
+        .args(["-c", r#"ulimit -u 1 && exec "$0" "$@""#])
+        .arg(env!("CARGO_BIN_EXE_ferret"))
+        .args(["grep", "-uu", "red delta", "sub"]);
+    let output = run(command, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(2) => {
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(stderr.contains("starting a search thread"), "{stderr}");
+        }
+        Some(0) => assert_eq!(output.stdout, b"sub/three.rs:red delta\n", "{output:?}"),
+        _ => panic!("refused thread was not reported: {output:?}"),
+    }
+}
+
+#[test]
 fn non_utf8_filename_bytes_are_preserved() {
     let fixture = Fixture::new("path-bytes");
     let path = OsStr::from_bytes(b"name-\xff");

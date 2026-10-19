@@ -363,6 +363,7 @@ fn a_batch_boundary_output_failure_cancels_queued_workers() {
         workers: 2,
         starts: false,
         quit: &quit,
+        on_panic: None,
     };
     let errors = super::schedule::queued(
         &schedule,
@@ -438,5 +439,27 @@ fn execdir_cwd_failure_stops_before_the_next_start_like_gnu() {
             expected,
             "workers={workers}"
         );
+    }
+}
+
+#[test]
+fn a_refused_worker_spawn_leaves_the_walk_to_the_rest() {
+    // The OS may refuse a thread (RLIMIT_NPROC). The walk must still visit
+    // every entry, on the workers that did start, rather than panic.
+    let tree = Tree::new();
+    let (_, expected) = tree.run(&["-print"], 1);
+    let mut expected = expected.records.lock().unwrap().clone();
+    expected.sort();
+    for fail in [1, 3] {
+        let _seams = crate::verify::seam::Seams {
+            fail_spawn_at: Some(fail),
+            ..Default::default()
+        }
+        .set();
+        let (outcome, output) = tree.run(&["-print"], 4);
+        assert_eq!(outcome.errors, 0, "{:?}", output.errors);
+        let mut records = output.records.lock().unwrap().clone();
+        records.sort();
+        assert_eq!(records, expected, "fail at {fail}");
     }
 }
