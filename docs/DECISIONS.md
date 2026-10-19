@@ -5625,7 +5625,7 @@ expect an empty result to exit 1.
 
 ## D100 — Empty matches at the end of an unterminated last line
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: is the end of a last line that has no final LF a position where an
 empty match can occur?
@@ -5651,9 +5651,13 @@ with its own `$`. GNU grep has no `--count-matches`: its `-c` counts lines, and
 Recommendation: A, under D97 (simpler, and consistent). Would change it: a
 tool that depends on rg's count for unterminated files.
 
+> Dave: Agree with all of your recommendations from D100 up.
+
+**Answer: A.**
+
 ## D101 — Multiline `-c` for patterns that can match LF
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: under `-U`, should `-c` keep counting matches for a pattern that can
 match LF, as GREP.md documents since M7, or count selected lines?
@@ -5672,9 +5676,13 @@ cannot match LF count lines in both tools.
 Recommendation: A. Would change it: wanting `-c` to mean lines everywhere more
 than agreement with rg.
 
+> Dave: Agree with all of your recommendations from D100 up.
+
+**Answer: A.**
+
 ## D102 — A spill-file fault stops the whole search
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: when grep cannot create or write the temp file a capture over 4 MiB
 spills to (D93), should that fail only the file being captured, or the whole
@@ -5698,9 +5706,13 @@ is the design working as written. The message also blames stdout.
 Recommendation: A, and fix the message either way. Would change it: D103 A
 removing spilling altogether, which makes this moot.
 
+> Dave: Agree with all of your recommendations from D100 up.
+
+**Answer: A.**
+
 ## D103 — Streaming output from one large file
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: should a file whose capture passes 4 MiB stream its output as it is
 scanned, instead of publishing only after the closing version check?
@@ -5728,9 +5740,13 @@ must hold the file's whole output (or D102 applies).
 Recommendation: A. Would change it: a consumer that relies on never seeing a
 large file's output from two versions.
 
+> Dave: Agree with all of your recommendations from D100 up.
+
+**Answer: A.**
+
 ## D104 — Files that grow during the search
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: when a file's only change during the read is growth, should grep
 search the bytes up to its first observed size instead of exiting 2?
@@ -5757,6 +5773,10 @@ mid-read; a randomised run saw 428 growth signatures and no mixed bytes.
 
 Recommendation: B. Would change it: logs rotated by copytruncate being common
 in the trees ferret searches.
+
+> Dave: Agree with all of your recommendations from D100 up.
+
+**Answer: B.**
 
 ## D105 — A multi-threaded live walk for grep
 
@@ -5800,7 +5820,7 @@ Neither B nor C as written: the scheduler is shared, not duplicated.
 
 ## D106 — Keeping a directory's files on one worker (index mode)
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: should a worker take a run of consecutive small files at once, so
 that one directory's files are read by one worker?
@@ -5828,9 +5848,13 @@ of 16 tasks cuts kernel time to 2–4 s; with D107 B the wall falls to ~0.50 s.
 Recommendation: B. Would change it: accepting a bounded hold-back of up to 15
 small files behind a slow one; then A, for a quarter of the code.
 
+> Dave: Agree with all of your recommendations from D100 up.
+
+**Answer: B.**
+
 ## D107 — Fewer wakeups from the producer
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: may the producer queue several tasks before waking a sleeping worker?
 
@@ -5849,3 +5873,7 @@ on deep-idx (rg: under 1k at 8 threads).
 Recommendation: B together with D106, and only in index mode if D105 B lands,
 since there the producer makes no syscalls and cannot stall. Would change it:
 streaming latency on slow filesystems mattering more than CPU; then C.
+
+> Dave: Agree with all of your recommendations from D100 up.
+
+**Answer: B.**
