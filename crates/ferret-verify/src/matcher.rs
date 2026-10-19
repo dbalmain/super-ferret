@@ -45,6 +45,12 @@ impl Regex {
         self.0.find(bytes).map(|m| m.range())
     }
 
+    /// Leftmost-first span starting at or after `at`, with the whole of
+    /// `bytes` as assertion context.
+    pub(crate) fn find_at(&self, bytes: &[u8], at: usize) -> Option<std::ops::Range<usize>> {
+        self.0.find_at(bytes, at).map(|m| m.range())
+    }
+
     /// An earliest match end, allowing the engine to stop without finding
     /// the full leftmost span or running a reverse search for its start.
     pub(crate) fn shortest_match(&self, bytes: &[u8]) -> Option<usize> {
@@ -205,6 +211,7 @@ impl Replacement {
 
 /// Shared byte-span iteration. Every span retains the whole haystack's
 /// assertion context.
+#[derive(Debug)]
 pub struct Spans<'r, 't> {
     regex: &'r Regex,
     bytes: &'t [u8],
@@ -222,7 +229,7 @@ impl Iterator for Spans<'_, '_> {
                 self.next = None;
                 return None;
             }
-            let found = self.regex.0.find_at(self.bytes, from).map(|m| m.range());
+            let found = self.regex.find_at(self.bytes, from);
             let Some(span) = found else {
                 self.next = None;
                 return None;
