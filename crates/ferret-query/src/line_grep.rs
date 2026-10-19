@@ -666,8 +666,9 @@ pub fn candidates(
     Ok(docs)
 }
 
-/// Result of scanning one input. Binary detection discards the input's plain
-/// output; a quiet match may finish before a later NUL is read.
+/// Result of scanning one input. Binary detection replaces staged plain
+/// output with a warning; an already-streamed prefix cannot be withdrawn.
+/// A quiet match may finish before a later NUL is read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InputResult {
     pub matched: bool,
@@ -702,8 +703,8 @@ impl InputResult {
     }
 }
 
-/// Input faults may be recoverable per file; an output failure must stop the
-/// command, even when it occurs inside the checked-reader callback.
+/// Input faults belong to the file. Output includes context staging faults;
+/// the host distinguishes these from destination faults before publication.
 #[derive(Debug)]
 pub enum ScanError {
     Input(io::Error),
@@ -734,7 +735,7 @@ impl std::error::Error for ScanError {
 
 /// Emit selected records with 1-based line numbers after stripping one
 /// initial UTF-8 BOM. Line mode searches without LF terminators; multiline
-/// mode buffers the checked input. The host publishes only a successful read.
+/// mode buffers the checked input. The host owns publication and retry policy.
 pub fn scan(
     plan: &Plan,
     input: &mut dyn Read,
@@ -778,7 +779,7 @@ pub struct Line<'a> {
 
 /// Stream selected records and bounded before/after context without a second
 /// input read. Multiline buffers the checked input before producing records.
-/// All context-spool failures retain output-fault classification.
+/// Context-spool failures are Output errors, which the host treats per file.
 pub fn scan_lines(
     plan: &Plan,
     input: &mut dyn Read,
@@ -787,14 +788,28 @@ pub fn scan_lines(
     stopped: &dyn Fn() -> bool,
     emit: impl FnMut(Line<'_>) -> io::Result<()>,
 ) -> Result<InputResult, ScanError> {
+    scan_lines_progress(plan, input, size, buffer, stopped, emit).map_err(|(_, error)| error)
+}
+
+/// As [`scan_lines`], retaining observed statistics on failure. A streaming
+/// host uses these to close a JSON group whose prefix is already published.
+pub fn scan_lines_progress(
+    plan: &Plan,
+    input: &mut dyn Read,
+    size: u64,
+    buffer: &mut Vec<u8>,
+    stopped: &dyn Fn() -> bool,
+    emit: impl FnMut(Line<'_>) -> io::Result<()>,
+) -> Result<InputResult, (InputResult, ScanError)> {
     let start = std::time::Instant::now();
-    let mut result = if plan.json {
-        events::scan(plan, input, size, buffer, stopped, emit)
+    let mut result = InputResult::empty(plan);
+    let outcome = if plan.json {
+        events::scan(plan, input, size, buffer, stopped, &mut result, emit)
     } else {
-        scan_records(plan, input, size, buffer, stopped, emit)
-    }?;
+        scan_records(plan, input, size, buffer, stopped, &mut result, emit)
+    };
     result.elapsed = start.elapsed();
-    Ok(result)
+    outcome.map(|()| result).map_err(|error| (result, error))
 }
 
 fn scan_records(
@@ -803,10 +818,11 @@ fn scan_records(
     size: u64,
     buffer: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
+    result: &mut InputResult,
     mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
-) -> Result<InputResult, ScanError> {
+) -> Result<(), ScanError> {
     if plan.multiline {
-        return multiline::scan(plan, input, size, buffer, stopped, emit);
+        return multiline::scan_progress(plan, input, size, buffer, stopped, result, emit);
     }
     let search = plan.grep.borrowed_search();
     // LF exclusion alone is insufficient: absolute and CRLF anchors see a
@@ -822,9 +838,8 @@ fn scan_records(
     // Counting every LF costs about 15% of a dense scan; skip it unless
     // something reads the number.
     let count_lines = !fast || plan.line_number || plan.json;
-    let mut result = InputResult::empty(plan);
     if !result.searched {
-        return Ok(result);
+        return Ok(());
     }
     let mut selected_lines = 0;
     let mut bom = 0_u64;
@@ -1153,7 +1168,7 @@ fn scan_records(
             Ok(ControlFlow::Continue(()))
         },
     )?;
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(test)]

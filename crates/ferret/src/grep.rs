@@ -356,17 +356,10 @@ fn print(bytes: &[u8]) -> Exit {
     }
 }
 
-/// D94: a reader that closes the pipe ends grep quietly with success, as rg
-/// does. Every other output fault is reported; a spill fault names the
-/// temporary directory (`TMPDIR`) rather than stdout.
+/// D94: a reader that closes the pipe ends grep quietly with success. File
+/// staging faults have already been diagnosed by the per-file transaction.
 fn output_failure(error: &io::Error) -> Exit {
-    if let Some(spill) = ferret_query::find::spill_path(error) {
-        let directory = spill.parent().unwrap_or(spill);
-        failure(&format!(
-            "writing temporary output in {}: {error}",
-            directory.display()
-        ))
-    } else if error.kind() == io::ErrorKind::BrokenPipe {
+    if error.kind() == io::ErrorKind::BrokenPipe {
         Exit::Ok
     } else {
         failure(&format!("writing stdout: {error}"))
@@ -528,14 +521,76 @@ impl<W: Write> Host<'_, W> {
                 .then_some(label(path, self.plan.paths.is_empty())),
             stopped: &stopped,
         };
-        match groups::observe(&render, &mut self.buffer, read, false)? {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let mut stream = DirectStream {
+            host: self,
+            path,
+            printed: None,
+        };
+        let observed = groups::observe_streaming(&render, &mut buffer, read, false, &mut stream);
+        let printed = stream.printed;
+        self.buffer = buffer;
+        match observed? {
             groups::Observed::Ready(group) => self.commit(path, group.result, group.output),
             groups::Observed::Failed(error) => {
                 self.error(path, &error);
                 Ok(())
             }
+            groups::Observed::Spool(error) => {
+                self.error(path, &error);
+                Ok(())
+            }
             groups::Observed::Skipped => Ok(()),
+            groups::Observed::Streamed(result, error) => {
+                self.finish_stream(path, result, printed.unwrap_or(0), error)
+            }
         }
+    }
+
+    fn start_stream(&mut self, path: &Path) -> io::Result<u64> {
+        if self.plan.json {
+            let mut begin = Vec::new();
+            json::begin(&mut begin, label(path, self.plan.paths.is_empty()))?;
+            self.writer.write_all(&begin)?;
+            return Ok(begin.len() as u64);
+        }
+        if self.emitted_group {
+            if self.plan.presentation.heading == Some(true) {
+                self.writer.write_all(b"\n")?;
+            } else if self.plan.before > 0 || self.plan.after > 0 {
+                self.writer.write_all(b"--\n")?;
+            }
+        }
+        self.emitted_group = true;
+        Ok(0)
+    }
+
+    fn finish_stream(
+        &mut self,
+        path: &Path,
+        result: InputResult,
+        printed: u64,
+        error: Option<String>,
+    ) -> io::Result<()> {
+        self.matched |= result.matched;
+        if self.plan.json {
+            json::end(
+                &mut self.writer,
+                label(path, self.plan.paths.is_empty()),
+                result,
+                printed,
+            )?;
+            self.json_stats.add(result, printed);
+        } else if result.binary && result.matched {
+            self.writer
+                .write_all(label(path, self.plan.paths.is_empty()))?;
+            self.writer.write_all(b": binary file matches\n")?;
+        }
+        self.writer.flush()?;
+        if let Some(error) = error {
+            self.error(path, &error);
+        }
+        Ok(())
     }
 
     fn commit(&mut self, path: &Path, result: InputResult, output: OutputBuffer) -> io::Result<()> {
@@ -644,6 +699,38 @@ impl<W: Write> Host<'_, W> {
     }
 }
 
+/// Stdin and checked single-thread test hosts need no channel handoff.
+struct DirectStream<'h, 'p, W> {
+    host: &'h mut Host<'p, W>,
+    path: &'h Path,
+    printed: Option<u64>,
+}
+impl<W: Write> Write for DirectStream<'_, '_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.printed.is_none() {
+            self.printed = Some(self.host.start_stream(self.path)?);
+        }
+        if self
+            .host
+            .cancelled
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        let count = self
+            .host
+            .writer
+            .write(&bytes[..bytes.len().min(64 << 10)])?;
+        if let Some(printed) = &mut self.printed {
+            *printed += count as u64;
+        }
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.host.writer.flush()
+    }
+}
+
 fn label(path: &Path, implicit: bool) -> &[u8] {
     if path == Path::new("-") {
         b"<stdin>"
@@ -714,35 +801,35 @@ mod tests {
         );
     }
 
-    // Context and the selected line belong to one checked read. Force a
-    // first-attempt spill, then change its prefix after the first real read.
-    // The fixture is sized from the capture limit, and the published group
-    // must have spilled, so raising the limit cannot silently drop the spill.
+    // A changed attempt that crosses the output threshold cannot be retried,
+    // even when most output consists of before-context.
     #[test]
-    fn retried_context_discards_the_whole_spilled_group() {
+    fn changed_streamed_context_keeps_one_attempt_and_reports_the_file() {
         use std::cell::RefCell;
         use std::os::unix::fs::FileExt;
         use std::rc::Rc;
-        let lines = groups::GROUP_BYTES / b"old context\n".len() + 1;
+        let mut context = b"old context ".to_vec();
+        context.resize(1023, b'x');
+        context.push(b'\n');
+        let lines = groups::GROUP_BYTES / context.len() + 1;
         for recursive in [false, true] {
             let path = std::env::temp_dir().join(format!(
                 "ferret-context-retry-{}-{recursive}",
                 std::process::id()
             ));
-            let mut original = b"old context\n".repeat(lines);
+            let mut original = context.repeat(lines);
             original.extend_from_slice(b"red\n");
             fs::write(&path, &original).unwrap();
             let writer = OpenOptions::new().write(true).open(&path).unwrap();
             let mut changed = false;
+            let original_len = original.len();
             seam::AFTER_READ.with_borrow_mut(|hook| {
                 *hook = Some(Box::new(move || {
                     if !changed {
                         writer.write_all_at(b"NEW", 0).unwrap();
                         // A changed extent makes the retry independent of
                         // timestamp resolution.
-                        writer
-                            .write_all_at(b"tail\n", original.len() as u64)
-                            .unwrap();
+                        writer.write_all_at(b"tail\n", original_len as u64).unwrap();
                         changed = true;
                     }
                 }));
@@ -773,12 +860,14 @@ mod tests {
             host.file(&path, recursive).unwrap();
             seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
             seam::COMMIT.with_borrow_mut(|hook| *hook = None);
-            let mut expected = fs::read(&path).unwrap();
-            expected.truncate(expected.len() - b"tail\n".len());
+            let expected = original;
             fs::remove_file(path).unwrap();
             assert!(host.writer == expected, "replay differs");
-            assert!(host.matched && !host.errors);
-            assert_eq!(*spilled.borrow(), [true], "one published, spilled group");
+            assert!(host.matched && host.errors);
+            assert!(
+                spilled.borrow().is_empty(),
+                "streamed output bypasses capture commit"
+            );
         }
     }
 
@@ -1024,7 +1113,7 @@ mod tests {
         );
     }
 
-    // A later publication fault (including a spill read fault) must not
+    // A later destination fault must not
     // discard an already accepted JSON begin event before its diagnostic.
     #[test]
     fn publication_faults_flush_the_previously_accepted_prefix() {
@@ -1178,7 +1267,7 @@ mod seam {
         pub(super) static BEFORE_SCAN: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         pub(super) static AFTER_READ: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         /// Called on the publishing thread with each group about to be
-        /// committed, so a test can prove its fixture still spills.
+        /// committed, so tests can distinguish capture replay from streaming.
         pub(super) static COMMIT: RefCell<Option<Box<OnCommit>>> = RefCell::new(None);
     }
 

@@ -1,6 +1,6 @@
 //! rg JSON Lines, separate from ferret's envelope schema. Byte fields choose
-//! text or padded base64 independently. Encoding streams into the file spill;
-//! even a multiline event needs no second whole-group buffer.
+//! text or padded base64 independently. Encoding writes through the capture's
+//! streaming transition; even a multiline event needs no whole-group copy.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};

@@ -74,18 +74,39 @@ so a held group waits only on other output, never on its worker's next file
 or on a worker asleep waiting for the producer. For configured concurrency T,
 the queue holds at most T handoffs, each worker one group in progress and a
 batch of at most 64 KiB, and the host one handoff: live rendered capture bytes
-are bounded by (2T + 1) × 4 MiB + T × 64 KiB, 262 MiB at 32 threads (D93). This
-is not a peak-RSS bound. RSS adds the base heap (77 MiB on the 112k-file flat
-index at one thread), per-worker read and matcher state, and freed captures
+plus handoff buffers are bounded by (2T + 1) × 4 MiB + (4T + 1) × 64 KiB,
+under 269 MiB at 32 threads (D93). The 64 KiB terms cover held batches,
+stream buffering, one queued and one sending chunk per worker, and the
+publisher's current chunk. This is not a peak-RSS bound. RSS adds the base heap
+(77 MiB on the 112k-file flat index at one thread), per-worker read and matcher state, and freed captures
 that glibc keeps: once a large block is freed its dynamic mmap threshold rises,
 so later captures come from per-thread arenas that each keep their own high
-water. Flat `--json -F the` at 32 threads peaks at 436 MiB (226 MiB with
-`MALLOC_MMAP_THRESHOLD_=131072`), against rg's 591 MiB, so D93's answer —
-peak RSS up to rg's at the same thread count — holds. The producer's queue
-holds paths, not captures.
-Spill staging reuses that allocation in 64 KiB blocks with
-cancellation polls. Find retains its ordered publication path. The queue lets
-workers prepare ahead while the host waits on stdout; direct worker publication
+water. Before streaming, flat `--json -F the` at 32 threads measured 436 MiB
+(226 MiB with `MALLOC_MMAP_THRESHOLD_=131072`), against rg's 591 MiB. D93
+permits peak RSS up to rg's at the same thread count; these historical figures
+are not a new streaming measurement. The producer's queue holds paths, not
+captures.
+
+Above 4 MiB, a growing capture hands an active stream through the same completion
+queue, flushing that worker's held batch first. The publisher writes the prefix
+and consumes a one-slot channel of 64 KiB chunks until the file's closing check
+finishes (D103 A). Other groups queue within the same bound, then workers stall.
+No worker holds a queue-slot lock while sending. Sender/receiver drop releases
+waiters on cancellation or panic. Single-thread and spawn-fallback handoffs
+publish synchronously; stdin uses a direct writer. Find retains its ordered
+publication path.
+
+Rendered grep captures never spill, whether scanning, queued, or re-rendered
+from cached records. Only the separate rolling before-context spool spills,
+past 64 KiB, with its existing disk bound. Its faults fail the input file and
+continue with exit 2 (D102 A). Before publication the capture is discarded;
+after publication the prefix remains and the diagnostic names the input and
+temporary-file fault. Streamed files never retry. Up to 4 MiB, publication
+retains one checked version per file; above 4 MiB it promises **one version, or
+a diagnostic**. A changed closing version or later file error retains printed
+output, diagnoses the file, and sets exit 2. JSON closes its begun group with
+observed partial statistics. A broken stdout pipe remains silent exit 0 (D94).
+The queue lets workers prepare ahead while the host waits on stdout; direct worker publication
 regressed pipe throughput in the D92 measurements, despite reducing caller CPU
 work. Bounded catalog-version line records are reused only after each alias's
 own stat; current-byte answers stay local.
@@ -111,7 +132,7 @@ Grep M8 (2026-10-17) extends GrepFlags' shared profile compilation with
 replacement reference resolution. Verify owns capture spans and byte expansion;
 query projects expanded records one displayed line at a time, preserving the
 original source boundaries independently of display numbers. Host caches those
-records and highlights through the existing checked retry/spill transaction.
+records and highlights through the existing checked capture/stream transaction.
 No input write path or dependency edge is added.
 
 Two boundaries carry the design, and both are where D1 said the thought goes:

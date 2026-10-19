@@ -104,17 +104,31 @@ fn line_at(lines: &[Range<usize>], at: usize) -> usize {
         .min(lines.len() - 1)
 }
 
-pub(super) fn scan(
+#[cfg(test)]
+fn scan(
     plan: &Plan,
     source: &mut dyn Read,
     size: u64,
     buffer: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
-    mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
+    emit: impl FnMut(Line<'_>) -> io::Result<()>,
 ) -> Result<InputResult, ScanError> {
     let mut result = InputResult::empty(plan);
+    scan_progress(plan, source, size, buffer, stopped, &mut result, emit)?;
+    Ok(result)
+}
+
+pub(super) fn scan_progress(
+    plan: &Plan,
+    source: &mut dyn Read,
+    size: u64,
+    buffer: &mut Vec<u8>,
+    stopped: &dyn Fn() -> bool,
+    result: &mut InputResult,
+    mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
+) -> Result<(), ScanError> {
     if !result.searched {
-        return Ok(result);
+        return Ok(());
     }
     result.binary = read_all(source, size, buffer, plan.text, stopped)?;
     if result.binary {
@@ -138,7 +152,7 @@ pub(super) fn scan(
         push(&mut lines, start..bytes.len())?;
     }
     if lines.is_empty() {
-        return Ok(result);
+        return Ok(());
     }
 
     let whole = !plan.grep.excludes_lf();
@@ -198,14 +212,14 @@ pub(super) fn scan(
     let selected = !groups.is_empty();
     if plan.output == Output::WithoutMatch {
         result.matched = !selected;
-        return Ok(result);
+        return Ok(());
     }
     result.matched = selected;
     if (plan.quiet && !plan.json) || plan.output == Output::Names {
-        return Ok(result);
+        return Ok(());
     }
     if !selected {
-        return Ok(result);
+        return Ok(());
     }
     result.count =
         if !plan.invert && (whole || plan.only_matching || plan.output == Output::CountMatches) {
@@ -217,7 +231,7 @@ pub(super) fn scan(
                 .sum()
         };
     if plan.output != Output::Lines {
-        return Ok(result);
+        return Ok(());
     }
 
     let mut windows = Vec::new();
@@ -448,7 +462,7 @@ pub(super) fn scan(
             index += 1;
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(test)]

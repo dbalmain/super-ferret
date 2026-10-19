@@ -1850,10 +1850,36 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
     make: impl Fn() -> State + Sync,
     work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
     weight: impl Fn(&Group) -> u64 + Sync,
+    emit: impl FnMut(Group) -> ControlFlow<()>,
+) {
+    completion_groups_with_handoff(
+        threads,
+        cancelled,
+        next,
+        make,
+        |state, task, stopped, _, _| work(state, task, stopped),
+        weight,
+        emit,
+    );
+}
+
+/// Like [`completion_groups`], with handoffs during an active task. A handoff
+/// flushes that worker's held batch first and uses the same bounded queue.
+/// The final boolean tells `work` whether publication runs concurrently. On
+/// the single-thread and spawn-fallback paths handoffs publish synchronously;
+/// callers must not wait for that same task to supply more data in that case.
+/// A failed handoff means the publisher stopped and the task must unwind.
+pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
+    threads: usize,
+    cancelled: &AtomicBool,
+    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
+    make: impl Fn() -> State + Sync,
+    work: impl Fn(&mut State, Task, &dyn Fn() -> bool, &dyn Fn(Group) -> bool, bool) -> Group + Sync,
+    weight: impl Fn(&Group) -> u64 + Sync,
     mut emit: impl FnMut(Group) -> ControlFlow<()>,
 ) {
     if threads <= 1 {
-        groups_alone(next, cancelled, &make, &work, &mut emit);
+        groups_alone_with_handoff(next, cancelled, &make, &work, &mut emit);
         return;
     }
     let pool = Pool::<()>::schedule(0, threads);
@@ -1892,7 +1918,19 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
                         else {
                             break;
                         };
-                        let group = work(&mut state, task, &stopped);
+                        let handoff = |group| {
+                            let batch = lock(slot).take();
+                            if let Some(batch) = batch
+                                && sender.send(batch).is_err()
+                            {
+                                return false;
+                            }
+                            // A direct handoff wakes the caller even when it
+                            // has already inspected this worker's held slot.
+                            idle.store(false, Ordering::SeqCst);
+                            !stopped() && sender.send(vec![group]).is_ok()
+                        };
+                        let group = work(&mut state, task, &stopped, &handoff, true);
                         pool.release(size);
                         if stopped() {
                             break;
@@ -1948,7 +1986,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
         if !fed {
             // Any started workers find the feed closed and empty, and leave.
             feed.close();
-            groups_alone(&mut *lock(source), cancelled, make, work, &mut emit);
+            groups_alone_with_handoff(&mut *lock(source), cancelled, make, work, &mut emit);
             return;
         }
         // Slots seen empty in a row since `idle` was last set, and the next
@@ -2004,21 +2042,30 @@ fn publish<Group>(
     ControlFlow::Continue(())
 }
 
-fn groups_alone<Task, State, Group>(
+fn groups_alone_with_handoff<Task, State, Group>(
     mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
     cancelled: &AtomicBool,
     make: &impl Fn() -> State,
-    work: &impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group,
+    work: &impl Fn(&mut State, Task, &dyn Fn() -> bool, &dyn Fn(Group) -> bool, bool) -> Group,
     emit: &mut impl FnMut(Group) -> ControlFlow<()>,
 ) {
     let stopped = || cancelled.load(Ordering::Acquire);
+    let emit = std::cell::RefCell::new(emit);
+    let handoff = |group| {
+        if stopped() || emit.borrow_mut()(group).is_break() {
+            cancelled.store(true, Ordering::Release);
+            false
+        } else {
+            true
+        }
+    };
     let mut state = make();
     while !stopped() {
         let Some((_, task)) = next(&stopped) else {
             break;
         };
-        let item = work(&mut state, task, &stopped);
-        if stopped() || emit(item).is_break() {
+        let item = work(&mut state, task, &stopped, &handoff, false);
+        if stopped() || emit.borrow_mut()(item).is_break() {
             break;
         }
     }
