@@ -601,7 +601,9 @@ palettes and hyperlinks are outside this tier; exact escape placement remains
 an accepted-difference class, with no such difference found in M5's covered
 profiles. With multiple threads, finished checked groups enter a bounded
 completion queue and are published as soon as the destination is available
-(D92 B); their groups never interleave.
+(D92 B); their groups never interleave. While the host is busy, workers hold
+groups under 64 KiB in batches of up to 64 KiB; the host takes every held
+batch before it sleeps, so a held group never waits on its worker's next file.
 With one thread, groups retain walk order. Cross-file diagnostics follow
 completion order too, and cannot split another file’s group. Grep reuses find’s
 bounded output/spill machinery.
@@ -870,7 +872,10 @@ CatalogSource producer selects candidates with grep policy; a worker claims
 one file from it, reads/validates, matches and renders it. **P2 (2026-10-19):**
 completion-order grep runs that producer on its own thread, filling a queue of
 at most four paths per worker that idle workers sleep on, so workers no longer
-convoy on a producer lock and none holds a path while the producer blocks. One-file batches bound queued
+convoy on a producer lock and none holds a path while the producer blocks.
+**P5 (2026-10-19):** workers hand completed groups to the host in batches of
+at most 64 KiB while it is busy, and the host collects every held batch before
+it sleeps. One-file tasks and bounded handoffs bound queued
 groups; no array of every path or second concurrent pool is introduced. The
 calling thread publishes whole groups. Stdin is a direct operand barrier;
 workers never wait for its producer. Explicit operands resolve before searching,

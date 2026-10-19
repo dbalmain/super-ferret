@@ -634,6 +634,10 @@ pub(super) fn run<'a, W: Write>(
                 }
             }
         },
+        |(_, observed): &(Job, Observed)| match observed {
+            Observed::Ready(group) => group.output.memory_bytes() as u64,
+            Observed::Skipped | Observed::Failed(_) => 0,
+        },
         |(job, observed)| {
             let _publication = lock(&publication);
             if let Job::Failed(_, message) = &job {
@@ -1129,6 +1133,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(host.writer.bytes, b"fast:red\nslow:red\n");
+    }
+
+    // Batched handoffs: the worker that finished "fast" takes the next file,
+    // which is slow too. Its group must not wait in the worker's batch; it
+    // publishes before either slow file finishes.
+    #[test]
+    fn held_group_publishes_while_its_worker_reads_a_slow_file() {
+        struct Signal<'a> {
+            bytes: Vec<u8>,
+            published: &'a AtomicBool,
+        }
+        impl Write for Signal<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                self.published.store(true, Ordering::Release);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let plan = plan(&["red"]);
+        let published = AtomicBool::new(false);
+        let waited_out = AtomicBool::new(false);
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|name, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                if name.0 != 1 {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while !published.load(Ordering::Acquire) {
+                        if std::time::Instant::now() >= deadline {
+                            waited_out.store(true, Ordering::Release);
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+                each(&mut &b"red\n"[..], 4).unwrap();
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        let mut host = host(
+            &plan,
+            Signal {
+                bytes: Vec::new(),
+                published: &published,
+            },
+        );
+        let mut jobs = [
+            Job::Checked("slow".into(), NameId(0), 0),
+            Job::Checked("fast".into(), NameId(1), 1),
+            Job::Checked("later".into(), NameId(2), 2),
+        ]
+        .into_iter();
+        run(
+            &mut host,
+            |_| jobs.next().map(|job| (4, job)),
+            &fork,
+            None,
+            2,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!waited_out.load(Ordering::Acquire));
+        let output = std::str::from_utf8(&host.writer.bytes).unwrap();
+        let mut lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines[0], "fast:red");
+        lines.sort_unstable();
+        assert_eq!(lines, ["fast:red", "later:red", "slow:red"]);
     }
 
     // Policy can diagnose while advancing a live source. It must use the same
