@@ -1574,6 +1574,16 @@ fn spawn<'scope>(
     i: usize,
     work: impl FnOnce() + Send + 'scope,
 ) -> std::io::Result<()> {
+    spawn_named(scope, i, "ferret-verify", work)
+}
+
+/// Starts thread `i` on the scope, named so profiles can tell it apart.
+fn spawn_named<'scope>(
+    scope: &'scope Scope<'scope, '_>,
+    i: usize,
+    name: &str,
+    work: impl FnOnce() + Send + 'scope,
+) -> std::io::Result<()> {
     #[cfg(test)]
     if seam::Seams::current().fail_spawn_at == Some(i) {
         return Err(std::io::Error::other("injected spawn failure"));
@@ -1581,7 +1591,7 @@ fn spawn<'scope>(
     #[cfg(not(test))]
     let _ = i;
     std::thread::Builder::new()
-        .name("ferret-verify".into())
+        .name(name.into())
         .spawn_scoped(scope, work)
         .map(drop)
 }
@@ -1919,7 +1929,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
         drop(sender);
         let source = &source;
         let fed = started > 0
-            && spawn(scope, threads, move || {
+            && spawn_named(scope, threads, "ferret-producer", move || {
                 let _panic = StopOnPanic(pool);
                 let _close = CloseOnDrop(feed);
                 feed.produce(&mut *lock(source), &stopped);
