@@ -5219,3 +5219,63 @@ expect an empty result to exit 1.
 > Dave: Agree, option A
 
 **Answer: A.**
+
+## Grep streaming follow-up — a context-spool fault after publication
+
+**Status: awaiting Dave, 2026-10-20.** D102 A and D103 A are answered in
+the main checkout's decisions; this worktree starts before those sections.
+This question concerns their intersection, not their individual answers.
+
+Question: if a before-context spool fails after a file has started streaming,
+may grep retain the printed prefix, name the file in a diagnostic, continue
+with other files, and exit 2 without retrying it?
+
+D102 A requires a temp-file fault to publish nothing for the affected file.
+D103 A publishes before the scan finishes and explicitly permits a diagnostic
+instead of rollback when the closing version check fails. A context-spool
+fault can happen between these two points, so both requirements cannot hold
+literally for every file.
+
+Concrete input: more than 4 MiB of matching `hit\n` records, followed by an
+80 KiB nonmatching line and then another `hit\n`, searched with `-B1` and
+`TMPDIR=/nonexistent`. D103 starts publication during the matching prefix.
+The subsequent nonmatching line forces `Before::push_at` to create its first
+64 KiB context spill, which fails. This needs neither concurrent mutation
+nor a full disk. Context replay can likewise fail after publication starts.
+
+The paths are `crates/ferret-query/src/line_grep.rs` (selected records call
+`before.emit`, later nonselected records call `before.push_at`) and
+`crates/ferret-query/src/line_grep/context.rs` (rolling spill and replay).
+Removing rendered-output spills does not remove this spool.
+
+- **A — allow partial output after streaming begins.** Before publication,
+  a spool fault still discards the file. After publication, retain the prefix,
+  diagnose the input path and temporary-file fault, continue, exit 2, and
+  never retry. Preserves D103's latency and bounded context storage; weakens
+  D102's no-output guarantee for streaming files. For JSON, close the begun
+  group and report only statistics actually observed before the fault;
+  collecting that progress requires the scanner to return partial statistics
+  on failure rather than losing its local result.
+- **B — keep transactional output whenever before-context is requested.**
+  Disable streaming for `-B`/`-C` (including JSON with before-context), retain
+  rendered-output spill staging there, and make staging faults file-local.
+  Keeps D102's guarantee for context-spool faults but preserves D103's
+  whole-file latency and temp-disk cost in those modes. Rendered spill replay
+  also needs special care: a late read-back fault after a successful first
+  chunk cannot retract stdout either; a validation pass cannot guarantee a
+  later replay will succeed.
+- **C — remove context spilling as well.** Keep the entire before-context
+  window in memory. Removes temp-file faults from this path and simplifies
+  error handling, but user-controlled context counts and line lengths make
+  that memory unbounded. Allocation and input errors can still happen after
+  publication, so this does not remove the need for partial-output handling.
+
+**Recommendation: A.** Extend D103's irreversible-publication rule to file
+errors after streaming starts, including context-spool faults. Keep D102's
+discard rule before the first published byte. Broken stdout remains D94.
+**Would change it:** a consumer requiring no output for a file with a context
+staging error; then B, with an explicit exception for late replay faults.
+
+Implementation paused before code changes, as the streaming slice instructs
+for behavior choices not settled by the existing decisions. The worktree's
+`.ai/stream-notes.md` records the handoff design and remaining work.
