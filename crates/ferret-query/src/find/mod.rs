@@ -6,7 +6,7 @@ mod action;
 mod glob;
 mod output;
 mod parallel;
-pub use parallel::{Donor, Pool};
+pub mod schedule;
 mod parse;
 mod printf;
 mod test;
