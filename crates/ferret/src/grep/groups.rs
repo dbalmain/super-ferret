@@ -672,6 +672,22 @@ enum Handoff {
     Direct(PathBuf, Message),
 }
 
+// A closed relay is an aftermath, not the stdout fault itself. Receiver drop
+// can wake a worker before the publisher records BrokenPipe (D94); that worker
+// must not replace the original error with ConnectionAborted and exit 2.
+#[derive(Debug)]
+struct PublisherStopped;
+impl std::fmt::Display for PublisherStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("grep publisher stopped")
+    }
+}
+impl std::error::Error for PublisherStopped {}
+
+fn publisher_stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, PublisherStopped)
+}
+
 struct Relay<'a> {
     path: &'a Path,
     handoff: &'a dyn Fn(Handoff) -> bool,
@@ -688,7 +704,7 @@ impl Relay<'_> {
                 self.sender = Some(sender);
                 self.started = true;
                 if !(self.handoff)(Handoff::Stream(self.path.to_owned(), receiver)) {
-                    return Err(io::ErrorKind::ConnectionAborted.into());
+                    return Err(publisher_stopped());
                 }
             }
             self.sender
@@ -698,7 +714,7 @@ impl Relay<'_> {
             if !self.started {
                 self.started = true;
                 if !(self.handoff)(Handoff::Direct(self.path.to_owned(), Message::Begin)) {
-                    return Err(io::ErrorKind::ConnectionAborted.into());
+                    return Err(publisher_stopped());
                 }
             }
             (self.handoff)(Handoff::Direct(self.path.to_owned(), message))
@@ -706,7 +722,7 @@ impl Relay<'_> {
         if accepted {
             Ok(())
         } else {
-            Err(io::ErrorKind::ConnectionAborted.into())
+            Err(publisher_stopped())
         }
     }
 }
@@ -860,7 +876,11 @@ pub(super) fn run<'a, W: Write>(
                     Handoff::Complete(job, observed)
                 }
                 Err(error) => {
-                    if !stopped() {
+                    if !stopped()
+                        && !error
+                            .get_ref()
+                            .is_some_and(|cause| cause.is::<PublisherStopped>())
+                    {
                         let mut fatal = lock(&fatal);
                         if fatal.is_none() {
                             *fatal = Some(error);
@@ -1309,6 +1329,38 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(cancelled.load(Ordering::Acquire));
         assert_eq!(host.writer.0, 1);
+
+        // Dropping an active stream receiver wakes its sender before the
+        // caller records the stdout fault. That relay error must never win.
+        let mut bytes = b"red ".to_vec();
+        bytes.resize(GROUP_BYTES + CHUNK, b'x');
+        bytes.push(b'\n');
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                let _ = each(&mut &bytes[..], bytes.len() as u64);
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        for _ in 0..8 {
+            let mut streaming_host = self::host(&plan, Fault::default());
+            let mut jobs = (0..16).map(|n| Job::Checked(format!("file-{n}").into(), NameId(n), n));
+            let cancelled = AtomicBool::new(false);
+            let error = run(
+                &mut streaming_host,
+                |_| jobs.next().map(|job| (bytes.len() as u64, job)),
+                &fork,
+                None,
+                4,
+                &cancelled,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(cancelled.load(Ordering::Acquire));
+            assert_eq!(streaming_host.writer.0, 1);
+        }
     }
 
     // A slow first read cannot hold back another file's completed transaction.

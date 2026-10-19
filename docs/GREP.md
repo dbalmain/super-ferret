@@ -195,7 +195,7 @@ publication it retains the prefix. Both cases name the input and temporary-file
 fault, continue with other files, and exit 2 (D102 A). A streamed file is never
 retried. JSON closes a begun group with only observed partial statistics on a
 file error. A broken pipe on stdout still ends silently with exit 0 (D94);
-other stdout faults stop the run with exit 2. Find's captures are unchanged.
+other stdout faults stop the run with exit 2. Find's capture publication remains transactional.
 Redirected grep stdout uses a 64 KiB block buffer
 written to descriptor 1 itself, with no second descriptor (preserving shared
 stdout/stderr offsets); terminal stdout retains line buffering. NUL-terminated
@@ -585,7 +585,7 @@ input error. All bytes and rendered groups remain inside the existing
 bracket/retry transaction; a failed attempt publishes no prefix or zero record.
 There is **no small peak-memory bound** for explicit files, stdin or unrestricted
 multiline input. The whole input buffer and line/span metadata grow with the
-input and match count; output spills and host-cache budgets do not cap them.
+input and match count; rendered-capture and host-cache budgets do not cap them.
 Indexed and policy-preserving input retain their existing size cap. No extra
 cap is imposed on explicit, stdin or unrestricted input.
 
@@ -630,7 +630,7 @@ groups under 64 KiB in batches of up to 64 KiB; the host takes every held
 batch before it sleeps, so a held group never waits on its worker's next file.
 With one thread, groups retain walk order. Cross-file diagnostics follow
 completion order too, and cannot split another file’s group. Grep reuses find’s
-bounded output/spill machinery.
+bounded capture/stream machinery.
 
 **M2 output overrides (confirmed 2026-10-17):** the last `-l`/`-c` selects
 name or count output; `-q` independently overrides both, in either argv order.
@@ -673,7 +673,7 @@ adds/removes LF. LF-excluding profiles retain line-oriented replacement output,
 so an embedded replacement LF gets no additional prefix. `-o` never prints an
 empty expansion (D79 D); without `-o` an empty line still prints its LF.
 Expansion is cancellable and fallibly allocated. It keeps one displayed line
-and its highlights; rendered records still use the host's bounded cache/spill
+and its highlights; rendered records still use the host's bounded cache and capture/stream
 path. A source or expanded line can be arbitrarily long, under the existing
 line-sized memory exception. It does not accumulate an expanded multiline
 group. These presentation choices are settled (D84 B, through D98).
@@ -785,7 +785,7 @@ Detect NUL in each read chunk, without waiting for LF or EOF (review R1,
 2026-10-16). A producer that holds its stream open after NUL does not hold the
 query open. For non-binary input with no LF, line buffering grows with the line:
 explicit files and stdin have no invented cap and use fallible allocation;
-recursive input retains its existing file size cap. Output spill bounds output
+recursive input retains its existing file size cap. Capture buffering bounds rendered output
 memory, not this input-line buffer.
 If a selected line preceded it, plain line/span output prints
 `PATH: binary file matches` on stdout instead (stdin label: `(standard input)`).
@@ -863,7 +863,7 @@ require a second file read and would mishandle line anchors. M1 instead shares
 the extracted streaming core (`ferret-query/src/scan.rs`). Query owns grep’s
 parser, candidate selection and line records; the local host resolves operands,
 adapts policy/read faults, and renders bounded per-file output using find’s
-spill buffer. The same typed host adapter supplies search’s legacy optional
+capture buffer. The same typed host adapter supplies search’s legacy optional
 read result. There is no query-to-crawl/policy edge or new executor.
 
 M1 emitted file groups sequentially. M2 extends the same verification scheduler

@@ -3069,4 +3069,41 @@ mod group_tests {
             }
         }
     }
+
+    // An active task cannot wait for its own synchronous publisher. Both
+    // worker-start and producer-start fallback must expose that same mode.
+    #[test]
+    fn active_handoffs_publish_synchronously_on_serial_and_spawn_fallback_paths() {
+        if completion_child(
+            "active_handoffs_publish_synchronously_on_serial_and_spawn_fallback_paths",
+        ) {
+            return;
+        }
+        for (threads, fail_spawn_at) in [(1, None), (2, Some(0)), (2, Some(2))] {
+            let _seams = seam::Seams {
+                fail_spawn_at,
+                ..Default::default()
+            }
+            .set();
+            let mut tasks = (0..4).map(|task| (1, task));
+            let mut emitted = Vec::new();
+            completion_groups_with_handoff(
+                threads,
+                &AtomicBool::new(false),
+                |_| tasks.next(),
+                || (),
+                |_, task, _, handoff, concurrent| {
+                    assert!(!concurrent);
+                    assert!(handoff(task * 2));
+                    task * 2 + 1
+                },
+                |_| 0,
+                |item| {
+                    emitted.push(item);
+                    ControlFlow::Continue(())
+                },
+            );
+            assert_eq!(emitted, (0..8).collect::<Vec<_>>());
+        }
+    }
 }

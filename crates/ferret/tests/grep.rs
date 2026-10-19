@@ -5108,3 +5108,31 @@ fn streaming_context_and_match_limit_preserve_record_boundaries() {
         assert_eq!(output.stdout, expected);
     }
 }
+
+// A late binary sentinel cannot withdraw a streamed prefix, but its stdout
+// warning must retain the ordinary file/stdin label and follow the prefix.
+#[test]
+fn streaming_late_binary_sentinel_keeps_prefix_and_original_warning_label() {
+    let fixture = Fixture::new("streaming-late-binary");
+    let mut prefix = b"red ".to_vec();
+    prefix.resize(5 << 20, b'x');
+    prefix.push(b'\n');
+    let bytes = [prefix.as_slice(), b"\0tail"].concat();
+    fixture.write("large", &bytes);
+    for stdin in [false, true] {
+        let path = if stdin { "-" } else { "large" };
+        let output = fixture.ferret(&["grep", "red", path], stdin.then_some(bytes.as_slice()));
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        let label = if stdin {
+            b"(standard input)".as_slice()
+        } else {
+            b"large"
+        };
+        let expected = [prefix.as_slice(), label, b": binary file matches\n"].concat();
+        assert!(
+            output.stdout == expected,
+            "binary warning lost its streamed prefix or label"
+        );
+    }
+}

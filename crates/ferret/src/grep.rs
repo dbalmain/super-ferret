@@ -582,14 +582,23 @@ impl<W: Write> Host<'_, W> {
             )?;
             self.json_stats.add(result, printed);
         } else if result.binary && result.matched {
-            self.writer
-                .write_all(label(path, self.plan.paths.is_empty()))?;
-            self.writer.write_all(b": binary file matches\n")?;
+            self.binary_warning(path)?;
         }
         self.writer.flush()?;
         if let Some(error) = error {
             self.error(path, &error);
         }
+        Ok(())
+    }
+
+    fn binary_warning(&mut self, path: &Path) -> io::Result<()> {
+        self.writer.write_all(if path == Path::new("-") {
+            b"(standard input)"
+        } else {
+            label(path, self.plan.paths.is_empty())
+        })?;
+        self.writer.write_all(b": binary file matches\n")?;
+        self.emitted_group = true;
         Ok(())
     }
 
@@ -673,13 +682,7 @@ impl<W: Write> Host<'_, W> {
             }
         } else if result.binary {
             if result.matched {
-                self.writer.write_all(if path == Path::new("-") {
-                    b"(standard input)"
-                } else {
-                    label(path, self.plan.paths.is_empty())
-                })?;
-                self.writer.write_all(b": binary file matches\n")?;
-                self.emitted_group = true;
+                self.binary_warning(path)?;
             }
         } else {
             if self.emitted_group && !output.is_empty() {
