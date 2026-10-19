@@ -149,6 +149,7 @@ const RG_DIFFERS: &[Differs] = &[
     json(&["-U", "(?s:.*?)", "-"], Some(b"a\na\nbc"), 0, r#"[["begin", "<stdin>"], ["match", "a\na\nbc", 1, 0, [[0, 0, ""], [1, 1, ""], [2, 2, ""], [3, 3, ""], [4, 4, ""], [5, 5, ""], [6, 6, ""]]], ["end", null, [3, 7, 1]], ["summary", [3, 7, 1]]]"#, EOF),
     json(&["-U", "(?s:.*?)", "-"], Some(b"a\nbc"), 0, r#"[["begin", "<stdin>"], ["match", "a\nbc", 1, 0, [[0, 0, ""], [1, 1, ""], [2, 2, ""], [3, 3, ""], [4, 4, ""]]], ["end", null, [2, 5, 1]], ["summary", [2, 5, 1]]]"#, EOF),
     plain(&["-Ucm2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nfoo\n"), 0, b"3\n", D81),
+    plain(&["-U", "--count-matches", "-m2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nfoo\n"), 0, b"3\n", D81),
     plain(&["-Uom1", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"foo\nfoo\nbar\n", D81),
     plain(&["-Unm1", "-A2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"1:foo foo\n2:bar\n3-foo\n", D81),
     plain(&["-Uonm1", "-A2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"1:foo\n1:foo\n2:bar\n3-foo\n", D81),

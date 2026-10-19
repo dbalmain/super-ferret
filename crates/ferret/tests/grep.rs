@@ -4676,6 +4676,19 @@ fn d98_limit_takes_whole_groups() {
     assert_eq!(output.stdout, b"1:red red\n2:blue\n");
     let output = fixture.compare_raw(&["-Ucm1", "red(?:\nblue)?", "-"], Some(input));
     assert_eq!(output.stdout, b"2\n");
+    // The discriminating case: -m2 takes two line groups, and line 1's group
+    // holds two of the three matches. GREP.md: with -U, -c counts matches when
+    // the pattern can match LF, so -c equals --count-matches here (3), not the
+    // two selected lines; rg limits matches and prints 2. D101 is open on
+    // whether -c should count lines instead.
+    let input = b"foo foo\nfoo\n";
+    let output = fixture.compare_raw(&["-Ucm2", "foo(?:\\nbar)?", "-"], Some(input));
+    assert_eq!(output.stdout, b"3\n");
+    let output = fixture.compare_raw(
+        &["-U", "--count-matches", "-m2", "foo(?:\\nbar)?", "-"],
+        Some(input),
+    );
+    assert_eq!(output.stdout, b"3\n");
 }
 
 #[test]
