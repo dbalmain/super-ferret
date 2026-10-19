@@ -693,6 +693,7 @@ pub(super) struct Source<'a> {
     policy: Option<live::Policy>,
     selection: &'a GrepSelection,
     cwd: PathBuf,
+    searched: bool,
     #[cfg(test)]
     on_entry: Option<Box<OnEntry>>,
     #[cfg(test)]
@@ -719,6 +720,7 @@ impl<'a> Source<'a> {
             policy: None,
             selection,
             cwd,
+            searched: false,
             #[cfg(test)]
             on_entry: None,
             #[cfg(test)]
@@ -740,6 +742,13 @@ impl<'a> Source<'a> {
     pub(super) fn with_absence(mut self, emit: bool) -> Self {
         self.emit_absent = emit;
         self
+    }
+
+    /// Whether the walk selected any file: it passed depth, glob, hidden and
+    /// ignore filters. Index candidate pruning and binary or oversized
+    /// documents still count, as rg searches them (D99).
+    pub(super) fn searched(&self) -> bool {
+        self.searched
     }
 
     pub fn next(&mut self, stopped: &dyn Fn() -> bool) -> Option<(u64, Job)> {
@@ -839,6 +848,7 @@ impl<'a> Source<'a> {
                             }
                         }
                     }
+                    self.searched = true;
                     if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
                         let inode = catalog.name(name).child;
                         let Some(doc) = catalog.doc(inode) else {

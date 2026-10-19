@@ -814,6 +814,12 @@ Exit `0`: selected lines, matching names or listed files; `1`: none; `2`: parse,
 unsupported feature, pattern/index/read/write error. Continue after recoverable
 file errors. `-q` stops on a match and exits 0 even if a read error was already
 reported; a fatal pre-search error is still 2. Broken output stops work, exit 2.
+With no path operand (grep searches `.`), a walk whose depth, glob, hidden and
+ignore filters select no file exits 2 with a "no files were searched"
+diagnostic, after any walk error it reported (D99). A file selected but
+skipped by the index, or failing to open, still counts as searched. An
+explicit path (`.` included) or stdin keeps exit 1, silent. A spill fault
+names the temporary directory (`TMPDIR`) and file, not stdout.
 Error wording differs from rg; diagnostic presence and exit status are tested.
 
 ## Shared engine and crate seams

@@ -5084,3 +5084,30 @@ Recommendation was A, for the fixed order at a bounded memory cost.
 GREP.md already promised only that files finish in any order and their
 groups do not interleave. A sort-order flag (rg's `--sort path`, refused
 today) is a later feature.
+
+## D99 — Grep when no files were searched
+
+**Status: answered, 2026-10-19.**
+
+Question: when `ferret grep` is given no path, searches the current directory,
+and its filters leave nothing to search, should it exit 2 with a diagnostic,
+as rg 15.2.0 does ("No files were searched, which means ripgrep probably
+applied a filter you didn't expect"), or exit 1 silently?
+
+Probed with the pinned binaries: GNU grep 3.12 and rg both exit 1 silently
+when an explicit path or an include glob leaves nothing to search; rg exits 2
+only in the no-path case above. GNU grep with no path reads stdin, so it has
+no conflicting behaviour. The random tests found about 200 differences, all
+of this one shape.
+
+- **A — match rg in that one case.** About 10 lines: a count of files
+  searched, checked at exit only when no path operand was given; one test. No
+  cost on the search path. An agent whose filters exclude everything learns why.
+- **B — keep exit 1.** One less rule.
+
+Recommendation: A. Would change it: scripts that run ferret with no path and
+expect an empty result to exit 1.
+
+> Dave: Agree, option A
+
+**Answer: A.**

@@ -383,7 +383,9 @@ pub(super) struct Record {
     files: Vec<(super::action::SharedFile, OutputBuffer)>,
 }
 
-pub(super) fn error_path(error: &io::Error) -> Option<&Path> {
+/// The spill file an output error names, when the fault was in a capture's
+/// temporary file rather than its destination.
+pub fn spill_path(error: &io::Error) -> Option<&Path> {
     error
         .get_ref()?
         .downcast_ref::<SpillError>()
@@ -641,7 +643,7 @@ mod spill_tests {
             let error = output.write_to(&mut published).unwrap_err();
             WRITE.with_borrow_mut(|hook| *hook = None);
             assert!(published.is_empty());
-            assert_eq!(error_path(&error), Some(path.as_path()));
+            assert_eq!(spill_path(&error), Some(path.as_path()));
             if zero {
                 assert_eq!(error.kind(), io::ErrorKind::WriteZero);
                 assert_eq!(
@@ -729,7 +731,7 @@ mod spill_tests {
         let error = spill_progress(Ok(0), &[IoSlice::new(b""), IoSlice::new(b"x")], path)
             .expect_err("no progress on a nonempty vector");
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-        assert_eq!(error_path(&error), Some(path));
+        assert_eq!(spill_path(&error), Some(path));
         assert_eq!(
             error.to_string(),
             "write output spill /spill/ferret-output-1: failed to write whole buffer"
@@ -754,6 +756,6 @@ mod spill_tests {
         )
         .expect_err("errors keep their kind");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(error_path(&error), Some(path));
+        assert_eq!(spill_path(&error), Some(path));
     }
 }
