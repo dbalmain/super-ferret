@@ -24,7 +24,6 @@ pub(super) fn line(
         plan,
         Region {
             source: line.bytes,
-            clip: line.bytes.len(),
             range: 0..line.bytes.len(),
         },
         plan.grep.regex().spans(line.bytes),
@@ -34,47 +33,10 @@ pub(super) fn line(
     )
 }
 
-/// A cross-line discovery in an -m tail cannot publish the following line
-/// twice. Classify and capture this context line within its own bounds (M8-C).
-pub(super) fn trailing(
-    plan: &Plan,
-    source: &[u8],
-    line: Line<'_>,
-    stopped: &dyn Fn() -> bool,
-    emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
-) -> io::Result<()> {
-    let regex = plan.grep.regex();
-    let end = if plan.grep.excludes_lf() {
-        line.bytes.len()
-    } else {
-        source.len()
-    };
-    region(
-        plan,
-        Region {
-            source,
-            clip: source.len(),
-            range: 0..end,
-        },
-        regex.spans(source),
-        Line {
-            kind: if regex.find(source).is_some() {
-                LineKind::Match
-            } else {
-                LineKind::Context
-            },
-            ..line
-        },
-        stopped,
-        emit,
-    )
-}
-
-/// Original match bounds survive clipping and line-group projection. Captures
-/// must never be re-matched on a detached fragment or on expanded output.
+/// Original match bounds survive line-group projection. Captures must never
+/// be re-matched on a detached fragment or on expanded output.
 pub(super) struct Region<'a> {
     pub source: &'a [u8],
-    pub clip: usize,
     pub range: Range<usize>,
 }
 
@@ -103,49 +65,53 @@ pub(super) fn region(
         },
         whole,
     );
+    // Every ordinary span in the range expands (D83 A). An empty span at the
+    // range's end belongs to it unless that end follows an LF, where it starts
+    // the next line.
+    let after_lf =
+        region.range.end > region.range.start && region.source[region.range.end - 1] == b'\n';
     let mut at = region.range.start;
     let mut expanded = false;
-    let mut had_spans = false;
     for span in spans {
-        had_spans = true;
         cancelled(stopped)?;
         if span.start < region.range.start
             || span.start > region.range.end
-            || (span.start == region.range.end && !(span.is_empty() && line.terminated && !whole))
+            || (span.start == region.range.end && after_lf)
         {
             continue;
         }
-        let haystack = if span.start < region.clip {
-            &region.source[..region.clip]
-        } else {
-            region.source
-        };
-        let Some(captures) = plan.grep.regex().captures_at(haystack, span.start) else {
+        let Some(captures) = plan.grep.regex().captures_at(region.source, span.start) else {
             continue;
         };
-        expanded = true;
         if !only {
             output.push(&region.source[at..span.start], false, stopped, emit)?;
         } else if whole {
             output.line.number += line_feeds(&region.source[at..span.start], stopped)?;
         }
         output.merge = whole;
+        expanded = true;
         replacement.expand(&captures, |piece| output.push(piece, true, stopped, emit))?;
         if only {
-            output.flush(!whole, stopped, emit)?;
+            // D79 D: `-o` prints a non-empty expansion, never an empty record.
+            output.flush(false, stopped, emit)?;
         }
         at = span.end.min(region.range.end);
     }
-    if only && expanded {
-        return Ok(());
-    }
     if only {
-        // A discovered terminal assertion can select a line without a
-        // printable span. Keep the existing whole-line fallback.
-        return if had_spans || (plan.multiline && plan.invert) {
+        // Multiline inverted `-o` output is whole lines, so a context line
+        // without a match stays whole. Otherwise an empty fragment prints
+        // nothing; it keeps the line in the window.
+        return if output.printed {
+            Ok(())
+        } else if plan.multiline && plan.invert && !expanded {
             emit(line)
         } else {
-            Ok(())
+            emit(Line {
+                bytes: &[],
+                fragment: true,
+                highlights: None,
+                ..line
+            })
         };
     }
     output.push(&region.source[at..region.range.end], false, stopped, emit)?;
@@ -156,6 +122,7 @@ struct Records<'a> {
     line: Line<'a>,
     split: bool,
     merge: bool,
+    printed: bool,
     bytes: Vec<u8>,
     highlights: Vec<Range<usize>>,
 }
@@ -166,6 +133,7 @@ impl<'a> Records<'a> {
             line,
             split,
             merge: false,
+            printed: false,
             bytes: Vec::new(),
             highlights: Vec::new(),
         }
@@ -225,6 +193,7 @@ impl<'a> Records<'a> {
                 highlights: (!self.line.fragment).then_some(&self.highlights),
                 ..self.line
             })?;
+            self.printed = true;
             self.bytes.clear();
             self.highlights.clear();
         }

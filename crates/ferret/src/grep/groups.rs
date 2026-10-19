@@ -79,6 +79,16 @@ pub(super) struct Group {
     records: Option<Vec<Record>>,
 }
 
+/// Where a file's rendered output stands. A heading belongs to the first
+/// printed record. An empty `-o` fragment prints nothing but keeps its line in
+/// the window, so `--` marks only lines no window covered.
+#[derive(Default)]
+struct Cursor {
+    line: Option<u64>,
+    printed: bool,
+    gap: bool,
+}
+
 pub(super) enum Observed {
     Ready(Group),
     Skipped,
@@ -90,7 +100,7 @@ impl Render<'_> {
         &self,
         output: &mut OutputBuffer,
         line: line_grep::Line<'_>,
-        previous: &mut Option<u64>,
+        cursor: &mut Cursor,
     ) -> io::Result<()> {
         let mut output = CaptureWriter {
             inner: output,
@@ -107,7 +117,15 @@ impl Render<'_> {
                 line,
             );
         }
-        if previous.is_none()
+        let gap = cursor.line.is_some_and(|number| {
+            line.source_lines.map_or(line.number, |(start, _)| start) > number.saturating_add(1)
+        });
+        cursor.line = Some(line.source_lines.map_or(line.number, |(_, end)| end));
+        cursor.gap |= gap;
+        if line.fragment && line.bytes.is_empty() {
+            return Ok(());
+        }
+        if !cursor.printed
             && self.plan.presentation.heading == Some(true)
             && let Some(prefix) = self.prefix
         {
@@ -118,14 +136,11 @@ impl Render<'_> {
                 b"\n"
             })?;
         }
-        if (self.plan.before > 0 || self.plan.after > 0)
-            && previous.is_some_and(|number| {
-                line.source_lines.map_or(line.number, |(start, _)| start) > number.saturating_add(1)
-            })
-        {
+        if (self.plan.before > 0 || self.plan.after > 0) && cursor.printed && cursor.gap {
             output.write_all(b"--\n")?;
         }
-        *previous = Some(line.source_lines.map_or(line.number, |(_, end)| end));
+        cursor.printed = true;
+        cursor.gap = false;
         let delimiter: &[u8] = if line.kind == line_grep::LineKind::Context {
             b"-"
         } else {
@@ -188,10 +203,10 @@ impl Render<'_> {
         let mut observed = super::seam::Observed(input);
         #[cfg(test)]
         let input: &mut dyn Read = &mut observed;
-        let mut previous = None;
+        let mut cursor = Cursor::default();
         let result = line_grep::scan_lines(self.plan, input, size, buffer, self.stopped, |line| {
             capture.push(line);
-            self.line(output, line, &mut previous)
+            self.line(output, line, &mut cursor)
         });
         // Complete staging inside the checked-read callback: a late spill
         // fault must discard the capture, before any group can be published.
@@ -500,7 +515,7 @@ impl Worker<'_> {
                             let mut output = OutputBuffer::default()
                                 .with_memory_limit(GROUP_BYTES)
                                 .with_buffered_spill();
-                            let mut previous = None;
+                            let mut cursor = Cursor::default();
                             for record in &cached.records {
                                 render.line(
                                     &mut output,
@@ -514,7 +529,7 @@ impl Worker<'_> {
                                         fragment: record.fragment,
                                         highlights: record.highlights.as_deref(),
                                     },
-                                    &mut previous,
+                                    &mut cursor,
                                 )?;
                             }
                             output.flush()?;

@@ -27,36 +27,8 @@ pub(super) fn scan(
                 lines += memchr::memchr_iter(b'\n', chunk).count() as u64;
             }
             stats.matched_lines += lines;
-            stats.matches += if !plan.quiet {
-                line.highlights.map_or(0, |spans| spans.len() as u64)
-            } else if plan.invert && plan.grep.excludes_lf() {
-                lines
-            } else {
-                // Quiet has no submatch presentation: its source-group
-                // counting iterator retains a first terminal assertion,
-                // while omitting EOF reached by advancing an earlier match.
-                let source = if !plan.multiline && line.terminated {
-                    line.bytes.strip_suffix(b"\n").unwrap_or(line.bytes)
-                } else {
-                    line.bytes
-                };
-                let mut count = 0;
-                for span in plan.grep.regex().spans(source) {
-                    if stopped() {
-                        return Err(io::ErrorKind::ConnectionAborted.into());
-                    }
-                    if span.start == source.len()
-                        && count > 0
-                        && (plan.multiline || !line.terminated)
-                    {
-                        break;
-                    }
-                    count += 1;
-                }
-                // Without a submatch printer, inverted stats retain at least
-                // one logical match per selected source line.
-                if plan.invert { count.max(lines) } else { count }
-            };
+            // Quiet reports the same stats as the events it suppresses (D91 A).
+            stats.matches += line.highlights.map_or(0, |spans| spans.len() as u64);
         }
         emit(line)
     };
@@ -76,14 +48,18 @@ pub(super) fn scan(
             bytes.push(b'\n');
         }
         spans.clear();
+        // A record that already carries its spans (a never-searched context
+        // line) keeps them.
+        if let Some(highlights) = line.highlights {
+            return record(Line {
+                bytes: &bytes,
+                highlights: Some(highlights),
+                ..line
+            });
+        }
         for span in search.spans(line.bytes) {
             if stopped() {
                 return Err(io::ErrorKind::ConnectionAborted.into());
-            }
-            // rg's JSON presentation excludes terminal EOF empties on an
-            // unterminated line, while selection still retains discovery.
-            if span.start == line.bytes.len() && !line.terminated {
-                break;
             }
             spans.try_reserve(1).map_err(io::Error::other)?;
             spans.push(span);
