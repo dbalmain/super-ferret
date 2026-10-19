@@ -1082,11 +1082,7 @@ type PairedSegments = (Vec<Arc<Segment<File>>>, Vec<Arc<Segment<File>>>);
 /// Opens every segment pair in manifest order, on at most `threads` threads.
 /// The error is the first in manifest order, as a serial open returns it: a
 /// NotFound there makes [`View::open`] retry from a newer manifest.
-fn open_pairs(
-    dir: &Path,
-    manifest: &Manifest,
-    threads: usize,
-) -> Result<PairedSegments, Error> {
+fn open_pairs(dir: &Path, manifest: &Manifest, threads: usize) -> Result<PairedSegments, Error> {
     let one = |entry: &SegmentEntry| -> Result<OpenPair, Error> {
         let open = |tri: bool| -> Result<_, Error> {
             let name = if tri {

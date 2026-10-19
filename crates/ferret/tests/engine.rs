@@ -1370,7 +1370,13 @@ fn grep_walks_a_listing_whose_overlay_renames_swaps_and_deletes_base_names() {
     for name in ["one", "two", "moved", "gone", "kept"] {
         fs::write(root.join(format!("{name}.txt")), format!("red {name}\n")).unwrap();
     }
-    index(&tree.index(), &[root.clone()], Refresh::All, &options()).unwrap();
+    index(
+        &tree.index(),
+        std::slice::from_ref(&root),
+        Refresh::All,
+        &options(),
+    )
+    .unwrap();
     let engine = writer_engine(&tree);
     fs::rename(root.join("one.txt"), root.join("swap.tmp")).unwrap();
     fs::rename(root.join("two.txt"), root.join("one.txt")).unwrap();
@@ -1386,12 +1392,18 @@ fn grep_walks_a_listing_whose_overlay_renames_swaps_and_deletes_base_names() {
     // The CLI opens this, so it is what must hold the changes as an overlay.
     let disk = Catalog::open(&tree.index()).unwrap().unwrap();
     disk.load_all().unwrap();
-    assert!(disk.overlay_run_count() > 0, "the changes were checkpointed");
+    assert!(
+        disk.overlay_run_count() > 0,
+        "the changes were checkpointed"
+    );
     let output = fixture::bounded_command(env!("CARGO_BIN_EXE_ferret"), &tree.0)
         .args(["grep", "red", "tree"])
         .output()
         .unwrap();
-    assert!(output.status.success() && output.stderr.is_empty(), "{output:?}");
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "{output:?}"
+    );
     assert_eq!(
         lines(&output.stdout),
         lines(b"tree/kept.txt:red kept\ntree/one.txt:red two\ntree/renamed.txt:red moved\ntree/two.txt:red one\n")

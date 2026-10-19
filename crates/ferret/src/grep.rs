@@ -1160,9 +1160,10 @@ mod seam {
         pub(super) static AFTER_READ: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         /// Called on the publishing thread with each group about to be
         /// committed, so a test can prove its fixture still spills.
-        pub(super) static COMMIT: RefCell<Option<Box<dyn FnMut(&OutputBuffer)>>> =
-            RefCell::new(None);
+        pub(super) static COMMIT: RefCell<Option<Box<OnCommit>>> = RefCell::new(None);
     }
+
+    pub(super) type OnCommit = dyn FnMut(&OutputBuffer);
 
     pub(super) struct Observed<'a>(pub(super) &'a mut dyn Read);
 
