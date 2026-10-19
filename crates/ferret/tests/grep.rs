@@ -2899,6 +2899,94 @@ fn m6_live_bad_patterns_warn_and_preserve_valid_rules() {
     }
 }
 
+// D105: at T>1 `--live` and `-uu` walks are lent between workers. Each lent
+// subtree carries its own policy stack, so nested roots (D34), per-directory
+// rules and excluded subtrees agree with one thread; a directory's policy
+// warning never splits another file's group.
+#[test]
+fn parallel_live_and_unrestricted_walks_agree_with_one_thread() {
+    let fixture = Fixture::new("parallel-walk");
+    for top in 0..6 {
+        for sub in 0..6 {
+            let directory = format!("d{top}/s{sub}");
+            fs::create_dir_all(fixture.tree().join(&directory)).unwrap();
+            fixture.write(&format!("{directory}/.ferretignore"), b"*.log\nbad\\\n");
+            for file in 0..10 {
+                let mut bytes = Vec::new();
+                for line in 0..40 {
+                    writeln!(bytes, "red {directory} {file} {line}").unwrap();
+                }
+                let extension = ["txt", "log", "skip", "blocked", "rs"][file % 5];
+                fixture.write(&format!("{directory}/f{file}.{extension}"), &bytes);
+            }
+        }
+    }
+    fixture.write(".ferretignore", b"/d4/\n*.blocked\n");
+    fixture.write("d2/s3/.ferretignore", b"*.skip\n");
+    assert!(
+        fixture
+            .ferret(&["index", ".", "d2/s3"], None)
+            .status
+            .success()
+    );
+    for mode in ["--live", "-uu"] {
+        let mut expected = None;
+        for threads in ["1", "8"] {
+            let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+            command
+                .arg("--index")
+                .arg(fixture.base.join("index"))
+                .args(["grep", mode, "red", "."])
+                .env("FERRET_SEARCH_THREADS", threads);
+            let output = run(command, None);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let mut warnings: Vec<_> = output.stderr.split_inclusive(|&b| b == b'\n').collect();
+            warnings.sort();
+            let actual = (groups(&output.stdout, &fixture.tree()), warnings.len());
+            if mode == "--live" {
+                let text = String::from_utf8_lossy(&output.stdout);
+                // The nested root's rules replace the outer ones (D34).
+                assert!(!text.contains("d4/") && !text.contains("d2/s2/f3.blocked"));
+                assert!(text.contains("d2/s3/f3.blocked") && text.contains("d2/s3/f1.log"));
+                assert!(!text.contains("d2/s3/f2.skip") && text.contains("d2/s2/f2.skip"));
+                // One per loaded directory: 5 tops but d4, 6 subs, but d2/s3.
+                assert_eq!(actual.1, 29, "{}", String::from_utf8_lossy(&output.stderr));
+            }
+            match &expected {
+                None => expected = Some(actual),
+                Some(expected) => assert_eq!(&actual, expected, "{mode} at {threads}"),
+            }
+        }
+    }
+    // Shared stdout and stderr, which live mode leaves line buffered.
+    let combined = fixture.base.join("combined");
+    let file = fs::File::create(&combined).unwrap();
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "--live", "red", "."])
+        .env("FERRET_SEARCH_THREADS", "8")
+        .stdout(file.try_clone().unwrap())
+        .stderr(file);
+    assert!(command.status().unwrap().success());
+    let bytes = fs::read(&combined).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Option<&[u8]> = None;
+    for line in bytes.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+        if line.starts_with(b"ferret: warning:") {
+            last = None;
+            continue;
+        }
+        let path = line.split(|&b| b == b':').next().unwrap();
+        if last != Some(path) {
+            assert!(seen.insert(path), "{} split", String::from_utf8_lossy(path));
+            last = Some(path);
+        }
+    }
+    assert!(seen.len() > 100);
+}
+
 // Scoped policy must use crawl's bounded loader, including names-only and
 // negative-output modes: rejected policy cannot establish absence.
 #[test]
