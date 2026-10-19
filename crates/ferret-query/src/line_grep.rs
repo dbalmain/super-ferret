@@ -831,21 +831,43 @@ fn scan_records(
     let mut trailing = 0;
     let mut limited = false;
     let mut emit = |line: Line<'_>| {
+        // A context line matches only under inversion; otherwise it is never
+        // searched, including the lines after `-m`, which are context (GNU).
+        if line.kind == LineKind::Context && !plan.invert {
+            return emit(Line {
+                highlights: Some(&[]),
+                ..line
+            });
+        }
         if plan.replacement.is_some() {
             return replacement::line(plan, line, stopped, &mut emit);
         }
         if line.kind == LineKind::Context && plan.only_matching && plan.invert {
+            let mut printed = false;
             for span in search.spans(line.bytes) {
                 if stopped() {
                     return Err(io::ErrorKind::ConnectionAborted.into());
                 }
-                emit(Line {
-                    bytes: &line.bytes[span],
-                    fragment: true,
-                    ..line
-                })?;
+                // D79 D: `-o` never prints an empty record.
+                if !span.is_empty() {
+                    printed = true;
+                    emit(Line {
+                        bytes: &line.bytes[span],
+                        fragment: true,
+                        ..line
+                    })?;
+                }
             }
-            Ok(())
+            if printed {
+                return Ok(());
+            }
+            // An empty fragment prints nothing; it keeps the line in the
+            // window.
+            emit(Line {
+                bytes: &line.bytes[..0],
+                fragment: true,
+                ..line
+            })
         } else {
             emit(line)
         }
@@ -939,50 +961,27 @@ fn scan_records(
                 if stopped() {
                     return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                 }
-                let selected = fast || (search.find(line).is_some() != plan.invert);
                 if limited {
+                    // Lines after `-m` are context and are never searched.
                     if rendering {
-                        if selected
-                            && plan.only_matching
-                            && !plan.invert
-                            && plan.replacement.is_none()
-                        {
-                            for span in search.spans(line) {
-                                emit(Line {
-                                    offset: line_offset,
-                                    source_lines: None,
-                                    terminated: line_terminated,
-                                    number,
-                                    bytes: &line[span],
-                                    kind: LineKind::Match,
-                                    fragment: true,
-                                    highlights: None,
-                                })
-                                .map_err(ScanError::Output)?;
-                            }
-                        } else {
-                            emit(Line {
-                                offset: line_offset,
-                                source_lines: None,
-                                terminated: line_terminated,
-                                number,
-                                bytes: line,
-                                kind: if selected {
-                                    LineKind::Match
-                                } else {
-                                    LineKind::Context
-                                },
-                                fragment: false,
-                                highlights: None,
-                            })
-                            .map_err(ScanError::Output)?;
-                        }
+                        emit(Line {
+                            offset: line_offset,
+                            source_lines: None,
+                            terminated: line_terminated,
+                            number,
+                            bytes: line,
+                            kind: LineKind::Context,
+                            fragment: false,
+                            highlights: None,
+                        })
+                        .map_err(ScanError::Output)?;
                     }
                     if number >= trailing {
                         return Ok(ControlFlow::Break(()));
                     }
                     continue;
                 }
+                let selected = fast || (search.find(line).is_some() != plan.invert);
                 if selected {
                     if plan.output == Output::WithoutMatch {
                         result.matched = false;
@@ -998,12 +997,16 @@ fn scan_records(
                     }
                     trailing = number.saturating_add(after);
                     if (plan.only_matching || plan.output == Output::CountMatches) && !plan.invert {
+                        let fragments = plan.output == Output::Lines && plan.replacement.is_none();
+                        let mut printed = false;
                         for span in search.spans(line) {
                             if stopped() {
                                 return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                             }
                             result.count += 1;
-                            if plan.output == Output::Lines && plan.replacement.is_none() {
+                            // D79 D: `-o` never prints an empty record.
+                            if fragments && !span.is_empty() {
+                                printed = true;
                                 emit(Line {
                                     offset: line_offset,
                                     source_lines: None,
@@ -1016,6 +1019,21 @@ fn scan_records(
                                 })
                                 .map_err(ScanError::Output)?;
                             }
+                        }
+                        if fragments && !printed {
+                            // An empty fragment prints nothing; it keeps this
+                            // selected line in the context window.
+                            emit(Line {
+                                offset: line_offset,
+                                source_lines: None,
+                                terminated: line_terminated,
+                                number,
+                                bytes: &line[..0],
+                                kind: LineKind::Match,
+                                fragment: true,
+                                highlights: None,
+                            })
+                            .map_err(ScanError::Output)?;
                         }
                         if plan.output == Output::Lines && plan.replacement.is_some() {
                             emit(Line {
