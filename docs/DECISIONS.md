@@ -5744,6 +5744,15 @@ large file's output from two versions.
 
 **Answer: A.**
 
+
+**Applied 2026-10-20, by the D103 A answer's own rule:** a temp-file fault
+after a file has started streaming (a before-context spool that fails on a
+later long line, say) keeps the printed prefix, names the file and the fault,
+continues with other files and exits 2, without a retry. Before the first
+published byte, D102 A applies and nothing for the file is printed. For
+`--json`, the begun group is closed and its statistics cover only what was
+observed. Raised by Sol while building the slice; not a new question.
+
 ## D104 — Files that grow during the search
 
 **Status: answered, 2026-10-20.**
