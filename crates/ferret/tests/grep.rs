@@ -4395,12 +4395,13 @@ fn m9_json_limited_submatches_are_whole_matches() {
 fn m9_json_context_after_the_limit_is_never_searched() {
     let fixture = Fixture::new("m9-json-limit-context");
     for (args, bytes, expected) in [
-        // D80 A: x is the one selected line; a is context. Inverted context
-        // lines still carry their own local submatches.
+        // D80 A: x is the one selected line; a is context after the limit,
+        // so it is never searched and has no submatches (D98), although it
+        // holds a match. rg gives it the submatch.
         (
             vec!["-Uvm1", "-A1", "a", "-"],
             &b"x\na\ny\na\nz\n"[..],
-            r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["context","a\n",2,2,[[0,1,"a"]]],["end",null,[1,0,1]],["summary",[1,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["context","a\n",2,2,[]],["end",null,[1,0,1]],["summary",[1,0,1]]]"#,
         ),
         // Line mode matches each line on its own, so \A holds at each start.
         (
@@ -4717,6 +4718,29 @@ fn d98_final_lf_position_draws_no_context_after_the_limit() {
     assert_json_stream(
         &output,
         r#"[["begin","<stdin>"],["match","a\n",1,0,[[0,1,"a"]]],["end",null,[1,1,1]],["summary",[1,1,1]]]"#,
+        false,
+    );
+}
+
+#[test]
+fn d98_inverted_lines_after_the_limit_are_never_searched() {
+    // Review finding 2: the whole input has no `\Aa` match, so under -U -v
+    // both lines are unmatched; line 1 takes -m1 and line 2 is context after
+    // the limit. Searched on its own, `ay` would match `\Aa`; before the fix
+    // it was replaced (`Xy`), highlighted, and given a JSON submatch.
+    let fixture = Fixture::new("d98-inverted-tail");
+    let input = b"x\nay\n";
+    let output = fixture.compare_raw(&["-Uvm1", "-A1", "-rX", r"\Aa", "-"], Some(input));
+    assert_eq!(output.stdout, b"x\nay\n");
+    let output = fixture.compare_raw(
+        &["-Uvm1", "-A1", "--color=always", r"\Aa", "-"],
+        Some(input),
+    );
+    assert_eq!(output.stdout, b"x\nay\n");
+    let output = fixture.compare_json(&["-Uvm1", "-A1", r"\Aa", "-"], Some(input));
+    assert_json_stream(
+        &output,
+        r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["context","ay\n",2,2,[]],["end",null,[1,0,1]],["summary",[1,0,1]]]"#,
         false,
     );
 }

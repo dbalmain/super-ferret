@@ -423,6 +423,8 @@ const RG_DIFFERS: &[Differs] = &[
     json(&["-U", "-m1", "-A1", "(?s:.*?)", "-"], Some(b"a\nbc"), 0, r#"[["begin", "<stdin>"], ["match", "a\n", 1, 0, [[0, 0, ""], [1, 1, ""]]], ["context", "bc", 2, 2, []], ["end", null, [1, 2, 1]], ["summary", [1, 2, 1]]]"#, TAIL),
     json(&["-U", "-m1", "-A1", "(?s:.*?)", "-"], Some(b"a\nbc\n"), 0, r#"[["begin", "<stdin>"], ["match", "a\n", 1, 0, [[0, 0, ""], [1, 1, ""]]], ["context", "bc\n", 2, 2, []], ["end", null, [1, 2, 1]], ["summary", [1, 2, 1]]]"#, TAIL),
     json(&["-U", "-m1", "-A1", "(?s:.*?)", "-"], Some(b"abc\nabc\n"), 0, r#"[["begin", "<stdin>"], ["match", "abc\n", 1, 0, [[0, 0, ""], [1, 1, ""], [2, 2, ""], [3, 3, ""]]], ["context", "abc\n", 2, 4, []], ["end", null, [1, 4, 1]], ["summary", [1, 4, 1]]]"#, TAIL),
+    json(&["-Uvm1", "-A1", "a", "-"], Some(b"x\na\ny\na\nz\n"), 0, r#"[["begin", "<stdin>"], ["match", "x\n", 1, 0, []], ["context", "a\n", 2, 2, []], ["end", null, [1, 0, 1]], ["summary", [1, 0, 1]]]"#, TAIL),
+    json(&["-Uvm1", "-A1", "\\Aa", "-"], Some(b"x\nay\n"), 0, r#"[["begin", "<stdin>"], ["match", "x\n", 1, 0, []], ["context", "ay\n", 2, 2, []], ["end", null, [1, 0, 1]], ["summary", [1, 0, 1]]]"#, TAIL),
     json(&["-Um1", "-A2", "a(?:\\nb)?", "-"], Some(b"a\nb\na\nb\n"), 0, r#"[["begin", "<stdin>"], ["match", "a\nb\n", 1, 0, [[0, 3, "a\nb"]]], ["context", "a\n", 3, 4, []], ["context", "b\n", 4, 6, []], ["end", null, [2, 1, 1]], ["summary", [2, 1, 1]]]"#, TAIL),
     json(&["\\A", "-"], Some(b"abc\nabc\n"), 0, r#"[["begin", "<stdin>"], ["match", "abc\n", 1, 0, [[0, 0, ""]]], ["match", "abc\n", 2, 4, [[0, 0, ""]]], ["end", null, [2, 2, 1]], ["summary", [2, 2, 1]]]"#, LINE),
     plain(&["-UoH", "-A1", "--heading", "a|\\n", "d98-lf", "d98-a"], None, 0, b"d98-a\na\n", PRINTED),

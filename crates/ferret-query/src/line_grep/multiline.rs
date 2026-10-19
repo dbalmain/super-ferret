@@ -152,6 +152,8 @@ pub(super) fn scan(
     let mut spans: Vec<Range<usize>> = Vec::new();
     let mut groups: Vec<Range<usize>> = Vec::new();
     let (mut taken, mut group_end) = (0, 0);
+    // Lines from here on are past the `-m` limit: context, never searched.
+    let mut searched_end = lines.len();
     for span in regex.spans(bytes) {
         cancelled(stopped)?;
         if span.start == bytes.len() && bytes.ends_with(b"\n") {
@@ -187,6 +189,9 @@ pub(super) fn scan(
             add_group(&mut selected, next..next + keep)?;
             left -= keep as u64;
             next = matched.end;
+        }
+        if plan.max_count.is_some() && left == 0 {
+            searched_end = selected.last().map_or(0, |group| group.end);
         }
         groups = selected;
     }
@@ -277,9 +282,10 @@ pub(super) fn scan(
                 }
                 at
             };
-            // Inverted context lines are the matching ones. Their captures and
-            // highlights come from the complete line, including its LF.
-            let inverted_context = plan.invert && !selected;
+            // Inverted context lines before the limit are the matching ones.
+            // Their captures and highlights come from the complete line,
+            // including its LF.
+            let inverted_context = plan.invert && !selected && index < searched_end;
             if plan.json {
                 let region = range.start..end;
                 highlights.clear();
