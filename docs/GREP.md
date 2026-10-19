@@ -433,9 +433,9 @@ later offset-bearing output must specify its BOM offset convention.
 Match plain output **byte for byte per file/group**, for stable text inputs and
 supported flags: path spelling relative to operands, filename prefixes, 1-based
 line numbers, LF termination (also for an unterminated last line), CR retained,
-`-o` nonoverlapping spans **including empty spans**, and `-l` once per matching
-path. Overlapping contexts merge; each line prints once; matches use `:`, context
-uses `-`, groups use `--`. `-0` NUL-terminates names/prefixes, not contents. **M5 probes (2026-10-17):**
+`-o` nonoverlapping non-empty spans (an empty span prints no record, D79 D),
+and `-l` once per matching path. Overlapping contexts merge; each line prints
+once; matches use `:`, context uses `-`, groups use `--`. `-0` NUL-terminates names/prefixes, not contents. **M5 probes (2026-10-17):**
 with heading output, NUL replaces the heading's LF; otherwise it replaces the
 filename/content separator. Line numbers and count/content records still end
 in LF. Filename, heading and line-number switches resolve in argv order;
@@ -447,10 +447,11 @@ their path headings; count/name modes ignore headings.
 half of `-C`, in either argv order. Within each option the last value wins.
 Adjacent and overlapping windows merge; disjoint windows and non-heading
 file groups use `--` followed by LF. After `-m`, finish only the requested
-trailing window: matching lines there keep match formatting but neither
-increase the count nor extend the window. With `-v -o`, selected lines remain
-whole; regex-matching context lines emit their individual spans with context
-separators. Counts and name/quiet modes ignore context.
+trailing window: its lines are context (D98), never searched, so they are not
+highlighted, replaced or split by `-o`, and they do not extend the window.
+With `-v -o`, selected lines remain whole; regex-matching context lines before
+the limit emit their individual spans with context separators. Counts and
+name/quiet modes ignore context.
 
 Context is captured inside the same checked read as the matches. A retry
 throws away both. Before-context uses a rolling, header-bearing spill spool,
@@ -516,7 +517,10 @@ gives 2/2/3.
 
 **Lines after the limit are context** (D98, GNU's rule), in line and multiline
 mode, plain and JSON. Requested after-context prints them as context lines; they
-are never searched, so never re-classified as matches, highlighted or replaced.
+are never searched, also under `-v`, so never re-classified as matches,
+highlighted, replaced or split by `-o`. On `x\nab\n`, `-v -o -n -m1 -A1 a`
+prints `1:x` and `2-ab`, and `-U -v -m1 -A1 -r X '\Aa'` on `x\nay\n` prints
+`x` and `ay`.
 On unterminated `a\nbc`, `-n -m1 -A1 '\z'` prints `1:a` and `2-bc`, although
 `\z` matches at the end of `bc` too.
 
@@ -539,16 +543,17 @@ in line mode, so it draws no before-context either: on `a\nb\nc\n`,
 `-U -n -B1 '\z'` prints nothing and exits 1 (rg prints `3-c`), and
 `-U -n -m1 -B1 'a|\z'` prints `1:a`. Adjacent highlighted spans merge
 within each multiline output line. Multiline inverted output and its context
-remain whole lines under `-o`; context highlighting searches each complete
-context line, including its LF.
+remain whole lines under `-o`; before the `-m` limit, context highlighting
+searches each complete context line, including its LF.
 
 **Inversion (D98, D80 A):** LF-including `-U -v` selects the lines no match
-intersects, where a match covering an LF intersects the lines on both sides, and
-`-m` limits those selected lines. Counts are selected lines, also for
-`--count-matches`. On `x\na\ny\na\nz\n`, `-U -vn -m1 -A1 a` prints `1:x` and
-`2-a`. With `'a|\n'` every line holds an LF match, so `-U -vc` selects nothing
-and exits 1. On `foo foo\nbar\nfoo\n`, `-U -v 'foo(?:\nbar)?'` also selects
-nothing.
+intersects. A line's LF belongs to that line, so a match intersects the next
+line only if it continues past the LF: on `a\nb\n`, `-U -v 'a\n'` selects `b`,
+and `-U -v 'a\nb'` selects nothing. `-m` limits those selected lines. Counts are
+selected lines, also for `--count-matches`. On `x\na\ny\na\nz\n`,
+`-U -vn -m1 -A1 a` prints `1:x` and `2-a`. With `'a|\n'` every line holds an
+LF match, so `-U -vc` selects nothing and exits 1. On `foo foo\nbar\nfoo\n`,
+`-U -v 'foo(?:\nbar)?'` also selects nothing.
 
 `-U` buffers the complete checked input attempt (or the first-NUL prefix)
 before matching, including for quiet/name output. Reads and metadata/span
@@ -649,8 +654,7 @@ Expansion is cancellable and fallibly allocated. It keeps one displayed line
 and its highlights; rendered records still use the host's bounded cache/spill
 path. A source or expanded line can be arbitrarily long, under the existing
 line-sized memory exception. It does not accumulate an expanded multiline
-group. These presentation choices are provisional (M8-A/B in
-`.ai/m8-decisions.md`).
+group. These presentation choices are settled (D84 B, through D98).
 On `abc`, with or without a final LF, `-or X ''` emits four X records, and
 `-or X '\z'` on unterminated `abc` emits `X`. `-or '$wordX' '(?P<word>red)'`
 prints nothing.
@@ -712,9 +716,9 @@ retain the three semantic fields above.
 **Contract/oracle differences:** rg 15.2.0 lets names/count modes override JSON;
 ferret deliberately refuses their combination as required above. The earlier
 claim that rg JSON ignores replacement is wrong: rg retains source bytes but
-adds a `replacement` byte field to each submatch. Ferret provisionally retains
-the explicit ignore rule (M9-B); adopting that optional metadata is the proposed
-future shape. JSON also follows D79's per-line assertions: on `abc\nabc\n`
+adds a `replacement` byte field to each submatch. Ferret keeps the
+explicit ignore rule (D88 A, through D98); rg's optional metadata would be a
+separate feature. JSON also follows D79's per-line assertions: on `abc\nabc\n`
 with `'\A'`, ferret reports an empty submatch on each line, where rg reports it
 only on the first. With `-m1 -A1 '\z'` on `a\nbc`, `bc` is a context event.
 

@@ -4,7 +4,7 @@
 // docs/DECISIONS.md or the rg-issues row.
 
 const D79: &str = "D79 D: -o never prints an empty record (GNU); rg prints one per empty match";
-const EOF: &str = "D98: the end of an unterminated last line is a match position, as before an LF";
+const EOF: &str = "D100 (open, as built): the end of an unterminated last line is a match position, as before an LF";
 const D81: &str = "D81 C: one pass over the whole input; -m counts line groups, nothing clipped (rg-issues row 11)";
 const D80: &str = "D80 A: -U -v -m selects lines no match touches (rg-issues rows 9 and 10)";
 const D91: &str = "D91 A: quiet JSON reports the same stats as its events (rg-issues row 14)";
@@ -40,8 +40,8 @@ const RG_DIFFERS: &[Differs] = &[
     plain(&["-on", "-A1", "a|^$", "-"], Some(b"a\n\na\n"), 0, b"1:a\n3:a\n", D79),
     plain(&["-or", "$1X", "(red)", "-"], Some(b"red\n"), 0, b"", D79),
     plain(&["-or", "$wordX", "(?P<word>red)", "-"], Some(b"red\n"), 0, b"", D79),
-    plain(&["-or", "X", "", "-"], Some(b"abc"), 0, b"X\nX\nX\nX\n", D79),
-    plain(&["-or", "X", "\\z", "-"], Some(b"abc"), 0, b"X\n", D79),
+    plain(&["-or", "X", "", "-"], Some(b"abc"), 0, b"X\nX\nX\nX\n", EOF),
+    plain(&["-or", "X", "\\z", "-"], Some(b"abc"), 0, b"X\n", EOF),
     plain(&["-o", "", "-"], Some(b"abc"), 0, b"", D79),
     plain(&["-Uon", "\\b{end}", "-"], Some(b"\xc3\xa9"), 0, b"", D79),
     plain(&["-Uon", "\\b{end}", "-"], Some(b"a\nbc"), 0, b"", D79),
