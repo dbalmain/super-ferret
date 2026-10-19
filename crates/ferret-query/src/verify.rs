@@ -1634,38 +1634,37 @@ impl Drop for StopOnPanic<'_> {
 /// producer's wakes; the backlog is paths, not captures (D93 bounds those).
 const FEED_PER_THREAD: usize = 4;
 
-/// Tasks produced ahead of the workers by a producer on its own thread.
-///
-/// Workers never call the producer, so no worker holds a fetched task while
-/// the producer blocks: each task is takeable by any idle worker from the
-/// moment it is produced. A worker taking one task per producer lock convoyed
-/// 32 workers on that lock (grep-why P2). A worker-local handout held other
-/// files' tasks behind a slow file, and a shared queue refilled by a worker
-/// deadlocked when the refiller held a quiet hit while the producer waited for
-/// that hit to cancel it.
+/// At most this many consecutive indexed paths, and this many input bytes,
+/// belong to a worker's run. A larger file travels alone.
+const RUN_TASKS: usize = 16;
+const RUN_BYTES: u64 = 64 << 10;
+
+/// Tasks produced on a separate thread. Indexed paths are taken in runs for
+/// checked-directory reuse; their pending tails remain accessible even while
+/// the owner is blocked in a read. Streaming producers keep immediate wakes:
+/// they may block after producing a single task whose execution releases them.
 struct Feed<Task> {
     state: Mutex<FeedState<Task>>,
-    /// Workers sleep here for a task.
+    runs: Vec<Mutex<VecDeque<(u64, Task)>>>,
     ready: Condvar,
-    /// The producer sleeps here for room.
     room: Condvar,
     capacity: usize,
+    indexed: bool,
 }
 
 struct FeedState<Task> {
     tasks: VecDeque<(u64, Task)>,
-    /// No task will be added: the producer ended or a worker left. Queued
-    /// tasks may still be taken; a stopped run's workers do not start them.
+    /// No more tasks will arrive; pending runs can still be stolen.
     closed: bool,
-    /// Workers asleep on `ready`.
     sleeping: usize,
     /// The producer is asleep on `room` and has not been woken.
     full: bool,
 }
 
 impl<Task> Feed<Task> {
-    fn new(threads: usize) -> Self {
-        let capacity = threads * FEED_PER_THREAD;
+    fn new(threads: usize, indexed: bool) -> Self {
+        // D107's wake threshold must fit even with only two workers.
+        let capacity = (threads * FEED_PER_THREAD).max(if indexed { RUN_TASKS } else { 1 });
         Self {
             state: Mutex::new(FeedState {
                 tasks: VecDeque::with_capacity(capacity),
@@ -1673,14 +1672,15 @@ impl<Task> Feed<Task> {
                 sleeping: 0,
                 full: false,
             }),
+            runs: (0..threads).map(|_| Mutex::default()).collect(),
             ready: Condvar::new(),
             room: Condvar::new(),
             capacity,
+            indexed,
         }
     }
 
-    /// Runs `next` until it ends, `stopped` says stop, or the feed closes.
-    /// Holds no feed lock while `next` runs.
+    /// Runs `next` without holding a feed or run lock.
     fn produce(
         &self,
         next: &mut impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
@@ -1707,9 +1707,11 @@ impl<Task> Feed<Task> {
                 return;
             }
             state.tasks.push_back(task);
-            // Each task queued before this one already has a sleeper woken
-            // for it; wake one more only if a sleeper is left over.
-            let wake = state.sleeping >= state.tasks.len();
+            let wake = if self.indexed {
+                state.sleeping > 0 && state.tasks.len().is_multiple_of(RUN_TASKS)
+            } else {
+                state.sleeping >= state.tasks.len()
+            };
             drop(state);
             if wake {
                 self.ready.notify_one();
@@ -1717,13 +1719,23 @@ impl<Task> Feed<Task> {
         }
     }
 
-    /// The next task, waiting while the queue is empty and open; `None` once
-    /// it is empty and closed.
-    fn take(&self) -> Option<(u64, Task)> {
+    /// Takes the near end of this worker's run, a new run, or the far end of
+    /// another worker's run (half its pending tail). The feed lock orders
+    /// assignment and stealing against going to sleep, closing the
+    /// lost-wakeup window. Owners take only their run lock, and release it
+    /// before any read or publication.
+    fn take(&self, worker: usize) -> Option<(u64, Task)> {
+        if self.indexed
+            && let Some(task) = lock(&self.runs[worker]).pop_front()
+        {
+            return Some(task);
+        }
         let mut state = lock(&self.state);
         loop {
             if let Some(task) = state.tasks.pop_front() {
-                // Wake the producer at half full, not at every free slot.
+                let lend = self.indexed
+                    && self.fill_run(worker, &mut state.tasks, task.0)
+                    && state.sleeping > 0;
                 let wake = state.full && state.tasks.len() <= self.capacity / 2;
                 if wake {
                     state.full = false;
@@ -1732,7 +1744,32 @@ impl<Task> Feed<Task> {
                 if wake {
                     self.room.notify_one();
                 }
+                if lend {
+                    self.ready.notify_one();
+                }
                 return Some(task);
+            }
+            if self.indexed {
+                for offset in 1..self.runs.len() {
+                    let mut run = lock(&self.runs[(worker + offset) % self.runs.len()]);
+                    if !run.is_empty() {
+                        // Keep locality in the stolen tail too; repeated
+                        // single-file steals scatter the same directory
+                        // across every idle worker.
+                        let half = run.len() / 2;
+                        let mut own = lock(&self.runs[worker]);
+                        own.extend(run.drain(half..));
+                        let task = own.pop_front();
+                        let lend = (!run.is_empty() || !own.is_empty()) && state.sleeping > 0;
+                        drop(own);
+                        drop(run);
+                        drop(state);
+                        if lend {
+                            self.ready.notify_one();
+                        }
+                        return task;
+                    }
+                }
             }
             if state.closed {
                 return None;
@@ -1741,6 +1778,25 @@ impl<Task> Feed<Task> {
             state = wait(&self.ready, state);
             state.sleeping -= 1;
         }
+    }
+
+    /// Leaves the current file on the caller and its consecutive tail in
+    /// the shared run. The caller holds the feed lock; the run is empty.
+    fn fill_run(&self, worker: usize, tasks: &mut VecDeque<(u64, Task)>, mut bytes: u64) -> bool {
+        let mut run = lock(&self.runs[worker]);
+        while bytes <= RUN_BYTES && run.len() + 1 < RUN_TASKS {
+            let Some((size, _)) = tasks.front() else {
+                break;
+            };
+            if *size > RUN_BYTES - bytes {
+                break;
+            }
+            bytes += *size;
+            if let Some(next) = tasks.pop_front() {
+                run.push_back(next);
+            }
+        }
+        !run.is_empty()
     }
 
     fn close(&self) {
@@ -1819,6 +1875,15 @@ impl<G> Held<G> {
     }
 }
 
+/// Input scheduling for completed file groups, with the worker count.
+pub enum GroupSchedule {
+    /// A producer that may block: wake a worker for each available task.
+    Streaming(usize),
+    /// Catalog enumeration: take bounded runs with stealing and wake at 16
+    /// queued tasks, or when enumeration ends.
+    Indexed(usize),
+}
+
 /// Prepares checked file groups on workers and emits them on the caller in
 /// completion order. One thread keeps source order. The producer runs on its
 /// own thread, a few tasks per worker ahead of them, and no worker ever calls
@@ -1843,7 +1908,7 @@ impl<G> Held<G> {
 /// active reads. The producer receives the same stop predicate and must poll
 /// it during filtering or traversal before returning its next task.
 pub fn completion_groups<Task: Send, State, Group: Send>(
-    threads: usize,
+    schedule: GroupSchedule,
     cancelled: &AtomicBool,
     next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
     make: impl Fn() -> State + Sync,
@@ -1851,13 +1916,17 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
     weight: impl Fn(&Group) -> u64 + Sync,
     mut emit: impl FnMut(Group) -> ControlFlow<()>,
 ) {
+    let (threads, indexed) = match schedule {
+        GroupSchedule::Streaming(threads) => (threads, false),
+        GroupSchedule::Indexed(threads) => (threads, true),
+    };
     if threads <= 1 {
         groups_alone(next, cancelled, &make, &work, &mut emit);
         return;
     }
     let pool = Pool::<()>::schedule(0, threads);
     let source = Mutex::new(next);
-    let feed = Feed::new(threads);
+    let feed = Feed::new(threads, indexed);
     let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
     // Set by the caller before its last look at the slots ahead of sleeping;
     // cleared by the first worker to hand it work, or by the caller on waking.
@@ -1888,7 +1957,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
                         pool,
                     };
                     while !stopped() {
-                        let Some((size, task)) = feed.take() else {
+                        let Some((size, task)) = feed.take(i) else {
                             break;
                         };
                         let Some(reservation) = lane.reserve(size, &stopped) else {
@@ -2725,6 +2794,38 @@ mod group_tests {
         }
     }
 
+    // D106 B: the owner cannot step or lend while task zero is blocked.
+    // Every other task in its run must still reach the real publisher.
+    #[test]
+    fn indexed_run_is_stolen_while_its_head_is_blocked() {
+        let published = AtomicUsize::new(0);
+        let mut tasks = (0..RUN_TASKS).map(|task| (1, task));
+        completion_groups(
+            GroupSchedule::Indexed(2),
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                if task == 0 {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while published.load(Ordering::Acquire) < RUN_TASKS - 1 {
+                        assert!(Instant::now() < deadline, "run stranded behind its head");
+                        std::thread::yield_now();
+                    }
+                }
+                task
+            },
+            |_| 0,
+            |task| {
+                if task != 0 {
+                    published.fetch_add(1, Ordering::Release);
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(published.load(Ordering::Acquire), RUN_TASKS - 1);
+    }
+
     // A full queue must bound captures, and dropping its receiver on Break
     // must unblock senders before scope join. Isolate a regression's deadlock.
     // Groups exactly at the handoff threshold go alone, so the bound stays
@@ -2739,7 +2840,7 @@ mod group_tests {
         let mut tasks = (0..256).map(|task| (1, task));
         let mut emitted = 0;
         completion_groups(
-            threads,
+            GroupSchedule::Streaming(threads),
             &AtomicBool::new(false),
             |_| tasks.next(),
             || (),
@@ -2777,7 +2878,7 @@ mod group_tests {
         let result = std::panic::catch_unwind(|| {
             let mut task = 0;
             completion_groups(
-                2,
+                GroupSchedule::Streaming(2),
                 &AtomicBool::new(false),
                 |_| {
                     let current = task;
@@ -2816,7 +2917,7 @@ mod group_tests {
         let cancelled = AtomicBool::new(false);
         let mut calls = 0;
         completion_groups(
-            2,
+            GroupSchedule::Streaming(2),
             &cancelled,
             |stopped| {
                 calls += 1;
@@ -2850,7 +2951,7 @@ mod group_tests {
         let prepared = AtomicUsize::new(0);
         let mut tasks = (0..1024).map(|task| (1, task));
         completion_groups(
-            threads,
+            GroupSchedule::Streaming(threads),
             &AtomicBool::new(false),
             |_| tasks.next(),
             || (),
@@ -2889,7 +2990,7 @@ mod group_tests {
         let mut tasks = (0..3).map(|task| (1, task));
         let mut emitted = Vec::new();
         completion_groups(
-            2,
+            GroupSchedule::Streaming(2),
             &AtomicBool::new(false),
             |_| tasks.next(),
             || (),
@@ -2944,7 +3045,7 @@ mod group_tests {
         let mut tasks = (0..4).map(|task| (1, task));
         let mut emitted = Vec::new();
         completion_groups(
-            2,
+            GroupSchedule::Streaming(2),
             &AtomicBool::new(false),
             |_| tasks.next(),
             || (),
@@ -3028,7 +3129,7 @@ mod group_tests {
         let mut emitted = Vec::new();
         let mut tasks = (0..80).map(|at| (1, at));
         completion_groups(
-            4,
+            GroupSchedule::Streaming(4),
             &AtomicBool::new(false),
             move |_| tasks.next(),
             || false,
@@ -3065,7 +3166,7 @@ mod group_tests {
         let mut emitted = Vec::new();
         let mut tasks = (0..80).map(|at| (1, at));
         completion_groups(
-            4,
+            GroupSchedule::Streaming(4),
             &AtomicBool::new(false),
             move |_| tasks.next(),
             || (),
@@ -3107,7 +3208,7 @@ mod group_tests {
             let mut emitted = Vec::new();
             let on_caller = AtomicUsize::new(0);
             completion_groups(
-                threads,
+                GroupSchedule::Streaming(threads),
                 &AtomicBool::new(false),
                 |_| tasks.next(),
                 || (),

@@ -861,6 +861,14 @@ one file from it, reads/validates, matches and renders it. **P2 (2026-10-19):**
 completion-order grep runs that producer on its own thread, filling a queue of
 at most four paths per worker that idle workers sleep on, so workers no longer
 convoy on a producer lock and none holds a path while the producer blocks.
+**D106 B / D107 B (2026-10-20), indexed mode:** the queue holds at most
+max(4T, 16) paths, waking a worker at each 16 queued tasks and everyone at the
+producer's end. Workers take consecutive runs of at most 16 tasks or 64 KiB of
+summed catalog sizes; a larger file travels alone. Idle workers steal the far
+end of another run without waiting for its owner's read to finish. Runs hold
+at most 15 pending paths per worker, with no input reservation or output capture.
+Explicit-only feeds retain immediate wakes. Parallel `-uu` and `--live` walks
+use D105's scheduler instead.
 **P5 (2026-10-19):** workers hand completed groups to the host in batches of
 at most 64 KiB while it is busy, and the host collects every held batch before
 it sleeps. One-file tasks and bounded handoffs bound queued

@@ -4995,3 +4995,63 @@ fn d98_json_match_records_always_carry_their_submatches() {
         false,
     );
 }
+
+// D106 B: catalog sizes place all sixteen files in one run. Enlarging its
+// first file after indexing makes the real checked read slow without changing
+// those sizes. The pending tail must publish before that read finishes.
+#[test]
+fn indexed_run_tail_publishes_before_its_slow_head() {
+    let fixture = Fixture::new("index-stealing");
+    fs::create_dir(fixture.tree().join("run")).unwrap();
+    for file in 0..16 {
+        fixture.write(
+            &format!("run/f{file:02}"),
+            format!("red {file}\n").as_bytes(),
+        );
+    }
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "--files", "run"])
+        .env("FERRET_SEARCH_THREADS", "1");
+    let listed = run(command, None);
+    assert!(listed.status.success(), "{listed:?}");
+    let files: Vec<_> = listed
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert_eq!(files.len(), 16);
+    let head = Path::new(OsStr::from_bytes(files[0]));
+    let mut bytes = b"x\n".repeat((8 << 20) / 2 - 2);
+    bytes.extend_from_slice(b"red\n");
+    fs::write(fixture.tree().join(head), bytes).unwrap();
+    for threads in ["2", "8"] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .args(["grep", "-acF", "red", "run"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let actual = run(command, None);
+        assert!(actual.status.success(), "{threads}: {actual:?}");
+        assert!(actual.stderr.is_empty(), "{actual:?}");
+        let lines: Vec<_> = actual.stdout.split_inclusive(|&b| b == b'\n').collect();
+        assert_eq!(lines.len(), 16, "{actual:?}");
+        let mut slow = files[0].to_vec();
+        slow.extend_from_slice(b":1\n");
+        assert_eq!(
+            lines[15], slow,
+            "tail waited behind slow head at T={threads}"
+        );
+        assert_eq!(
+            groups(&actual.stdout, &fixture.tree()),
+            groups(
+                &fixture.oracle(&["-acF", "red", "run"], None).stdout,
+                &fixture.tree()
+            )
+        );
+    }
+}
