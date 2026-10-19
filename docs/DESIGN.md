@@ -60,10 +60,15 @@ grep share the candidate seam, crawl reader adaptation and query’s streaming
 core. Find exposes source constructors without requiring a parsed expression.
 
 Grep M2 (2026-10-17) keeps that graph: the existing query verification scheduler
-also carries bounded line-group payloads. Its streaming producer runs on its
-own thread, at most four paths per worker ahead in a shared queue; workers
-never call it, so none holds a path while the producer blocks, and a slow file
-holds no other file's path. Workers own checked reads and line rendering. Grep
+also carries bounded line-group payloads. Its producer runs on its own thread;
+workers never call it. Streaming feeds queue at most four paths per worker.
+Indexed feeds queue at most max(4T, 16) paths and wake a worker at each 16 queued
+paths, then everyone when enumeration ends (D107 B). Workers take consecutive
+runs of at most 16 files or 64 KiB of summed catalog sizes, with larger files
+alone (D106 B). Each run's pending tail remains shared: idle workers steal its
+far end even while the owner is blocked in a file read. At most 15 pending paths
+per worker join the producer backlog; these hold no input-byte reservation or
+rendered capture. Workers own checked reads and line rendering. Grep
 workers send completed groups through a bounded completion queue (D92 B); the
 calling host publishes each whole group. One thread keeps walk order. A
 publication mutex excludes live policy warnings from groups; per-file

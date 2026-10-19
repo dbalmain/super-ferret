@@ -3,9 +3,9 @@
 //! parallelism. A bounded completion queue feeds the calling publisher.
 
 use super::*;
-use ferret_query::Lane;
 use ferret_query::find::LiveWalk;
 use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
+use ferret_query::{GroupSchedule, Lane};
 use ferret_query::{ReadOperation, ReadVersion};
 use std::collections::HashMap;
 use std::io::{BufRead, IoSlice};
@@ -623,8 +623,13 @@ pub(super) fn run<'a, W: Write>(
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
     let search = Search::new(host, cancelled);
+    // The document-name view is present only for a catalog-backed segment.
     ferret_query::completion_groups(
-        threads,
+        if names.is_some() {
+            GroupSchedule::Indexed(threads)
+        } else {
+            GroupSchedule::Streaming(threads)
+        },
         cancelled,
         |stopped| {
             let _publication = search
