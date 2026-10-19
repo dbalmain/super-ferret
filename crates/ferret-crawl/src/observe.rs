@@ -369,8 +369,9 @@ pub(crate) fn bracket_search(file: &File, first: &Stat) -> Result<Stat, ContentF
     match fstat(file.as_fd()) {
         Ok(raw) => {
             let after = catalog_stat(&raw);
-            if first.same_version(&after)
-                || (first.size != 0 && first.same_inode_and_not_shrunk(&after))
+            if after.nlink > 0
+                && (first.same_version(&after)
+                    || (first.size != 0 && first.same_inode_and_not_shrunk(&after)))
             {
                 Ok(after)
             } else {
@@ -378,6 +379,29 @@ pub(crate) fn bracket_search(file: &File, first: &Stat) -> Result<Stat, ContentF
             }
         }
         Err(e) => Err(ContentFault::Stat(e.into())),
+    }
+}
+
+#[cfg(test)]
+mod search_bracket_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn search_rejects_an_unlinked_open_inode() {
+        let path = std::env::temp_dir().join(format!(
+            "ferret-unlinked-search-bracket-{}",
+            std::process::id()
+        ));
+        fs::write(&path, b"prefix\n").unwrap();
+        let file = File::open(&path).unwrap();
+        let first = catalog_stat(&fstat(file.as_fd()).unwrap());
+        fs::remove_file(path).unwrap();
+
+        assert!(matches!(
+            bracket_search(&file, &first),
+            Err(ContentFault::Changed)
+        ));
     }
 }
 

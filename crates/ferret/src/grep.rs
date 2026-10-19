@@ -764,8 +764,7 @@ mod tests {
             host.file(&path, recursive).unwrap();
             seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
             seam::COMMIT.with_borrow_mut(|hook| *hook = None);
-            let mut expected = fs::read(&path).unwrap();
-            expected.truncate(expected.len() - 1);
+            let expected = fs::read(&path).unwrap();
             fs::remove_file(path).unwrap();
             assert!(host.writer == expected, "replay differs");
             assert!(host.matched && !host.errors);
