@@ -534,8 +534,10 @@ Multiline search takes **one pass of whole matches over the original input**
 rendering all use those spans. On `abc\nabc\n`, `-U -n '\A'` prints line 1
 only, `-U -c '\A'` prints 1, and `-U -o '\A'` prints nothing, because its one
 span is empty. A match at the end of an unterminated last line selects that
-line. After a final LF the end position selects no line, but requested
-before-context can still print with exit 1. Adjacent highlighted spans merge
+line. After a final LF the end position is on no line and never matches, as
+in line mode, so it draws no before-context either: on `a\nb\nc\n`,
+`-U -n -B1 '\z'` prints nothing and exits 1 (rg prints `3-c`), and
+`-U -n -m1 -B1 'a|\z'` prints `1:a`. Adjacent highlighted spans merge
 within each multiline output line. Multiline inverted output and its context
 remain whole lines under `-o`; context highlighting searches each complete
 context line, including its LF.

@@ -152,12 +152,11 @@ pub(super) fn scan(
     let mut spans: Vec<Range<usize>> = Vec::new();
     let mut groups: Vec<Range<usize>> = Vec::new();
     let (mut taken, mut group_end) = (0, 0);
-    let mut terminal_context = false;
     for span in regex.spans(bytes) {
         cancelled(stopped)?;
         if span.start == bytes.len() && bytes.ends_with(b"\n") {
-            // The position after a final LF is on no line.
-            terminal_context = !plan.invert;
+            // The position after a final LF is on no line and never matches,
+            // so it draws no before-context either (D98).
             break;
         }
         let first = line_at(&lines, span.start);
@@ -200,7 +199,7 @@ pub(super) fn scan(
     if (plan.quiet && !plan.json) || plan.output == Output::Names {
         return Ok(result);
     }
-    if !(selected || terminal_context && plan.before > 0 && plan.output == Output::Lines) {
+    if !selected {
         return Ok(result);
     }
     result.count =
@@ -224,13 +223,6 @@ pub(super) fn scan(
         add_group(
             &mut windows,
             group.start.saturating_sub(before)..group.end.saturating_add(after).min(lines.len()),
-        )?;
-    }
-    if terminal_context && plan.before > 0 {
-        let before = usize::try_from(plan.before).unwrap_or(usize::MAX);
-        add_group(
-            &mut windows,
-            lines.len().saturating_sub(before)..lines.len(),
         )?;
     }
     // JSON events and replacement cover a whole selected group; plain and

@@ -13,6 +13,7 @@ const LINE: &str = "D79: line mode matches each line on its own, so \\A holds at
 const PRINTED: &str = "fuzz B4: headings follow printed records; rg heads a file that printed nothing";
 const BINARY: &str = "GREP.md binary policy: an explicit input is searched as its first-NUL prefix";
 const D83: &str = "D83 A: -r expands every ordinary span; rg falls back to the unchanged line";
+const FINAL_LF: &str = "D98: the position after a final LF is on no line and never matches, so it draws no before-context; rg prints context with exit 1";
 
 const RG_DIFFERS: &[Differs] = &[
     plain(&["-UvonC1", "-r", "", "\\z", "-"], Some(b"a x\nb\nc"), 0, b"1:a x\n2:b\n", D79),
@@ -427,4 +428,13 @@ const RG_DIFFERS: &[Differs] = &[
     plain(&["-UoH", "-A1", "--heading", "a|\\n", "d98-lf", "d98-a"], None, 0, b"d98-a\na\n", PRINTED),
     json(&["", "d98-nul"], None, 0, r#"[["begin","d98-nul"],["match","",1,0,[[0,0,""]]],["end",0,[1,1,1]],["summary",[1,1,1]]]"#, BINARY),
     plain(&["-UnorX", "\\z", "last"], None, 0, b"1:X\n", D83),
+    plain(&["-UnB1", "\\z", "-"], Some(b"abc\nabc\n"), 1, b"", FINAL_LF),
+    plain(&["-r", "X", "-UnB1", "\\z", "-"], Some(b"abc\nabc\n"), 1, b"", FINAL_LF),
+    plain(&["-r", "<$0>", "-UnB1", "\\z", "-"], Some(b"abc\nabc\n"), 1, b"", FINAL_LF),
+    plain(&["-r", "", "-UnB1", "\\z", "-"], Some(b"abc\nabc\n"), 1, b"", FINAL_LF),
+    plain(&["-r", "X\nY", "-UnB1", "\\z", "-"], Some(b"abc\nabc\n"), 1, b"", FINAL_LF),
+    plain(&["-UHnB1", "\\z", "m7-binary", "m7-text"], None, 1, b"", FINAL_LF),
+    plain(&["-UHnB1", "-rX", "\\z", "terminal-binary", "terminal-b"], None, 1, b"", FINAL_LF),
+    json(&["-UB1", "\\z", "one.rs"], None, 1, r#"[["summary", [0, 0, 0]]]"#, FINAL_LF),
+    json(&["-UB1", "\\z", "context-a", "context-b"], None, 1, r#"[["summary", [0, 0, 0]]]"#, FINAL_LF),
 ];

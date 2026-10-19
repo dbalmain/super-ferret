@@ -3330,38 +3330,21 @@ fn m7_r1_first_terminal_word_assertion_is_discovered_counted_and_rendered() {
 }
 
 #[test]
-fn m7_r1_context_only_files_emit_complete_separated_groups() {
+fn m7_r1_final_lf_position_draws_no_context_only_groups() {
+    // D98: \z after a final LF is on no line and never matches, so it draws
+    // no before-context and no file group. rg prints each file's last line as
+    // context, exit 1; RG_DIFFERS pins that for one file.
     let fixture = Fixture::new("m7-r1-context-groups");
     fixture.write("m7-a", b"one\n");
     fixture.write("m7-b", b"two\n");
-    for (extra, expected) in [
-        (
-            vec![],
-            [
-                b"m7-a-1-one\n--\nm7-b-1-two\n".as_slice(),
-                b"m7-b-1-two\n--\nm7-a-1-one\n",
-            ],
-        ),
-        (
-            vec!["--heading"],
-            [
-                b"m7-a\n1-one\n\nm7-b\n1-two\n",
-                b"m7-b\n1-two\n\nm7-a\n1-one\n",
-            ],
-        ),
-    ] {
-        let mut args = vec!["-UHnB1"];
+    for extra in [vec![], vec!["--heading"]] {
+        let mut args = vec!["grep", "-UHnB1"];
         args.extend(extra);
         args.extend([r"\z", "m7-a", "m7-b"]);
-        let oracle = fixture.oracle(&args, None);
-        assert_eq!(oracle.status.code(), Some(1));
-        assert!(expected.contains(&oracle.stdout.as_slice()), "{oracle:?}");
-        let mut actual_args = vec!["grep"];
-        actual_args.extend(&args);
-        let actual = fixture.ferret(&actual_args, None);
-        assert_eq!(actual.status.code(), Some(1));
-        assert!(expected.contains(&actual.stdout.as_slice()), "{actual:?}");
-        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+        let actual = fixture.ferret(&args, None);
+        assert_eq!(actual.status.code(), Some(1), "{args:?}");
+        assert!(actual.stdout.is_empty(), "{args:?}: {actual:?}");
+        assert!(actual.stderr.is_empty());
     }
 }
 
@@ -3970,7 +3953,8 @@ fn m8_r1_replacement_crosses_m7_terminal_publication_matrix() {
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(output.stdout, b"1\n", "{args:?}");
     }
-    // Whole context-only and empty groups retain M7's inter-file separators.
+    // Empty groups retain M7's inter-file separators. D98: \z after a final
+    // LF never matches, so it draws no context-only group (rg draws one).
     fixture.write("terminal-a", b"one\n");
     fixture.write("terminal-b", b"abc\n");
     for extra in [vec![], vec!["--heading", "-I"]] {
@@ -3979,13 +3963,17 @@ fn m8_r1_replacement_crosses_m7_terminal_publication_matrix() {
                 let mut args = vec!["-UHnoB1", "-r", replacement];
                 args.extend(&extra);
                 args.extend([pattern, "terminal-a", "terminal-b"]);
-                let oracle = fixture.oracle(&args, None);
                 let mut actual_args = vec!["grep"];
                 actual_args.extend(&args);
                 let actual = fixture.ferret(&actual_args, None);
-                let expected_exit = if pattern == r"\z" { 1 } else { 0 };
-                assert_eq!(actual.status.code(), Some(expected_exit));
-                assert_eq!(oracle.status.code(), Some(expected_exit));
+                if pattern == r"\z" {
+                    assert_eq!(actual.status.code(), Some(1), "{args:?}");
+                    assert!(actual.stdout.is_empty() && actual.stderr.is_empty());
+                    continue;
+                }
+                let oracle = fixture.oracle(&args, None);
+                assert_eq!(actual.status.code(), Some(0));
+                assert_eq!(oracle.status.code(), Some(0));
                 assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
                 assert_eq!(
                     actual.stdout.ends_with(b"\n"),
@@ -4284,16 +4272,16 @@ fn m9_json_first_nul_prefix_is_the_existing_binary_policy() {
 }
 
 #[test]
-fn m9_json_context_only_and_empty_success_publish_independently() {
+fn m9_json_final_lf_and_empty_success_publish_independently() {
     let fixture = Fixture::new("m9-json-publication");
     fixture.write("context-a", b"a\nb\n");
     fixture.write("context-b", b"c\nd\n");
+    // D98: \z after a final LF never matches and draws no before-context, so
+    // neither file publishes a group; rg publishes two context-only groups.
     let output = fixture.compare_json(&["-UB1", r"\z", "context-a", "context-b"], None);
     assert_eq!(output.status.code(), Some(1));
     let raw = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(raw.matches(r#""type":"begin""#).count(), 2);
-    assert_eq!(raw.matches(r#""type":"end""#).count(), 2);
-    assert!(!raw.contains(r#""type":"match""#));
+    assert!(!raw.contains(r#""type":"begin""#), "{raw}");
     // JSON ignores -o: a selected empty-span source still has a match event.
     fixture.compare_json(&["-Uo", "(?s:.*?)", "context-a", "empty"], None);
 }
@@ -4713,6 +4701,24 @@ fn d98_line_after_the_limit_is_context_though_it_matches() {
         Some(b"\n\n "),
     );
     assert_eq!(output.stdout, b"1:<>\n2:<>\n3- \n");
+}
+
+#[test]
+fn d98_final_lf_position_draws_no_context_after_the_limit() {
+    // Review finding 1: \z after the final LF is on no line and never
+    // matches (D98), so once -m1 is reached it adds no before-context. Before
+    // the fix this printed `1:a`, `--`, `3-c`, and JSON a context event.
+    let fixture = Fixture::new("d98-final-lf-limit");
+    let input = b"a\nb\nc\n";
+    let output = fixture.compare_raw(&["-Unm1", "-B1", r"a|\z", "-"], Some(input));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"1:a\n");
+    let output = fixture.compare_json(&["-Um1", "-B1", r"a|\z", "-"], Some(input));
+    assert_json_stream(
+        &output,
+        r#"[["begin","<stdin>"],["match","a\n",1,0,[[0,1,"a"]]],["end",null,[1,1,1]],["summary",[1,1,1]]]"#,
+        false,
+    );
 }
 
 #[test]
