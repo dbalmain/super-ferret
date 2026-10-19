@@ -717,12 +717,14 @@ mod tests {
     }
 
     #[test]
-    fn inversion_counts_selected_lines_even_when_rg_counts_positive_tail_matches() {
-        // M7-A: rg reports 6 for this four-line gap. GREP.md explicitly
-        // requires selected nonmatching lines, including --count-matches.
-        for args in [
-            vec!["-Uvcm1", "a|\\n"],
-            vec!["-Uvm1", "--count-matches", "a|\\n"],
+    fn inversion_counts_lines_no_match_touches_up_to_the_limit() {
+        // D80 A: -U -v selects the lines no match intersects, -m limits them,
+        // and both count modes report selected lines.
+        for (args, count) in [
+            (vec!["-Uvcm2", "a"], 2),
+            (vec!["-Uvm2", "--count-matches", "a"], 2),
+            (vec!["-Uvc", "a"], 3),
+            (vec!["-Uvcm1", "a|\\n"], 0),
         ] {
             let result = scan(
                 &plan(&args),
@@ -733,8 +735,8 @@ mod tests {
                 |_| Ok(()),
             )
             .unwrap();
-            assert!(result.matched);
-            assert_eq!(result.count, 4);
+            assert_eq!(result.matched, count > 0, "{args:?}");
+            assert_eq!(result.count, count, "{args:?}");
         }
     }
 }

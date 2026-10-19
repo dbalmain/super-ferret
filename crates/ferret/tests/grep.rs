@@ -169,6 +169,15 @@ impl Fixture {
         {
             oracle = self.oracle_file(args, input);
         }
+        if let Some(harvest) = std::env::var_os("FERRET_HARVEST")
+            && !(actual.status.code() == oracle.status.code() && same(&oracle))
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).create(true).open(harvest).unwrap();
+            let stdin: Option<Vec<u32>> = input.map(|i| i.iter().map(|&b| u32::from(b)).collect());
+            file.write_all(format!("{json}\t{lookup:?}\t{stdin:?}\n").as_bytes()).unwrap();
+            return;
+        }
         assert_eq!(
             actual.status.code(),
             oracle.status.code(),
@@ -2143,7 +2152,9 @@ fn m5_real_terminal_matrix() {
         &["--files"],
         &["-HnC1"],
         &["-vonC1"],
-        &["-m1", "-A2"],
+        // Line 2 has no match, so rg's re-classified tail (D98 cluster 3;
+        // `-m1 -nA2 red one.rs` in RG_DIFFERS) does not reach this window.
+        &["-m1", "-A1"],
         &["-q"],
     ];
     for &profile in profiles {
@@ -3164,10 +3175,11 @@ fn m7_spec_examples_have_explicit_bytes_and_counts() {
             b"foo foo\nfoo\n",
             b"2\n",
         ),
+        // D98: -m counts line groups; line 1's group holds both matches.
         (
             vec!["-Ucm2", "foo(?:\\nbar)?", "-"],
             b"foo foo\nfoo\n",
-            b"2\n",
+            b"3\n",
         ),
         (
             vec!["-Ucm3", "foo(?:\\nbar)?", "-"],
@@ -3177,7 +3189,7 @@ fn m7_spec_examples_have_explicit_bytes_and_counts() {
         (
             vec!["-Uom1", "foo(?:\\nbar)?", "-"],
             b"foo foo\nbar\nfoo\n",
-            b"foo\nfoo\n",
+            b"foo\nfoo\nbar\n",
         ),
     ] {
         let output = fixture.compare_raw(&args, Some(input));
@@ -3243,62 +3255,62 @@ differential! {
 }
 
 #[test]
-fn m7_inverted_gap_counts_keep_the_written_line_contract() {
-    // M7-A: rg re-counts positive regex spans in this gap (6). The spec
-    // explicitly requires selected lines under inversion (4).
-    let fixture = Fixture::new("m7-inverted-gap-counts");
+fn d98_inverted_limit_selects_lines_no_match_touches() {
+    // D98 cluster 2 (D80 A): -U -v selects the lines no match intersects and
+    // -m limits those; the line after the limit is context. The old engine
+    // re-counted positive spans in the gap.
+    let fixture = Fixture::new("d98-inverted-limit");
+    let input = b"x\na\ny\na\nz\n";
+    let output = fixture.compare_raw(&["-Uvn", "-m1", "-A1", "a", "-"], Some(input));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"1:x\n2-a\n");
+    // Every line holds an LF match, so nothing is selected.
     for flags in [vec!["-Uvcm1"], vec!["-Uvm1", "--count-matches"]] {
         let mut args = flags;
         args.extend(["a|\\n", "-"]);
-        let oracle = fixture.oracle(&args, Some(b"x\na\ny\na\nz\n"));
-        let mut ferret_args = vec!["grep"];
-        ferret_args.extend(&args);
-        let actual = fixture.ferret(&ferret_args, Some(b"x\na\ny\na\nz\n"));
-        assert_eq!(actual.status.code(), Some(0));
-        assert_eq!(oracle.status.code(), Some(0));
-        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
-        assert_eq!(actual.stdout, b"4\n");
-        assert_eq!(oracle.stdout, b"6\n");
+        let output = fixture.compare_raw(&args, Some(input));
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
     }
 }
 
 #[test]
 fn m7_r1_first_terminal_word_assertion_is_discovered_counted_and_rendered() {
-    // A first hit found at EOF differs from advancing an empty iterator to EOF.
+    // D98: the end of an unterminated last line is a match position like the
+    // one before an LF, so `\b{end}` there selects and counts the line. Its
+    // span is empty, so -o prints nothing for it (D79 D).
     let fixture = Fixture::new("m7-r1-terminal-word");
     for (flags, expected) in [
         (vec!["-Un"], b"1:abc\n".as_slice()),
-        (vec!["-Uon"], b"1:abc\n"),
+        (vec!["-Uon"], b""),
         (vec!["-Uc"], b"1\n"),
         (vec!["-Uco"], b"1\n"),
         (vec!["-U", "--count-matches"], b"1\n"),
     ] {
         let mut args = flags;
         args.extend([r"\b{end}", "-"]);
-        let oracle = fixture.oracle(&args, Some(b"abc"));
-        assert_eq!(oracle.status.code(), Some(0));
-        assert_eq!(oracle.stdout, expected, "{args:?}");
-        let mut actual_args = vec!["grep"];
-        actual_args.extend(&args);
-        let actual = fixture.ferret(&actual_args, Some(b"abc"));
-        assert_eq!(actual.status.code(), Some(0), "{args:?}: {actual:?}");
-        assert_eq!(actual.stdout, expected, "{args:?}");
-        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+        let output = fixture.compare_raw(&args, Some(b"abc"));
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert_eq!(output.stdout, expected, "{args:?}");
     }
-    for (bytes, expected) in [
-        (b"a\nbc".as_slice(), b"1:\n2:bc\n".as_slice()),
-        (b"abc def", b"1:\n"),
-        ("é".as_bytes(), "1:é\n".as_bytes()),
+    for (bytes, count) in [
+        (b"a\nbc".as_slice(), b"2\n".as_slice()),
+        (b"abc def", b"2\n"),
+        ("é".as_bytes(), b"1\n"),
     ] {
         let output = fixture.compare_raw(&["-Uon", r"\b{end}", "-"], Some(bytes));
-        assert_eq!(output.stdout, expected);
-        fixture.compare_raw(&["-Uco", r"\b{end}", "-"], Some(bytes));
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty());
+        let output = fixture.compare_raw(&["-Uco", r"\b{end}", "-"], Some(bytes));
+        assert_eq!(output.stdout, count);
     }
-    // These terminal positions are reached by advancement, not a first hit.
-    for pattern in ["", r"\b", "a*"] {
-        fixture.compare_raw(&["-Uco", pattern, "-"], Some(b"abc"));
+    // One position per byte plus the end: a* takes "a" whole, then 2 and 3.
+    for (pattern, count) in [("", b"4\n".as_slice()), (r"\b", b"2\n"), ("a*", b"3\n")] {
+        let output = fixture.compare_raw(&["-Uco", pattern, "-"], Some(b"abc"));
+        assert_eq!(output.stdout, count, "{pattern}");
     }
-    fixture.compare_raw(&["-Uvn", r"\b{end}", "-"], Some(b"abc"));
+    let output = fixture.compare_raw(&["-Uvn", r"\b{end}", "-"], Some(b"abc"));
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
@@ -3363,8 +3375,10 @@ fn m7_r1_empty_span_output_does_not_create_file_separators() {
 }
 
 #[test]
-fn m7_r1_clipped_zero_counts_need_include_zero_but_keep_search_success() {
-    let fixture = Fixture::new("m7-r1-clipped-zero");
+fn m7_r1_whole_cross_line_match_counts_once_under_the_limit() {
+    // D98 cluster 2 (D81 C): the match "a\n" is taken whole, assertion and
+    // all, and its group is line 1. Nothing is clipped to a zero count.
+    let fixture = Fixture::new("m7-r1-whole-match-count");
     for flags in [
         vec!["-Ucm1"],
         vec!["-Ucom1"],
@@ -3376,19 +3390,9 @@ fn m7_r1_clipped_zero_counts_need_include_zero_but_keep_search_success() {
                 args.push("--include-zero");
             }
             args.extend([r"a\n\b", "-"]);
-            let oracle = fixture.oracle(&args, Some(b"a\nb\n"));
-            assert_eq!(oracle.status.code(), Some(0));
-            assert_eq!(oracle.stdout, b"1\n");
-            let mut actual_args = vec!["grep"];
-            actual_args.extend(&args);
-            let actual = fixture.ferret(&actual_args, Some(b"a\nb\n"));
-            assert_eq!(actual.status.code(), Some(0));
-            assert_eq!(
-                actual.stdout,
-                if include { b"0\n".as_slice() } else { b"" },
-                "{args:?}"
-            );
-            assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+            let output = fixture.compare_raw(&args, Some(b"a\nb\n"));
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(output.stdout, b"1\n", "{args:?}");
         }
     }
 }
@@ -3439,63 +3443,34 @@ fn m7_r2_context_only_binary_results_discard_every_plain_decoration() {
 }
 
 #[test]
-fn m7_r2_first_terminal_tail_hits_keep_match_formatting_after_the_limit() {
+fn m7_r2_lines_after_the_limit_are_context() {
+    // D98 cluster 3: once -m is reached the following lines are context,
+    // never searched or re-classified as matches, whatever the pattern finds
+    // there. Under -o, a selected line whose only spans are empty prints
+    // nothing but still anchors the context window.
     let fixture = Fixture::new("m7-r2-terminal-tail");
-    for (pattern, expected) in [
-        (r"\b{end}", b"1:\n2:bc\n".as_slice()),
-        (r"a|\z", b"1:a\n2:bc\n"),
+    for (pattern, bytes, after, only, lines) in [
+        (r"\b{end}", b"a\nbc".as_slice(), "-A1", b"2-bc\n".as_slice(), b"1:a\n2-bc\n".as_slice()),
+        (r"a|\z", b"a\nbc", "-A1", b"1:a\n2-bc\n", b"1:a\n2-bc\n"),
+        (r"\b", b"a\nbc", "-A1", b"2-bc\n", b"1:a\n2-bc\n"),
+        (r"\b{end}", b"a\nbc def", "-A1", b"2-bc def\n", b"1:a\n2-bc def\n"),
+        (r"\b{end}", b"a\nbc\n", "-A1", b"2-bc\n", b"1:a\n2-bc\n"),
+        (r"\b{end}", b"a\nx\nbc", "-A1", b"2-x\n", b"1:a\n2-x\n"),
+        (r"a|\z", b"a\na\nbc", "-A2", b"1:a\n2-a\n3-bc\n", b"1:a\n2-a\n3-bc\n"),
+        (r"\b{end}", b"a\nx\nbc", "-A2", b"2-x\n3-bc\n", b"1:a\n2-x\n3-bc\n"),
+        (r"a|\z", b"a\nbc\n", "-A1", b"1:a\n2-bc\n", b"1:a\n2-bc\n"),
+        (r"a|\z", b"a\nbc\n", "-A2", b"1:a\n2-bc\n", b"1:a\n2-bc\n"),
     ] {
-        let args = ["-Uonm1", "-A1", pattern, "-"];
-        let oracle = fixture.oracle(&args, Some(b"a\nbc"));
-        assert_eq!(oracle.status.code(), Some(0));
-        assert_eq!(oracle.stdout, expected);
-        assert!(oracle.stderr.is_empty());
-        let actual = fixture.ferret(&["grep", "-Uonm1", "-A1", pattern, "-"], Some(b"a\nbc"));
-        assert_eq!(actual.status.code(), Some(0));
-        assert_eq!(actual.stdout, expected, "{pattern}: {actual:?}");
-        assert!(actual.stderr.is_empty());
-        for extra in [vec!["-Unm1"], vec!["-Uonm1", "--color=always"]] {
-            let mut args = extra;
-            args.extend(["-A1", pattern, "-"]);
-            fixture.compare_raw(&args, Some(b"a\nbc"));
-        }
+        let output = fixture.compare_raw(&["-Uonm1", after, pattern, "-"], Some(bytes));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, only, "-o {pattern} {bytes:?}");
+        let output = fixture.compare_raw(&["-Unm1", after, pattern, "-"], Some(bytes));
+        assert_eq!(output.stdout, lines, "{pattern} {bytes:?}");
+        fixture.compare_raw(&["-Uonm1", "--color=always", after, pattern, "-"], Some(bytes));
     }
-    // Discovery on the last line is distinct from advancing to its terminal
-    // position after an earlier hit, or reaching a final LF. Context stays
-    // bounded.
-    for (pattern, bytes) in [
-        (r"\b", b"a\nbc".as_slice()),
-        (r"\b{end}", b"a\nbc def"),
-        (r"\b{end}", b"a\nbc\n"),
-        (r"\b{end}", b"a\nx\nbc"),
-    ] {
-        fixture.compare_raw(&["-Uonm1", "-A1", pattern, "-"], Some(bytes));
-    }
-    // Suffix discovery can find the final assertion after earlier tail hits.
-    // An LF-including EOF assertion can label the existing trailing line even
-    // after LF; it adds no selected line or count.
-    for (pattern, bytes, expected) in [
-        (
-            r"a|\z",
-            b"a\na\nbc".as_slice(),
-            b"1:a\n2:a\n3:bc\n".as_slice(),
-        ),
-        (r"\b{end}", b"a\nx\nbc", b"1:\n2:\n3:bc\n"),
-        (r"a|\z", b"a\nbc\n", b"1:a\n2:bc\n"),
-    ] {
-        let actual = fixture.compare_raw(&["-Uonm1", "-A2", pattern, "-"], Some(bytes));
-        assert_eq!(actual.stdout, expected);
-        fixture.compare_raw(&["-Unm1", "-A2", pattern, "-"], Some(bytes));
-    }
-    // D82 A: counts re-match the clipped prefix; a trailing match does not
-    // raise the limited count. rg's LF-excluding -co path instead prints 2.
-    let oracle = fixture.oracle(&["-Ucom1", "-A1", r"\b{end}", "-"], Some(b"a\nbc"));
-    assert_eq!(oracle.status.code(), Some(0));
-    assert_eq!(oracle.stdout, b"2\n");
-    let actual = fixture.ferret(&["grep", "-Ucom1", "-A1", r"\b{end}", "-"], Some(b"a\nbc"));
-    assert_eq!(actual.status.code(), Some(0));
-    assert_eq!(actual.stdout, b"1\n");
-    assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+    // The limit stops the count at line 1's group, which holds one span.
+    let output = fixture.compare_raw(&["-Ucom1", "-A1", r"\b{end}", "-"], Some(b"a\nbc"));
+    assert_eq!(output.stdout, b"1\n");
 }
 
 // M8: references are resolved from the original captures, before -o detaches
@@ -3646,36 +3621,23 @@ fn m8_replacement_line_counts_preserve_original_context_boundaries() {
 }
 
 #[test]
-fn m8_clipped_replacement_captures_retain_m7_bounds_provisionally() {
+fn m8_limited_replacement_captures_are_whole_matches() {
     let fixture = Fixture::new("m8-clipped-captures");
     let input = b"red red\nblue\ngap\nred\nblue\n";
-    // M8-C: rg's replacement fast path widens capture bounds and can copy an
-    // unselected suffix. Retain the explicit M7 clipping contract
-    // provisionally.
-    for (only, expected, oracle_expected) in [
-        (
-            false,
-            b"1:<red> <red>\n2-blue\n3-gap\n".as_slice(),
-            b"1:<red> <red\n2:blue>\n3:gap\n4:red\n5:blue\n2-blue\n3-gap\n".as_slice(),
-        ),
-        (
-            true,
-            b"1:<red>\n1:<red>\n2-blue\n3-gap\n".as_slice(),
-            b"1:<red>\n1:<red\n2:blue>\n2-blue\n3-gap\n".as_slice(),
-        ),
+    // D98 cluster 2 (D81 C, D85 moot): the second match is taken whole
+    // across the LF and line 2 joins the limited group; lines after it are
+    // context and keep their bytes.
+    for (only, expected) in [
+        (false, b"1:<red> <red\n2:blue>\n3-gap\n4-red\n".as_slice()),
+        (true, b"1:<red>\n1:<red\n2:blue>\n3-gap\n4-red\n"),
     ] {
         let mut args = vec!["-Unm1", "-A2", "-r<$0>", "red(?:\nblue)?", "-"];
         if only {
             args.insert(0, "-o");
         }
-        let oracle = fixture.oracle(&args, Some(input));
-        assert_eq!(oracle.status.code(), Some(0));
-        assert_eq!(oracle.stdout, oracle_expected);
-        args.insert(0, "grep");
-        let actual = fixture.ferret(&args, Some(input));
-        assert_eq!(actual.status.code(), Some(0));
-        assert!(actual.stderr.is_empty());
-        assert_eq!(actual.stdout, expected);
+        let output = fixture.compare_raw(&args, Some(input));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, expected, "{args:?}");
     }
     // D79's existing per-line absolute-anchor choice also applies to capture
     // replacement. rg carries empty \A presentation state across lines.
@@ -3730,7 +3692,8 @@ fn m8_spec_replacement_examples_are_discriminating() {
         (
             b"red\n".as_slice(),
             vec!["-or", "$wordX", "(?P<word>red)", "-"],
-            b"\n".as_slice(),
+            // D79 D: an empty expansion prints no record.
+            b"".as_slice(),
         ),
         (
             b"red\n".as_slice(),
@@ -3740,7 +3703,7 @@ fn m8_spec_replacement_examples_are_discriminating() {
         (
             b"red\n".as_slice(),
             vec!["-or", "$1X", "(red)", "-"],
-            b"\n".as_slice(),
+            b"".as_slice(),
         ),
         (
             b"red\n".as_slice(),
@@ -3758,9 +3721,10 @@ fn m8_spec_replacement_examples_are_discriminating() {
             b"<red:> <:blue>\n".as_slice(),
         ),
         (
+            // The end of an unterminated line is a position too (D98).
             b"abc".as_slice(),
             vec!["-or", "X", "", "-"],
-            b"X\nX\nX\n".as_slice(),
+            b"X\nX\nX\nX\n".as_slice(),
         ),
         (
             b"abc\n".as_slice(),
@@ -3770,7 +3734,7 @@ fn m8_spec_replacement_examples_are_discriminating() {
         (
             b"abc".as_slice(),
             vec!["-or", "X", "\\z", "-"],
-            b"abc\n".as_slice(),
+            b"X\n".as_slice(),
         ),
         (
             b"a\nb\nc\nd\n".as_slice(),
@@ -3845,23 +3809,14 @@ fn m8_limited_trailing_context_never_repeats_a_cross_line_capture() {
         );
     }
     let input = b"red x\ngap\nred\nblue\nend\n";
-    // M8-C also bounds captures on independently discovered trailing lines.
-    // rg can expand red-LF-blue then print blue again as context.
-    let actual = fixture.ferret(
-        &["grep", "-Unm1", "-A4", "-r<$0>", "red(?:\nblue)?", "-"],
-        Some(input),
-    );
-    assert_eq!(actual.status.code(), Some(0));
-    assert_eq!(actual.stdout, b"1:<red> x\n2-gap\n3:<red>\n4-blue\n5-end\n");
-    let oracle = fixture.oracle(
+    // D98 cluster 3: lines after the limit are context, never searched, so
+    // the later red-LF-blue is neither expanded nor printed twice.
+    let output = fixture.compare_raw(
         &["-Unm1", "-A4", "-r<$0>", "red(?:\nblue)?", "-"],
         Some(input),
     );
-    assert_eq!(oracle.status.code(), Some(0));
-    assert_eq!(
-        oracle.stdout,
-        b"1:<red> x\n2-gap\n3:<red\n4:blue>\n5:end\n4-blue\n5-end\n"
-    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"1:<red> x\n2-gap\n3-red\n4-blue\n5-end\n");
 }
 
 #[test]
@@ -3873,11 +3828,12 @@ fn m8_r1_selected_inverted_lines_do_not_invent_terminal_captures() {
 }
 
 #[test]
-fn m8_r1_terminal_tail_fallback_survives_replacement_without_spans() {
+fn m8_r1_context_after_the_limit_is_not_replaced() {
     let fixture = Fixture::new("m8-r1-terminal-tail");
+    // D98 cluster 3: line 2 is context after the limit, never searched.
     let actual = fixture.compare_raw(&["-Uonm1", "-A1", "-rX", r"a|\z", "-"], Some(b"a\nbc\n"));
     assert_eq!(actual.status.code(), Some(0));
-    assert_eq!(actual.stdout, b"1:X\n2:bc\n");
+    assert_eq!(actual.stdout, b"1:X\n2-bc\n");
 }
 
 #[test]
@@ -3951,40 +3907,22 @@ fn m8_r1_replacement_crosses_m7_terminal_publication_matrix() {
             fixture.compare_raw(&args, Some(bytes));
         }
     }
-    // M7 R1: counts retain bounded re-matching regardless of replacement.
-    for flags in [
-        vec!["-Ucm1"],
-        vec!["-Ucom1"],
-        vec!["-U", "--count-matches", "-m1"],
+    // Counts ignore replacement: the whole match a\n counts once (D81 C),
+    // and the limit stops at line 1's group.
+    for (flags, bytes) in [
+        (vec!["-Ucm1"], b"a\nb\n".as_slice()),
+        (vec!["-Ucom1"], b"a\nb\n"),
+        (vec!["-U", "--count-matches", "-m1"], b"a\nb\n"),
+        (vec!["-Ucm1", "--include-zero"], b"a\nb\n"),
+        (vec!["-Ucom1", "-A1"], b"a\nbc"),
     ] {
-        for include in [false, true] {
-            let mut args = flags.clone();
-            args.extend(["-rX"]);
-            if include {
-                args.push("--include-zero");
-            }
-            args.extend([r"a\n\b", "-"]);
-            let oracle = fixture.oracle(&args, Some(b"a\nb\n"));
-            assert_eq!(oracle.status.code(), Some(0));
-            assert_eq!(oracle.stdout, b"1\n");
-            args.insert(0, "grep");
-            let actual = fixture.ferret(&args, Some(b"a\nb\n"));
-            assert_eq!(actual.status.code(), Some(0));
-            assert_eq!(actual.stdout, if include { b"0\n".as_slice() } else { b"" });
-            assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
-        }
+        let pattern = if bytes == b"a\nbc" { r"\b{end}" } else { r"a\n\b" };
+        let mut args = flags;
+        args.extend(["-rX", pattern, "-"]);
+        let output = fixture.compare_raw(&args, Some(bytes));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, b"1\n", "{args:?}");
     }
-    // D82 A's independent tail count remains unchanged as well.
-    let args = ["-Ucom1", "-A1", "-rX", r"\b{end}", "-"];
-    let oracle = fixture.oracle(&args, Some(b"a\nbc"));
-    assert_eq!(oracle.stdout, b"2\n");
-    let actual = fixture.ferret(
-        &["grep", "-Ucom1", "-A1", "-rX", r"\b{end}", "-"],
-        Some(b"a\nbc"),
-    );
-    assert_eq!(actual.stdout, b"1\n");
-    assert_eq!(actual.status.code(), Some(0));
-    assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
     // Whole context-only and empty groups retain M7's inter-file separators.
     fixture.write("terminal-a", b"one\n");
     fixture.write("terminal-b", b"abc\n");
@@ -4149,7 +4087,7 @@ json_cases! {
     m9_json_multiline_context_only: 1 => ["-UB1", r"\z", "one.rs"];
     m9_json_multiline_invert: 0 => ["-UvC1", r"red lantern\nBLUE", "one.rs"];
     m9_json_multiline_invert_empty: 0 => ["-Uv", r"\z", "one.rs"];
-    m9_json_multiline_inverted_limit: 0 => ["-Uvm1", "red|\n", "one.rs"];
+    m9_json_multiline_inverted_limit: 1 => ["-Uvm1", "red|\n", "one.rs"];
     m9_json_indexed: 0 => ["red", "."];
     m9_json_indexed_context: 0 => ["-C1", "lantern", "."];
     m9_json_unrestricted: 0 => ["-uu", "red", "."];
@@ -4388,95 +4326,69 @@ fn m9_json_terminal_and_inverted_context_matrix() {
 }
 
 #[test]
-fn m9_json_clipped_submatches_remain_within_the_published_region() {
-    let fixture = Fixture::new("m9-json-clipping-contract");
-    let args = ["--json", "-Um1", r"red(?:\nblue)?", "-"];
-    let actual = fixture.ferret(
-        &["grep", args[0], args[1], args[2], args[3]],
-        Some(b"red red\nblue\n"),
-    );
-    assert_eq!(actual.status.code(), Some(0));
-    assert_json_stream(
-        &actual,
-        r#"[
-        ["begin","<stdin>"], ["match","red red\n",1,0,[[0,3,"red"],[4,7,"red"]]],
-        ["end",null,[1,2,1]], ["summary",[1,2,1]]
-    ]"#,
-        false,
-    );
-    // D87: rg panics before publishing a match; no suffix is licensed here.
-    let oracle = fixture.oracle(&args, Some(b"red red\nblue\n"));
-    assert_eq!(oracle.status.code(), Some(101));
-    assert!(String::from_utf8_lossy(&oracle.stderr).contains("out of range"));
-    assert_partial_json_stream(&oracle, r#"[["begin","<stdin>"]]"#);
-
-    let args = ["--json", "-Um1", r"a\n\b", "-"];
-    let actual = fixture.ferret(
-        &["grep", args[0], args[1], args[2], args[3]],
-        Some(b"a\nb\n"),
-    );
-    assert_eq!(actual.status.code(), Some(0));
-    assert_json_stream(
-        &actual,
-        r#"[
-        ["begin","<stdin>"], ["match","a\n",1,0,[]],
-        ["end",null,[1,0,1]], ["summary",[1,0,1]]
-    ]"#,
-        false,
-    );
-    let oracle = fixture.oracle(&args, Some(b"a\nb\n"));
-    assert_eq!(oracle.status.code(), Some(0));
-    assert_json_stream(
-        &oracle,
-        r#"[
-        ["begin","<stdin>"], ["match","a\n",1,0,[[0,2,"a\n"]]],
-        ["end",null,[1,1,1]], ["summary",[1,1,1]]
-    ]"#,
-        false,
-    );
+fn m9_json_limited_submatches_are_whole_matches() {
+    // D98 cluster 2 (D81 C): the limited group takes its matches whole, so the
+    // event spans both lines and the second submatch crosses the LF. rg's
+    // stream reader panics here (D87, now moot).
+    let fixture = Fixture::new("m9-json-whole-matches");
+    for (args, bytes, expected) in [
+        (
+            ["-Um1", r"red(?:\nblue)?", "-"],
+            b"red red\nblue\n".as_slice(),
+            r#"[
+            ["begin","<stdin>"],
+            ["match","red red\nblue\n",1,0,[[0,3,"red"],[4,12,"red\nblue"]]],
+            ["end",null,[2,2,1]], ["summary",[2,2,1]]
+        ]"#,
+        ),
+        (
+            ["-Um1", r"a\n\b", "-"],
+            b"a\nb\n",
+            r#"[
+            ["begin","<stdin>"], ["match","a\n",1,0,[[0,2,"a\n"]]],
+            ["end",null,[1,1,1]], ["summary",[1,1,1]]
+        ]"#,
+        ),
+    ] {
+        let output = fixture.compare_json(&args, Some(bytes));
+        assert_eq!(output.status.code(), Some(0));
+        assert_json_stream(&output, expected, false);
+    }
 }
 
 #[test]
-fn m9_json_inherits_line_assertion_and_limit_windows_provisionally() {
-    let fixture = Fixture::new("m9-json-inherited-contracts");
-    for (args, bytes, chosen, oracle_expected) in [
-        // D90: pin x and a specifically; counts cannot license publishing z.
+fn m9_json_context_after_the_limit_is_never_searched() {
+    let fixture = Fixture::new("m9-json-limit-context");
+    for (args, bytes, expected) in [
+        // D80 A: x is the one selected line; a is context. Inverted context
+        // lines still carry their own local submatches.
         (
             vec!["-Uvm1", "-A1", "a", "-"],
             &b"x\na\ny\na\nz\n"[..],
             r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["context","a\n",2,2,[[0,1,"a"]]],["end",null,[1,0,1]],["summary",[1,0,1]]]"#,
-            r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["match","a\n",2,2,[[0,1,"a"]]],["match","y\n",3,4,[]],["end",null,[3,1,1]],["summary",[3,1,1]]]"#,
         ),
-        // D89 inherits D79's per-line absolute assertions.
+        // Line mode matches each line on its own, so \A holds at each start.
         (
             vec![r"\A", "-"],
             b"abc\nabc\n",
             r#"[["begin","<stdin>"],["match","abc\n",1,0,[[0,0,""]]],["match","abc\n",2,4,[[0,0,""]]],["end",null,[2,2,1]],["summary",[2,2,1]]]"#,
-            r#"[["begin","<stdin>"],["match","abc\n",1,0,[[0,0,""]]],["match","abc\n",2,4,[]],["end",null,[2,1,1]],["summary",[2,1,1]]]"#,
         ),
+        // D98 cluster 3: the line after -m is context even though \z matches
+        // at its end.
         (
             vec!["-m1", "-A1", r"\z", "-"],
             b"a\nbc",
-            r#"[["begin","<stdin>"],["match","a\n",1,0,[[1,1,""]]],["match","bc",2,2,[]],["end",null,[2,1,1]],["summary",[2,1,1]]]"#,
             r#"[["begin","<stdin>"],["match","a\n",1,0,[[1,1,""]]],["context","bc",2,2,[]],["end",null,[1,1,1]],["summary",[1,1,1]]]"#,
         ),
-        // D90: terminal suffix discovery differs without widening source bytes.
         (
             vec!["-Um1", "-A1", r"a|\z", "-"],
             b"x\na\ny\na\nz\n",
             r#"[["begin","<stdin>"],["match","a\n",2,2,[[0,1,"a"]]],["context","y\n",3,4,[]],["end",null,[1,1,1]],["summary",[1,1,1]]]"#,
-            r#"[["begin","<stdin>"],["match","a\n",2,2,[[0,1,"a"]]],["match","y\n",3,4,[]],["end",null,[2,1,1]],["summary",[2,1,1]]]"#,
         ),
     ] {
-        let mut full = vec!["--json"];
-        full.extend(args);
-        let oracle = fixture.oracle(&full, Some(bytes));
-        full.insert(0, "grep");
-        let actual = fixture.ferret(&full, Some(bytes));
-        assert_eq!(actual.status.code(), Some(0));
-        assert_eq!(oracle.status.code(), Some(0));
-        assert_json_stream(&actual, chosen, false);
-        assert_json_stream(&oracle, oracle_expected, false);
+        let output = fixture.compare_json(&args, Some(bytes));
+        assert_eq!(output.status.code(), Some(0));
+        assert_json_stream(&output, expected, false);
     }
 }
 
@@ -4505,18 +4417,10 @@ fn m9_json_quiet_stats_keep_counting_and_event_span_bounds_separate() {
 }
 
 fn assert_json_stream(output: &Output, expected: &str, quiet: bool) {
-    assert_json_projection(output, expected, quiet, "--expect");
-}
-
-fn assert_partial_json_stream(output: &Output, expected: &str) {
-    assert_json_projection(output, expected, false, "--expect-partial");
-}
-
-fn assert_json_projection(output: &Output, expected: &str, quiet: bool, flag: &str) {
     let python = std::env::var_os("FERRET_PYTHON").unwrap_or_else(|| panic!("nix supplies Python"));
     let mut command = Command::new(python);
     command
-        .args(["-c", include_str!("support/grep_json.py"), flag, expected])
+        .args(["-c", include_str!("support/grep_json.py"), "--expect", expected])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if quiet {
@@ -4531,58 +4435,45 @@ fn assert_json_projection(output: &Output, expected: &str, quiet: bool, flag: &s
 
 #[test]
 fn m9_r1_trailing_multiline_submatches_are_rechecked_within_source_lines() {
+    // D98 cluster 3: after the limited group the following lines are
+    // context, in JSON and plain output alike, though a\nb matches again.
     let fixture = Fixture::new("m9-r1-cross-line-tail");
     let input = b"a\nb\na\nb\n";
-    let args = ["--json", "-Um1", "-A2", r"a\nb", "-"];
-    let expected = r#"[
+    let output = fixture.compare_json(&["-Um1", "-A2", r"a\nb", "-"], Some(input));
+    assert_eq!(output.status.code(), Some(0));
+    assert_json_stream(
+        &output,
+        r#"[
         ["begin","<stdin>"],
         ["match","a\nb\n",1,0,[[0,3,"a\nb"]]],
         ["context","a\n",3,4,[]],
         ["context","b\n",4,6,[]],
         ["end",null,[2,1,1]],
         ["summary",[2,1,1]]
-    ]"#;
-    let oracle = fixture.oracle(&args, Some(input));
-    assert_eq!(oracle.status.code(), Some(0));
-    assert_json_stream(&oracle, expected, false);
-    let mut command = vec!["grep"];
-    command.extend(args);
-    let actual = fixture.ferret(&command, Some(input));
-    assert_eq!(actual.status.code(), Some(0));
-    assert_json_stream(&actual, expected, false);
-    let plain = fixture.ferret(&["grep", "-Unm1", "-A2", r"a\nb", "-"], Some(input));
-    assert_eq!(plain.stdout, b"1:a\n2:b\n3:a\n4:b\n");
+    ]"#,
+        false,
+    );
+    let plain = fixture.compare_raw(&["-Unm1", "-A2", r"a\nb", "-"], Some(input));
+    assert_eq!(plain.stdout, b"1:a\n2:b\n3-a\n4-b\n");
 }
 
 #[test]
 fn m9_r1_optional_cross_line_tail_keeps_only_complete_local_matches() {
+    // D98 cluster 3: line 3's "a" is after the limit, so it is context.
+    // rg's stream reader panics here (D87, now moot).
     let fixture = Fixture::new("m9-r1-optional-tail");
-    let input = b"a\nb\na\nb\n";
-    let args = ["--json", "-Um1", "-A2", r"a(?:\nb)?", "-"];
-    let mut full = vec!["grep"];
-    full.extend(args);
-    let actual = fixture.ferret(&full, Some(input));
-    assert_eq!(actual.status.code(), Some(0));
+    let output = fixture.compare_json(&["-Um1", "-A2", r"a(?:\nb)?", "-"], Some(b"a\nb\na\nb\n"));
+    assert_eq!(output.status.code(), Some(0));
     assert_json_stream(
-        &actual,
+        &output,
         r#"[
         ["begin","<stdin>"],
         ["match","a\nb\n",1,0,[[0,3,"a\nb"]]],
-        ["match","a\n",3,4,[[0,1,"a"]]],
+        ["context","a\n",3,4,[]],
         ["context","b\n",4,6,[]],
-        ["end",null,[3,2,1]], ["summary",[3,2,1]]
+        ["end",null,[2,1,1]], ["summary",[2,1,1]]
     ]"#,
         false,
-    );
-    // D87 retains valid line-local matches instead of reproducing rg's panic.
-    let oracle = fixture.oracle(&args, Some(input));
-    assert_eq!(oracle.status.code(), Some(101));
-    assert!(String::from_utf8_lossy(&oracle.stderr).contains("out of range"));
-    assert_partial_json_stream(
-        &oracle,
-        r#"[
-        ["begin","<stdin>"], ["match","a\nb\n",1,0,[[0,3,"a\nb"]]]
-    ]"#,
     );
 }
 
@@ -4662,41 +4553,167 @@ fn m9_r1_nul_line_selection_and_raw_prefix_are_explicit_binary_policy() {
 
 #[test]
 fn m9_r1_quiet_decision_has_independent_summary_expectations() {
+    // D98 cluster 2 (D91 A): a quiet summary reports what the events would
+    // have: selected lines and their submatches, nothing after the limit.
     let fixture = Fixture::new("m9-r1-quiet-decision");
-    for (args, input, expected) in [
+    for (args, input, status, expected) in [
         (
-            vec!["--json", "-q", "-Um1", "-A2", r"a\nb", "-"],
+            vec!["-q", "-Um1", "-A2", r"a\nb", "-"],
             &b"a\nb\na\nb\n"[..],
+            0,
             r#"[["summary",[2,1,1]]]"#,
         ),
         (
-            vec!["--json", "-q", "-Um1", "-A2", r"a(?:\nb)?", "-"],
+            vec!["-q", "-Um1", "-A2", r"a(?:\nb)?", "-"],
             b"a\nb\na\nb\n",
-            r#"[["summary",[3,2,1]]]"#,
+            0,
+            r#"[["summary",[2,1,1]]]"#,
         ),
+        (vec!["-q", r"\z", "-"], &b"abc"[..], 0, r#"[["summary",[1,1,1]]]"#),
+        // D80 A: every line holds an LF match, so none is selected.
         (
-            vec!["--json", "-q", r"\z", "-"],
-            &b"abc"[..],
-            r#"[["summary",[1,1,1]]]"#,
-        ),
-        (
-            vec!["--json", "-q", "-Uvm1", r"a|\n", "-"],
+            vec!["-q", "-Uvm1", r"a|\n", "-"],
             b"x\na\ny\na\nz\n",
-            r#"[["summary",[4,6,1]]]"#,
+            1,
+            r#"[["summary",[0,0,0]]]"#,
         ),
+        // \z after the final LF is on no line; every line is selected and an
+        // inverted line has no submatches.
         (
-            vec!["--json", "-q", "-Uv", r"\z", "-"],
+            vec!["-q", "-Uv", r"\z", "-"],
             b"x\na\ny\na\nz\n",
-            r#"[["summary",[5,5,1]]]"#,
+            0,
+            r#"[["summary",[5,0,1]]]"#,
         ),
     ] {
-        let oracle = fixture.oracle(&args, Some(input));
-        assert_eq!(oracle.status.code(), Some(0));
-        assert_json_stream(&oracle, expected, true);
-        let mut full = vec!["grep"];
-        full.extend(args);
-        let actual = fixture.ferret(&full, Some(input));
-        assert_eq!(actual.status.code(), Some(0));
-        assert_json_stream(&actual, expected, true);
+        let output = fixture.compare_json(&args, Some(input));
+        assert_eq!(output.status.code(), Some(status), "{args:?}");
+        assert_json_stream(&output, expected, true);
     }
+}
+
+// D98 regression inputs: each one printed something else before D98.
+
+#[test]
+fn d98_only_never_prints_an_empty_record() {
+    // D98 cluster 1 (D79 D): \A matches once, at the start of the input, and
+    // its span is empty; the search still succeeds.
+    let fixture = Fixture::new("d98-only-empty");
+    let output = fixture.compare_raw(&["-Uo", r"\A", "-"], Some(b"abc\nabc\n"));
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    // Fuzz B1: `$` at the end of an unterminated line is empty too.
+    let output = fixture.compare_raw(&["-o", "$", "-"], Some(b"abc"));
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn d98_limit_takes_whole_groups() {
+    // D98 cluster 2 (D81 C): the second match starts on line 1 and is taken
+    // whole, so line 1's group extends to line 2.
+    let fixture = Fixture::new("d98-limit-group");
+    let input = b"red red\nblue\n";
+    let output = fixture.compare_raw(&["-Unm1", "red(?:\nblue)?", "-"], Some(input));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"1:red red\n2:blue\n");
+    let output = fixture.compare_raw(&["-Ucm1", "red(?:\nblue)?", "-"], Some(input));
+    assert_eq!(output.stdout, b"2\n");
+}
+
+#[test]
+fn d98_line_after_the_limit_is_context_though_it_matches() {
+    // D98 cluster 3: \z matches at the end of line 2 too, but -m1 has been
+    // reached, so line 2 is context, plain and JSON.
+    let fixture = Fixture::new("d98-limit-context");
+    let output = fixture.compare_raw(&["-nm1", "-A1", r"\z", "-"], Some(b"a\nbc"));
+    assert_eq!(output.stdout, b"1:a\n2-bc\n");
+    let output = fixture.compare_json(&["-m1", "-A1", r"\z", "-"], Some(b"a\nbc"));
+    assert_json_stream(
+        &output,
+        r#"[["begin","<stdin>"],["match","a\n",1,0,[[1,1,""]]],["context","bc",2,2,[]],["end",null,[1,1,1]],["summary",[1,1,1]]]"#,
+        false,
+    );
+    // Fuzz D1: two empty lines take the limit; the third line is context and
+    // is not replaced.
+    let output = fixture.compare_raw(
+        &["-n", "-m2", "-C3", "-r", "<$0>", "-e", r"(\z)", "-e", "", "-"],
+        Some(b"\n\n "),
+    );
+    assert_eq!(output.stdout, b"1:<>\n2:<>\n3- \n");
+}
+
+#[test]
+fn d98_end_of_an_unterminated_line_is_a_match_position() {
+    // Fuzz B1. `abc` has four positions, before each byte and at its end;
+    // `abc\n` has the same four on line 1 and a fifth after the LF, which is
+    // on no line. So both count 4, every view agrees, and -o prints nothing
+    // because every span is empty.
+    let fixture = Fixture::new("d98-terminal-position");
+    for input in [b"abc".as_slice(), b"abc\n"] {
+        let output = fixture.compare_raw(&["--count-matches", "", "-"], Some(input));
+        assert_eq!(output.stdout, b"4\n", "{input:?}");
+        let output = fixture.compare_raw(&["-o", "", "-"], Some(input));
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty());
+        let output = fixture.compare_raw(&["-or", "X", "", "-"], Some(input));
+        assert_eq!(output.stdout, b"X\nX\nX\nX\n");
+    }
+    let output = fixture.compare_json(&["", "-"], Some(b"abc"));
+    assert_json_stream(
+        &output,
+        r#"[["begin","<stdin>"],["match","abc",1,0,[[0,0,""],[1,1,""],[2,2,""],[3,3,""]]],["end",null,[1,4,1]],["summary",[1,4,1]]]"#,
+        false,
+    );
+    // Fuzz B2: x\n is taken whole; the empty alternative cannot match where
+    // that match ended (2), but can at 3, the end of the unterminated y.
+    let output = fixture.compare_raw(&["-U", "x\\n|", "-"], Some(b"x\ny"));
+    assert_eq!(output.stdout, b"x\ny\n");
+    // After a final LF, 3 is on no line, so line 2 is not selected.
+    let output = fixture.compare_raw(&["-U", "x\\n|", "-"], Some(b"x\n\n"));
+    assert_eq!(output.stdout, b"x\n");
+}
+
+#[test]
+fn d98_separators_and_headings_follow_printed_records() {
+    // Fuzz B4: a line whose only matches are empty or LF-only prints no -o
+    // record, but stays in the context window, so no `--` appears between
+    // windows that touch.
+    let fixture = Fixture::new("d98-printed-groups");
+    let input = b"a\n\na\n";
+    let output = fixture.compare_raw(&["-Uon", "-A1", "a|\\n", "-"], Some(input));
+    assert_eq!(output.stdout, b"1:a\n3:a\n");
+    let output = fixture.compare_raw(&["-on", "-A1", "a|^$", "-"], Some(input));
+    assert_eq!(output.stdout, b"1:a\n3:a\n");
+    // A file whose only matches print nothing gets no heading and no
+    // separator before the next file.
+    fixture.write("d98-lf", b"\n");
+    fixture.write("d98-a", b"a\n");
+    for (extra, expected) in [
+        (vec![], b"d98-a:a\n".as_slice()),
+        (vec!["--heading"], b"d98-a\na\n"),
+    ] {
+        let mut args = vec!["-UoH", "-A1"];
+        args.extend(extra);
+        args.extend(["a|\\n", "d98-lf", "d98-a"]);
+        let output = fixture.compare_raw(&args, None);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, expected, "{args:?}");
+    }
+}
+
+#[test]
+fn d98_json_match_records_always_carry_their_submatches() {
+    // Fuzz D2: an explicit file that is one NUL is searched as its empty
+    // first-NUL prefix (binary policy); the empty pattern matches there, so
+    // the match record has that submatch and the stats count it.
+    let fixture = Fixture::new("d98-json-nul");
+    fixture.write("d98-nul", b"\0");
+    let output = fixture.compare_json(&["", "d98-nul"], None);
+    assert_eq!(output.status.code(), Some(0));
+    assert_json_stream(
+        &output,
+        r#"[["begin","d98-nul"],["match","",1,0,[[0,0,""]]],["end",0,[1,1,1]],["summary",[1,1,1]]]"#,
+        false,
+    );
 }

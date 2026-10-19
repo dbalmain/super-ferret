@@ -131,11 +131,9 @@ def projection(raw):
 
 if __name__ == '__main__':
     raw = sys.stdin.buffer.read()
-    partial = '--expect-partial' in sys.argv
-    normalized = b'' if partial else normalize(raw, quiet='--quiet' in sys.argv)
-    flag = '--expect-partial' if partial else '--expect'
-    if flag in sys.argv:
-        expected = json.loads(sys.argv[sys.argv.index(flag) + 1])
+    normalized = normalize(raw, quiet='--quiet' in sys.argv)
+    if '--expect' in sys.argv:
+        expected = json.loads(sys.argv[sys.argv.index('--expect') + 1])
         actual = projection(raw)
         assert actual == expected, (actual, expected)
     else:
