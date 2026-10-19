@@ -173,8 +173,12 @@ pool across inputs; content-search workers retain their owned search copies.
 Line selection can narrow required-run searches to consuming-byte windows while
 preserving the original left haystack and four bytes of right context for
 LF/Unicode word assertions. An occurrence ending beyond the consuming window
-cannot select it. Actual spans, captures, replacement and JSON still use their
-original source-line bounds. Uncoloured, unnumbered plain records combine path,
+cannot select it. Match spans for `-o`, `--count-matches`, highlighting and JSON
+use the same windows (2026-10-20): each span is searched in the window around
+the next required-run occurrence, not from the previous match to the line end,
+which was quadratic on long lines and ran the engine's slow Unicode-`\b`
+fallback over non-ASCII text. Captures and replacement still use the whole
+source line. Uncoloured, unnumbered plain records combine path,
 separator, data and LF through the capture's vectored writer. Grep holds up to 4 MiB per file capture (D93), then stages spill
 writes in 64 KiB blocks, finishing them inside the
 checked-read callback before accepting a group. A broken pipe on stdout ends

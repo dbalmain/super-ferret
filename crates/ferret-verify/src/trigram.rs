@@ -469,7 +469,7 @@ impl Search<'_> {
     /// and four bytes of right context, as [`Search::matching_line`] does.
     /// Searching from each match to the end of `text` instead is quadratic in
     /// a long line's matches, and with Unicode word boundaries over non-ASCII
-    /// text the engine's slow fallback runs over all of that (D105).
+    /// text the engine's slow fallback runs over all of that.
     pub fn spans<'r, 't>(&'r self, text: &'t [u8]) -> Spans<'r, 't> {
         match &self.filter {
             None => Spans(Windows::Whole(self.regex.spans(text))),

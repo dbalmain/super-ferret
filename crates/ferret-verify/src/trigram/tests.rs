@@ -1200,3 +1200,51 @@ fn earliest_end_and_full_span_select_the_same_source_line() {
         }
     }
 }
+
+// A filtered search finds each span in its required-run window. Every line
+// built from these pieces must give the spans the unfiltered regex gives:
+// runs at window edges, back to back, in non-word bytes' right context, next
+// to non-ASCII word characters and invalid UTF-8.
+#[test]
+fn windowed_spans_equal_the_regex_spans_over_every_line() {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    let pieces: [&[u8]; 10] = [
+        b"ing",
+        b"sing",
+        b" ",
+        b",",
+        "é".as_bytes(),
+        b"\xff",
+        b"_",
+        b"xab",
+        b"ab",
+        "ж".as_bytes(),
+    ];
+    for pattern in [
+        r"\w+ing\b",
+        r"\w*ing\b",
+        r"\w*ab\w*ing\b",
+        r"[a-z]+xab\b",
+        r"(?i)[A-Z_]+ing",
+    ] {
+        let grep = flags.compile_lines(pattern).unwrap();
+        let search = grep.borrowed_search();
+        assert!(search.filters(), "{pattern} must take the windowed path");
+        // Every sequence of up to five pieces, by counting in base ten.
+        for n in 0..100_000_u32 {
+            let mut line = Vec::new();
+            let mut rest = n;
+            for _ in 0..5 {
+                line.extend_from_slice(pieces[(rest % 10) as usize]);
+                rest /= 10;
+            }
+            assert_eq!(
+                search.spans(&line).collect::<Vec<_>>(),
+                grep.regex().spans(&line).collect::<Vec<_>>(),
+                "{pattern}: {line:?}"
+            );
+        }
+    }
+}
