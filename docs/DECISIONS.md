@@ -5020,7 +5020,7 @@ daemons or not, since the first query after each start pays it.
 
 ## D79 — Empty absolute anchors in line grep output
 
-**Status: open, 2026-10-17; M2 uses A provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 **Question:** should line-oriented `-o`/`-co` retain the per-line span rule in
 GREP.md, or reproduce rg 15.2.0’s cross-line empty-absolute-anchor artefacts?
@@ -5047,7 +5047,7 @@ Then B, with owned positive/negative cases for that rule.
 
 ## D80 — Multiline inversion with a limit
 
-**Status: open, 2026-10-17; M7 (`wt/grep-m7`) uses B provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 **Question:** should `-U -v -m` reproduce rg 15.2.0's positive-search limit and
 its gaps, or keep GREP.md's nonmatching-line selection rule? Owned probes (no
@@ -5070,7 +5070,7 @@ artefact. Then A.
 
 ## D81 — Multiline search assertions versus rendering assertions
 
-**Status: open, 2026-10-17; M7 (`wt/grep-m7`) uses B provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 **Question:** should multiline search keep the original haystack at every
 resume, or follow rg's suffix-based search while counting and rendering against
@@ -5092,7 +5092,7 @@ the artefact. Then A.
 
 ## D82 — Clipped multiline zero counts
 
-**Status: open, 2026-10-17; M7 (`wt/grep-m7`) uses A provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 **Question:** when `-m` clips a multiline match so that bounded re-matching
 finds nothing, should the count re-match within its bound or count the
@@ -5112,7 +5112,7 @@ Then B.
 
 ## D83 — Replacement presentation and terminal empty matches
 
-**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-A) uses B provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should replacement use every ordinary line span, or reproduce pinned
 rg 15.2.0's replacement-specific terminal bounds and whole-line fallback?
@@ -5135,7 +5135,7 @@ would change the recommendation to A.
 
 ## D84 — Multiline replacement records
 
-**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-B) uses B provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should multiline replacement preserve one output record per source
 line, or reproduce rg's transformed match-group records?
@@ -5156,7 +5156,7 @@ an oracle changing this projection, would change the recommendation to A.
 
 ## D85 — Replacement captures after multiline clipping
 
-**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-C) uses A provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should replacement preserve M7's bounded re-match contract, or adopt
 rg's replacement-specific unbounded re-match and suffix publication after -m?
@@ -5191,7 +5191,7 @@ The owned tail regression records both the agreement and the rg discrepancy.
 
 ## D86 — Inherited absolute-anchor presentation
 
-**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-D) uses A provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should replacement inherit D79's per-line absolute-anchor spans or
 reproduce rg's cross-line empty-anchor presentation state?
@@ -5214,7 +5214,7 @@ changed by this final coverage addition, and no private row is waived.
 
 ## D87 — Clipped multiline JSON submatches
 
-**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-A) uses B provisionally; tail rule amended by fix round 1, `a05e100`.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should JSON re-match beyond a clipped selected region to reproduce
 rg 15.2.0, or retain M7/M8's bounded publication contract?
@@ -5250,7 +5250,7 @@ initial event. Initial clipped-region assertion bounds are unchanged.
 
 ## D88 — rg 15.2 replacement metadata versus the written contract
 
-**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-B) uses A provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should JSON ignore replacement as GREP.md explicitly requires, or
 add rg 15.2.0's replacement metadata to each submatch?
@@ -5274,7 +5274,7 @@ corpus row is waived by this owned discrepancy.
 
 ## D89 — Inherited line assertion presentation in JSON
 
-**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-C) uses A provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should JSON use the specified per-line assertion scope, or reproduce
 rg's stateful absolute-assertion spans and trailing-context classification?
@@ -5296,7 +5296,7 @@ answer replacing per-line scope, would change the recommendation to B.
 
 ## D90 — Inherited inverted limit/context windows
 
-**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-D) uses A provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should JSON reuse the selected-line and clipped-window contract, or
 reproduce rg's additional inverted tail search and terminal suffix artifacts?
@@ -5320,7 +5320,7 @@ selection fix plus regressions for the existing plain path.
 
 ## D91 — Quiet JSON summary counting bounds
 
-**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-E) uses B provisionally.**
+**Status: answered 2026-10-19 by D98.** (Was: open, 2026-10-17; provisional.)
 
 Question: should quiet summary reuse ordinary event submatch counts, or follow
 rg's separate counting iterator and inverted logical-line floor?
@@ -5505,7 +5505,9 @@ as an issue with a minimal repro, not as a source patch.
 
 ## D98 — D79–D91 under D97: four cluster answers
 
-**Status: open, 2026-10-19.** Built from a read-only review (private notes;
+**Status: answered, 2026-10-19: every recommendation taken (D79 D, D83 A,
+D86 A; D81 C, D80 A, D91 A, D82/D85/D87 moot; lines after `-m` are context,
+D89 A, D90 A; D84 B, D88 A).** Built from a read-only review (private notes;
 oracles GNU grep 3.12 and rg 15.2.0, synthetic probes, `LC_ALL=C`). D79–D91
 stay as written; this brief proposes revised answers for them in four
 clusters, so they can be answered in four lines.
@@ -5583,3 +5585,5 @@ and D88 A (rg's `replacement` field is a feature, not an artefact; GREP.md says
 JSON ignores `-r`).
 
 **Recommendation:** take both as recommended.
+
+> Dave: I agree with all of your D98 recommendations.
