@@ -96,6 +96,21 @@ impl Fixture {
         command.args(args);
         run(command, input)
     }
+    /// rg's file reader over the same bytes. It and GNU grep agree where rg's
+    /// stream reader does not (D98 finding 1; rg-issues rows 5 and 6).
+    fn oracle_file(&self, args: &[&str], input: &[u8]) -> Output {
+        let path = self.base.join("rg-input");
+        fs::write(&path, input).unwrap();
+        let path = path.to_str().unwrap();
+        let mut file_args = vec!["--mmap"];
+        file_args.extend(args.iter().map(|&arg| if arg == "-" { path } else { arg }));
+        let mut output = self.oracle(&file_args, None);
+        let quoted = format!("\"{path}\"");
+        for (from, to) in [(quoted.as_str(), "\"<stdin>\""), (path, "<stdin>")] {
+            output.stdout = replace(&output.stdout, from.as_bytes(), to.as_bytes());
+        }
+        output
+    }
     fn compare(&self, args: &[&str], input: Option<&[u8]>) -> Output {
         self.check(args, input, false)
     }
@@ -103,10 +118,57 @@ impl Fixture {
         self.check(args, input, true)
     }
     fn check(&self, args: &[&str], input: Option<&[u8]>, raw: bool) -> Output {
-        let oracle = self.oracle(args, input);
         let mut ferret_args = vec!["grep"];
         ferret_args.extend_from_slice(args);
         let actual = self.ferret(&ferret_args, input);
+        let same = |oracle: &Output| {
+            if raw {
+                actual.stdout == oracle.stdout
+            } else {
+                groups(&actual.stdout, &self.tree()) == groups(&oracle.stdout, &self.tree())
+            }
+        };
+        self.differential(args, input, &actual, same, |row| {
+            assert_eq!(actual.stdout, row.owned, "{args:?}: {actual:?}");
+        });
+        actual
+    }
+    /// Compare with pinned rg: its stream reader, then its file reader. A row of
+    /// `RG_DIFFERS` instead pins ferret's owned output and requires both
+    /// readers still to differ from it.
+    fn differential(
+        &self,
+        args: &[&str],
+        input: Option<&[u8]>,
+        actual: &Output,
+        same: impl Fn(&Output) -> bool,
+        owned: impl Fn(&Differs),
+    ) {
+        let json = args.first() == Some(&"--json");
+        let lookup = if json { &args[1..] } else { args };
+        if let Some(row) = RG_DIFFERS
+            .iter()
+            .find(|row| row.json == json && row.args == lookup && row.stdin == input)
+        {
+            assert_eq!(actual.status.code(), Some(row.status), "{args:?}: {actual:?}");
+            owned(row);
+            let mut oracles = vec![self.oracle(args, input)];
+            oracles.extend(input.map(|input| self.oracle_file(args, input)));
+            for oracle in oracles {
+                assert!(
+                    oracle.status.code() != actual.status.code() || !same(&oracle),
+                    "{args:?} is listed as differing from rg ({}), but rg agrees: {oracle:?}",
+                    row.why
+                );
+            }
+            return;
+        }
+        let mut oracle = self.oracle(args, input);
+        if let Some(input) = input
+            && !(oracle.status.code() == actual.status.code() && same(&oracle))
+        {
+            oracle = self.oracle_file(args, input);
+        }
         assert_eq!(
             actual.status.code(),
             oracle.status.code(),
@@ -117,21 +179,123 @@ impl Fixture {
             oracle.stderr.is_empty(),
             "{args:?}: {actual:?} vs {oracle:?}"
         );
-        if raw {
-            assert_eq!(
-                actual.stdout, oracle.stdout,
-                "{args:?}: {actual:?} vs {oracle:?}"
-            );
-        } else {
-            assert_eq!(
-                groups(&actual.stdout, &self.tree()),
-                groups(&oracle.stdout, &self.tree()),
-                "{args:?}: {actual:?} vs {oracle:?}"
-            );
-        }
-        actual
+        assert!(same(&oracle), "{args:?}: {actual:?} vs {oracle:?}");
     }
 }
+
+fn replace(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(from) {
+            out.extend_from_slice(to);
+            at += from.len();
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    out
+}
+
+/// A case where ferret deliberately differs from pinned rg 15.2.0 under D97
+/// and D98. The comparison is kept: ferret must print `owned` with `status`,
+/// and both of rg's readers must still print something else, so a row that rg
+/// comes to agree with fails. `owned` is exact stdout, or for `json` rows the
+/// `assert_json_stream` projection.
+struct Differs {
+    json: bool,
+    args: &'static [&'static str],
+    stdin: Option<&'static [u8]>,
+    status: i32,
+    owned: &'static [u8],
+    why: &'static str,
+}
+
+const fn plain(
+    args: &'static [&'static str],
+    stdin: Option<&'static [u8]>,
+    status: i32,
+    owned: &'static [u8],
+    why: &'static str,
+) -> Differs {
+    Differs {
+        json: false,
+        args,
+        stdin,
+        status,
+        owned,
+        why,
+    }
+}
+
+const fn json(
+    args: &'static [&'static str],
+    stdin: Option<&'static [u8]>,
+    status: i32,
+    owned: &'static str,
+    why: &'static str,
+) -> Differs {
+    Differs {
+        json: true,
+        args,
+        stdin,
+        status,
+        owned: owned.as_bytes(),
+        why,
+    }
+}
+
+// Why ferret differs, by D98 cluster (docs/DECISIONS.md) or rg-issues row.
+const D79: &str = "D79 D: -o never prints an empty record (GNU); rg prints one per empty match";
+const D80: &str = "D80 A: -U -v -m selects lines no match touches (rg-issues rows 9 and 10)";
+const D81: &str = "D81 C: one pass over the whole input; -m counts line groups, nothing clipped (rg-issues row 11)";
+const D83: &str = "D83 A: -r expands every ordinary span; rg falls back to the unchanged line";
+const D91: &str = "D91 A: quiet JSON reports the same stats as its events (rg-issues row 14)";
+const TAIL: &str = "D89/D90: lines after -m are context and never searched (GNU; rg-issues rows 12 and 13)";
+const EOF: &str = "D98: the end of an unterminated last line is a match position, as before an LF";
+
+const RG_DIFFERS: &[Differs] = &[
+    plain(&["-o", "-e", "", "-e", "red", "one.rs"], None, 0, b"", D79),
+    plain(&["-o", "", "-"], Some(b"abc\n"), 0, b"", D79),
+    plain(&["-o", "", "-"], Some(b"\xc3\xa9\xe7\x95\x8cx\n"), 0, b"", D79),
+    plain(&["-o", "(?u:)", "-"], Some(b"\xc3\xa9\xe7\x95\x8cx\n"), 0, b"", D79),
+    plain(&["-o", "(?-u:)", "-"], Some(b"\xffx\n"), 0, b"", D79),
+    plain(&["-o", "a*", "-"], Some(b"abc\n"), 0, b"a\n", D79),
+    plain(&["-o", "\\b", "-"], Some(b"cedar stone\n"), 0, b"", D79),
+    plain(&["-o", "^|$", "one.rs"], None, 0, b"", D79),
+    plain(&["-wo", "", "-"], Some(b"a ! b\n"), 0, b"", D79),
+    plain(&["-xo", "", "-"], Some(b"\nred\n"), 0, b"", D79),
+    plain(&["--color=always", "-no", "", "one.rs"], None, 0, b"", D79),
+    plain(&["-m1", "-onA2", "red", "one.rs"], None, 0, b"1:red\n2-BLUE\n3-red red\n", TAIL),
+    plain(&["-m1", "-nA2", "red", "one.rs"], None, 0, b"1:red lantern\n2-BLUE\n3-red red\n", TAIL),
+    plain(&["-Ucm2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nfoo\n"), 0, b"3\n", D81),
+    plain(&["-Uom1", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"foo\nfoo\nbar\n", D81),
+    plain(&["-Unm1", "-A2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"1:foo foo\n2:bar\n3-foo\n", D81),
+    plain(&["-Uonm1", "-A2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"1:foo\n1:foo\n2:bar\n3-foo\n", D81),
+    plain(&["-Uon", "", "-"], Some(b"abc\n"), 0, b"", D79),
+    plain(&["-Uo", "", "-"], Some(b"abc"), 0, b"", D79),
+    plain(&["-Uvnm1", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 1, b"", D80),
+    plain(&["-Un", "\\A", "-"], Some(b"abc\nabc\n"), 0, b"1:abc\n", D81),
+    plain(&["-Unm1", "-A2", "\\A", "-"], Some(b"abc\nabc\nabc\n"), 0, b"1:abc\n2-abc\n3-abc\n", D81),
+    plain(&["-Uonm1", "-A2", "\\A", "-"], Some(b"abc\nabc\nabc\n"), 0, b"2-abc\n3-abc\n", D81),
+    plain(&["-Uon", "\\z", "-"], Some(b"abc"), 0, b"", D79),
+    plain(&["-Unm1", "-A1", "(?s:.*?)", "-"], Some(b"abc\nabc\n"), 0, b"1:abc\n2-abc\n", TAIL),
+    plain(&["-or", "<$0>", "", "last"], None, 0, b"<>\n<>\n<>\n<>\n<>\n<>\n<>\n<>\n<>\n<>\n", EOF),
+    plain(&["-or", "", "red", "one.rs"], None, 0, b"", D79),
+    plain(&["-or", "$999999999999999999999999", "red", "one.rs"], None, 0, b"", D79),
+    plain(&["-nm1", "-A2", "-r<$0>", "red", "one.rs"], None, 0, b"1:<red> lantern\n2-BLUE\n3-red red\n", TAIL),
+    plain(&["--color=always", "-or<$0>", "", "last"], None, 0, b"\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n", EOF),
+    plain(&["-UnrX", "\\A", "one.rs"], None, 0, b"1:Xred lantern\n", D81),
+    plain(&["-UnorX", "\\z", "last"], None, 0, b"1:X\n", D83),
+    plain(&["-Unm1", "-A2", "-rX", "red(?:\nBLUE)?", "one.rs"], None, 0, b"1:X lantern\n2-BLUE\n3-red red\n", D81),
+    json(&["\\z", "last"], None, 0, r#"[["begin", "last"], ["match", "red final", 1, 0, [[9, 9, ""]]], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, EOF),
+    json(&["-m1", "-A2", "red", "one.rs"], None, 0, r#"[["begin", "one.rs"], ["match", "red lantern\n", 1, 0, [[0, 3, "red"]]], ["context", "BLUE\n", 2, 12, []], ["context", "red red\n", 3, 17, []], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, TAIL),
+    json(&["-q", "-v", "red", "one.rs"], None, 0, r#"[["summary", [1, 0, 1]]]"#, D91),
+    json(&["-U", "\\A", "one.rs"], None, 0, r#"[["begin", "one.rs"], ["match", "red lantern\n", 1, 0, [[0, 0, ""]]], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, D81),
+    json(&["-U", "\\z", "last"], None, 0, r#"[["begin", "last"], ["match", "red final", 1, 0, [[9, 9, ""]]], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, EOF),
+    json(&["-Uvm1", "red|\n", "one.rs"], None, 1, r#"[["summary", [0, 0, 0]]]"#, D80),
+];
 
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -183,6 +347,7 @@ fn groups(bytes: &[u8], root: &Path) -> Vec<Vec<u8>> {
     groups.sort_by(|a, b| a.0.cmp(&b.0));
     groups.into_iter().map(|(_, v)| v).collect()
 }
+
 
 macro_rules! differential {
     ($($name:ident: [$($arg:expr),*] $(, stdin = $input:expr)?;)+) => { $(
@@ -3915,24 +4080,17 @@ impl Fixture {
     fn compare_json(&self, args: &[&str], input: Option<&[u8]>) -> Output {
         let mut options = vec!["--json"];
         options.extend_from_slice(args);
-        let oracle = self.oracle(&options, input);
-        options.insert(0, "grep");
-        let actual = self.ferret(&options, input);
-        assert_eq!(
-            actual.status.code(),
-            oracle.status.code(),
-            "{args:?}: {actual:?} vs {oracle:?}"
-        );
-        assert_eq!(
-            actual.stderr.is_empty(),
-            oracle.stderr.is_empty(),
-            "{args:?}: {actual:?} vs {oracle:?}"
-        );
+        let mut ferret_args = vec!["grep"];
+        ferret_args.extend_from_slice(&options);
+        let actual = self.ferret(&ferret_args, input);
         let quiet = args.contains(&"-q");
-        assert_eq!(
-            normalized_json(&actual.stdout, quiet),
-            normalized_json(&oracle.stdout, quiet),
-            "{args:?}: {actual:?} vs {oracle:?}"
+        let normalized = normalized_json(&actual.stdout, quiet);
+        self.differential(
+            &options,
+            input,
+            &actual,
+            |oracle| normalized_json(&oracle.stdout, quiet) == normalized,
+            |row| assert_json_stream(&actual, std::str::from_utf8(row.owned).unwrap(), quiet),
         );
         actual
     }

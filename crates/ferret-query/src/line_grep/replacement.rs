@@ -96,9 +96,13 @@ pub(super) fn region(
         at = span.end.min(region.range.end);
     }
     if only {
-        // An empty fragment prints nothing; it keeps the line in the window.
+        // Multiline inverted `-o` output is whole lines, so a context line
+        // without an expansion stays whole. Otherwise an empty fragment prints
+        // nothing; it keeps the line in the window.
         return if output.printed {
             Ok(())
+        } else if plan.multiline && plan.invert {
+            emit(line)
         } else {
             emit(Line {
                 bytes: &[],
