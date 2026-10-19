@@ -5663,3 +5663,89 @@ cannot match LF count lines in both tools.
 
 Recommendation: A. Would change it: wanting `-c` to mean lines everywhere more
 than agreement with rg.
+
+## D102 — A spill-file fault stops the whole search
+
+**Status: open, 2026-10-20.**
+
+Question: when grep cannot create or write the temp file a capture over 4 MiB
+spills to (D93), should that fail only the file being captured, or the whole
+run as now?
+
+Found by the hostile suite and reproduced: with `r/a` holding `hit small`, `r/b`
+holding one 6 MiB matching line, `TMPDIR=/nonexistent FERRET_SEARCH_THREADS=1
+ferret grep -uu hit r` prints only `writing stdout: create output spill …` and
+exits 2. `r/a`'s match is never printed. At `ulimit -n 32` and 32 threads,
+1,900 of 4,000 small files were dropped this way without any message naming
+them. rg printed every file. GREP.md documents spill faults as fatal, so this
+is the design working as written. The message also blames stdout.
+
+- **A — fail the file.** Name the file in a diagnostic, publish nothing for it,
+  carry on, exit 2: the same treatment as a read error. About 30 lines; the
+  spill fault stops being an output fault. A full disk then fails every large
+  file but still prints the small ones.
+- **B — keep it fatal, fix the message.** One line. Output is still silently
+  lost whenever TMPDIR is full, missing or out of descriptors.
+
+Recommendation: A, and fix the message either way. Would change it: D103 A
+removing spilling altogether, which makes this moot.
+
+## D103 — Streaming output from one large file
+
+**Status: open, 2026-10-20.**
+
+Question: should a file whose capture passes 4 MiB stream its output as it is
+scanned, instead of publishing only after the closing version check?
+
+Measured by the hostile suite on one 2 GB file, every line matching, 8 threads:
+the full run takes 3.28 s and `| head -n1` takes 3.13 s, against rg's 0.01 s.
+The first byte reaches the pipe after 2.97 s, and the unlinked spill file grows
+to 1,935 MiB. Grep cannot notice the closed pipe until it publishes, and TMPDIR
+must hold the file's whole output (or D102 applies).
+
+- **A — stream at the head.** Once a capture passes 4 MiB, the worker waits for
+  the output writer, writes what it has, and writes the rest directly as it
+  scans. A closed pipe is then seen on the next write. If the closing check
+  finds the file changed, what was printed cannot be withdrawn: grep says so
+  and exits 2, without a retry. Buys: `| head` in milliseconds, no temp disk,
+  and the spill machinery can probably be deleted (D97: simpler). Costs: other
+  workers' groups wait while one file streams, up to D93's queue bound, then
+  workers stall; "one version per file" weakens to "one version or a
+  diagnostic" for files over 4 MiB.
+- **B — poll stdout for closure.** The output thread checks fd 1 for a closed
+  reader while it waits. Cheap, but it does not help `| head -n1` on one file,
+  because nothing is written for head to close on until the scan ends.
+- **C — keep as is.**
+
+Recommendation: A. Would change it: a consumer that relies on never seeing a
+large file's output from two versions.
+
+## D104 — Files that grow during the search
+
+**Status: open, 2026-10-20.**
+
+Question: when a file's only change during the read is growth, should grep
+search the bytes up to its first observed size instead of exiting 2?
+
+GREP.md says "retry instability once, then continue with exit 2", and the
+version compares `(dev, ino, size, mtime, ctime)`, so any append counts.
+Measured, 50 runs per cell: a 64 MiB log appended at 100 lines/s exits 2 in 50
+of 50, at 1 and at 32 threads, and prints nothing for that file; a 4 MiB log at
+100 lines/s fails 4–40 of 50; 1 line/s never fails. rg exits 0 every time.
+
+With a real appender, 1,347 of 2,000 checked reads saw a change; all were pure
+growth (same inode, larger size), and the bytes up to the first size never
+differed. A constructed truncate-and-regrow (logrotate's copytruncate) can give
+the same signature with mixed bytes, but only if the reader is descheduled
+mid-read; a randomised run saw 428 growth signatures and no mixed bytes.
+
+- **A — keep exit 2.**
+- **B — accept growth.** Read only up to the first observed size; accept the
+  read when device and inode match and the new size is no smaller. About 20
+  lines in the checked read. Costs: a copytruncate that lands mid-read can
+  print a mix of old and new bytes, as rg can.
+- **C — B, but only after the one retry fails.** Same risk, slightly rarer,
+  and one more read of every growing file.
+
+Recommendation: B. Would change it: logs rotated by copytruncate being common
+in the trees ferret searches.
