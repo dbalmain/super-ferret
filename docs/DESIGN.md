@@ -73,9 +73,16 @@ together up to 64 KiB, and the host takes every held batch before it sleeps,
 so a held group waits only on other output, never on its worker's next file
 or on a worker asleep waiting for the producer. For configured concurrency T,
 the queue holds at most T handoffs, each worker one group in progress and a
-batch of at most 64 KiB, and the host one handoff: rendered capture allocation
-is bounded by (2T + 1) × 4 MiB + T × 64 KiB, 262 MiB at 32 threads, inside
-rg's own peak there (D93). The producer's queue holds paths, not captures.
+batch of at most 64 KiB, and the host one handoff: live rendered capture bytes
+are bounded by (2T + 1) × 4 MiB + T × 64 KiB, 262 MiB at 32 threads (D93). This
+is not a peak-RSS bound. RSS adds the base heap (77 MiB on the 112k-file flat
+index at one thread), per-worker read and matcher state, and freed captures
+that glibc keeps: once a large block is freed its dynamic mmap threshold rises,
+so later captures come from per-thread arenas that each keep their own high
+water. Flat `--json -F the` at 32 threads peaks at 436 MiB (226 MiB with
+`MALLOC_MMAP_THRESHOLD_=131072`), against rg's 591 MiB, so D93's answer —
+peak RSS up to rg's at the same thread count — holds. The producer's queue
+holds paths, not captures.
 Spill staging reuses that allocation in 64 KiB blocks with
 cancellation polls. Find retains its ordered publication path. The queue lets
 workers prepare ahead while the host waits on stdout; direct worker publication

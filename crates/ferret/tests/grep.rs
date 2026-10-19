@@ -4163,6 +4163,23 @@ fn m9_json_replacement_is_ignored_as_specified_provisionally() {
 }
 
 #[test]
+fn m9_json_backspace_and_form_feed_use_short_escapes() {
+    // rg spells U+0008 and U+000C `\b` and `\f`; any other spelling parses the
+    // same but breaks byte comparisons and `bytes_printed`.
+    let fixture = Fixture::new("m9-json-short-escapes");
+    let output = fixture.ferret(
+        &["grep", "--json", "red", "-"],
+        Some(b"a\x08red\x0cb\x01\n"),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(r#""lines":{"text":"a\bred\fb\u0001\n"}"#),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn m9_json_source_bytes_spans_offsets_and_semantic_stats() {
     let fixture = Fixture::new("m9-json-source-stats");
     let output = fixture.compare_json(&["red", "-"], Some(b"red red\nblue\nred"));

@@ -179,7 +179,7 @@ the next required-run occurrence, not from the previous match to the line end,
 which was quadratic on long lines and ran the engine's slow Unicode-`\b`
 fallback over non-ASCII text. Captures and replacement still use the whole
 source line. Uncoloured, unnumbered plain records combine path,
-separator, data and LF through the capture's vectored writer. Grep holds up to 4 MiB per file capture (D93), then stages spill
+separator, data and LF through the capture's vectored writer. Grep holds up to 4 MiB per file capture (D93; the formula in DESIGN.md bounds live capture bytes, not RSS), then stages spill
 writes in 64 KiB blocks, finishing them inside the
 checked-read callback before accepting a group. A broken pipe on stdout ends
 grep silently with exit 0, as rg does (D94). Find's default captures retain
@@ -687,7 +687,8 @@ refuse it with names/count modes. Ferret envelopes are not rg JSON.
 JSON defaults line numbers on and respects explicit `-N`; paths are always
 present. Every byte field independently uses `{text:...}` for valid UTF-8 or
 `{bytes:...}` for standard padded base64. Source LF is retained, CR is literal,
-and an unterminated last line gains no LF. Absolute offsets and binary offsets
+and an unterminated last line gains no LF. Strings escape as rg does, byte for byte:
+`\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, other C0 controls as `\u00xx`. Absolute offsets and binary offsets
 are measured **after stripping the initial UTF-8 BOM**; submatch start/end are
 byte offsets relative to the event's source bytes, including empty spans.
 LF-including multiline matches publish a complete contiguous selected source

@@ -78,6 +78,8 @@ fn field(out: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
                     b'\n' => encoded.extend_from_slice(b"\\n"),
                     b'\r' => encoded.extend_from_slice(b"\\r"),
                     b'\t' => encoded.extend_from_slice(b"\\t"),
+                    0x08 => encoded.extend_from_slice(b"\\b"),
+                    0x0c => encoded.extend_from_slice(b"\\f"),
                     0..0x20 => write!(encoded, "\\u{byte:04x}")?,
                     _ => encoded.push(byte),
                 }
