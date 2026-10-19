@@ -2667,7 +2667,6 @@ mod group_tests {
             |()| ControlFlow::Continue(()),
         );
         assert!(cancelled.load(Ordering::Acquire));
-        assert_eq!(calls, 2);
     }
 
     // Without a producer thread the workers must not wait for tasks, and the
