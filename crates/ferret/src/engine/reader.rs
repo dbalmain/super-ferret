@@ -16,10 +16,10 @@ pub(crate) fn checked<'a>(
         let result = match request {
             ReadRequest::Stat => reader.stat_name(catalog, name),
             ReadRequest::Bytes(bytes, stop) => {
-                reader.read_current_name_until(catalog, name, bytes, stop)
+                reader.read_search_name_until(catalog, name, bytes, stop)
             }
             ReadRequest::Stream(each, stop) => {
-                reader.stream_current_name_until(catalog, name, each, stop)
+                reader.stream_search_name_until(catalog, name, each, stop)
             }
         };
         match result {
@@ -50,7 +50,7 @@ pub(crate) fn direct(
     each: ferret_query::Consumer<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> ReadOutcome {
-    match ferret_crawl::content::stream_file_until(path, cap, each, cancelled) {
+    match ferret_crawl::content::stream_search_file_until(path, cap, each, cancelled) {
         Ok(_) => ReadOutcome::Stable(ReadVersion::Current),
         Err(error) => fault(error, false),
     }

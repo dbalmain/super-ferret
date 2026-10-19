@@ -829,7 +829,12 @@ Query's neutral read outcome retains Stable(Catalogued/Current), Vanished,
 RetryChanged, Failed(operation/error, size/cap, allocation or instability),
 and Cancelled. Map crawl's typed `ContentFault` at the host, without a
 query→crawl edge. ENOENT is Vanished; Changed renews the reader observation and
-retries once, then reports instability; other faults report errors. Preserve
+retries once, then reports instability; other faults report errors. Search
+reads accept growth when the opened inode is unchanged and its closing size is
+at least the opening size: they read only the opening size's prefix and return
+the closing stat, so that prefix is never cached as the catalogued version.
+A copytruncate rotation that truncates and regrows past the opening size during
+a read can mix old and new bytes. Preserve
 cancellation and retry outcomes; failed bytes never enter caches. Constructor/
 reader adaptation must pass fault/retry regressions before M1 CLI wiring;
 direct streams use an input adapter with the same matcher and typed I/O errors.

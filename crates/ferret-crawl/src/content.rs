@@ -31,7 +31,7 @@ use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 
 use crate::ContentFault;
-use crate::observe::{BulkRead, Opened, Reader, bracket, catalog_stat};
+use crate::observe::{BulkRead, Opened, Reader, bracket, bracket_search, catalog_stat};
 
 /// Streams an explicit regular file or live-fallback file, using the same
 /// current-version bracket as catalogued candidates. `None` imposes no policy
@@ -44,6 +44,27 @@ pub fn stream_file_until(
     cap: Option<u64>,
     each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
     cancelled: &dyn Fn() -> bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    stream_file_until_with_growth(path, cap, each, cancelled, false)
+}
+
+/// Search-only form of [`stream_file_until`]. The caller publishes the
+/// opening-size prefix only after this function accepts its closing stat.
+pub fn stream_search_file_until(
+    path: &std::path::Path,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    stream_file_until_with_growth(path, cap, each, cancelled, true)
+}
+
+fn stream_file_until_with_growth(
+    path: &std::path::Path,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+    accept_growth: bool,
 ) -> Result<ferret_catalog::Stat, ContentFault> {
     if cancelled() {
         return Err(ContentFault::Cancelled);
@@ -63,7 +84,7 @@ pub fn stream_file_until(
             cap,
         });
     }
-    checked_file(file, current, &mut |file, size| {
+    checked_file(file, current, accept_growth, &mut |file, size| {
         let extent = if size == 0 { u64::MAX } else { size };
         each(&mut Read::take(file, extent), extent).map_err(|error| {
             if cancelled() {
@@ -88,11 +109,16 @@ fn regular_file(fd: OwnedFd) -> Result<(File, ferret_catalog::Stat), ContentFaul
 fn checked_file(
     mut file: File,
     current: ferret_catalog::Stat,
+    accept_growth: bool,
     pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
 ) -> Result<ferret_catalog::Stat, ContentFault> {
     pass(&mut file, current.size)?;
-    bracket(&file, &current, ferret_catalog::Content::Binary)?;
-    Ok(current)
+    if accept_growth {
+        bracket_search(&file, &current)
+    } else {
+        bracket(&file, &current, ferret_catalog::Content::Binary)?;
+        Ok(current)
+    }
 }
 
 /// One catalog view's documents, each with one of its names.
@@ -357,12 +383,40 @@ impl Documents {
         out: &mut Vec<u8>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.read_current_name_with_growth(catalog, name, out, cancelled, false)
+    }
+
+    /// Search-only version of [`Documents::read_current_name_until`].
+    pub fn read_search_name_until(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        out: &mut Vec<u8>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.read_current_name_with_growth(catalog, name, out, cancelled, true)
+    }
+
+    fn read_current_name_with_growth(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        out: &mut Vec<u8>,
+        cancelled: &dyn Fn() -> bool,
+        accept_growth: bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
         out.clear();
         let (cap, limiter) = (self.config.size_cap, self.limiter.clone());
-        let current = self.current_until(catalog, name, cancelled, &mut |file, size| {
-            out.clear();
-            read_all(file, size, cap, limiter.as_deref(), out, cancelled)
-        });
+        let current = self.current_until(
+            catalog,
+            name,
+            cancelled,
+            accept_growth,
+            &mut |file, size| {
+                out.clear();
+                read_all(file, size, cap, limiter.as_deref(), out, cancelled)
+            },
+        );
         if current.is_ok() {
             self.bytes_read += out.len() as u64;
         }
@@ -381,30 +435,58 @@ impl Documents {
         each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.stream_current_name_with_growth(catalog, name, each, cancelled, false)
+    }
+
+    /// Search-only version of [`Documents::stream_current_name_until`].
+    pub fn stream_search_name_until(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.stream_current_name_with_growth(catalog, name, each, cancelled, true)
+    }
+
+    fn stream_current_name_with_growth(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+        cancelled: &dyn Fn() -> bool,
+        accept_growth: bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
         let (cap, limiter) = (self.config.size_cap, self.limiter.clone());
-        self.current_until(catalog, name, cancelled, &mut |file, size| {
-            if cancelled() {
-                return Err(ContentFault::Cancelled);
-            }
-            if size > cap {
-                return Err(ContentFault::TooLarge { size, cap });
-            }
-            let done = match limiter.as_deref() {
-                Some(limiter) => each(
-                    &mut BulkRead {
-                        file,
-                        limiter: Some(limiter),
-                        remaining: size,
-                    },
-                    size,
-                ),
-                None => each(&mut Read::take(file, size), size),
-            };
-            done.map_err(|e| match cancelled() {
-                true => ContentFault::Cancelled,
-                false => ContentFault::Read(e),
-            })
-        })
+        self.current_until(
+            catalog,
+            name,
+            cancelled,
+            accept_growth,
+            &mut |file, size| {
+                if cancelled() {
+                    return Err(ContentFault::Cancelled);
+                }
+                if size > cap {
+                    return Err(ContentFault::TooLarge { size, cap });
+                }
+                let done = match limiter.as_deref() {
+                    Some(limiter) => each(
+                        &mut BulkRead {
+                            file,
+                            limiter: Some(limiter),
+                            remaining: size,
+                        },
+                        size,
+                    ),
+                    None => each(&mut Read::take(file, size), size),
+                };
+                done.map_err(|e| match cancelled() {
+                    true => ContentFault::Cancelled,
+                    false => ContentFault::Read(e),
+                })
+            },
+        )
     }
 
     /// The current version of the file `name` names, read by `pass` (given
@@ -419,6 +501,7 @@ impl Documents {
         catalog: &Catalog,
         name: NameId,
         cancelled: &dyn Fn() -> bool,
+        accept_growth: bool,
         pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
         if cancelled() {
@@ -435,7 +518,7 @@ impl Documents {
             .map_err(|e| ContentFault::Open(e.into()))
         })?;
         let (file, current) = regular_file(fd)?;
-        let current = checked_file(file, current, pass)?;
+        let current = checked_file(file, current, accept_growth, pass)?;
         self.files_read += 1;
         Ok(current)
     }
