@@ -461,10 +461,25 @@ impl Search<'_> {
         None
     }
 
-    /// Every match's byte span, for line rendering and match counts. The
-    /// first-match screen does not narrow the haystack or assertion context.
-    pub fn spans<'r, 't>(&'r self, text: &'t [u8]) -> crate::matcher::Spans<'r, 't> {
-        self.regex.spans(text)
+    /// Every match's byte span, for line rendering and match counts: the
+    /// spans [`Regex::spans`] gives over `text`.
+    ///
+    /// With a filter, each match is searched for only in the window around
+    /// the next occurrence of the required run, with the left haystack intact
+    /// and four bytes of right context, as [`Search::matching_line`] does.
+    /// Searching from each match to the end of `text` instead is quadratic in
+    /// a long line's matches, and with Unicode word boundaries over non-ASCII
+    /// text the engine's slow fallback runs over all of that (D105).
+    pub fn spans<'r, 't>(&'r self, text: &'t [u8]) -> Spans<'r, 't> {
+        match &self.filter {
+            None => Spans(Windows::Whole(self.regex.spans(text))),
+            Some(filter) => Spans(Windows::Filtered {
+                regex: &self.regex,
+                filter,
+                text,
+                at: 0,
+            }),
+        }
     }
 
     /// Whether the search looks for a required run before the pattern.
@@ -478,6 +493,61 @@ impl Search<'_> {
         self.filter
             .as_ref()
             .is_some_and(|filter| filter.run.find(text).is_some())
+    }
+}
+
+/// [`Search::spans`]'s iterator.
+#[derive(Debug)]
+pub struct Spans<'r, 't>(Windows<'r, 't>);
+
+#[derive(Debug)]
+enum Windows<'r, 't> {
+    /// No filter: the engine searches the rest of the text for each match.
+    Whole(crate::matcher::Spans<'r, 't>),
+    /// The windows around the required run, in order, from `at`.
+    Filtered {
+        regex: &'r Regex,
+        filter: &'r Filter,
+        text: &'t [u8],
+        at: usize,
+    },
+}
+
+impl Iterator for Spans<'_, '_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (regex, filter, text, at) = match &mut self.0 {
+            Windows::Whole(spans) => return spans.next(),
+            Windows::Filtered {
+                regex,
+                filter,
+                text,
+                at,
+            } => (*regex, *filter, *text, at),
+        };
+        // Every match contains an occurrence of the run and lies within one
+        // window, whose end byte no match contains; a match is never empty,
+        // as the run is at least three long. So the next match is the first
+        // one found in a window, searched in order.
+        while *at <= text.len() {
+            let Some(hit) = filter.run.find(&text[*at..]) else {
+                *at = text.len() + 1;
+                return None;
+            };
+            let (start, end) = filter.window(text, *at, *at + hit.start..*at + hit.end);
+            let context = end.saturating_add(4).min(text.len());
+            match regex.find_at(&text[..context], start) {
+                // A span reaching into the added context may owe its match to
+                // the artificial end of text.
+                Some(span) if span.end <= end => {
+                    *at = span.end;
+                    return Some(span);
+                }
+                _ => *at = end + 1,
+            }
+        }
+        None
     }
 }
 
