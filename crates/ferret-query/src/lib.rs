@@ -132,4 +132,4 @@ pub use run::{Row, RunError, Stats};
 pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers};
 
 /// Shared bounded scheduling for completed grep file groups.
-pub use verify::completion_groups;
+pub use verify::{Lane, completion_groups, lane_groups};

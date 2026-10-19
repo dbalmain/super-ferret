@@ -8,6 +8,7 @@ mod output;
 mod parallel;
 mod parse;
 mod printf;
+pub mod schedule;
 mod test;
 mod walk;
 

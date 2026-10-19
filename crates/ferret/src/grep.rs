@@ -277,15 +277,20 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .with_traversal(plan.traversal, plan.text)
             .with_live(live.as_ref())
             .with_absence(plan.universe() == line_grep::Universe::Searchable);
-            let result = groups::run(
-                &mut host,
-                |stopped| source.next(stopped),
-                &fork,
-                names,
-                threads,
-                &cancelled,
-            );
-            searched |= source.searched();
+            let result = if threads > 1 && source.walks_live() {
+                groups::walk(&mut host, source, threads, &cancelled, &mut searched)
+            } else {
+                let result = groups::run(
+                    &mut host,
+                    |stopped| source.next(stopped),
+                    &fork,
+                    names,
+                    threads,
+                    &cancelled,
+                );
+                searched |= source.searched();
+                result
+            };
             if let Err(error) = result {
                 return output_failure(&error);
             }

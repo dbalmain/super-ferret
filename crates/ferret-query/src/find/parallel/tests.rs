@@ -284,13 +284,12 @@ fn start_donation_uses_existing_effectful_plan_for_every_action_variant() {
             effectful,
             "{expression:?}"
         );
-        let quit = Arc::new(super::AtomicBool::new(false));
-        let mut task = super::Task::new(plan.live_source(), None, &quit);
-        assert!(super::super::EntrySource::next(&mut task.walk, true).is_some());
-        // Starts can be donated before descending into any sibling range.
+        let mut walk = plan.live_source();
+        assert!(super::super::EntrySource::next(&mut walk, true).is_some());
+        // Starts can be lent before descending into any sibling range.
         assert_eq!(
-            task.donate(&quit, effectful)
-                .is_some_and(|donated| donated.completion.is_none()),
+            super::Split::split(&mut walk, !effectful)
+                .is_some_and(|(_, completion)| completion.is_none()),
             !effectful,
             "{expression:?}"
         );
@@ -349,25 +348,27 @@ fn a_batch_boundary_output_failure_cancels_queued_workers() {
         flushes: Arc::default(),
     };
     let quit = Arc::new(super::AtomicBool::new(false));
-    let mut failing = super::Task::new(plan.live_source(), None, &quit);
+    let mut walk = plan.live_source();
+    let mut failing = super::Task::new(&quit);
     assert!(failing.step(
+        &mut walk,
         &plan,
         &plan.expression,
         &mut output,
         crate::find::output::policy(&plan.expression)
     ));
     let later = tree.plan(&["-maxdepth", "0", "-print"]);
-    let queued = super::Task::new(later.live_source(), None, &quit);
-    let pool = super::Pool {
-        queue: Mutex::new(super::Queue {
-            tasks: vec![queued, failing],
-            active: 0,
-        }),
-        changed: super::Condvar::new(),
-        quit: quit.clone(),
+    let queued = super::Task::new(&quit);
+    let schedule = super::Schedule {
         workers: 2,
+        starts: false,
+        quit: &quit,
     };
-    let errors = pool.worker(&plan, &plan.expression, output.clone());
+    let errors = super::schedule::queued(
+        &schedule,
+        vec![(later.live_source(), queued), (walk, failing)],
+        &mut super::Worker::new(&plan, &plan.expression, output.clone(), &quit),
+    );
     assert_eq!(errors, expected.errors);
     assert!(
         quit.load(Ordering::Acquire),

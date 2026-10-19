@@ -1,30 +1,29 @@
-//! Bounded sibling donation over the ordinary DFS engine. Suspended parents
-//! return to the queue rather than occupying a worker while descendants run.
-//! Tasks own expression control and directory-local batches; ordinary batches
-//! are shared across the run. Effects are
-//! worker-local handles to the host's synchronized output and prompt sinks.
+//! Find's expression over the [`schedule`](super::schedule) walk. Tasks own
+//! expression control and directory-local batches; ordinary batches are shared
+//! across the run. Effects are worker-local handles to the host's synchronized
+//! output and prompt sinks.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use super::schedule::{self, Schedule, Split, Step, Visitor};
 
 use super::{
     Control, Effects, EntrySource, EvaluationError, Expression, LiveWalk, Outcome, Plan,
     Unsupported, WalkError, evaluate,
 };
 
-struct Task<W = LiveWalk> {
-    walk: W,
+struct Task {
     control: Control,
     descend: bool,
-    completion: Option<Arc<AtomicUsize>>,
     errors: u64,
     record: super::output::Record,
     gate: Arc<Mutex<()>>,
     quit: Arc<AtomicBool>,
 }
 
-impl<W: EntrySource> Task<W> {
-    fn new(walk: W, completion: Option<Arc<AtomicUsize>>, quit: &Arc<AtomicBool>) -> Self {
+impl Task {
+    fn new(quit: &Arc<AtomicBool>) -> Self {
         let gate = Arc::new(Mutex::new(()));
         let mut control = Control {
             cancelled: Some(quit.clone()),
@@ -33,10 +32,8 @@ impl<W: EntrySource> Task<W> {
         control.actions.gate = gate.clone();
         control.actions.quit = quit.clone();
         Self {
-            walk,
             control,
             descend: true,
-            completion,
             errors: 0,
             record: super::output::Record::default(),
             gate,
@@ -46,6 +43,7 @@ impl<W: EntrySource> Task<W> {
 
     fn step(
         &mut self,
+        walk: &mut impl EntrySource,
         plan: &Plan,
         expression: &Expression,
         effects: &mut impl Effects,
@@ -72,8 +70,7 @@ impl<W: EntrySource> Task<W> {
                 }
                 quit.load(Ordering::Acquire)
             };
-            self.walk
-                .next_with_cancel(self.descend, &mut before_directory, &mut cancelled)
+            walk.next_with_cancel(self.descend, &mut before_directory, &mut cancelled)
         };
         let effects = effects.into_inner();
         let Some(item) = item else {
@@ -164,26 +161,7 @@ impl<W: EntrySource> Task<W> {
 
     fn finish(&mut self, effects: &mut impl Effects) -> u64 {
         self.flush(effects);
-        if let Some(completion) = self.completion.take() {
-            completion.fetch_sub(1, Ordering::Release);
-        }
         self.errors + self.control.actions.errors
-    }
-}
-
-impl Task {
-    fn donate(&mut self, quit: &Arc<AtomicBool>, sequential: bool) -> Option<Self> {
-        let (walk, completion) = if !sequential && let Some(walk) = self.walk.split_start() {
-            (walk, None)
-        } else {
-            let (walk, completion) = self.walk.split()?;
-            (walk, Some(completion))
-        };
-        let mut task = Self::new(walk, completion, quit);
-        task.gate = self.gate.clone();
-        task.control.actions.gate = self.gate.clone();
-        task.control.actions.shared = self.control.actions.shared.clone();
-        Some(task)
     }
 }
 
@@ -197,12 +175,12 @@ pub(super) fn run(
         return Ok(outcome);
     };
     let quit = Arc::new(AtomicBool::new(false));
-    let mut task = Task::new(source, None, &quit);
+    let mut task = Task::new(&quit);
     task.control.cancelled = None;
     let policy = super::output::policy(&expression);
     let shared = task.control.actions.shared.clone();
     let gate = task.gate.clone();
-    while !quit.load(Ordering::Acquire) && task.step(plan, &expression, effects, policy) {
+    while !quit.load(Ordering::Acquire) && task.step(source, plan, &expression, effects, policy) {
         if task.control.quit {
             break;
         }
@@ -218,134 +196,111 @@ pub(super) fn run(
     Ok(outcome)
 }
 
-struct Queue {
-    tasks: Vec<Task>,
-    active: usize,
+impl Split for LiveWalk {
+    // Read-only starts may overlap. Effectful starts stay in the lender and
+    // advance only after all lent descendants have completed.
+    fn split(
+        &mut self,
+        starts: bool,
+    ) -> Option<(Self, Option<Arc<std::sync::atomic::AtomicUsize>>)> {
+        if starts && let Some(walk) = self.split_start() {
+            return Some((walk, None));
+        }
+        let (walk, completion) = LiveWalk::split(self)?;
+        Some((walk, Some(completion)))
+    }
+    fn waiting(&self) -> bool {
+        LiveWalk::waiting(self)
+    }
+    fn suspended(&self) -> bool {
+        LiveWalk::suspended(self)
+    }
 }
 
-struct Pool {
-    queue: Mutex<Queue>,
-    changed: Condvar,
-    quit: Arc<AtomicBool>,
-    workers: usize,
+/// A find worker: its effects handle, and a record whose allocation stays
+/// with the worker when a task completes or suspends. Queued tasks have
+/// already flushed their transactions.
+struct Worker<'p, E> {
+    plan: &'p Plan,
+    expression: &'p Expression,
+    effects: E,
+    record: super::output::Record,
+    policy: super::output::Policy,
+    quit: &'p Arc<AtomicBool>,
 }
 
-// A worker panic must wake siblings before the scoped join can propagate it.
-// Taking the queue lock closes the check-then-condvar-wait lost-wakeup window.
-struct PanicStop<'a>(&'a Pool);
-impl Drop for PanicStop<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            let _queue = self
-                .0
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.0.quit.store(true, Ordering::Release);
-            self.0.changed.notify_all();
+impl<'p, E: Effects> Worker<'p, E> {
+    fn new(
+        plan: &'p Plan,
+        expression: &'p Expression,
+        effects: E,
+        quit: &'p Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            plan,
+            expression,
+            effects,
+            record: super::output::Record::default(),
+            policy: super::output::policy(expression),
+            quit,
         }
     }
 }
 
-impl Pool {
-    fn worker(&self, plan: &Plan, expression: &Expression, mut effects: impl Effects) -> u64 {
-        let _panic = PanicStop(self);
-        let mut errors = 0;
-        // Keep allocation capacity with the worker when a task completes or
-        // suspends. Queued tasks have already flushed their transactions.
-        let mut record = super::output::Record::default();
-        let policy = super::output::policy(expression);
-        let sequential = super::sequential_starts(expression);
-        loop {
-            let mut queue = self
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut task = loop {
-                if self.quit.load(Ordering::Acquire) {
-                    return errors;
-                }
-                if let Some(index) = queue.tasks.iter().rposition(|task| !task.walk.waiting()) {
-                    queue.active += 1;
-                    break queue.tasks.swap_remove(index);
-                }
-                if queue.active == 0 {
-                    return errors;
-                }
-                queue = self
-                    .changed
-                    .wait(queue)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            };
-            drop(queue);
-            std::mem::swap(&mut record, &mut task.record);
-            let mut steps = 0usize;
-            while !self.quit.load(Ordering::Acquire)
-                && task.step(plan, expression, &mut effects, policy)
-            {
-                if task.control.quit {
-                    self.quit.store(true, Ordering::Release);
-                    break;
-                }
-                if steps.is_multiple_of(64) {
-                    let mut queue = self
-                        .queue
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if queue.tasks.len() + queue.active < self.workers * 2
-                        && let Some(donated) = task.donate(&self.quit, sequential)
-                    {
-                        // Publish earlier records before children can
-                        // evaluate.
-                        if let Err(error) = (super::output::EntryEffects {
-                            host: &mut effects,
-                            record: &mut task.record,
-                            gate: &task.gate,
-                            quit: &task.quit,
-                        })
-                        .commit(false)
-                        .and_then(|()| task.control.actions.flush_files())
-                        .and_then(|()| effects.flush())
-                        {
-                            effects.error(&WalkError {
-                                path: ".".into(),
-                                error,
-                            });
-                            task.errors += 1;
-                            self.quit.store(true, Ordering::Release);
-                        }
-                        queue.tasks.push(donated);
-                        self.changed.notify_all();
-                    }
-                }
-                steps += 1;
-            }
-            if task.control.quit {
-                self.quit.store(true, Ordering::Release);
-            }
-            // Completion can race with the None returned for suspension. Use
-            // the recorded reason, not a second counter read, to
-            // retain the task.
-            let waiting = task.walk.suspended() && !self.quit.load(Ordering::Acquire);
-            let suspended = if waiting {
-                task.flush(&mut effects);
-                std::mem::swap(&mut record, &mut task.record);
-                Some(task)
-            } else {
-                errors += task.finish(&mut effects);
-                std::mem::swap(&mut record, &mut task.record);
-                None
-            };
-            let mut queue = self
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queue.active -= 1;
-            if let Some(task) = suspended {
-                queue.tasks.push(task);
-            }
-            self.changed.notify_all();
+impl<E: Effects> Visitor<LiveWalk, Task> for Worker<'_, E> {
+    fn step(&mut self, walk: &mut LiveWalk, task: &mut Task) -> Step {
+        let more = task.step(
+            walk,
+            self.plan,
+            self.expression,
+            &mut self.effects,
+            self.policy,
+        );
+        if task.control.quit {
+            Step::Quit
+        } else if more {
+            Step::Next
+        } else {
+            Step::Done
         }
+    }
+    fn lend(&mut self, parent: &mut Task) -> Task {
+        parent.control.cancelled = Some(self.quit.clone());
+        // Publish earlier records before children can evaluate.
+        if let Err(error) = (super::output::EntryEffects {
+            host: &mut self.effects,
+            record: &mut parent.record,
+            gate: &parent.gate,
+            quit: &parent.quit,
+        })
+        .commit(false)
+        .and_then(|()| parent.control.actions.flush_files())
+        .and_then(|()| self.effects.flush())
+        {
+            self.effects.error(&WalkError {
+                path: ".".into(),
+                error,
+            });
+            parent.errors += 1;
+            self.quit.store(true, Ordering::Release);
+        }
+        let mut task = Task::new(self.quit);
+        task.gate = parent.gate.clone();
+        task.control.actions.gate = parent.gate.clone();
+        task.control.actions.shared = parent.control.actions.shared.clone();
+        task
+    }
+    fn resume(&mut self, task: &mut Task) {
+        std::mem::swap(&mut self.record, &mut task.record);
+    }
+    fn park(&mut self, task: &mut Task) {
+        task.flush(&mut self.effects);
+        std::mem::swap(&mut self.record, &mut task.record);
+    }
+    fn end(&mut self, task: &mut Task) -> u64 {
+        let errors = task.finish(&mut self.effects);
+        std::mem::swap(&mut self.record, &mut task.record);
+        errors
     }
 }
 
@@ -380,89 +335,25 @@ impl Plan {
         let shallow_catalog =
             source.catalog().is_some() && self.options.max_depth.is_some_and(|depth| depth <= 2);
         let quit = Arc::new(AtomicBool::new(false));
-        let mut task = Task::new(source, None, &quit);
+        let mut task = Task::new(&quit);
         task.control.cancelled = None;
-        let policy = super::output::policy(&expression);
         let sequential = super::sequential_starts(&expression);
         let shared = task.control.actions.shared.clone();
         let gate = task.gate.clone();
-        while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, policy) {
-            if task.control.quit {
-                break;
-            }
-            if workers > 1
-                && (!shallow_catalog
-                    || task.walk.in_live_directory()
-                    || !sequential && task.walk.has_starts())
-                && let Some(donated) = task.donate(&quit, sequential)
-            {
-                task.control.cancelled = Some(quit.clone());
-                if let Err(error) = (super::output::EntryEffects {
-                    host: &mut effects,
-                    record: &mut task.record,
-                    gate: &task.gate,
-                    quit: &task.quit,
-                })
-                .commit(false)
-                .and_then(|()| task.control.actions.flush_files())
-                .and_then(|()| effects.flush())
-                {
-                    effects.error(&WalkError {
-                        path: ".".into(),
-                        error,
-                    });
-                    task.errors += 1;
-                    quit.store(true, Ordering::Release);
-                }
-                let pool = Pool {
-                    queue: Mutex::new(Queue {
-                        tasks: vec![task, donated],
-                        active: 0,
-                    }),
-                    changed: Condvar::new(),
-                    quit,
-                    workers,
-                };
-                let errors = std::thread::scope(|scope| {
-                    let handles: Vec<_> = (1..workers)
-                        .map(|_| {
-                            let pool = &pool;
-                            let expression = &expression;
-                            let effects = effects.clone();
-                            scope.spawn(move || pool.worker(self, expression, effects))
-                        })
-                        .collect();
-                    let mut errors = pool.worker(self, &expression, effects.clone());
-                    for handle in handles {
-                        errors += handle
-                            .join()
-                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    }
-                    errors
-                });
-                let queue = pool
-                    .queue
-                    .into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let errors = errors
-                    + queue
-                        .tasks
-                        .into_iter()
-                        .map(|mut task| task.finish(&mut effects))
-                        .sum::<u64>();
-                let errors = errors
-                    + super::action::flush_shared(&shared, &mut effects, &gate, &pool.quit)
-                        .unwrap_or_else(|error| {
-                            effects.error(&WalkError {
-                                path: ".".into(),
-                                error,
-                            });
-                            1
-                        });
-                return Ok(Outcome { errors });
-            }
-        }
-        let errors = task.finish(&mut effects)
+        let schedule = Schedule {
+            workers,
+            starts: !sequential,
+            quit: &quit,
+        };
+        let errors = schedule::run(
+            &schedule,
+            source,
+            task,
+            &mut Worker::new(self, &expression, effects.clone(), &quit),
+            |walk| !shallow_catalog || walk.in_live_directory() || !sequential && walk.has_starts(),
+            |_| Worker::new(self, &expression, effects.clone(), &quit),
+        );
+        let errors = errors
             + super::action::flush_shared(&shared, &mut effects, &gate, &quit).unwrap_or_else(
                 |error| {
                     effects.error(&WalkError {

@@ -17,25 +17,33 @@ impl Directory {
         cwd: &Path,
         unrestricted: bool,
     ) -> io::Result<Self> {
-        // Follow an explicit directory symlink only at its start. Descendant
-        // symlinks remain physical, using find's trailing-slash resolution.
-        let mut start = path.as_os_str().to_owned();
-        if !start.as_bytes().ends_with(b"/") {
-            start.push("/");
-        }
-        let starts = vec![start.into()];
         Ok(if unrestricted {
-            Self::Live(LiveWalk::paths(starts, cwd.to_owned()))
+            Self::Live(live(path, cwd))
         } else {
             let catalog =
                 catalog.ok_or_else(|| io::Error::other("directory input has no catalog"))?;
             Self::Catalog(CatalogSource::paths(
                 catalog.clone(),
-                starts,
+                vec![start(path)],
                 cwd.to_owned(),
             ))
         })
     }
+}
+
+/// A walk of the live tree below directory operand `path`.
+pub(super) fn live(path: &Path, cwd: &Path) -> LiveWalk {
+    LiveWalk::paths(vec![start(path)], cwd.to_owned())
+}
+
+// Follow an explicit directory symlink only at its start. Descendant symlinks
+// remain physical, using find's trailing-slash resolution.
+fn start(path: &Path) -> PathBuf {
+    let mut start = path.as_os_str().to_owned();
+    if !start.as_bytes().ends_with(b"/") {
+        start.push("/");
+    }
+    start.into()
 }
 
 impl EntrySource for Directory {

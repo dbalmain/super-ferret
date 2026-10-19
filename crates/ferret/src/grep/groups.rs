@@ -3,6 +3,9 @@
 //! parallelism. A bounded completion queue feeds the calling publisher.
 
 use super::*;
+use ferret_query::Lane;
+use ferret_query::find::LiveWalk;
+use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
 use ferret_query::{ReadOperation, ReadVersion};
 use std::collections::HashMap;
 use std::io::{BufRead, IoSlice};
@@ -497,89 +500,112 @@ impl Worker<'_> {
         eligible: bool,
         stopped: &dyn Fn() -> bool,
     ) -> io::Result<Observed> {
-        let render = Render {
-            plan: &self.plan,
-            prefix: (filename || self.plan.json)
-                .then(|| label(job.path(), self.plan.paths.is_empty())),
+        prepare(
+            &self.plan,
+            &mut self.buffer,
+            self.read.as_deref_mut(),
+            job,
+            filename,
+            cache,
+            eligible,
             stopped,
-        };
-        let observed = match job {
-            Job::Checked(_, name, doc) => {
-                let Some(read) = self.read.as_mut() else {
-                    return Err(io::Error::other("catalogued input has no checked reader"));
-                };
-                let cached = eligible.then(|| lock(cache).get(*doc)).flatten();
-                if let Some(cached) = cached {
-                    match read(*name, ReadRequest::Stat) {
-                        ReadOutcome::Stable(ReadVersion::Catalogued) => {
-                            let mut output = OutputBuffer::default()
-                                .with_memory_limit(GROUP_BYTES)
-                                .with_buffered_spill();
-                            let mut cursor = Cursor::default();
-                            for record in &cached.records {
-                                render.line(
-                                    &mut output,
-                                    line_grep::Line {
-                                        offset: record.offset,
-                                        source_lines: record.source_lines,
-                                        terminated: record.terminated,
-                                        number: record.number,
-                                        bytes: &record.bytes,
-                                        kind: record.kind,
-                                        fragment: record.fragment,
-                                        highlights: record.highlights.as_deref(),
-                                    },
-                                    &mut cursor,
-                                )?;
-                            }
-                            output.flush()?;
-                            return Ok(Observed::Ready(Group {
-                                result: cached.result,
-                                output,
-                                version: ReadVersion::Catalogued,
-                                records: None,
-                            }));
+        )
+    }
+}
+
+/// Searches one job's bytes into a group, or replays a cached duplicate's.
+#[allow(clippy::too_many_arguments)]
+fn prepare(
+    plan: &Plan,
+    buffer: &mut Vec<u8>,
+    read: Option<&mut CheckedReader<'_>>,
+    job: &Job,
+    filename: bool,
+    cache: &Mutex<Cache>,
+    eligible: bool,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<Observed> {
+    let render = Render {
+        plan,
+        prefix: (filename || plan.json).then(|| label(job.path(), plan.paths.is_empty())),
+        stopped,
+    };
+    let observed = match job {
+        Job::Checked(_, name, doc) => {
+            let Some(read) = read else {
+                return Err(io::Error::other("catalogued input has no checked reader"));
+            };
+            let cached = eligible.then(|| lock(cache).get(*doc)).flatten();
+            if let Some(cached) = cached {
+                match read(*name, ReadRequest::Stat) {
+                    ReadOutcome::Stable(ReadVersion::Catalogued) => {
+                        let mut output = OutputBuffer::default()
+                            .with_memory_limit(GROUP_BYTES)
+                            .with_buffered_spill();
+                        let mut cursor = Cursor::default();
+                        for record in &cached.records {
+                            render.line(
+                                &mut output,
+                                line_grep::Line {
+                                    offset: record.offset,
+                                    source_lines: record.source_lines,
+                                    terminated: record.terminated,
+                                    number: record.number,
+                                    bytes: &record.bytes,
+                                    kind: record.kind,
+                                    fragment: record.fragment,
+                                    highlights: record.highlights.as_deref(),
+                                },
+                                &mut cursor,
+                            )?;
                         }
-                        ReadOutcome::Failed(error) => return Ok(Observed::Failed(error)),
-                        ReadOutcome::Cancelled | ReadOutcome::Vanished => {
-                            return Ok(Observed::Skipped);
-                        }
-                        ReadOutcome::Stable(ReadVersion::Current) | ReadOutcome::RetryChanged => {}
+                        output.flush()?;
+                        return Ok(Observed::Ready(Group {
+                            result: cached.result,
+                            output,
+                            version: ReadVersion::Catalogued,
+                            records: None,
+                        }));
                     }
-                }
-                let observed = observe(
-                    &render,
-                    &mut self.buffer,
-                    &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
-                    eligible,
-                )?;
-                if let Observed::Ready(mut group) = observed {
-                    if eligible {
-                        lock(cache).remember(*doc, &mut group);
+                    ReadOutcome::Failed(error) => return Ok(Observed::Failed(error)),
+                    ReadOutcome::Cancelled | ReadOutcome::Vanished => {
+                        return Ok(Observed::Skipped);
                     }
-                    Observed::Ready(group)
-                } else {
-                    observed
+                    ReadOutcome::Stable(ReadVersion::Current) | ReadOutcome::RetryChanged => {}
                 }
             }
-            Job::Direct(path, recursive) => observe(
+            let observed = observe(
                 &render,
-                &mut self.buffer,
-                &mut |each| read_file(path, *recursive, &self.plan, each, stopped),
-                false,
-            )?,
-            Job::Absent(_) => Observed::Ready(Group {
-                result: InputResult::empty(&self.plan),
-                output: OutputBuffer::default()
-                    .with_memory_limit(GROUP_BYTES)
-                    .with_buffered_spill(),
-                version: ReadVersion::Catalogued,
-                records: None,
-            }),
-            Job::Failed(_, _) => Observed::Skipped,
-        };
-        Ok(observed)
-    }
+                buffer,
+                &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
+                eligible,
+            )?;
+            if let Observed::Ready(mut group) = observed {
+                if eligible {
+                    lock(cache).remember(*doc, &mut group);
+                }
+                Observed::Ready(group)
+            } else {
+                observed
+            }
+        }
+        Job::Direct(path, recursive) => observe(
+            &render,
+            buffer,
+            &mut |each| read_file(path, *recursive, plan, each, stopped),
+            false,
+        )?,
+        Job::Absent(_) => Observed::Ready(Group {
+            result: InputResult::empty(plan),
+            output: OutputBuffer::default()
+                .with_memory_limit(GROUP_BYTES)
+                .with_buffered_spill(),
+            version: ReadVersion::Catalogued,
+            records: None,
+        }),
+        Job::Failed(_, _) => Observed::Skipped,
+    };
+    Ok(observed)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -596,97 +622,476 @@ pub(super) fn run<'a, W: Write>(
     threads: usize,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    let plan = host.plan;
-    let filename = host.filename;
-    let cache = Mutex::new(Cache::default());
-    let hit = AtomicBool::new(false);
-    let quiet_stats = Mutex::new(json::Stats::default());
-    let fatal = Mutex::new(None);
-    let publication = Mutex::new(());
+    let search = Search::new(host, cancelled);
     ferret_query::completion_groups(
         threads,
         cancelled,
         |stopped| {
-            let _publication = plan.traversal.live.then(|| lock(&publication));
+            let _publication = search
+                .plan
+                .traversal
+                .live
+                .then(|| lock(&search.publication));
             next(stopped)
         },
         || Worker {
-            plan: plan.clone(),
+            plan: search.plan.clone(),
             buffer: Vec::new(),
             read: fork(),
         },
         |worker, job, stopped| {
             let eligible = matches!(&job, Job::Checked(_,_,doc) if names.is_some_and(|names| names.names(*doc).len() > 1));
-            let result = worker.prepare(&job, filename, &cache, eligible, stopped);
+            let result = worker.prepare(&job, search.filename, &search.cache, eligible, stopped);
             if worker.buffer.capacity() > ferret_query::KEPT_BUFFER {
                 worker.buffer = Vec::new();
             }
-            match result {
-                Ok(observed) => {
-                    if plan.quiet
-                        && plan.json
-                        && let Observed::Ready(group) = &observed
-                    {
-                        lock(&quiet_stats).add(group.result, 0);
-                    }
-                    if plan.quiet
-                        && matches!(&observed, Observed::Ready(group) if group.result.matched)
-                    {
-                        hit.store(true, Ordering::Release);
-                        cancelled.store(true, Ordering::Release);
-                    }
-                    (job, observed)
-                }
-                Err(error) => {
-                    if !stopped() {
-                        let mut fatal = lock(&fatal);
-                        if fatal.is_none() {
-                            *fatal = Some(error);
-                        }
-                        cancelled.store(true, Ordering::Release);
-                    }
-                    (job, Observed::Skipped)
-                }
-            }
+            search.observed(job, result, stopped)
         },
-        |(_, observed): &(Job, Observed)| match observed {
-            Observed::Ready(group) => group.output.memory_bytes() as u64,
-            Observed::Skipped | Observed::Failed(_) => 0,
-        },
-        |(job, observed)| {
-            let _publication = lock(&publication);
-            if let Job::Failed(_, message) = &job {
-                host.error(job.path(), message);
-                return ControlFlow::Continue(());
-            }
-            let result = match observed {
-                Observed::Ready(_) if plan.quiet && plan.json => Ok(()),
-                Observed::Ready(group) => host.commit(job.path(), group.result, group.output),
-                Observed::Skipped => Ok(()),
-                Observed::Failed(error) => {
-                    host.error(job.path(), &error);
-                    Ok(())
-                }
-            };
-            if let Err(error) = result {
-                let mut fatal = lock(&fatal);
-                if fatal.is_none() {
-                    *fatal = Some(error);
-                }
-                cancelled.store(true, Ordering::Release);
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        },
+        weight,
+        |group| search.publish(host, group),
     );
-    host.matched |= hit.load(Ordering::Acquire);
-    host.json_stats
-        .merge(std::mem::take(&mut *lock(&quiet_stats)));
-    if let Some(error) = lock(&fatal).take() {
-        Err(error)
-    } else {
-        Ok(())
+    search.finish(host)
+}
+
+type Searched = (Job, Observed);
+
+fn weight((_, observed): &Searched) -> u64 {
+    match observed {
+        Observed::Ready(group) => group.output.memory_bytes() as u64,
+        Observed::Skipped | Observed::Failed(_) => 0,
+    }
+}
+
+/// What the workers of one segment share: the duplicate cache, quiet and
+/// fatal outcomes, and the publication lock that orders live policy
+/// warnings against groups.
+struct Search<'s> {
+    plan: &'s Plan,
+    filename: bool,
+    cancelled: &'s AtomicBool,
+    cache: Mutex<Cache>,
+    hit: AtomicBool,
+    quiet_stats: Mutex<json::Stats>,
+    fatal: Mutex<Option<io::Error>>,
+    publication: Mutex<()>,
+}
+
+impl<'s> Search<'s> {
+    fn new<W>(host: &Host<'s, W>, cancelled: &'s AtomicBool) -> Self {
+        Self {
+            plan: host.plan,
+            filename: host.filename,
+            cancelled,
+            cache: Mutex::new(Cache::default()),
+            hit: AtomicBool::new(false),
+            quiet_stats: Mutex::new(json::Stats::default()),
+            fatal: Mutex::new(None),
+            publication: Mutex::new(()),
+        }
+    }
+
+    /// Records the first fatal error and stops the run.
+    fn fail(&self, error: io::Error) {
+        let mut fatal = lock(&self.fatal);
+        if fatal.is_none() {
+            *fatal = Some(error);
+        }
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// A worker's outcome for `job`: `-q` stops at the first match, and an
+    /// error not caused by stopping is fatal.
+    fn observed(
+        &self,
+        job: Job,
+        result: io::Result<Observed>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Searched {
+        match result {
+            Ok(observed) => {
+                if self.plan.quiet
+                    && self.plan.json
+                    && let Observed::Ready(group) = &observed
+                {
+                    lock(&self.quiet_stats).add(group.result, 0);
+                }
+                if self.plan.quiet
+                    && matches!(&observed, Observed::Ready(group) if group.result.matched)
+                {
+                    self.hit.store(true, Ordering::Release);
+                    self.cancelled.store(true, Ordering::Release);
+                }
+                (job, observed)
+            }
+            Err(error) => {
+                if !stopped() {
+                    self.fail(error);
+                }
+                (job, Observed::Skipped)
+            }
+        }
+    }
+
+    /// Publishes one group on the output thread.
+    fn publish<W: Write>(
+        &self,
+        host: &mut Host<'_, W>,
+        (job, observed): Searched,
+    ) -> ControlFlow<()> {
+        let _publication = lock(&self.publication);
+        if let Job::Failed(_, message) = &job {
+            host.error(job.path(), message);
+            return ControlFlow::Continue(());
+        }
+        let result = match observed {
+            Observed::Ready(_) if self.plan.quiet && self.plan.json => Ok(()),
+            Observed::Ready(group) => host.commit(job.path(), group.result, group.output),
+            Observed::Skipped => Ok(()),
+            Observed::Failed(error) => {
+                host.error(job.path(), &error);
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            self.fail(error);
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn finish<W>(self, host: &mut Host<'_, W>) -> io::Result<()> {
+        host.matched |= self.hit.load(Ordering::Acquire);
+        host.json_stats.merge(
+            self.quiet_stats
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        match self
+            .fatal
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Searches `source`'s operands with the walk itself spread over `threads`
+/// workers (D105): find's walk schedule lends subtrees of each live
+/// directory operand between workers, each searching the files it reaches
+/// and handing groups to this thread in completion order, under the same
+/// handoff and input bounds as [`run`]. File operands are searched in order
+/// by the first worker. Sets `searched` if any walk selected a file (D99).
+pub(super) fn walk<W: Write>(
+    host: &mut Host<'_, W>,
+    source: Source<'_>,
+    threads: usize,
+    cancelled: &AtomicBool,
+    searched: &mut bool,
+) -> io::Result<()> {
+    let search = Search::new(host, cancelled);
+    let found = AtomicBool::new(false);
+    let Source {
+        inputs,
+        filter,
+        live,
+        ..
+    } = source;
+    ferret_query::lane_groups(
+        threads,
+        cancelled,
+        |lanes, stopped| {
+            let walker = |i: usize| Walker {
+                search: &search,
+                filter: &filter,
+                lane: &lanes[i],
+                stopped,
+                found: &found,
+                live: live.is_some(),
+                plan: search.plan.clone(),
+                buffer: Vec::new(),
+            };
+            let mut first = walker(0);
+            for input in inputs {
+                if stopped() {
+                    break;
+                }
+                let go = match input {
+                    Input::File(path, size) => first.search(size, Job::Direct(path, false)),
+                    Input::Failed(path, error) => {
+                        first.search(0, Job::Failed(path, error.to_string()))
+                    }
+                    Input::Directory(path) => {
+                        let policy = {
+                            // The root's rules may warn, as in the serial
+                            // source.
+                            let _publication = live.is_some().then(|| lock(&search.publication));
+                            live.map(|anchors| anchors.start(&path, stopped))
+                                .transpose()
+                        };
+                        match policy {
+                            Ok(policy) => {
+                                let quit = AtomicBool::new(false);
+                                let schedule = Schedule {
+                                    workers: threads,
+                                    starts: false,
+                                    quit: &quit,
+                                };
+                                schedule::run(
+                                    &schedule,
+                                    sources::live(&path, &filter.cwd),
+                                    Walked {
+                                        descend: true,
+                                        policy: policy.map(live::Policy::deferring),
+                                    },
+                                    &mut first,
+                                    |_| true,
+                                    walker,
+                                );
+                                !quit.load(Ordering::Acquire)
+                            }
+                            Err(error) => first.search(0, Job::Failed(path, error.to_string())),
+                        }
+                    }
+                    // The parent splits operands at stdin barriers.
+                    Input::Stdin => false,
+                };
+                if !go {
+                    break;
+                }
+            }
+            for lane in &lanes {
+                lane.flush(stopped());
+            }
+        },
+        |group| search.publish(host, group),
+    );
+    *searched |= found.load(Ordering::Acquire);
+    search.finish(host)
+}
+
+/// A walk task's own state: whether to enter the directory it last
+/// yielded, and its copy of the live policy stack (D13), cloned when the
+/// task lends part of its walk.
+struct Walked {
+    descend: bool,
+    policy: Option<live::Policy>,
+}
+
+/// One worker of [`walk`]: filters each entry its task reaches and searches
+/// the selected files.
+struct Walker<'w, 's> {
+    search: &'w Search<'s>,
+    filter: &'w Filter<'w>,
+    lane: &'w Lane<'w, Searched>,
+    stopped: &'w (dyn Fn() -> bool + Sync),
+    found: &'w AtomicBool,
+    live: bool,
+    plan: Plan,
+    buffer: Vec<u8>,
+}
+
+impl Walker<'_, '_> {
+    /// Searches one job and hands its group over; false once the run stops.
+    fn search(&mut self, size: u64, job: Job) -> bool {
+        if matches!(job, Job::Failed(..)) {
+            return self.lane.hand((job, Observed::Skipped), 0).is_continue();
+        }
+        let Some(size) = self.lane.reserve(size, self.stopped) else {
+            return false;
+        };
+        let result = prepare(
+            &self.plan,
+            &mut self.buffer,
+            None,
+            &job,
+            self.search.filename,
+            &self.search.cache,
+            false,
+            self.stopped,
+        );
+        if self.buffer.capacity() > ferret_query::KEPT_BUFFER {
+            self.buffer = Vec::new();
+        }
+        let group = self.search.observed(job, result, self.stopped);
+        self.lane.release(size);
+        if (self.stopped)() {
+            return false;
+        }
+        let bytes = weight(&group);
+        self.lane.hand(group, bytes).is_continue()
+    }
+}
+
+impl Visitor<LiveWalk, Walked> for Walker<'_, '_> {
+    fn step(&mut self, walk: &mut LiveWalk, task: &mut Walked) -> Step {
+        let stopped = self.stopped;
+        if stopped() {
+            return Step::Quit;
+        }
+        let Some(entry) = walk.next_with_cancel(task.descend, &mut || Ok(()), &mut || stopped())
+        else {
+            return if stopped() { Step::Quit } else { Step::Done };
+        };
+        task.descend = true;
+        let job = match entry {
+            Ok(entry) => {
+                let mut selected = false;
+                let job = self.filter.entry(
+                    entry,
+                    &mut task.descend,
+                    task.policy.as_mut(),
+                    &mut selected,
+                    self.live.then_some(&self.search.publication),
+                    stopped,
+                );
+                if selected && !self.found.load(Ordering::Relaxed) {
+                    self.found.store(true, Ordering::Relaxed);
+                }
+                job
+            }
+            Err(error) => Some((0, Job::Failed(error.path, error.error.to_string()))),
+        };
+        match job {
+            Some((size, job)) => {
+                if self.search(size, job) {
+                    Step::Next
+                } else {
+                    Step::Quit
+                }
+            }
+            None => Step::Next,
+        }
+    }
+
+    // The lent levels are below a directory on the lender's stack, which the
+    // borrower's first entry unwinds to.
+    fn lend(&mut self, parent: &mut Walked) -> Walked {
+        Walked {
+            descend: true,
+            policy: parent.policy.clone(),
+        }
+    }
+
+    // Errors are published as groups.
+    fn end(&mut self, _task: &mut Walked) -> u64 {
+        0
+    }
+}
+
+/// The per-entry selection every walk applies: depth, glob, hidden and
+/// ignore filters, live policy, then the catalog's view of the file.
+pub(super) struct Filter<'a> {
+    catalog: Option<&'a ferret_catalog::Catalog>,
+    candidates: Option<&'a ferret_index::DocSet>,
+    emit_absent: bool,
+    traversal: line_grep::Traversal,
+    text: bool,
+    selection: &'a GrepSelection,
+    cwd: PathBuf,
+}
+
+impl Filter<'_> {
+    /// The job a walked entry yields, if any. Sets `descend` for a directory
+    /// and `searched` for a selected file (D99). `publication`, when given,
+    /// is held while printing a deferred policy's warnings.
+    fn entry(
+        &self,
+        entry: &ferret_query::find::Entry,
+        descend: &mut bool,
+        policy: Option<&mut live::Policy>,
+        searched: &mut bool,
+        publication: Option<&Mutex<()>>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Option<(u64, Job)> {
+        let kind = match entry.kind() {
+            Ok(kind) => kind,
+            Err(error) => {
+                return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+            }
+        };
+        let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
+        if self
+            .traversal
+            .max_depth
+            .is_some_and(|limit| entry.depth() > limit)
+        {
+            *descend = false;
+            return None;
+        }
+        if kind == FileKind::Directory {
+            *descend = self
+                .traversal
+                .max_depth
+                .is_none_or(|limit| entry.depth() < limit)
+                && self
+                    .selection
+                    .descend(relative.as_os_str().as_bytes(), entry.depth());
+            if *descend && let Some(policy) = policy {
+                let accepted = policy.accepts(entry, true, stopped);
+                let warnings = policy.take_warnings();
+                if !warnings.is_empty() {
+                    // Not inside another file's group.
+                    let _publication = publication.map(lock);
+                    for warning in warnings {
+                        eprintln!("{warning}");
+                    }
+                }
+                match accepted {
+                    Ok(allowed) => *descend = allowed,
+                    Err(error) => {
+                        *descend = false;
+                        return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+                    }
+                }
+            }
+            return None;
+        }
+        if kind != FileKind::File
+            || !self
+                .selection
+                .allows(relative.as_os_str().as_bytes(), entry.depth())
+        {
+            return None;
+        }
+        if let Some(policy) = policy {
+            match policy.accepts(entry, true, stopped) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(error) => {
+                    return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+                }
+            }
+        }
+        *searched = true;
+        if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
+            let inode = catalog.name(name).child;
+            let Some(doc) = catalog.doc(inode) else {
+                if self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary {
+                    return Some((
+                        catalog.inode(inode).stat.size,
+                        Job::Direct(entry.path().to_owned(), true),
+                    ));
+                }
+                return None;
+            };
+            if self
+                .candidates
+                .is_some_and(|candidates| !candidates.contains(doc.0))
+            {
+                if self.emit_absent {
+                    return Some((0, Job::Absent(entry.path().to_owned())));
+                }
+                return None;
+            }
+            return Some((
+                catalog.inode(inode).stat.size,
+                Job::Checked(entry.path().to_owned(), name, doc.0),
+            ));
+        }
+        Some((0, Job::Direct(entry.path().to_owned(), true)))
     }
 }
 
@@ -699,15 +1104,9 @@ pub(super) struct Source<'a> {
     inputs: std::vec::IntoIter<Input>,
     source: Option<sources::Directory>,
     descend: bool,
-    catalog: Option<&'a ferret_catalog::Catalog>,
-    candidates: Option<&'a ferret_index::DocSet>,
-    emit_absent: bool,
-    traversal: line_grep::Traversal,
-    text: bool,
+    filter: Filter<'a>,
     live: Option<&'a live::Anchors>,
     policy: Option<live::Policy>,
-    selection: &'a GrepSelection,
-    cwd: PathBuf,
     searched: bool,
     #[cfg(test)]
     on_entry: Option<Box<OnEntry>>,
@@ -726,15 +1125,17 @@ impl<'a> Source<'a> {
             inputs: inputs.into_iter(),
             source: None,
             descend: true,
-            catalog,
-            candidates,
-            emit_absent: false,
-            traversal: Default::default(),
-            text: false,
+            filter: Filter {
+                catalog,
+                candidates,
+                emit_absent: false,
+                traversal: Default::default(),
+                text: false,
+                selection,
+                cwd,
+            },
             live: None,
             policy: None,
-            selection,
-            cwd,
             searched: false,
             #[cfg(test)]
             on_entry: None,
@@ -749,14 +1150,25 @@ impl<'a> Source<'a> {
     }
 
     pub(super) fn with_traversal(mut self, traversal: line_grep::Traversal, text: bool) -> Self {
-        self.traversal = traversal;
-        self.text = text;
+        self.filter.traversal = traversal;
+        self.filter.text = text;
         self
     }
 
     pub(super) fn with_absence(mut self, emit: bool) -> Self {
-        self.emit_absent = emit;
+        self.filter.emit_absent = emit;
         self
+    }
+
+    /// Whether a directory operand walks the live tree, which [`walk`] can
+    /// spread over workers.
+    pub(super) fn walks_live(&self) -> bool {
+        (self.filter.traversal.unrestricted || self.live.is_some())
+            && self
+                .inputs
+                .as_slice()
+                .iter()
+                .any(|input| matches!(input, Input::Directory(_)))
     }
 
     /// Whether the walk selected any file: it passed depth, glob, hidden and
@@ -802,96 +1214,16 @@ impl<'a> Source<'a> {
                     if let Some(hook) = &mut self.on_entry {
                         hook(entry.path());
                     }
-                    let kind = match entry.kind() {
-                        Ok(kind) => kind,
-                        Err(error) => {
-                            return Some((
-                                0,
-                                Job::Failed(entry.path().to_owned(), error.to_string()),
-                            ));
-                        }
-                    };
-                    let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
-                    if self
-                        .traversal
-                        .max_depth
-                        .is_some_and(|limit| entry.depth() > limit)
-                    {
-                        self.descend = false;
-                        continue;
+                    if let Some(job) = self.filter.entry(
+                        entry,
+                        &mut self.descend,
+                        self.policy.as_mut(),
+                        &mut self.searched,
+                        None,
+                        stopped,
+                    ) {
+                        return Some(job);
                     }
-                    if kind == FileKind::Directory {
-                        self.descend = self
-                            .traversal
-                            .max_depth
-                            .is_none_or(|limit| entry.depth() < limit)
-                            && self
-                                .selection
-                                .descend(relative.as_os_str().as_bytes(), entry.depth());
-                        if self.descend
-                            && let Some(policy) = &mut self.policy
-                        {
-                            match policy.accepts(entry, true, stopped) {
-                                Ok(allowed) => self.descend = allowed,
-                                Err(error) => {
-                                    self.descend = false;
-                                    return Some((
-                                        0,
-                                        Job::Failed(entry.path().to_owned(), error.to_string()),
-                                    ));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if kind != FileKind::File
-                        || !self
-                            .selection
-                            .allows(relative.as_os_str().as_bytes(), entry.depth())
-                    {
-                        continue;
-                    }
-                    if let Some(policy) = &mut self.policy {
-                        match policy.accepts(entry, true, stopped) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(error) => {
-                                return Some((
-                                    0,
-                                    Job::Failed(entry.path().to_owned(), error.to_string()),
-                                ));
-                            }
-                        }
-                    }
-                    self.searched = true;
-                    if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
-                        let inode = catalog.name(name).child;
-                        let Some(doc) = catalog.doc(inode) else {
-                            if self.text
-                                && catalog.state(inode) == ferret_catalog::ContentState::Binary
-                            {
-                                return Some((
-                                    catalog.inode(inode).stat.size,
-                                    Job::Direct(entry.path().to_owned(), true),
-                                ));
-                            }
-                            continue;
-                        };
-                        if self
-                            .candidates
-                            .is_some_and(|candidates| !candidates.contains(doc.0))
-                        {
-                            if self.emit_absent {
-                                return Some((0, Job::Absent(entry.path().to_owned())));
-                            }
-                            continue;
-                        }
-                        return Some((
-                            catalog.inode(inode).stat.size,
-                            Job::Checked(entry.path().to_owned(), name, doc.0),
-                        ));
-                    }
-                    return Some((0, Job::Direct(entry.path().to_owned(), true)));
                 }
                 self.source = None;
             }
@@ -911,9 +1243,9 @@ impl<'a> Source<'a> {
                     };
                     match sources::Directory::new(
                         &path,
-                        self.catalog,
-                        &self.cwd,
-                        self.traversal.unrestricted || self.live.is_some(),
+                        self.filter.catalog,
+                        &self.filter.cwd,
+                        self.filter.traversal.unrestricted || self.live.is_some(),
                     ) {
                         Ok(source) => self.source = Some(source),
                         Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
