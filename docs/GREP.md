@@ -866,8 +866,12 @@ at most 64 KiB while it is busy, and the host collects every held batch before
 it sleeps. One-file tasks and bounded handoffs bound queued
 groups; no array of every path or second concurrent pool is introduced. The
 calling thread publishes whole groups. Stdin is a direct operand barrier;
-workers never wait for its producer. Explicit operands resolve before searching,
-including failed-path diagnostics even when a quiet match is found elsewhere.
+workers never wait for its producer. The D105 parallel live walk (`-uu`,
+`--live`) has no producer, and orders operands with two more barriers: file
+operands are searched in order by one worker, and each directory operand's walk
+ends before the next operand starts (DESIGN.md, Grep M2). Explicit operands
+resolve before searching, including failed-path diagnostics even when a quiet
+match is found elsewhere.
 
 D77's index setting and environment override select workers. Explicit-only
 commands keep the no-index rule and use the override/default count, limited to

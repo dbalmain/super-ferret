@@ -63,8 +63,15 @@ Grep M2 (2026-10-17) keeps that graph: the existing query verification scheduler
 also carries bounded line-group payloads. Its streaming producer runs on its
 own thread, at most four paths per worker ahead in a shared queue; workers
 never call it, so none holds a path while the producer blocks, and a slow file
-holds no other file's path. Workers own checked reads and line rendering. Grep
-workers send completed groups through a bounded completion queue (D92 B); the
+holds no other file's path. That is the indexed producer path. The D105
+parallel live walk (`-uu`, `--live`) has no producer: workers lend each other
+subtrees of a directory operand, so there a slow file holds only its own
+worker. Two bends keep operand order. A segment's file operands are searched
+in order by one worker, so a slow one delays the files after it. Each
+directory operand is its own scheduler run, a barrier: it starts after the
+operands before it finish and ends before the next starts. Workers own checked
+reads and line rendering. Grep workers send completed groups through a
+bounded completion queue (D92 B); the
 calling host publishes each whole group. One thread keeps walk order. A
 publication mutex excludes live policy warnings from groups; per-file
 diagnostics share the host. Workers batch groups only while the host is busy:
