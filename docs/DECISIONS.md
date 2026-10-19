@@ -5502,3 +5502,84 @@ design, ferret takes the simplest correct behaviour instead of copying it.
 
 Because of the clean room, ferret's side reports a confirmed rg error upstream
 as an issue with a minimal repro, not as a source patch.
+
+## D98 — D79–D91 under D97: four cluster answers
+
+**Status: open, 2026-10-19.** Built from a read-only review (private notes;
+oracles GNU grep 3.12 and rg 15.2.0, synthetic probes, `LC_ALL=C`). D79–D91
+stay as written; this brief proposes revised answers for them in four
+clusters, so they can be answered in four lines.
+
+Three findings change the earlier briefs:
+
+1. **rg disagrees with itself.** Some outputs depend on its reader. On
+   `x\na\ny\na\nz\n`, `rg -vn -m1 -A1 a` prints `1:x 2-a` from a file (mmap, as
+   GNU and ferret do) and `1:x 2:a 3:y` from stdin, in plain line mode. On
+   `ox\ncedar\nx\n`, `rg -no '\A'` prints `2:cedar` from a file and `2:` from
+   stdin; D79's brief quoted the stdin output. The grep test fixtures feed rg
+   through stdin, so "matches rg" on the M branches means "matches rg's stream
+   reader".
+2. **D82, D85, D87, D91 and the tails of D89/D90 exist only because `-U`
+   clips its input after `-m`** and re-matches inside the clip. A single pass
+   over the original input never clips, so those questions disappear.
+3. **On `a\nbc` with `-m1 -A1 '\z'`, GNU and rg both print `2-bc` (context);
+   ferret prints `2:bc`.** GNU's rule is that lines after `-m` are context, and
+   they are never searched.
+
+Net effect if every recommendation below is taken: about −450 / +50 lines of
+production code across `multiline.rs`, `matcher.rs`, `replacement.rs`,
+`events.rs` and `line_grep.rs`. Every one removes a special case or changes
+nothing, and none adds work to an ordinary line-mode search. The cost is in
+tests: about 22 M7–M9 test functions pin rg's stdin output and need owned
+expectations, an estimated 400–600 changed test lines, in one slice on the
+grep tip.
+
+### Cluster 1: `-o` and empty matches (D79, D83, D86)
+
+**Question:** should `-o` print empty matches at all?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Per-line empty records (D79 A today) | Keeps two `-o` fallback branches. Prints records neither GNU nor rg's file reader agree on. | Closest to rg's stdin output on `\A`. |
+| **D. `-o` never prints an empty record** (GNU's rule; a non-empty `-r` expansion still prints) | Differs from rg wherever rg prints an empty record. | About −35 lines; one rule. D83 becomes A (ordinary spans, about −12 more), D86 stays A. |
+
+**Recommendation: D.** GNU and rg disagree, and D is the simpler of the two.
+**Would change it:** agents relying on empty `-o` records as markers.
+
+### Cluster 2: the multiline engine (D81, then D80, D82, D85, D87, D91)
+
+**Question:** should `-U` search, count and render from one pass over the
+original input, with no clipping after `-m`?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. One haystack, re-match inside the clip | Keeps the separate count and render passes and every clip question (D82, D85, D87, D91). | `\A` means the start of the file. |
+| B. Suffix search (built) | 3–5 regex passes per `-U` search; `rebased_spans`; every clip question. One rough run put the count re-match alone at about +30%. | Matches rg's stdin output. |
+| **C. One pass, whole matches, no clip** | After `-m`, can print one more line than rg: the rest of a match that started on the last selected line. | About −230 / +40 lines and one regex pass. D82, D85, D87 become moot; D80 becomes A; D91 becomes A by construction. |
+
+On `red red\nblue\n`, `-Unm1 'red(?:\nblue)?'` under C prints `1:red red` and
+`2:blue`. rg prints only line 1, but its own `-or '<$0>'` already shows
+`<red\nblue>`, so C is rg's `-o` view made consistent.
+
+**Recommendation: C.** **Would change it:** a requirement that `-U -m N`
+never prints a line past the N-th group's last line; then A.
+
+### Cluster 3: lines after `-m` (D89 tail, D90)
+
+**Question:** are lines printed after the `-m` limit always context?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| **GNU's rule: always context** | Changes ferret's line-mode output on `-m N -A M` where a trailing line would match (it agrees with GNU and rg on the probe; today ferret differs from both). | Removes the tail search: about −70 lines, and no regex run on trailing lines. D89 A for `\A`, D90 A. |
+| Today's re-search of the tail | Keeps `tail_selection`, `tail_match` and the `-o` tail licence. | Nothing either oracle does. |
+
+**Recommendation: GNU's rule.** **Would change it:** none known; both
+oracles already do this.
+
+### Cluster 4: unchanged
+
+D84 B (expanding a replacement that spans lines is what substitution means)
+and D88 A (rg's `replacement` field is a feature, not an artefact; GREP.md says
+JSON ignores `-r`).
+
+**Recommendation:** take both as recommended.
