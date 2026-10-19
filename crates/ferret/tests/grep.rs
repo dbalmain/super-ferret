@@ -145,7 +145,12 @@ fn run(mut command: Command, input: Option<&[u8]>) -> Output {
     }
     let mut child = command.spawn().unwrap();
     if let Some(input) = input {
-        child.stdin.take().unwrap().write_all(input).unwrap();
+        // grep may stop reading early (binary input, `-q`, `-m`) and exit
+        // before the whole input is written.
+        match child.stdin.take().unwrap().write_all(input) {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            result => result.unwrap(),
+        }
     }
     child.wait_with_output().unwrap()
 }
