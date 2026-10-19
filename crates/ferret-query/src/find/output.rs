@@ -196,8 +196,9 @@ impl OutputBuffer {
         self.bytes.capacity()
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_spilled(&self) -> bool {
+    /// Whether the capture has moved to its spill file. Hosts' tests use it
+    /// to prove a fixture still exceeds the memory limit.
+    pub fn is_spilled(&self) -> bool {
         self.file.is_some()
     }
 

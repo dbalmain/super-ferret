@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-const GROUP_BYTES: usize = 4 << 20;
+pub(super) const GROUP_BYTES: usize = 4 << 20;
 const ENTRY_BYTES: usize = 64 << 10;
 const CACHE_BYTES: usize = 16 << 20;
 const CHUNK: usize = 64 << 10;
@@ -918,11 +918,43 @@ mod tests {
     }
 
     // Drive checked capture and real Host::commit with groups larger than
-    // capture, spill, stdout and replay buffers. Every file must remain whole.
+    // capture, spill, stdout and replay buffers. Every file must remain whole,
+    // and every published group must have spilled: the fixture is sized from
+    // the capture limit, so raising it cannot silently drop the spill. Eight
+    // threads bound the test's capture memory at (2T+1) * GROUP_BYTES.
     #[test]
     fn parallel_publication_keeps_large_groups_whole() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // Checks each 20-byte "file-NN:red payload\n" line as it arrives and
+        // records runs of one prefix, without holding the output.
+        #[derive(Default)]
+        struct Runs {
+            carry: Vec<u8>,
+            runs: Vec<(Vec<u8>, usize)>,
+        }
+        impl Write for Runs {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.carry.extend_from_slice(bytes);
+                let whole = self.carry.len() / 20 * 20;
+                for line in self.carry[..whole].chunks_exact(20) {
+                    assert_eq!(&line[8..], b"red payload\n");
+                    match self.runs.last_mut() {
+                        Some((prefix, count)) if prefix[..] == line[..8] => *count += 1,
+                        _ => self.runs.push((line[..8].to_vec(), 1)),
+                    }
+                }
+                self.carry.drain(..whole);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        const FILES: u32 = 24;
         let plan = plan(&["red"]);
-        let bytes = b"red payload\n".repeat(40_000);
+        let lines = GROUP_BYTES / 20 + 1;
+        let bytes = b"red payload\n".repeat(lines);
         let fork = || -> Option<Box<CheckedReader<'_>>> {
             Some(Box::new(|_, request| {
                 let ReadRequest::Stream(each, _) = request else {
@@ -932,36 +964,34 @@ mod tests {
                 ReadOutcome::Stable(ReadVersion::Current)
             }))
         };
-        let mut host = host(&plan, Vec::new());
-        let mut jobs = (0..64).map(|n| Job::Checked(format!("file-{n:02}").into(), NameId(n), n));
-        run(
+        let spilled = Rc::new(RefCell::new(Vec::new()));
+        let seen = spilled.clone();
+        super::super::seam::COMMIT.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move |output| {
+                seen.borrow_mut().push(output.is_spilled());
+            }));
+        });
+        let mut host = host(&plan, Runs::default());
+        let mut jobs =
+            (0..FILES).map(|n| Job::Checked(format!("file-{n:02}").into(), NameId(n), n));
+        let result = run(
             &mut host,
             |_| jobs.next().map(|job| (bytes.len() as u64, job)),
             &fork,
             None,
-            32,
+            8,
             &AtomicBool::new(false),
-        )
-        .unwrap();
-        let mut groups = host
-            .writer
-            .chunks_exact(20 * 40_000)
-            .map(|group| {
-                let prefix = &group[..8];
-                assert!(
-                    group
-                        .chunks_exact(20)
-                        .all(|line| &line[..8] == prefix && &line[8..] == b"red payload\n")
-                );
-                prefix.to_vec()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(host.writer.len(), 64 * 20 * 40_000);
-        groups.sort();
+        );
+        super::super::seam::COMMIT.with_borrow_mut(|hook| *hook = None);
+        result.unwrap();
+        assert!(host.writer.carry.is_empty());
+        assert_eq!(*spilled.borrow(), [true; FILES as usize]);
+        let mut runs = std::mem::take(&mut host.writer.runs);
+        runs.sort();
         assert_eq!(
-            groups,
-            (0..64)
-                .map(|n| format!("file-{n:02}:").into_bytes())
+            runs,
+            (0..FILES)
+                .map(|n| (format!("file-{n:02}:").into_bytes(), lines))
                 .collect::<Vec<_>>()
         );
     }
@@ -1211,15 +1241,22 @@ mod tests {
         );
     }
 
+    // Records go through the production capture writer. Three records of a
+    // quarter of the limit stay in memory; three of half the limit spill.
     #[test]
     fn vectored_plain_records_replay_exactly_before_and_after_spilling() {
-        for size in [0, 11, ENTRY_BYTES * 3 + 7] {
+        for (size, spills) in [
+            (0, false),
+            (11, false),
+            (GROUP_BYTES / 4, false),
+            (GROUP_BYTES / 2, true),
+        ] {
             let bytes = vec![b'x'; size];
             let mut output = OutputBuffer::default()
                 .with_memory_limit(GROUP_BYTES)
                 .with_buffered_spill();
             for _ in 0..3 {
-                let mut writer = Cancellable {
+                let mut writer = CaptureWriter {
                     inner: &mut output,
                     stopped: &|| false,
                 };
@@ -1234,11 +1271,13 @@ mod tests {
                 )
                 .unwrap();
             }
+            output.flush().unwrap();
+            assert_eq!(output.is_spilled(), spills, "{size}-byte records");
             let mut replay = Vec::new();
             output.write_to(&mut replay).unwrap();
-            assert_eq!(
-                replay,
-                [b"path:".as_slice(), &bytes, b"\n"].concat().repeat(3)
+            assert!(
+                replay == [b"path:".as_slice(), &bytes, b"\n"].concat().repeat(3),
+                "{size}-byte records replay"
             );
             assert_eq!(output.len(), replay.len() as u64);
         }

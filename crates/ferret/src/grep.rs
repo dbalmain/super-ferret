@@ -520,6 +520,12 @@ impl<W: Write> Host<'_, W> {
     }
 
     fn commit(&mut self, path: &Path, result: InputResult, output: OutputBuffer) -> io::Result<()> {
+        #[cfg(test)]
+        seam::COMMIT.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(&output);
+            }
+        });
         let published = self.publish(path, result, output);
         // NUL names retain std's existing line buffering and diagnostic
         // ordering, including a pending name when the next operand fails.
@@ -691,15 +697,20 @@ mod tests {
 
     // Context and the selected line belong to one checked read. Force a
     // first-attempt spill, then change its prefix after the first real read.
+    // The fixture is sized from the capture limit, and the published group
+    // must have spilled, so raising the limit cannot silently drop the spill.
     #[test]
     fn retried_context_discards_the_whole_spilled_group() {
+        use std::cell::RefCell;
         use std::os::unix::fs::FileExt;
+        use std::rc::Rc;
+        let lines = groups::GROUP_BYTES / b"old context\n".len() + 1;
         for recursive in [false, true] {
             let path = std::env::temp_dir().join(format!(
                 "ferret-context-retry-{}-{recursive}",
                 std::process::id()
             ));
-            let mut original = b"old context\n".repeat(24_000);
+            let mut original = b"old context\n".repeat(lines);
             original.extend_from_slice(b"red\n");
             fs::write(&path, &original).unwrap();
             let writer = OpenOptions::new().write(true).open(&path).unwrap();
@@ -717,8 +728,15 @@ mod tests {
                     }
                 }));
             });
+            let spilled = Rc::new(RefCell::new(Vec::new()));
+            let seen = spilled.clone();
+            seam::COMMIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move |output| {
+                    seen.borrow_mut().push(output.is_spilled());
+                }));
+            });
             let line_grep::Command::Search(plan) =
-                line_grep::parse(&["-B25000".into(), "red".into()]).unwrap()
+                line_grep::parse(&[format!("-B{lines}").into(), "red".into()]).unwrap()
             else {
                 panic!("search")
             };
@@ -735,11 +753,13 @@ mod tests {
             };
             host.file(&path, recursive).unwrap();
             seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
+            seam::COMMIT.with_borrow_mut(|hook| *hook = None);
             let mut expected = fs::read(&path).unwrap();
             expected.truncate(expected.len() - b"tail\n".len());
             fs::remove_file(path).unwrap();
-            assert_eq!(host.writer, expected);
+            assert!(host.writer == expected, "replay differs");
             assert!(host.matched && !host.errors);
+            assert_eq!(*spilled.borrow(), [true], "one published, spilled group");
         }
     }
 
@@ -1131,12 +1151,17 @@ mod tests {
 
 #[cfg(test)]
 mod seam {
+    use super::OutputBuffer;
     use std::cell::RefCell;
     use std::io::{self, Read};
 
     thread_local! {
         pub(super) static BEFORE_SCAN: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         pub(super) static AFTER_READ: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+        /// Called on the publishing thread with each group about to be
+        /// committed, so a test can prove its fixture still spills.
+        pub(super) static COMMIT: RefCell<Option<Box<dyn FnMut(&OutputBuffer)>>> =
+            RefCell::new(None);
     }
 
     pub(super) struct Observed<'a>(pub(super) &'a mut dyn Read);

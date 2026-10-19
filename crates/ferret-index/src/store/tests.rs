@@ -995,7 +995,7 @@ fn every_head_fact_is_checked_for_each_file() {
             }
             // Direct pair opening also isolates a bad version from fits().
             assert!(matches!(
-                open_pairs(&dir.0, &manifest),
+                open_pairs(&dir.0, &manifest, 4),
                 Err(Error::Segment(ReadError::Head))
             ));
             {
@@ -1203,4 +1203,68 @@ fn error_after_successful_reconcile_cleans_unpublished_outputs() {
     );
     assert!(writer.view().segments().is_empty());
     assert_eq!(dir.files(), named(&writer.view()));
+}
+
+/// Review of P7: segments open on the host's thread count, capped by the
+/// segment count, and a refused spawn opens the rest on the calling thread,
+/// in manifest order and with the first error a serial open returns.
+#[test]
+fn segment_open_follows_the_thread_count_and_survives_a_refused_spawn() {
+    let dir = Dir::new("open-threads");
+    let corpus = Corpus::new(1049, 40);
+    let writer = four_segments(&dir, &corpus);
+    let catalog = Catalog::new(40, &[]);
+    let manifest = writer.view().manifest().clone();
+    let entries = &manifest.segments;
+    let expected: Vec<_> = entries
+        .iter()
+        .map(|e| e.digest)
+        .chain(entries.iter().map(|e| e.trigram_digest))
+        .collect();
+    let digests = |segments: &[Arc<Segment<File>>], trigrams: &[Arc<Segment<File>>]| {
+        segments
+            .iter()
+            .chain(trigrams)
+            .map(|s| s.digest())
+            .collect::<Vec<_>>()
+    };
+    for (threads, spawned) in [(0, 0), (1, 0), (2, 2), (3, 2), (4, 4), (64, 4)] {
+        OPEN_SPAWNS.set(0);
+        let view = View::open_with_threads(&dir.0, &catalog.view(), threads)
+            .unwrap()
+            .unwrap();
+        let opened = digests(view.segments(), view.trigrams());
+        assert_eq!((OPEN_SPAWNS.get(), opened), (spawned, expected.clone()));
+    }
+    for fail_at in [0, 1, 3] {
+        FAIL_OPEN_SPAWN_AT.set(Some(fail_at));
+        OPEN_SPAWNS.set(0);
+        let (segments, trigrams) = open_pairs(&dir.0, &manifest, 4).unwrap();
+        let opened = digests(&segments, &trigrams);
+        assert_eq!((OPEN_SPAWNS.get(), opened), (fail_at, expected.clone()));
+    }
+    // A bad head in the last chunk is reported, whoever opens that chunk.
+    let mut broken = manifest.clone();
+    broken.segments[3].bytes += 1;
+    let refusals = [None, Some(0), Some(1), Some(3)];
+    for (threads, fail_at) in [2, 4].into_iter().flat_map(|t| refusals.map(|f| (t, f))) {
+        FAIL_OPEN_SPAWN_AT.set(fail_at);
+        let error = open_pairs(&dir.0, &broken, threads).err();
+        assert!(
+            matches!(error, Some(Error::Segment(ReadError::Head))),
+            "{threads} threads, refused at {fail_at:?}: {error:?}"
+        );
+    }
+    // An earlier NotFound wins over that later head error, as serially: the
+    // NotFound is what makes View::open retry from a newer manifest.
+    fs::remove_file(dir.0.join(entries[1].file_name())).unwrap();
+    for (threads, fail_at) in [2, 4].into_iter().flat_map(|t| refusals.map(|f| (t, f))) {
+        FAIL_OPEN_SPAWN_AT.set(fail_at);
+        let error = open_pairs(&dir.0, &broken, threads).err();
+        assert!(
+            matches!(&error, Some(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound),
+            "{threads} threads, refused at {fail_at:?}: {error:?}"
+        );
+    }
+    FAIL_OPEN_SPAWN_AT.set(None);
 }

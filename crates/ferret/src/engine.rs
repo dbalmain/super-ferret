@@ -246,12 +246,18 @@ impl Engine {
     /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] under the
     /// writer lock this engine holds. An index that does not fit the current
     /// catalog view is discarded, to be rebuilt by [`Engine::follow_content`].
+    /// Segments open on the search thread count.
     pub fn attach_content(&self, catalog_dir: &Path) -> Result<(), Error> {
+        let threads = self.pin().search_threads();
         let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let live = live_documents(&view);
-        let opened = IndexWriter::open(&catalog_dir.join(CONTENT_DIR), &catalog_view(&view, &live))
-            .map_err(Error::Content)?;
+        let opened = IndexWriter::open_with_threads(
+            &catalog_dir.join(CONTENT_DIR),
+            &catalog_view(&view, &live),
+            threads,
+        )
+        .map_err(Error::Content)?;
         let published = opened.view();
         *self.content.lock().map_err(|_| Error::WriterPanicked)? = Some(opened);
         self.select_content(published);
@@ -262,12 +268,13 @@ impl Engine {
     /// reading, for a query-only engine: no writer lock, nothing repaired
     /// or removed. An index that is absent or does not fit the catalog view
     /// leaves the engine without one, which content queries treat as
-    /// nothing covered.
+    /// nothing covered. Segments open on the search thread count.
     pub fn open_content(&self, catalog_dir: &Path) -> Result<(), Error> {
         let pin = self.pin();
-        let view = ferret_index::View::open(
+        let view = ferret_index::View::open_with_threads(
             &catalog_dir.join(CONTENT_DIR),
             &catalog_view(pin.catalog(), pin.live()),
+            pin.search_threads(),
         )
         .map_err(Error::Content)?;
         let mut current = self
