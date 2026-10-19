@@ -60,8 +60,11 @@ grep share the candidate seam, crawl reader adaptation and query’s streaming
 core. Find exposes source constructors without requiring a parsed expression.
 
 Grep M2 (2026-10-17) keeps that graph: the existing query verification scheduler
-also carries bounded line-group payloads. Its streaming producer avoids a path
-backlog; workers own checked reads and line rendering. Grep workers send
+also carries bounded line-group payloads. Its streaming producer runs on its
+own thread, at most four paths per worker ahead in a shared queue; workers
+never call it, so none holds a path while the producer blocks, and a slow file
+holds no other file's path. Workers own checked reads and line rendering.
+Grep workers send
 completed groups through a bounded completion queue (D92 B); the calling host
 publishes each whole group. One thread keeps walk order. A publication mutex
 excludes live policy warnings from groups; per-file diagnostics share the host.

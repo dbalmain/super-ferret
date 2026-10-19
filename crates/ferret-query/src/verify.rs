@@ -64,7 +64,7 @@
 //! read. The ring holds finished rows, not documents: a path and a few
 //! words per position.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1574,6 +1574,16 @@ fn spawn<'scope>(
     i: usize,
     work: impl FnOnce() + Send + 'scope,
 ) -> std::io::Result<()> {
+    spawn_named(scope, i, "ferret-verify", work)
+}
+
+/// Starts thread `i` on the scope, named so profiles can tell it apart.
+fn spawn_named<'scope>(
+    scope: &'scope Scope<'scope, '_>,
+    i: usize,
+    name: &str,
+    work: impl FnOnce() + Send + 'scope,
+) -> std::io::Result<()> {
     #[cfg(test)]
     if seam::Seams::current().fail_spawn_at == Some(i) {
         return Err(std::io::Error::other("injected spawn failure"));
@@ -1581,7 +1591,7 @@ fn spawn<'scope>(
     #[cfg(not(test))]
     let _ = i;
     std::thread::Builder::new()
-        .name("ferret-verify".into())
+        .name(name.into())
         .spawn_scoped(scope, work)
         .map(drop)
 }
@@ -1724,11 +1734,149 @@ impl Drop for StopOnPanic<'_> {
     }
 }
 
+/// Tasks the [`completion_groups`] producer may run ahead of the workers, per
+/// worker. A few per worker keep the queue from emptying between the
+/// producer's wakes; the backlog is paths, not captures (D93 bounds those).
+const FEED_PER_THREAD: usize = 4;
+
+/// Tasks produced ahead of the workers by a producer on its own thread.
+///
+/// Workers never call the producer, so no worker holds a fetched task while
+/// the producer blocks: each task is takeable by any idle worker from the
+/// moment it is produced. A worker taking one task per producer lock convoyed
+/// 32 workers on that lock (grep-why P2). A worker-local handout held other
+/// files' tasks behind a slow file, and a shared queue refilled by a worker
+/// deadlocked when the refiller held a quiet hit while the producer waited for
+/// that hit to cancel it.
+struct Feed<Task> {
+    state: Mutex<FeedState<Task>>,
+    /// Workers sleep here for a task.
+    ready: Condvar,
+    /// The producer sleeps here for room.
+    room: Condvar,
+    capacity: usize,
+}
+
+struct FeedState<Task> {
+    tasks: VecDeque<(u64, Task)>,
+    /// No task will be added: the producer ended or a worker left. Queued
+    /// tasks may still be taken; a stopped run's workers do not start them.
+    closed: bool,
+    /// Workers asleep on `ready`.
+    sleeping: usize,
+    /// The producer is asleep on `room` and has not been woken.
+    full: bool,
+}
+
+impl<Task> Feed<Task> {
+    fn new(threads: usize) -> Self {
+        let capacity = threads * FEED_PER_THREAD;
+        Self {
+            state: Mutex::new(FeedState {
+                tasks: VecDeque::with_capacity(capacity),
+                closed: false,
+                sleeping: 0,
+                full: false,
+            }),
+            ready: Condvar::new(),
+            room: Condvar::new(),
+            capacity,
+        }
+    }
+
+    /// Runs `next` until it ends, `stopped` says stop, or the feed closes.
+    /// Holds no feed lock while `next` runs.
+    fn produce(
+        &self,
+        next: &mut impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
+        stopped: &dyn Fn() -> bool,
+    ) {
+        loop {
+            {
+                let mut state = lock(&self.state);
+                while state.tasks.len() >= self.capacity && !state.closed {
+                    state.full = true;
+                    state = wait(&self.room, state);
+                }
+                state.full = false;
+                if state.closed {
+                    return;
+                }
+            }
+            if stopped() {
+                return;
+            }
+            let Some(task) = next(stopped) else { return };
+            let mut state = lock(&self.state);
+            if state.closed {
+                return;
+            }
+            state.tasks.push_back(task);
+            // Each task queued before this one already has a sleeper woken
+            // for it; wake one more only if a sleeper is left over.
+            let wake = state.sleeping >= state.tasks.len();
+            drop(state);
+            if wake {
+                self.ready.notify_one();
+            }
+        }
+    }
+
+    /// The next task, waiting while the queue is empty and open; `None` once
+    /// it is empty and closed.
+    fn take(&self) -> Option<(u64, Task)> {
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(task) = state.tasks.pop_front() {
+                // Wake the producer at half full, not at every free slot.
+                let wake = state.full && state.tasks.len() <= self.capacity / 2;
+                if wake {
+                    state.full = false;
+                }
+                drop(state);
+                if wake {
+                    self.room.notify_one();
+                }
+                return Some(task);
+            }
+            if state.closed {
+                return None;
+            }
+            state.sleeping += 1;
+            state = wait(&self.ready, state);
+            state.sleeping -= 1;
+        }
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.ready.notify_all();
+        self.room.notify_all();
+    }
+}
+
+fn wait<'a, T>(signal: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    signal.wait(guard).unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Closes the feed when its holder leaves, by any path: the producer's end
+/// wakes the sleeping workers, and a worker's exit stops the producer.
+struct CloseOnDrop<'f, Task>(&'f Feed<Task>);
+
+impl<Task> Drop for CloseOnDrop<'_, Task> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Prepares checked file groups on workers and emits them on the caller in
 /// completion order. One thread keeps source order. A bounded queue holds at
 /// most `threads` groups; workers own at most one each, and the caller one.
-/// Input reservations and producer cancellation match [`file_groups`].
-pub fn completion_groups<Task, State, Group: Send>(
+/// Input reservations and producer cancellation match [`file_groups`]. The
+/// producer runs on its own thread, a few tasks per worker ahead of them, and
+/// no worker ever calls it; if that thread cannot start, the caller works
+/// alone.
+pub fn completion_groups<Task: Send, State, Group: Send>(
     threads: usize,
     cancelled: &AtomicBool,
     next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
@@ -1741,33 +1889,28 @@ pub fn completion_groups<Task, State, Group: Send>(
         return;
     }
     let pool = Pool::<GroupItem<()>>::schedule(0, threads);
-    let source = Mutex::new((next, false));
+    let source = Mutex::new(next);
+    let feed = Feed::new(threads);
     let (sender, receiver) = std::sync::mpsc::sync_channel(threads);
     std::thread::scope(|scope| {
         let _stop = StopOnDrop(&pool);
+        let _close = CloseOnDrop(&feed);
         let make = &make;
         let work = &work;
+        let feed = &feed;
+        let pool = &pool;
+        let stopped = move || pool.halted() || cancelled.load(Ordering::Acquire);
         let started = (0..threads)
             .take_while(|&i| {
                 let sender = sender.clone();
-                let source = &source;
-                let pool = &pool;
                 spawn(scope, i, move || {
                     let _panic = StopOnPanic(pool);
+                    let _close = CloseOnDrop(feed);
                     let mut state = make();
-                    let stopped = || pool.halted() || cancelled.load(Ordering::Acquire);
                     while !stopped() {
-                        let task = {
-                            let mut source = lock(source);
-                            if source.1 || stopped() {
-                                None
-                            } else {
-                                let task = source.0(&stopped);
-                                source.1 = task.is_none();
-                                task
-                            }
+                        let Some((size, task)) = feed.take() else {
+                            break;
                         };
-                        let Some((size, task)) = task else { break };
                         let Some(size) =
                             pool.reserve(size.max(crate::scan::BUFFER as u64), &stopped)
                         else {
@@ -1784,8 +1927,18 @@ pub fn completion_groups<Task, State, Group: Send>(
             })
             .count();
         drop(sender);
-        if started == 0 {
-            groups_alone(&mut lock(&source).0, cancelled, make, work, &mut emit);
+        let source = &source;
+        let fed = started > 0
+            && spawn_named(scope, threads, "ferret-producer", move || {
+                let _panic = StopOnPanic(pool);
+                let _close = CloseOnDrop(feed);
+                feed.produce(&mut *lock(source), &stopped);
+            })
+            .is_ok();
+        if !fed {
+            // Any started workers find the feed closed and empty, and leave.
+            feed.close();
+            groups_alone(&mut *lock(source), cancelled, make, work, &mut emit);
             return;
         }
         // The owning iterator drops the receiver on break, unblocking senders
@@ -1838,7 +1991,8 @@ pub(crate) mod seam {
 
     #[derive(Clone, Default)]
     pub(crate) struct Seams {
-        /// The worker whose spawn fails.
+        /// The thread whose spawn fails: worker `i`, or `threads` for the
+        /// completion producer.
         pub fail_spawn_at: Option<usize>,
         /// Called, under the budget lock, when a worker sleeps for bytes.
         pub on_budget_wait: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -2482,6 +2636,66 @@ mod group_tests {
             );
         });
         assert!(result.is_err());
+    }
+
+    // The first task is a quiet hit and the producer then blocks until that
+    // hit cancels the run, as grep's filtering producer can. A worker that
+    // fetched the hit and called the producer again before working it would
+    // wait forever (grep-why P2); isolate a regression's deadlock.
+    #[test]
+    fn a_first_task_hit_reaches_a_worker_while_the_producer_blocks() {
+        if completion_child("a_first_task_hit_reaches_a_worker_while_the_producer_blocks") {
+            return;
+        }
+        let cancelled = AtomicBool::new(false);
+        let mut calls = 0;
+        completion_groups(
+            2,
+            &cancelled,
+            |stopped| {
+                calls += 1;
+                if calls == 1 {
+                    return Some((1, ()));
+                }
+                while !stopped() {
+                    std::thread::yield_now();
+                }
+                None
+            },
+            || (),
+            |_, (), _| cancelled.store(true, Ordering::Release),
+            |()| ControlFlow::Continue(()),
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    // Without a producer thread the workers must not wait for tasks, and the
+    // caller still emits every group.
+    #[test]
+    fn producer_spawn_failure_uses_the_caller() {
+        if completion_child("producer_spawn_failure_uses_the_caller") {
+            return;
+        }
+        let threads = 4;
+        let _seams = seam::Seams {
+            fail_spawn_at: Some(threads),
+            ..Default::default()
+        }
+        .set();
+        let mut tasks = (0..8).map(|task| (1, task));
+        let mut emitted = Vec::new();
+        completion_groups(
+            threads,
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| task,
+            |task| {
+                emitted.push(task);
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(emitted, (0..8).collect::<Vec<_>>());
     }
 
     #[test]
