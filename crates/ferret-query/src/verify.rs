@@ -1882,56 +1882,30 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
                     let _panic = StopOnPanic(pool);
                     let _close = CloseOnDrop(feed);
                     let mut state = make();
-                    let slot = &held[i];
-                    'tasks: while !stopped() {
+                    let lane = Lane {
+                        slot: &held[i],
+                        idle,
+                        sender,
+                        pool,
+                    };
+                    while !stopped() {
                         let Some((size, task)) = feed.take() else {
                             break;
                         };
-                        let Some(size) =
-                            pool.reserve(size.max(crate::scan::BUFFER as u64), &stopped)
-                        else {
+                        let Some(size) = lane.reserve(size, &stopped) else {
                             break;
                         };
                         let group = work(&mut state, task, &stopped);
-                        pool.release(size);
+                        lane.release(size);
                         if stopped() {
                             break;
                         }
                         let bytes = weight(&group);
-                        let handoffs = {
-                            let mut slot = lock(slot);
-                            let mut handoffs = slot.add(group, bytes);
-                            // Read under the slot lock, which orders it after
-                            // the caller's last look at this slot. Any send
-                            // wakes the caller, who looks at every slot again
-                            // before sleeping, so only one worker need flush.
-                            if handoffs.iter().all(Option::is_none)
-                                && idle.load(Ordering::SeqCst)
-                                && idle.swap(false, Ordering::SeqCst)
-                            {
-                                handoffs[1] = slot.take();
-                            }
-                            handoffs
-                        };
-                        // Send outside the slot lock: the caller takes that
-                        // lock to collect, and a full queue waits on the
-                        // caller.
-                        for batch in handoffs.into_iter().flatten() {
-                            if sender.send(batch).is_err() {
-                                break 'tasks;
-                            }
+                        if lane.hand(group, bytes).is_break() {
+                            break;
                         }
                     }
-                    // Out of files, hand over what is held. A stopped run
-                    // drops it, as the caller drops queued groups.
-                    // Take first: a guard in the condition would live
-                    // through a send that may wait on the collecting caller.
-                    let batch = lock(slot).take();
-                    if !stopped()
-                        && let Some(batch) = batch
-                    {
-                        let _ = sender.send(batch);
-                    }
+                    lane.flush(stopped());
                 })
                 .is_ok()
             })
@@ -1951,6 +1925,82 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
             groups_alone(&mut *lock(source), cancelled, make, work, &mut emit);
             return;
         }
+        collect(&receiver, held, idle, &stopped, &mut emit);
+        // Dropping the receiver unblocks senders before scope join. The stop
+        // guard also wakes input-budget waiters.
+        drop(receiver);
+    });
+}
+
+/// A worker's way to the caller: its slot of held groups, and the bounded
+/// queue of handoffs. Shared by [`completion_groups`] and [`lane_groups`].
+pub struct Lane<'g, Group> {
+    slot: &'g Mutex<Held<Group>>,
+    idle: &'g AtomicBool,
+    sender: std::sync::mpsc::SyncSender<Vec<Group>>,
+    pool: &'g Pool<()>,
+}
+
+impl<Group> Lane<'_, Group> {
+    /// Reserves the input bytes for a task of `size` (at least one read
+    /// buffer); `None` once the run stops.
+    pub fn reserve(&self, size: u64, stopped: &dyn Fn() -> bool) -> Option<u64> {
+        self.pool
+            .reserve(size.max(crate::scan::BUFFER as u64), stopped)
+    }
+
+    pub fn release(&self, size: u64) {
+        self.pool.release(size);
+    }
+
+    /// Holds a completed group of `bytes`, or hands batches over now (see
+    /// [`completion_groups`]). Breaks once the caller has gone.
+    pub fn hand(&self, group: Group, bytes: u64) -> ControlFlow<()> {
+        let handoffs = {
+            let mut slot = lock(self.slot);
+            let mut handoffs = slot.add(group, bytes);
+            // Read under the slot lock, which orders it after the caller's
+            // last look at this slot. Any send wakes the caller, who looks at
+            // every slot again before sleeping, so only one worker need flush.
+            if handoffs.iter().all(Option::is_none)
+                && self.idle.load(Ordering::SeqCst)
+                && self.idle.swap(false, Ordering::SeqCst)
+            {
+                handoffs[1] = slot.take();
+            }
+            handoffs
+        };
+        // Send outside the slot lock: the caller takes that lock to collect,
+        // and a full queue waits on the caller.
+        for batch in handoffs.into_iter().flatten() {
+            if self.sender.send(batch).is_err() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Out of work, hands over what is held. A stopped run drops it, as the
+    /// caller drops queued groups.
+    pub fn flush(&self, stopped: bool) {
+        // Take first: a guard in the condition would live through a send
+        // that may wait on the collecting caller.
+        let batch = lock(self.slot).take();
+        if !stopped && let Some(batch) = batch {
+            let _ = self.sender.send(batch);
+        }
+    }
+}
+
+/// Collects handoffs on the caller until every lane has gone, the run stops
+/// or `emit` breaks. Before sleeping, takes every held batch.
+fn collect<Group>(
+    receiver: &std::sync::mpsc::Receiver<Vec<Group>>,
+    held: &[Mutex<Held<Group>>],
+    idle: &AtomicBool,
+    stopped: &dyn Fn() -> bool,
+    emit: &mut impl FnMut(Group) -> ControlFlow<()>,
+) {
         // Slots seen empty in a row since `idle` was last set, and the next
         // slot to look at. Sleeping needs a full clean pass after setting it.
         let mut clean = 0;
@@ -1978,13 +2028,50 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
             if let Some(batch) = batch {
                 idle.store(false, Ordering::SeqCst);
                 clean = 0;
-                if publish(batch, &stopped, &mut emit).is_break() {
+                if publish(batch, stopped, emit).is_break() {
                     break;
                 }
             }
         }
-        // Dropping the receiver unblocks senders before scope join. The stop
-        // guard also wakes input-budget waiters.
+}
+
+/// Like [`completion_groups`], for workers that find their own tasks: `run`
+/// gets one [`Lane`] per worker and the stop predicate, starts its workers,
+/// and returns once they have all finished. The caller emits groups in
+/// completion order meanwhile, under the same handoff and input bounds.
+pub fn lane_groups<'g, Group: Send + 'g>(
+    threads: usize,
+    cancelled: &AtomicBool,
+    run: impl FnOnce(Vec<Lane<'_, Group>>, &(dyn Fn() -> bool + Sync)) + Send,
+    mut emit: impl FnMut(Group) -> ControlFlow<()>,
+) {
+    let threads = threads.max(1);
+    let pool = Pool::<()>::schedule(0, threads);
+    let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
+    let idle = AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Group>>(threads);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&pool);
+        let pool = &pool;
+        let held = &held;
+        let idle = &idle;
+        let stopped = move || pool.halted() || cancelled.load(Ordering::Acquire);
+        let lanes = (0..threads)
+            .map(|i| Lane {
+                slot: &held[i],
+                idle,
+                sender: sender.clone(),
+                pool,
+            })
+            .collect();
+        drop(sender);
+        let started = spawn_named(scope, threads, "ferret-walk", move || {
+            let _panic = StopOnPanic(pool);
+            run(lanes, &stopped);
+        });
+        if started.is_ok() {
+            collect(&receiver, held, idle, &stopped, &mut emit);
+        }
         drop(receiver);
     });
 }
