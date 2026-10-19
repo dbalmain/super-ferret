@@ -218,13 +218,39 @@ pub(super) fn run(
     Ok(outcome)
 }
 
-struct Queue {
-    tasks: Vec<Task>,
+/// Walk work that [`Pool`] runs and donates between workers: find's
+/// expression tasks, or grep's search tasks. `L` is a worker thread's own
+/// state, lent to each task while that worker runs it.
+pub trait Donor<L>: Send + Sized {
+    /// Suspended until donated descendants complete; not runnable yet.
+    fn waiting(&self) -> bool;
+    /// Takes the worker's state before a run of steps.
+    fn resume(&mut self, local: &mut L);
+    /// Advances one entry; false once the task has ended or suspended.
+    fn advance(&mut self, local: &mut L) -> bool;
+    /// The task asks the whole pool to stop.
+    fn quits(&self) -> bool;
+    /// Splits sibling work off for an idle worker, having first published
+    /// whatever must precede it. Called with the pool's queue locked.
+    fn give(&mut self, local: &mut L, quit: &Arc<AtomicBool>) -> Option<Self>;
+    /// The walk stopped only to wait for donated descendants.
+    fn suspended(&self) -> bool;
+    /// Hands the worker's state back before the task is queued again.
+    fn park(&mut self, local: &mut L);
+    /// Ends the task, handing the worker's state back; its error count.
+    fn end(&mut self, local: &mut L) -> u64;
+}
+
+struct Queue<T> {
+    tasks: Vec<T>,
     active: usize,
 }
 
-struct Pool {
-    queue: Mutex<Queue>,
+/// Bounded sibling donation among `workers` threads, each running
+/// [`Pool::worker`]. Suspended parents return to the queue rather than
+/// occupying a worker while descendants run.
+pub struct Pool<T> {
+    queue: Mutex<Queue<T>>,
     changed: Condvar,
     quit: Arc<AtomicBool>,
     workers: usize,
@@ -232,8 +258,8 @@ struct Pool {
 
 // A worker panic must wake siblings before the scoped join can propagate it.
 // Taking the queue lock closes the check-then-condvar-wait lost-wakeup window.
-struct PanicStop<'a>(&'a Pool);
-impl Drop for PanicStop<'_> {
+struct PanicStop<'a, T>(&'a Pool<T>);
+impl<T> Drop for PanicStop<'_, T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             let _queue = self
@@ -247,15 +273,33 @@ impl Drop for PanicStop<'_> {
     }
 }
 
-impl Pool {
-    fn worker(&self, plan: &Plan, expression: &Expression, mut effects: impl Effects) -> u64 {
+impl<T> Pool<T> {
+    pub fn new(tasks: Vec<T>, quit: Arc<AtomicBool>, workers: usize) -> Self {
+        Self {
+            queue: Mutex::new(Queue { tasks, active: 0 }),
+            changed: Condvar::new(),
+            quit,
+            workers,
+        }
+    }
+
+    /// Tasks left queued when the workers returned: suspended ones, after a
+    /// quit.
+    pub fn into_tasks(self) -> Vec<T> {
+        self.queue
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tasks
+    }
+
+    /// Runs queued tasks until none is runnable and none is active, or the
+    /// pool quits; the errors the finished tasks counted.
+    pub fn worker<L>(&self, mut local: L) -> u64
+    where
+        T: Donor<L>,
+    {
         let _panic = PanicStop(self);
         let mut errors = 0;
-        // Keep allocation capacity with the worker when a task completes or
-        // suspends. Queued tasks have already flushed their transactions.
-        let mut record = super::output::Record::default();
-        let policy = super::output::policy(expression);
-        let sequential = super::sequential_starts(expression);
         loop {
             let mut queue = self
                 .queue
@@ -265,7 +309,7 @@ impl Pool {
                 if self.quit.load(Ordering::Acquire) {
                     return errors;
                 }
-                if let Some(index) = queue.tasks.iter().rposition(|task| !task.walk.waiting()) {
+                if let Some(index) = queue.tasks.iter().rposition(|task| !task.waiting()) {
                     queue.active += 1;
                     break queue.tasks.swap_remove(index);
                 }
@@ -278,12 +322,10 @@ impl Pool {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             };
             drop(queue);
-            std::mem::swap(&mut record, &mut task.record);
+            task.resume(&mut local);
             let mut steps = 0usize;
-            while !self.quit.load(Ordering::Acquire)
-                && task.step(plan, expression, &mut effects, policy)
-            {
-                if task.control.quit {
+            while !self.quit.load(Ordering::Acquire) && task.advance(&mut local) {
+                if task.quits() {
                     self.quit.store(true, Ordering::Release);
                     break;
                 }
@@ -293,47 +335,26 @@ impl Pool {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if queue.tasks.len() + queue.active < self.workers * 2
-                        && let Some(donated) = task.donate(&self.quit, sequential)
+                        && let Some(donated) = task.give(&mut local, &self.quit)
                     {
-                        // Publish earlier records before children can
-                        // evaluate.
-                        if let Err(error) = (super::output::EntryEffects {
-                            host: &mut effects,
-                            record: &mut task.record,
-                            gate: &task.gate,
-                            quit: &task.quit,
-                        })
-                        .commit(false)
-                        .and_then(|()| task.control.actions.flush_files())
-                        .and_then(|()| effects.flush())
-                        {
-                            effects.error(&WalkError {
-                                path: ".".into(),
-                                error,
-                            });
-                            task.errors += 1;
-                            self.quit.store(true, Ordering::Release);
-                        }
                         queue.tasks.push(donated);
                         self.changed.notify_all();
                     }
                 }
                 steps += 1;
             }
-            if task.control.quit {
+            if task.quits() {
                 self.quit.store(true, Ordering::Release);
             }
             // Completion can race with the None returned for suspension. Use
             // the recorded reason, not a second counter read, to
             // retain the task.
-            let waiting = task.walk.suspended() && !self.quit.load(Ordering::Acquire);
+            let waiting = task.suspended() && !self.quit.load(Ordering::Acquire);
             let suspended = if waiting {
-                task.flush(&mut effects);
-                std::mem::swap(&mut record, &mut task.record);
+                task.park(&mut local);
                 Some(task)
             } else {
-                errors += task.finish(&mut effects);
-                std::mem::swap(&mut record, &mut task.record);
+                errors += task.end(&mut local);
                 None
             };
             let mut queue = self
@@ -346,6 +367,80 @@ impl Pool {
             }
             self.changed.notify_all();
         }
+    }
+}
+
+/// A find worker's state: its effects handle, and a record whose allocation
+/// stays with the worker when a task completes or suspends. Queued tasks have
+/// already flushed their transactions.
+struct FindLocal<'p, E> {
+    plan: &'p Plan,
+    expression: &'p Expression,
+    effects: E,
+    record: super::output::Record,
+    policy: super::output::Policy,
+    sequential: bool,
+}
+
+impl<'p, E: Effects> FindLocal<'p, E> {
+    fn new(plan: &'p Plan, expression: &'p Expression, effects: E) -> Self {
+        Self {
+            plan,
+            expression,
+            effects,
+            record: super::output::Record::default(),
+            policy: super::output::policy(expression),
+            sequential: super::sequential_starts(expression),
+        }
+    }
+}
+
+impl<E: Effects> Donor<FindLocal<'_, E>> for Task {
+    fn waiting(&self) -> bool {
+        self.walk.waiting()
+    }
+    fn resume(&mut self, local: &mut FindLocal<'_, E>) {
+        std::mem::swap(&mut local.record, &mut self.record);
+    }
+    fn advance(&mut self, local: &mut FindLocal<'_, E>) -> bool {
+        self.step(local.plan, local.expression, &mut local.effects, local.policy)
+    }
+    fn quits(&self) -> bool {
+        self.control.quit
+    }
+    fn give(&mut self, local: &mut FindLocal<'_, E>, quit: &Arc<AtomicBool>) -> Option<Self> {
+        let donated = self.donate(quit, local.sequential)?;
+        // Publish earlier records before children can evaluate.
+        if let Err(error) = (super::output::EntryEffects {
+            host: &mut local.effects,
+            record: &mut self.record,
+            gate: &self.gate,
+            quit: &self.quit,
+        })
+        .commit(false)
+        .and_then(|()| self.control.actions.flush_files())
+        .and_then(|()| local.effects.flush())
+        {
+            local.effects.error(&WalkError {
+                path: ".".into(),
+                error,
+            });
+            self.errors += 1;
+            quit.store(true, Ordering::Release);
+        }
+        Some(donated)
+    }
+    fn suspended(&self) -> bool {
+        self.walk.suspended()
+    }
+    fn park(&mut self, local: &mut FindLocal<'_, E>) {
+        self.flush(&mut local.effects);
+        std::mem::swap(&mut local.record, &mut self.record);
+    }
+    fn end(&mut self, local: &mut FindLocal<'_, E>) -> u64 {
+        let errors = self.finish(&mut local.effects);
+        std::mem::swap(&mut local.record, &mut self.record);
+        errors
     }
 }
 
@@ -414,25 +509,19 @@ impl Plan {
                     task.errors += 1;
                     quit.store(true, Ordering::Release);
                 }
-                let pool = Pool {
-                    queue: Mutex::new(Queue {
-                        tasks: vec![task, donated],
-                        active: 0,
-                    }),
-                    changed: Condvar::new(),
-                    quit,
-                    workers,
-                };
+                let pool = Pool::new(vec![task, donated], quit, workers);
                 let errors = std::thread::scope(|scope| {
                     let handles: Vec<_> = (1..workers)
                         .map(|_| {
                             let pool = &pool;
                             let expression = &expression;
                             let effects = effects.clone();
-                            scope.spawn(move || pool.worker(self, expression, effects))
+                            scope.spawn(move || {
+                                pool.worker(FindLocal::new(self, expression, effects))
+                            })
                         })
                         .collect();
-                    let mut errors = pool.worker(self, &expression, effects.clone());
+                    let mut errors = pool.worker(FindLocal::new(self, &expression, effects.clone()));
                     for handle in handles {
                         errors += handle
                             .join()
@@ -440,18 +529,15 @@ impl Plan {
                     }
                     errors
                 });
-                let queue = pool
-                    .queue
-                    .into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let quit = pool.quit.clone();
                 let errors = errors
-                    + queue
-                        .tasks
+                    + pool
+                        .into_tasks()
                         .into_iter()
                         .map(|mut task| task.finish(&mut effects))
                         .sum::<u64>();
                 let errors = errors
-                    + super::action::flush_shared(&shared, &mut effects, &gate, &pool.quit)
+                    + super::action::flush_shared(&shared, &mut effects, &gate, &quit)
                         .unwrap_or_else(|error| {
                             effects.error(&WalkError {
                                 path: ".".into(),
