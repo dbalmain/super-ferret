@@ -93,7 +93,7 @@ impl Anchors {
             .iter()
             .find(|root| real.starts_with(root))
             .ok_or_else(|| io::Error::other("no covering policy root"))?;
-        let mut state = self.root(root, stopped)?;
+        let mut state = self.root(root, None, stopped)?;
         let mut at = root.clone();
         for component in real
             .strip_prefix(root)
@@ -102,7 +102,7 @@ impl Anchors {
         {
             at.push(component);
             state = if !matches!(state, State::Bypass) && self.roots.contains(&at) {
-                self.root(&at, stopped)?
+                self.root(&at, None, stopped)?
             } else {
                 match state {
                     State::Rules { root, rules } => {
@@ -110,7 +110,7 @@ impl Anchors {
                         match rules.decide(relative, PolicyEntry::Dir) {
                             Decision::Descend => State::Rules {
                                 root,
-                                rules: enter(&rules, &at, stopped)?,
+                                rules: enter(&rules, &at, None, stopped)?,
                             },
                             Decision::Traverse => State::Rules {
                                 root,
@@ -130,10 +130,16 @@ impl Anchors {
             spelling: path.to_owned(),
             real: real.clone(),
             stack: vec![(real, state)],
+            warnings: None,
         })
     }
-    fn root(&self, path: &Path, stopped: &dyn Fn() -> bool) -> io::Result<State> {
-        let rules = load(path, None, Some(&self.global), stopped)?;
+    fn root(
+        &self,
+        path: &Path,
+        warnings: Option<&mut Vec<String>>,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<State> {
+        let rules = load(path, None, Some(&self.global), warnings, stopped)?;
         Ok(State::Rules {
             root: path.to_owned(),
             rules,
@@ -228,8 +234,24 @@ pub(super) struct Policy {
     spelling: PathBuf,
     real: PathBuf,
     stack: Vec<(PathBuf, State)>,
+    /// Held for the caller to print, when deferred.
+    warnings: Option<Vec<String>>,
 }
 impl Policy {
+    /// Holds warnings from directories' rules for [`Self::take_warnings`],
+    /// so a worker can print them under its own ordering.
+    pub fn deferring(mut self) -> Self {
+        self.warnings = Some(Vec::new());
+        self
+    }
+
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        self.warnings
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
     pub fn accepts(
         &mut self,
         entry: &Entry,
@@ -265,7 +287,7 @@ impl Policy {
         let kind = entry.kind()?;
         let directory = kind == FileKind::Directory;
         if directory && !matches!(state, State::Bypass) && self.anchors.roots.contains(&path) {
-            let state = self.anchors.root(&path, stopped)?;
+            let state = self.anchors.root(&path, self.warnings.as_mut(), stopped)?;
             self.stack.push((path, state));
             return Ok(true);
         }
@@ -291,7 +313,7 @@ impl Policy {
             let next = match (decision, state) {
                 (Decision::Descend, State::Rules { root, rules }) => State::Rules {
                     root: root.clone(),
-                    rules: enter(rules, &path, stopped)?,
+                    rules: enter(rules, &path, self.warnings.as_mut(), stopped)?,
                 },
                 (Decision::Traverse, State::Rules { root, rules }) => State::Rules {
                     root: root.clone(),
@@ -309,14 +331,22 @@ impl Policy {
     }
 }
 
-fn enter(parent: &DirRules, path: &Path, stopped: &dyn Fn() -> bool) -> io::Result<DirRules> {
-    load(path, Some(parent), None, stopped)
+fn enter(
+    parent: &DirRules,
+    path: &Path,
+    warnings: Option<&mut Vec<String>>,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<DirRules> {
+    load(path, Some(parent), None, warnings, stopped)
 }
 
+/// Loads a directory's rules. Warnings go to `warnings` when given, else
+/// straight to stderr.
 fn load(
     path: &Path,
     parent: Option<&DirRules>,
     global: Option<&str>,
+    mut warnings: Option<&mut Vec<String>>,
     stopped: &dyn Fn() -> bool,
 ) -> io::Result<DirRules> {
     if stopped() {
@@ -331,7 +361,11 @@ fn load(
             Config::default(),
             |event| match event {
                 ferret_crawl::Event::Pattern(error) => {
-                    eprintln!("ferret: warning: ignore pattern skipped: {error}");
+                    let warning = format!("ferret: warning: ignore pattern skipped: {error}");
+                    match warnings.as_deref_mut() {
+                        Some(warnings) => warnings.push(warning),
+                        None => eprintln!("{warning}"),
+                    }
                 }
                 ferret_crawl::Event::Io {
                     path: relative,

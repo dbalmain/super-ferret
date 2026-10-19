@@ -844,7 +844,7 @@ pub(super) fn walk<W: Write>(
                                     sources::live(&path, &filter.cwd),
                                     Walked {
                                         descend: true,
-                                        policy,
+                                        policy: policy.map(live::Policy::deferring),
                                     },
                                     &mut first,
                                     |_| true,
@@ -996,7 +996,7 @@ pub(super) struct Filter<'a> {
 impl Filter<'_> {
     /// The job a walked entry yields, if any. Sets `descend` for a directory
     /// and `searched` for a selected file (D99). `publication`, when given,
-    /// is held while a directory's policy loads.
+    /// is held while printing a deferred policy's warnings.
     fn entry(
         &self,
         entry: &ferret_query::find::Entry,
@@ -1030,10 +1030,16 @@ impl Filter<'_> {
                     .selection
                     .descend(relative.as_os_str().as_bytes(), entry.depth());
             if *descend && let Some(policy) = policy {
-                // Loading a directory's rules may warn: not inside
-                // another file's group.
-                let _publication = publication.map(lock);
-                match policy.accepts(entry, true, stopped) {
+                let accepted = policy.accepts(entry, true, stopped);
+                let warnings = policy.take_warnings();
+                if !warnings.is_empty() {
+                    // Not inside another file's group.
+                    let _publication = publication.map(lock);
+                    for warning in warnings {
+                        eprintln!("{warning}");
+                    }
+                }
+                match accepted {
                     Ok(allowed) => *descend = allowed,
                     Err(error) => {
                         *descend = false;
