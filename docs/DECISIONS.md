@@ -5479,3 +5479,16 @@ slower 1-thread runs or more context switches.
 saturates a core (a live walk over many small files is the likely case), use
 T − 1 workers. P2's measurements record the producer thread's CPU share per
 corpus shape to find where that happens.
+
+## D97 — When GNU grep and rg disagree
+
+**Status: answered, 2026-10-19 (a principle, not a brief).**
+
+> Dave: when GNU grep and rg disagree, we should take the simplest, fastest
+> solution. In such a case, if there is an approach that is "more correct" but
+> matches neither output and is simpler than both, we take that too.
+
+**Answer:** where the two oracles disagree, ferret's behaviour is chosen for
+simplicity and speed rather than for matching either one. A third behaviour
+that is more correct and simpler than both is allowed. D79–D91 are being
+re-examined under this rule.
