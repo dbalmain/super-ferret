@@ -5492,3 +5492,13 @@ corpus shape to find where that happens.
 simplicity and speed rather than for matching either one. A third behaviour
 that is more correct and simpler than both is allowed. D79–D91 are being
 re-examined under this rule.
+
+Scope: the rule also covers features only rg has (`-U`, `--json`, `-r`
+replacement). Where rg's output there looks like an artefact rather than a
+design, ferret takes the simplest correct behaviour instead of copying it.
+
+> Dave: Agree, option A. We could even open a PR in ripgrep if we are
+> confident it is an error. The reds example appears to be that to me.
+
+Because of the clean room, ferret's side reports a confirmed rg error upstream
+as an issue with a minimal repro, not as a source patch.
