@@ -610,6 +610,54 @@ fn read_denial_is_an_error_and_special_operands_are_refused() {
     assert!(result.stdout.is_empty() && !result.stderr.is_empty());
 }
 
+// D99: only a run with no path operand, which searches the current
+// directory, diagnoses a walk that searched nothing; it exits 2 as rg does. An
+// explicit `.`, stdin, or a file that fails to open (it was searched) keeps
+// the ordinary statuses. A walk error is reported and the diagnostic follows.
+#[test]
+fn no_path_and_nothing_searched_exits_two() {
+    const NOTHING: &str = "no files were searched";
+    let fixture = Fixture::new("nothing-searched");
+    let diagnosed = |output: &Output| String::from_utf8_lossy(&output.stderr).contains(NOTHING);
+    for (args, code, diagnostic) in [
+        (&["-g", "*.zz", "red"][..], 2, true),
+        (&["-q", "-g", "*.zz", "red"], 2, true),
+        (&["-l", "-g", "*.zz", "red"], 2, true),
+        (&["-c", "-g", "*.zz", "red"], 2, true),
+        (&["-uu", "--max-depth", "0", "red"], 2, true),
+        (&["-g", "*.zz", "red", "."], 1, false),
+        (&["-uu", "--max-depth", "0", "red", "."], 1, false),
+        (&["-g", "*.rs", "red"], 0, false),
+        (&["-g", "*.rs", "violet"], 1, false),
+    ] {
+        let output = fixture.compare(args, None);
+        assert_eq!(output.status.code(), Some(code), "{args:?}: {output:?}");
+        assert_eq!(diagnosed(&output), diagnostic, "{args:?}: {output:?}");
+    }
+    for (input, code) in [(&b"red\n"[..], 0), (b"blue\n", 1)] {
+        let output = fixture.compare_raw(&["-g", "*.zz", "red"], Some(input));
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    let path = fixture.tree().join("one.rs");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let open_fault = fixture.compare(&["-uu", "-g", "one.rs", "red"], None);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(open_fault.status.code(), Some(2), "{open_fault:?}");
+    assert!(!diagnosed(&open_fault), "{open_fault:?}");
+
+    let sub = fixture.tree().join("sub");
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+    let walk_fault = fixture.compare(&["-uu", "-g", "*.zz", "red"], None);
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = String::from_utf8_lossy(&walk_fault.stderr);
+    assert_eq!(walk_fault.status.code(), Some(2), "{walk_fault:?}");
+    assert_eq!(stderr.lines().count(), 2, "{stderr}");
+    assert!(stderr.lines().next().unwrap().contains("sub"), "{stderr}");
+    assert_eq!(stderr.matches(NOTHING).count(), 1, "{stderr}");
+}
+
 #[test]
 fn non_utf8_filename_bytes_are_preserved() {
     let fixture = Fixture::new("path-bytes");
@@ -766,6 +814,29 @@ fn spill_failure_stops_before_the_next_matching_file() {
         [(Some(2), true, true); 3],
         "a later file printed after output failed"
     );
+}
+
+// A spill fault is a temporary-file fault: the message names the spill
+// directory and file, not stdout.
+#[test]
+fn spill_failure_names_the_temporary_directory() {
+    let fixture = Fixture::new("spill-message");
+    fixture.write("big.txt", &b"red\n".repeat(1_200_000));
+    let missing = fixture.base.join("missing-spill-dir");
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .args(["grep", "red", "big.txt"])
+        .env("TMPDIR", &missing);
+    let output = run(command, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let directory = format!("writing temporary output in {}: ", missing.display());
+    assert!(stderr.contains(&directory), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}/ferret-output-", missing.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("stdout"), "{stderr}");
 }
 
 // R2: regular virtual files can report size zero while yielding content.

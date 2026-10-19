@@ -127,7 +127,7 @@ impl<W: EntrySource> Task<W> {
                 EvaluationError::Output(error) => (error, true),
             };
             effects.error(&WalkError {
-                path: super::output::error_path(&error)
+                path: super::output::spill_path(&error)
                     .unwrap_or(entry.path())
                     .to_owned(),
                 error,

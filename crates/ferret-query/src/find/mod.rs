@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
-pub use output::OutputBuffer;
+pub use output::{OutputBuffer, spill_path};
 pub use parse::{ParseError, Plan};
 pub use walk::{CatalogSource, Entry, EntrySource, FileKind, LiveWalk, WalkError};
 

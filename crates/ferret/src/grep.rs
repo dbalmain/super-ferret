@@ -244,6 +244,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .zip(documents.as_ref())
             .map(|(pin, documents)| engine::reader::checked(pin.catalog(), documents))
     };
+    // D99: with no path operand, a walk whose filters selected no file is
+    // diagnosed at exit.
+    let mut searched = false;
     let mut inputs = inputs.into_iter().peekable();
     'inputs: while inputs.peek().is_some() {
         let mut segment = Vec::new();
@@ -274,14 +277,16 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .with_traversal(plan.traversal, plan.text)
             .with_live(live.as_ref())
             .with_absence(plan.universe() == line_grep::Universe::Searchable);
-            if let Err(error) = groups::run(
+            let result = groups::run(
                 &mut host,
-                move |stopped| source.next(stopped),
+                |stopped| source.next(stopped),
                 &fork,
                 names,
                 threads,
                 &cancelled,
-            ) {
+            );
+            searched |= source.searched();
+            if let Err(error) = result {
                 return output_failure(&error);
             }
             if plan.quiet && host.matched {
@@ -293,6 +298,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         }
         if matches!(inputs.peek(), Some(Input::Stdin)) {
             inputs.next();
+            searched = true;
             if let Err(error) = host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX) {
                 return output_failure(&error);
             }
@@ -314,6 +320,12 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     }
     if plan.quiet && host.matched {
         Exit::Ok
+    } else if plan.paths.is_empty() && !searched {
+        cli::error(
+            "grep: no files were searched; a glob, depth, hidden or ignore filter probably \
+             excluded every file under the current directory",
+        );
+        Exit::Usage
     } else if host.errors {
         Exit::Usage
     } else if host.matched {
@@ -345,9 +357,16 @@ fn print(bytes: &[u8]) -> Exit {
 }
 
 /// D94: a reader that closes the pipe ends grep quietly with success, as rg
-/// does. Every other output fault is reported.
+/// does. Every other output fault is reported; a spill fault names the
+/// temporary directory (`TMPDIR`) rather than stdout.
 fn output_failure(error: &io::Error) -> Exit {
-    if error.kind() == io::ErrorKind::BrokenPipe {
+    if let Some(spill) = ferret_query::find::spill_path(error) {
+        let directory = spill.parent().unwrap_or(spill);
+        failure(&format!(
+            "writing temporary output in {}: {error}",
+            directory.display()
+        ))
+    } else if error.kind() == io::ErrorKind::BrokenPipe {
         Exit::Ok
     } else {
         failure(&format!("writing stdout: {error}"))
