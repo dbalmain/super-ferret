@@ -219,30 +219,32 @@ impl OutputBuffer {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "output range outside capture")
             })?;
+        // Unspilled bytes are written in place. Only a chunk that starts on
+        // disk is staged, so small in-memory reads (context headers) do not
+        // zero a 64 KiB buffer each.
+        let disk_len = self.len - self.bytes.len() as u64;
         let mut at = start;
-        let mut buffer = [0; MEMORY_LIMIT];
         while at < end {
             if stopped() {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
             let count = (end - at).min(MEMORY_LIMIT as u64) as usize;
-            if let Some(spill) = &self.file {
-                let disk_len = self.len - self.bytes.len() as u64;
-                let disk_count = disk_len.saturating_sub(at).min(count as u64) as usize;
-                if disk_count > 0 {
-                    spill
-                        .file
-                        .read_exact_at(&mut buffer[..disk_count], at)
-                        .map_err(|error| spill_error("read", &spill.path, error))?;
-                }
+            if at < disk_len
+                && let Some(spill) = &self.file
+            {
+                let mut buffer = [0; MEMORY_LIMIT];
+                let disk_count = (disk_len - at).min(count as u64) as usize;
+                spill
+                    .file
+                    .read_exact_at(&mut buffer[..disk_count], at)
+                    .map_err(|error| spill_error("read", &spill.path, error))?;
                 if disk_count < count {
-                    let tail = (at + disk_count as u64 - disk_len) as usize;
-                    buffer[disk_count..count]
-                        .copy_from_slice(&self.bytes[tail..tail + count - disk_count]);
+                    buffer[disk_count..count].copy_from_slice(&self.bytes[..count - disk_count]);
                 }
                 writer.write_all(&buffer[..count])?;
             } else {
-                writer.write_all(&self.bytes[at as usize..at as usize + count])?;
+                let from = (at - disk_len) as usize;
+                writer.write_all(&self.bytes[from..from + count])?;
             }
             at += count as u64;
         }

@@ -813,8 +813,12 @@ fn scan_records(
     // different boundary on a detached line (D79). The shared HIR proof also
     // rules those out. Context and inversion still need every intervening line.
     let fast = !plan.invert && plan.before == 0 && plan.after == 0 && plan.grep.is_line_local();
+    // Context still needs the lines around each selection, but not a search
+    // of each one: the same proof finds the next selected line, and only the
+    // trailing window and the last `-B` lines before it are visited.
+    let skip = !fast && !plan.invert && plan.grep.is_line_local();
     #[cfg(test)]
-    let fast = fast && !plan.force_per_line;
+    let (fast, skip) = (fast && !plan.force_per_line, skip && !plan.force_per_line);
     // Counting every LF costs about 15% of a dense scan; skip it unless
     // something reads the number.
     let count_lines = !fast || plan.line_number || plan.json;
@@ -827,7 +831,8 @@ fn scan_records(
     let mut number = 0;
     let rendering = plan.output == Output::Lines && (!plan.quiet || plan.json);
     let after = if rendering { plan.after } else { 0 };
-    let mut before = context::Before::new(if rendering { plan.before } else { 0 }, stopped);
+    let before_lines = if rendering { plan.before } else { 0 };
+    let mut before = context::Before::new(before_lines, stopped);
     let mut trailing = 0;
     let mut limited = false;
     let mut emit = |line: Line<'_>| {
@@ -897,8 +902,11 @@ fn scan_records(
             }
             let mut offset = base as u64 - if base == 0 { 0 } else { bom };
             let text = &run[..binary.unwrap_or(run.len())];
-            let mut lines = text.split(|&b| b == b'\n').peekable();
             let mut next = Some(0);
+            // The start of the run's next selected line in skip mode, or
+            // `usize::MAX` when the rest of the run selects nothing.
+            let mut hit_line = None;
+            let mut line_start = 0;
             loop {
                 let line = if fast {
                     let Some(start) = next.take() else { break };
@@ -937,24 +945,68 @@ fn scan_records(
                     }
                     &remaining[first..end]
                 } else {
-                    let Some(line) = lines.next() else { break };
-                    line
+                    let Some(start) = next.take() else { break };
+                    if skip && !limited {
+                        let hit = match hit_line {
+                            Some(hit) if hit >= start => hit,
+                            _ => {
+                                let rest = &text[start..];
+                                let hit = search.matching_line(rest).map_or(usize::MAX, |hit| {
+                                    start
+                                        + memchr::memrchr(b'\n', &rest[..hit])
+                                            .map_or(0, |at| at + 1)
+                                });
+                                hit_line = Some(hit);
+                                hit
+                            }
+                        };
+                        // Jump over whole unselected lines that are neither
+                        // trailing context nor among the last `-B` lines
+                        // before the next selected line or the run's end.
+                        let jump = if number < trailing || hit == start {
+                            start
+                        } else if hit == usize::MAX {
+                            // A final empty piece without LF is no line.
+                            let end = if !terminated && binary.is_none() && text.ends_with(b"\n") {
+                                text.len() - 1
+                            } else {
+                                text.len()
+                            };
+                            start
+                                + context::tail_start(
+                                    &text[start..end.max(start)],
+                                    before_lines.max(1),
+                                )
+                        } else {
+                            start + context::tail_start(&text[start..hit - 1], before_lines)
+                        };
+                        if jump > start {
+                            if stopped() {
+                                return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
+                            }
+                            number += memchr::memchr_iter(b'\n', &text[start..jump]).count() as u64;
+                            offset += (jump - start) as u64;
+                            result.bytes_searched = offset;
+                            next = Some(jump);
+                            continue;
+                        }
+                    }
+                    line_start = start;
+                    let rest = &text[start..];
+                    match memchr::memchr(b'\n', rest) {
+                        Some(at) => {
+                            next = Some(start + at + 1);
+                            &rest[..at]
+                        }
+                        None => rest,
+                    }
                 };
                 // No extra line after a terminal LF or at empty EOF. A partial
                 // line before NUL is searched: NUL is a binary sentinel.
-                if !fast
-                    && line.is_empty()
-                    && lines.peek().is_none()
-                    && !terminated
-                    && binary.is_none()
-                {
+                if !fast && line.is_empty() && next.is_none() && !terminated && binary.is_none() {
                     break;
                 }
-                let line_terminated = if fast {
-                    next.is_some()
-                } else {
-                    lines.peek().is_some()
-                } || terminated;
+                let line_terminated = next.is_some() || terminated;
                 let line_offset = offset;
                 offset += line.len() as u64 + u64::from(line_terminated);
                 result.bytes_searched = offset;
@@ -982,7 +1034,13 @@ fn scan_records(
                     }
                     continue;
                 }
-                let selected = fast || (search.find(line).is_some() != plan.invert);
+                let selected = if fast {
+                    true
+                } else if skip {
+                    hit_line == Some(line_start)
+                } else {
+                    search.find(line).is_some() != plan.invert
+                };
                 if selected {
                     if plan.output == Output::WithoutMatch {
                         result.matched = false;
@@ -1187,6 +1245,11 @@ mod tests {
             b"red\nred\nred\n",
             b"\xffred\n\xff\nred\xff\n",
             "Kilo\nred\nſea\n".as_bytes(),
+            // Gaps longer and shorter than the context windows.
+            b"a\nb\nc\nd\nred\ne\nf\ng\nh\ni\nred\nj\nred\nk\nl\nm\nn\n",
+            b"a\nb\nc\nd\ne\nf\n\n\nred\n\n\n\n\ng",
+            b"a\nb\nc\nd\ne\nf\ng\n",
+            b"a\nb\nc\nd\ne\nf\n\0g\nred\n",
         ];
         let patterns = [
             "red",
@@ -1249,7 +1312,17 @@ mod tests {
             // Unchanged fallbacks share the same switch and public entry point.
             &["-v"],
             &["-C1"],
+            &["-B2"],
+            &["-A2"],
+            &["-C3"],
+            &["-A1", "-B3"],
+            &["-B2", "-m1"],
+            &["-C2", "-m2"],
+            &["-C1", "-o"],
+            &["-c", "-C2"],
+            &["-B2", "-r", "<$0>"],
             &["--json", "-A1"],
+            &["--json", "-B2"],
             &["-U"],
         ];
         for pattern in patterns {
@@ -1268,6 +1341,33 @@ mod tests {
                     }
                 }
             }
+        }
+        // Context windows that straddle 64 KiB read runs, around lines that
+        // are long, short and empty.
+        let mut runs = Vec::new();
+        for line in 0..12_000 {
+            match line % 4_001 {
+                0 | 4_000 => runs.extend_from_slice(b"red\n"),
+                7 => runs.extend(std::iter::repeat_n(b'x', 70_000)),
+                _ if line % 3 == 0 => {}
+                _ => runs.extend_from_slice(format!("gap {line}").as_bytes()),
+            }
+            runs.push(b'\n');
+        }
+        for profile in [
+            &["-C3"][..],
+            &["-B5"],
+            &["-A2"],
+            &["-B2", "-m2"],
+            &["-c", "-C1"],
+        ] {
+            let mut args: Vec<_> = profile.iter().map(OsString::from).collect();
+            args.push("red".into());
+            let Command::Search(plan) = parse(&args).unwrap() else {
+                panic!("search")
+            };
+            compare_scanners(&plan, &runs);
+            compare_scanners(&plan, &runs[..runs.len() - 1]);
         }
         for flags in [
             vec!["-F"],
