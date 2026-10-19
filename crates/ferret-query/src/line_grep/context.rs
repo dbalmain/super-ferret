@@ -7,6 +7,18 @@ use std::io::{self, Write};
 use super::{Line, LineKind};
 use crate::find::OutputBuffer;
 
+/// Where the last `lines` LF-separated lines of `text` begin. Zero lines
+/// begin past the LF that follows `text`; fewer lines than asked begin at 0.
+pub(super) fn tail_start(text: &[u8], lines: u64) -> usize {
+    let Some(skip) = lines.checked_sub(1) else {
+        return text.len() + 1;
+    };
+    usize::try_from(skip)
+        .ok()
+        .and_then(|skip| memchr::memrchr_iter(b'\n', text).nth(skip))
+        .map_or(0, |at| at + 1)
+}
+
 pub(super) struct Before<'a> {
     store: OutputBuffer,
     head: u64,

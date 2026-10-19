@@ -454,7 +454,9 @@ the limit emit their individual spans with context separators. Counts and
 name/quiet modes ignore context.
 
 Context is captured inside the same checked read as the matches. A retry
-throws away both. Before-context uses a rolling, header-bearing spill spool,
+throws away both. Without `-v`, a line-local pattern finds the next selected line
+as the plain scan does; only trailing context and the last `-B` lines
+before it are visited, so context costs O(N) lines per match. Before-context uses a rolling, header-bearing spill spool,
 with at most 64 KiB of captured bytes in memory; compaction bounds retained
 spool bytes to twice the live window plus 64 KiB. Rendered groups retain the
 existing 64 KiB spill threshold. Replaying a context line needs one line-sized
