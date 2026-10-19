@@ -5757,3 +5757,83 @@ mid-read; a randomised run saw 428 growth signatures and no mixed bytes.
 
 Recommendation: B. Would change it: logs rotated by copytruncate being common
 in the trees ferret searches.
+
+## D105 — A multi-threaded live walk for grep
+
+**Status: open, 2026-10-20.**
+
+Question: should `ferret grep -uu` (the live walk, no index) walk on several
+threads, as `ferret find` already does?
+
+Measured on a deep tree of ~300k small files: one producer thread does the
+whole walk, using 1.12 s CPU, which is the whole wall time. More workers do not
+help: ferret stays at ~1 s from 2 threads up, about 3.5–4× rg's 0.26 s.
+`ferret find -I` makes the same walk (the same ~490k syscalls) in 0.07–0.09 s
+on ~15 threads.
+
+- **A — keep the serial producer.** No code. deep-uu stays ~0.9 s; src-uu keeps
+  a ~0.2 s floor.
+- **B — several producers, each owning a split of the walk**, reusing find's
+  `LiveWalk::split` and its donation queue, all feeding the existing queue.
+  About 300–400 lines with tests; one thread keeps the serial path, and
+  `--live` stays serial at first. Expected 0.15–0.3 s (estimated from find's
+  walk, not measured). Output order is already completion order, so nothing
+  visible changes.
+- **C — workers walk their own subtrees** (rg's model, no producer). The
+  largest rewrite. Gives directory locality for free, but gives up P2's rule
+  that any idle worker takes any task as soon as it exists.
+
+Recommendation: B. Would change it: `--live` (policy mode) being the main use;
+then split the policy stack in the same slice, about a third more code.
+
+## D106 — Keeping a directory's files on one worker (index mode)
+
+**Status: open, 2026-10-20.**
+
+Question: should a worker take a run of consecutive small files at once, so
+that one directory's files are read by one worker?
+
+Measured on the deep tree with its index, at 32 threads: 0.70 s wall and
+8.7–12.5 s of kernel time, against rg's 0.26 s. Neighbouring files go to
+different workers, and each re-opens the same directories for the checked-path
+rule (D21): 514k directory opens at 32 threads against 84k at 1. This is most
+of why 32 threads runs slower than 8 (see D96's measurement note). Taking runs
+of 16 tasks cuts kernel time to 2–4 s; with D107 B the wall falls to ~0.50 s.
+
+- **A — batched take.** A worker takes up to 16 consecutive tasks whose sizes
+  sum to at most 64 KiB. About 40 lines. Cost: up to 15 small files (64 KiB in
+  all) can wait behind one slow file, as in rg by design; the test
+  `completed_group_publishes_before_a_slow_earlier_file` needs rewriting around
+  that bound.
+- **B — batched take plus stealing.** An idle worker steals the far end of
+  another's run, so no file waits behind a slow one (P2's rule kept). About 150
+  lines and a new concurrent structure to review.
+- **C — share checked directory descriptors across workers.** Scheduling
+  unchanged, but it needs a sharded descriptor map with an LRU against D21's
+  1,024-descriptor budget. A quick global-mutex version cut kernel time but
+  made the wall worse (1.24 s).
+
+Recommendation: B. Would change it: accepting a bounded hold-back of up to 15
+small files behind a slow one; then A, for a quarter of the code.
+
+## D107 — Fewer wakeups from the producer
+
+**Status: open, 2026-10-20.**
+
+Question: may the producer queue several tasks before waking a sleeping worker?
+
+Today it wakes one per task: 374k voluntary context switches on deep-uu, 57–108k
+on deep-idx (rg: under 1k at 8 threads).
+
+- **A — as today.**
+- **B — wake when 16 tasks are queued**, and wake everyone when the walk ends.
+  deep-uu switches 374k → 103k, producer CPU 1.12 → 0.90 s. Alone it does not
+  move deep-idx; with D106 it takes deep-idx from 0.70 to ~0.50 s. Cost: up to
+  15 tasks wait while the producer finds more, longer if a slow filesystem
+  stalls the walk.
+- **C — wake only when no worker is awake or the backlog reaches 2.** At most
+  one task waits. Smaller savings, not measured.
+
+Recommendation: B together with D106, and only in index mode if D105 B lands,
+since there the producer makes no syscalls and cannot stall. Would change it:
+streaming latency on slow filesystems mattering more than CPU; then C.
