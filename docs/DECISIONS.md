@@ -5760,7 +5760,7 @@ in the trees ferret searches.
 
 ## D105 — A multi-threaded live walk for grep
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-20.**
 
 Question: should `ferret grep -uu` (the live walk, no index) walk on several
 threads, as `ferret find` already does?
@@ -5785,6 +5785,18 @@ on ~15 threads.
 
 Recommendation: B. Would change it: `--live` (policy mode) being the main use;
 then split the policy stack in the same slice, about a third more code.
+
+> Dave: Ok, I think we want both of those (i.e. --live too) to be enhanced.
+> Please try to do it orthogonally. i.e. abstract the complicated part of the
+> walk and make it reusable.
+
+**Answer: parallel walks for both `-uu` and `--live`, built orthogonally.** The
+complicated part (find's sibling donation, suspended donors, the active count
+and cancellation in `find/parallel.rs`) becomes a reusable walk scheduler,
+generic over what each worker does with an entry. find evaluates its
+expression; grep runs the checked read and search and hands the group to the
+output thread. `--live` gives each split its own copy of the D13 policy state.
+Neither B nor C as written: the scheduler is shared, not duplicated.
 
 ## D106 — Keeping a directory's files on one worker (index mode)
 
