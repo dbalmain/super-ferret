@@ -676,7 +676,8 @@ pub struct InputResult {
     pub searched: bool,
     /// First detected NUL, relative to bytes after initial BOM removal.
     pub binary_offset: Option<u64>,
-    /// Semantic JSON counts describe published match records, including tails.
+    /// Semantic JSON counts describe published match records and their
+    /// submatches; quiet counts the same (D91 A).
     pub stats: EventStats,
     pub bytes_searched: u64,
     pub elapsed: std::time::Duration,
@@ -763,8 +764,7 @@ pub struct Line<'a> {
     /// Inclusive original source lines when replacement changes displayed
     /// line counts. Group separators use these boundaries, not display numbers.
     pub source_lines: Option<(u64, u64)>,
-    /// Whether the original line had LF; replacement omits advanced EOF
-    /// empties.
+    /// Whether the original line had LF, which JSON restores to `bytes`.
     pub terminated: bool,
     /// One-based line number. The line-local fast path counts lines only
     /// when the plan prints numbers or JSON, so it is unspecified otherwise.

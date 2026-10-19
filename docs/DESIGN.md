@@ -94,9 +94,11 @@ same bracket/retry and bounded worker/group engine.
 Grep M7 (2026-10-17) keeps the graph. Verify resolves multiline/dotall and
 conservative LF exclusion alongside the shared HIR/necessary query. Query's
 multiline scanner buffers one checked attempt with fallible allocation, then
-separates search-region limits, line clipping, counts and output spans. Host
-records retain cross-line highlight spans through bounded duplicate caching;
-rendering does not re-run a cross-line pattern on detached line contents.
+takes one pass of whole matches over it (D98): the `-m` limit, counts, rendering,
+replacement captures and JSON submatches all read those spans, and lines after
+the limit are context that is never searched. Host records retain cross-line
+highlight spans through bounded duplicate caching; rendering does not re-run a
+cross-line pattern on detached line contents.
 
 Grep M8 (2026-10-17) extends GrepFlags' shared profile compilation with
 replacement reference resolution. Verify owns capture spans and byte expansion;

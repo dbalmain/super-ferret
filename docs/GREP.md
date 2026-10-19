@@ -460,26 +460,27 @@ existing 64 KiB spill threshold. Replaying a context line needs one line-sized
 buffer, under the same unbounded-long-line exception as scanning; neither
 context line count nor rendered output accumulates an unbounded memory list.
 
-In line-oriented execution, empty `-o` spans emit their prefix and LF, not
-nothing. Resume after a consuming match at its end; suppress an empty match
-immediately at that previous match's end. After an empty match (emitted or
-suppressed), advance one **byte** before searching again; emit an allowed
-terminal empty once. Line terminators supply no extra searchable line. Thus
-`abc\n` with line-oriented `-o ''` emits four LFs; `a*` emits `a` and empties at
-offsets 2 and 3. On a six-byte UTF-8 line, `''` and `(?u:)` emit seven empties,
-including inside codepoints; Unicode consuming patterns still match whole
-scalars, byte-mode patterns may split them. Empty input has no lines (exit 1),
-while an empty LF-terminated line supplies one empty (exit 0). Use the shared
-byte matcher iterator; no Unicode-boundary postfilter. Multiline iteration,
-counting and rendering are separate: on `abc\n`, `-U -o '(?s:.*?)'` prints
-nothing and exits 0, while `-U -c '(?s:.*?)'` prints 4. Gate multiline rendering
-separately in M7.
+In line-oriented execution, resume after a consuming match at its end;
+suppress an empty match immediately at that previous match's end. After an
+empty match (counted or suppressed), advance one **byte** before searching
+again. Each line has a match position before every byte and one at its end,
+before its LF. An unterminated last line has the same end position, so `abc` and
+`abc\n` both hold four `''` matches; the position after a final LF is on no line
+and never matches (D98). Empty spans select and count their line, but `-o` never
+prints an empty record (D79 D, GNU's rule): on `abc\n`, `-o ''` prints nothing
+and exits 0, `--count-matches ''` prints 4, and `-o 'a*'` prints `a`. On a
+six-byte UTF-8 line, `''` and `(?u:)` count seven empties, including inside
+codepoints; Unicode consuming patterns still match whole scalars, byte-mode
+patterns may split them. Empty input has no lines (exit 1), while an empty
+LF-terminated line supplies one empty (exit 0). Use the shared byte matcher
+iterator; no Unicode-boundary postfilter. Multiline iteration applies the same
+rules to the whole input: on `abc\n`, `-U -o '(?s:.*?)'` prints nothing and exits
+0, while `-U -c '(?s:.*?)'` prints 4.
 
-**M2 observation (2026-10-17, D79 open):** rg 15.2.0’s empty absolute-anchor
-`-o`/`-co` output can carry state across lines: `-o '\A'` over three `red`
-lines emits one empty record and two full lines. M2 provisionally retains the
-per-line spans specified here; D79 asks whether to reproduce that artefact.
-This is not yet an approved compatibility exception.
+**D79 (answered in D98):** line mode searches each line on its own, so
+`-o '\A'` over three `red` lines matches at every line start. Each span is
+empty, so `-o` prints nothing. rg 15.2.0 carries empty absolute-anchor state
+across lines; ferret does not reproduce that.
 
 In line mode `-c` counts selected lines; `--count-matches` and `-c -o` count
 iterator matches, including empties. With `-U`, shared compilation exposes a
@@ -502,15 +503,22 @@ posting absence may still emit a stale name, as D73 permits.
 In line mode `-m` limits selected lines, finishing every span on the last
 selected line. `-m0` loads pattern files and validates globs, but skips regex
 compilation and all search-input/index resolution; it prints nothing, including
-under zero/no-match modes. Names-only ignores the limit. Separate `-m`'s search limit, line-boundary clipping after
-that limit, and subsequent rendering/counting. Pin the clipping interaction:
-`foo foo\nbar\nfoo\n`, `-U -m1 'foo(?:\nbar)?'` gives count 2 and `-o`
-emits two three-byte `foo` records, not the later `bar` portion. `-m0` searches
-nothing. On `foo foo\nfoo\n`, `-U -c 'foo(?:\nbar)?'` with `-m1`, `-m2`
-and `-m3` gives 2/2/3. Trailing context may include more matches; M7 gates
-these interactions, including LF classification for impossible alternatives,
-classes, scoped dotall, fixed strings and repeated patterns; empty-span
-rendering; and limit, clipping, counting and output behavior.
+under zero/no-match modes. Names-only ignores the limit.
+
+With `-U`, `-m N` limits **line groups** (D98, D81 C). A group is the lines a
+match touches together with every later match that *starts* on them, each taken
+whole, so the last group can extend downward. Nothing is clipped: counts,
+rendering, `-o`, `-r` captures and JSON submatches use the same whole matches.
+On `red red\nblue\n`, `-U -n -m1 'red(?:\nblue)?'` prints `1:red red` and
+`2:blue`, and `-c` prints 2. On `foo foo\nfoo\n`, `-U -c 'foo(?:\nbar)?'` with
+`-m1`, `-m2` and `-m3` gives 2/3/3; rg limits matches rather than groups and
+gives 2/2/3.
+
+**Lines after the limit are context** (D98, GNU's rule), in line and multiline
+mode, plain and JSON. Requested after-context prints them as context lines; they
+are never searched, so never re-classified as matches, highlighted or replaced.
+On unterminated `a\nbc`, `-n -m1 -A1 '\z'` prints `1:a` and `2-bc`, although
+`\z` matches at the end of `bc` too.
 
 **M7 probes (2026-10-17):** `--multiline`/`-U` and `--no-multiline`
 resolve in argv order; `--multiline-dotall`/`--no-multiline-dotall` resolve
@@ -521,29 +529,24 @@ no LF-exclusion proof, while word assertions do. Thus `foo|^a$` also counts
 matches rather than lines. Zero repetitions already removed by HIR lowering
 have no LF effect. Fixed strings and repeated patterns use that same profile.
 
-Multiline search, counting and presentation have distinct assertion bounds.
-The **provisional M7 implementation follows pinned rg's suffix-based search**:
-on `abc\nabc\n`, `-U -n '\A'` prints both lines, `-U -c '\A'` prints 1,
-and `-U -o '\A'` prints nothing. Empty iteration omits a terminal empty
-reached by advancing to EOF. A first terminal assertion on an unterminated
-line can select/render that line, even with `-o`; after a final LF it supplies
-no selected line, but requested before-context can still print with exit 1.
-Adjacent highlighted spans merge within each multiline output line. Multiline
-inverted output and its context remain whole lines under `-o`; context
-highlighting searches each complete context line, including its LF.
+Multiline search takes **one pass of whole matches over the original input**
+(D98, D81 C). Assertions see the whole input, and selection, counts and
+rendering all use those spans. On `abc\nabc\n`, `-U -n '\A'` prints line 1
+only, `-U -c '\A'` prints 1, and `-U -o '\A'` prints nothing, because its one
+span is empty. A match at the end of an unterminated last line selects that
+line. After a final LF the end position selects no line, but requested
+before-context can still print with exit 1. Adjacent highlighted spans merge
+within each multiline output line. Multiline inverted output and its context
+remain whole lines under `-o`; context highlighting searches each complete
+context line, including its LF.
 
-**M7 inversion/limit clarification (provisional):** LF-including inversion
-follows rg's positive-search limit: one positive search per matched line group,
-then the remaining suffix is selected as a gap if the limit is exhausted.
-This can print matching lines: on `foo foo\nbar\nfoo\n`, `-U -v -m1
-'foo(?:\nbar)?'` prints `bar` and the final `foo`; unlimited prints only
-`bar`. This qualifies the earlier blanket nonmatching-line wording.
-**The counting contract deliberately remains selected-line counts under `-v`.**
-Pinned rg can instead count regex matches in the remaining gap: on
-`x\na\ny\na\nz\n`, `-U -vc -m1 'a|\n'` prints 6 for four output lines.
-Ferret prints 4 as specified here. The M7 decision briefs record both choices
-and their provisional status; this is a known spec/oracle conflict, not an
-unexplained matcher difference.
+**Inversion (D98, D80 A):** LF-including `-U -v` selects the lines no match
+intersects, where a match covering an LF intersects the lines on both sides, and
+`-m` limits those selected lines. Counts are selected lines, also for
+`--count-matches`. On `x\na\ny\na\nz\n`, `-U -vn -m1 -A1 a` prints `1:x` and
+`2-a`. With `'a|\n'` every line holds an LF match, so `-U -vc` selects nothing
+and exits 1. On `foo foo\nbar\nfoo\n`, `-U -v 'foo(?:\nbar)?'` also selects
+nothing.
 
 `-U` buffers the complete checked input attempt (or the first-NUL prefix)
 before matching, including for quiet/name output. Reads and metadata/span
@@ -557,27 +560,19 @@ input and match count; output spills and host-cache budgets do not cap them.
 Indexed and policy-preserving input retain their existing size cap. No extra
 cap is imposed on explicit, stdin or unrestricted input.
 
-**M7 fix round 1 (2026-10-17):** discovery of a first terminal word assertion
-on an unterminated line is retained in selection, counts and spans; advancing
-an iterator to EOF still supplies no extra match. Context-only file groups
-participate in inter-file separators even when search status is no-match;
-a successful search with empty span output supplies no separator. A zero count
-is published only with `--include-zero`, independently of search success.
-For `a\nb\n`, `-Ucm1 'a\n\b'` still discovers a hit and exits 0, but the
-bounded re-match count is 0: it prints nothing, or `0` with `--include-zero`.
-Pinned rg prints `1` in this case. The separate search/count bounds are retained
-as required; the zero-publication correction does not change those bounds.
+**Separators and headings follow printed records** (D98, fuzz B4). A file's
+heading, an inter-file separator and a `--` are each printed only before a
+record that prints something. Context-only file groups print, so they take part
+in inter-file separators even when search status is no-match. A selected line
+whose `-o` output is empty prints nothing but stays in its context window, so
+`--` marks only lines that no window covered: on `a\n\na\n`,
+`-U -on -A1 'a|\n'` prints `1:a` and `3:a`. A file whose matches print nothing
+gets no heading. A zero count is published only with `--include-zero`,
+independently of search success.
 
-**M7 fix round 2 (2026-10-17):** after `-m`, a first terminal word assertion
-in the trailing window keeps match formatting: on unterminated `a\nbc`,
-`-Uonm1 -A1 '\b{end}'` prints `1:` and `2:bc`. Tail discovery and re-matched
-spans retain distinct assertion bounds. With the LF-including `a|\z`, even
-`a\nbc\n` formats the existing second line as a match; this adds no searchable
-line after LF. Neither case increases the limited count. Ferret's
-`-Ucom1 -A1 '\b{end}'` remains `1`, while pinned rg prints `2`; the accepted
-bounded-count contract above is retained. Binary results discard every
-buffered plain group, including context-only and decorated output; search
-success decides only whether a binary warning is printed.
+Binary results discard every buffered plain group, including context-only and
+decorated output; search success decides only whether a binary warning is
+printed.
 
 Pipe defaults: no colour, no heading, no line numbers, filename prefixes for
 recursive/multiple operands; one explicit file/stdin omits its filename. Tty
@@ -624,12 +619,9 @@ are accepted; the last replacement wins. Replacement arguments must be UTF-8;
 captured bytes may contain invalid UTF-8 and are preserved unchanged. Counts,
 name modes, quiet and names-only retain original search semantics.
 
-The existing D79 per-line absolute-anchor choice also applies to replacement,
-provisionally (M8-D). On three `red` lines, `-nr '<$0:$1>' '()\A'` inserts
-`<:>` on every line; pinned rg inserts it only on the first and prints later
-lines unchanged.
-This preserves the written line-scope contract and is an explicit oracle
-artifact, rather than a new silent exception.
+D79's per-line absolute anchors apply to replacement too. On three `red` lines,
+`-nr '<$0:$1>' '()\A'` inserts `<:>` on every line; pinned rg inserts it only on
+the first and prints later lines unchanged.
 
 `$0` is the complete match; `$1`, `${1}`, `$name` and `${name}` interpolate
 captures. Unbraced references consume the longest ASCII alphanumeric/underscore
@@ -644,45 +636,34 @@ Replacement precedes colour and `-o` projection, retaining original capture
 bounds. `-o` emits each expansion, and colour highlights replacement bytes.
 Line-mode context is also replaced; inversion still selects original lines.
 With replacement, multiline inverted context also uses line-local captures;
-`-o` emits its expansions when present, otherwise keeps the whole context line.
+`-o` emits its non-empty expansions, and a context line with no match stays
+whole.
 Multiline replacement expands selected source groups before projecting display
 lines; context separators retain original source boundaries even when expansion
 adds/removes LF. LF-excluding profiles retain line-oriented replacement output,
-so an embedded replacement LF gets no additional prefix. LF-including `-o`
-suppresses empty expansions; ordinary empty output records still print LF.
+so an embedded replacement LF gets no additional prefix. `-o` never prints an
+empty expansion (D79 D); without `-o` an empty line still prints its LF.
 Expansion is cancellable and fallibly allocated. It keeps one displayed line
 and its highlights; rendered records still use the host's bounded cache/spill
 path. A source or expanded line can be arbitrarily long, under the existing
 line-sized memory exception. It does not accumulate an expanded multiline
 group. These presentation choices are provisional (M8-A/B in
 `.ai/m8-decisions.md`).
-On unterminated `abc`, `-or X ''` emits three X records; with final LF it emits
-four. `-or X '\z'` on unterminated `abc` emits the unchanged `abc` line.
+On `abc`, with or without a final LF, `-or X ''` emits four X records, and
+`-or X '\z'` on unterminated `abc` emits `X`. `-or '$wordX' '(?P<word>red)'`
+prints nothing.
 On `a\nb\nc\nd\n`, `-UnC1 -r X 'b\nc'` prints `1-a`, `2:X`, `4-d`,
 without an inserted group separator. Replacing with `X`-LF-`Y`-LF-`Z` prints
 `2:X`, `3:Y`, `4:Z`, followed by original context `4-d`.
 
-Replacement keeps M7's clipped capture/assertion bounds after `-m`,
-**provisionally (M8-C)**. Pinned rg can instead re-match past the clipped group
-and publish an unmatched suffix: on `red red\nblue\ngap\nred\nblue\n`,
-`-Unm1 -A2 -r '<$0>' 'red(?:\nblue)?'` captures cross-boundary `blue` and
-copies the remaining suffix into the positive group before repeating requested
-context. Ferret emits bounded `1:<red> <red>`, `2-blue`, `3-gap`.
-This is a documented spec/oracle conflict; replacement does not silently widen
-M7's established publication bounds. Cross-line discoveries in replacement's
-trailing context are rechecked within that source line: a mandatory LF match
-cannot publish its following context line twice. An optional LF branch can
-therefore differ from rg's cross-boundary capture there as well (M8-C).
+Replacement uses the same whole matches (D98; D85 is moot). On
+`red red\nblue\ngap\nred\nblue\n`, `-Unm1 -A2 -r '<$0>' 'red(?:\nblue)?'`
+prints `1:<red> <red`, `2:blue>`, `3-gap` and `4-red`. Context lines after the
+limit are never replaced.
 
-**M8 fix round 1 (2026-10-17):** selected multiline inverted lines have no
-replacement captures. Context capture searches retain their original LF rather
-than manufacturing EOF on a detached line. On `a\nb\nc\n`, `-Uv -r X '\z'`
-prints the three unchanged lines. Replacement shares the ordinary renderer's
-explicit terminal-tail fallback: on `a\nbc\n`, `-Uonm1 -A1 -r X 'a|\z'`
-prints `1:X` and `2:bc`. Tail discovery can license that unchanged existing
-line even when bounded span collection has no terminal span; it does not add
-a searchable line or increase the count. Both examples agree with pinned rg
-15.2.0; neither is a D85/D86 compatibility exception.
+Selected multiline inverted lines have no replacement captures: on
+`a\nb\nc\n`, `-Uv -r X '\z'` prints the three unchanged lines. Inverted
+context lines are searched on their own, including their LF, for captures.
 
 `--json` emits rg begin/match/context/end/summary JSON Lines: byte spans,
 absolute offsets, line numbers, text-or-base64 fields and semantic counts.
@@ -713,39 +694,33 @@ read attempt; retry, disappearance and faults discard them together. Summary
 is emitted once even with no file events; `-m0` emits nothing. Quiet emits only
 summary and finishes the matching file's semantic stats before stopping work.
 
-`matched_lines` counts source lines in **match events**, including matching
-trailing context after `-m`; `matches` counts their submatches. Context events
-can carry submatches but contribute neither count. `searches_with_match` counts
+`matched_lines` counts source lines in **match events**; lines after `-m` are
+context events. `matches` counts match-event submatches. Context events can
+carry submatches but contribute neither count. `searches_with_match` counts
 successful selected files independently of span count or context publication.
-Summary sums these semantic fields from successful files. Quiet has no event
-submatch printer: its separate counting iterator retains a first terminal
-assertion but omits advanced EOF empties, and LF-including inverted regions
-contribute at least one logical match per selected source line. Thus `-q '\z'` on unterminated `abc`
-reports matches 1, while ordinary JSON publishes that source with no submatches.
-These are separate from plain `-c` / `--count-matches` and D82's bounded count: on `a\nb\n` with
-`-Um1 'a\n\b'`, a selected a-LF event has no bounded submatches, matched_lines
-1, matches 0, searches_with_match 1. Pinned rg instead reports one truncated
-submatch. Timings and physical `searches`, `bytes_searched`, `bytes_printed`
-may differ; the JSON audit must retain the three semantic fields above.
+Summary sums these semantic fields from successful files. Every match event
+carries its submatches; an inverted selected line has none. Quiet reports the
+stats its events would have had (D98, D91 A): `-q '\z'` on unterminated `abc`
+reports matches 1, and ordinary JSON publishes that line with the empty
+submatch [3,3). On `a\nb\n` with `-Um1 'a\n\b'`, the a-LF event has submatch
+[0,2): matched_lines 1, matches 1, searches_with_match 1. Timings and physical
+`searches`, `bytes_searched`, `bytes_printed` may differ; the JSON audit must
+retain the three semantic fields above.
 
 **Contract/oracle differences:** rg 15.2.0 lets names/count modes override JSON;
 ferret deliberately refuses their combination as required above. The earlier
 claim that rg JSON ignores replacement is wrong: rg retains source bytes but
 adds a `replacement` byte field to each submatch. Ferret provisionally retains
 the explicit ignore rule (M9-B); adopting that optional metadata is the proposed
-future shape. JSON also inherits the D79 per-line assertion choice (M9-C): on
-`abc\nabc\n` with `'\A'`, ferret reports an empty submatch on each line,
-where rg reports it only on the first. With `-m1 -A1 '\z'` on `a\nbc`,
-ferret labels the tail as a match without submatches; rg labels it context.
+future shape. JSON also follows D79's per-line assertions: on `abc\nabc\n`
+with `'\A'`, ferret reports an empty submatch on each line, where rg reports it
+only on the first. With `-m1 -A1 '\z'` on `a\nbc`, `bc` is a context event.
 
-M9-A provisionally preserves bounded multiline submatches: rg can panic on
-`red red\nblue\n` with `-Um1 'red(?:\nblue)?'`; ferret publishes the selected
-first line and two bounded red spans. M9-D preserves existing limit/window
-selection: on `x\na\ny\na\nz\n` with `-Uvm1 -A1 a`, ferret emits match x
-and context a, while rg emits matches x/a/y (the discrepancy also exists in
-plain line mode). With `-Um1 -A1 'a|\z'`, ferret emits match a and context y,
-while rg labels y as a match. These owned discrepancies are provisional choices,
-not accepted differences in private audit rows.
+Limited multiline events carry whole matches (D98). On `red red\nblue\n` with
+`-Um1 'red(?:\nblue)?'`, one event holds both lines with submatches [0,3) and
+[4,12); rg's stream reader panics there. On `x\na\ny\na\nz\n` with
+`-Uvm1 -A1 a`, ferret emits match x and context a, as rg's file reader does.
+With `-Um1 -A1 'a|\z'` it emits match a and context y.
 
 JSON retains the first-NUL prefix policy below: prior events survive, and
 `end.binary_offset` identifies the sentinel. For `red\0red\n`, the selected
@@ -754,26 +729,20 @@ rg substitutes LF for NUL and can search its received suffix. Ferret neither
 invents that LF nor searches beyond its first-NUL stop. `-a` disables detection
 and publishes original NUL bytes as escaped text.
 
-**M9 fix round 1 (2026-10-18):** a cross-line occurrence split by trailing
-JSON event boundaries must be rechecked within each original source line,
-including its LF, as replacement already does. Only complete local regex
-matches become submatches; intersecting a global span with a line can fabricate
-bytes that do not match. A tail line with no local match becomes JSON context.
-Plain trailing discovery/formatting is unchanged. This corrects D87 / M9-A's
-former blanket tail clamping; initial clipped assertion bounds are unchanged.
-
-On `a\nb\na\nb\n` with `--json -Um1 -A2 'a\nb'`, JSON emits one match event
-containing `a\nb\n` at line 1 / offset 0, followed by context `a\n` at line 3 /
-offset 4 and context `b\n` at line 4 / offset 6. Stats are matches 1 and
-matched_lines 2, agreeing with pinned rg 15.2.0. With `'a(?:\nb)?'`, the tail
-has a complete local `a` submatch [0,1) and then context `b\n`: matches 2 and
-matched_lines 3. Pinned rg instead panics after the initial cross-line event.
+Lines after the limit are context events and are never searched (D98). On
+`a\nb\na\nb\n` with `--json -Um1 -A2 'a\nb'` or `'a(?:\nb)?'`, JSON emits one
+match event containing `a\nb\n` at line 1 / offset 0, then context `a\n` at
+line 3 / offset 4 and `b\n` at line 4 / offset 6: matches 1 and matched_lines
+2. Inverted context lines are searched on their own, including their LF, for
+their submatches.
 
 A NUL-only input under line-mode `--json -v red` still selects the pending
 sentinel line: an empty source-prefix event at line 1 / offset 0, no submatches,
 matched_lines 1, matches 0, binary_offset 0 and exit 0. An LF before NUL leaves
 the NUL on another real source line; its empty prefix is not a phantom EOF
-record. Pinned rg 15.2.0 selects the same lines, but emits literal NUL for regular
+record. Under `--json ''` the empty prefix carries the empty submatch [0,0),
+so matches is 1 (fuzz D2). Pinned rg 15.2.0 selects the same lines, but emits
+literal NUL for regular
 files and a substituted LF for stdin. Ferret's empty text follows the existing
 first-NUL raw-prefix policy, without either sentinel representation; this is a
 binary-policy compatibility difference, not D74 visibility. Multiline buffers
@@ -975,7 +944,7 @@ including the contract correction, run CLAUDE’s full gates per the M1 brief.
 | M4 | Line qualifiers, smart case, pattern files and counts. `ferret`, `ferret-query`, `ferret-verify` | 2,437 / 2,437 | at least 130 cases; half boundaries, case/count/quiet; posting-positive/negative zero and no-match records |
 | M5 | Context, heading/filename, NUL names and tty/colour. `ferret`, `ferret-query` | 2,565 / 2,565 | at least 160 cases; byte-exact context groups, tty matrix and bounded output |
 | M6 | Policy-preserving `--live`, unrestricted mode, `-a`, depth. `ferret`, `ferret-query`, `ferret-policy` | 2,600 / 2,596 | at least 180 cases; freshness separate from visibility; unchanged tree and policy: indexed and `--live` agree; new-name/match, binary and operand matrix |
-| M7 | Multiline matching/count/limit/output semantics. `ferret`, `ferret-query`, `ferret-verify` | 2,660 / 2,656 | at least 210 cases; conservative LF classification (impossible alternatives, classes, scoped dotall, fixed strings, repeated patterns); limits/clipping/counting/rendering, inversion, spans, empty iteration, soundness/cancellation/allocation |
+| M7 | Multiline matching/count/limit/output semantics. `ferret`, `ferret-query`, `ferret-verify` | 2,660 / 2,656 | at least 210 cases; conservative LF classification (impossible alternatives, classes, scoped dotall, fixed strings, repeated patterns); limits/counting/rendering, inversion, spans, empty iteration, soundness/cancellation/allocation |
 | M8 | Replacement/capture rendering. `ferret`, `ferret-query`, `ferret-verify` | 2,792 / 2,788 | at least 230 cases; named/numbered/empty captures and unchanged input files |
 | M9 | rg JSON events. `ferret`, `ferret-query` | 2,794 / 2,790 | at least 250 cases; invalid-byte fields, flag interactions and stable semantic counts |
 
