@@ -5449,3 +5449,33 @@ users have.
 > Dave: Ok, then I'm happy with option 1.
 
 **Answer: A.** One writer thread; reduce its per-group cost.
+
+## D96 — Grep's producer thread: on top of T, or counted in it
+
+**Status: answered, 2026-10-19.**
+
+Question: P2 (`wt/grep-p2`) moves grep's file producer onto its own thread,
+which feeds a bounded queue of at most 4 tasks per worker, so no worker calls
+the producer or holds a task while it blocks. Should that thread count against
+the T search threads (`-j`, `FERRET_SEARCH_THREADS`, the index `settings`
+count)?
+
+- **1 — T workers plus the producer.** Workers keep all their capacity. At
+  T = 32 on a 32-thread machine one core is oversubscribed only while all 33
+  threads are runnable; the serial producer's work was about 0.08 s of a 4 GB
+  search after P1.
+- **2 — T − 1 workers plus the producer.** The thread count is exactly as
+  configured, at the cost of a worker, which matters most at small T: `-j2`
+  searches with one worker.
+
+Recommendation: 1. The fact that would change it: P2's measurements showing
+slower 1-thread runs or more context switches.
+
+> Dave: Agree, but we should consider a thread count where we do T-1 if the
+> core that the producer thread is running on is close to saturated by the
+> producer thread.
+
+**Answer: 1, with a refinement to measure.** Where the producer itself nearly
+saturates a core (a live walk over many small files is the likely case), use
+T − 1 workers. P2's measurements record the producer thread's CPU share per
+corpus shape to find where that happens.
