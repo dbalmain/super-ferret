@@ -71,6 +71,7 @@ pub(super) fn region(
     let after_lf =
         region.range.end > region.range.start && region.source[region.range.end - 1] == b'\n';
     let mut at = region.range.start;
+    let mut expanded = false;
     for span in spans {
         cancelled(stopped)?;
         if span.start < region.range.start
@@ -88,6 +89,7 @@ pub(super) fn region(
             output.line.number += line_feeds(&region.source[at..span.start], stopped)?;
         }
         output.merge = whole;
+        expanded = true;
         replacement.expand(&captures, |piece| output.push(piece, true, stopped, emit))?;
         if only {
             // D79 D: `-o` prints a non-empty expansion, never an empty record.
@@ -97,11 +99,11 @@ pub(super) fn region(
     }
     if only {
         // Multiline inverted `-o` output is whole lines, so a context line
-        // without an expansion stays whole. Otherwise an empty fragment prints
+        // without a match stays whole. Otherwise an empty fragment prints
         // nothing; it keeps the line in the window.
         return if output.printed {
             Ok(())
-        } else if plan.multiline && plan.invert {
+        } else if plan.multiline && plan.invert && !expanded {
             emit(line)
         } else {
             emit(Line {

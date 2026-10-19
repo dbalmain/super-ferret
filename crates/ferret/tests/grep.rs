@@ -133,8 +133,8 @@ impl Fixture {
         });
         actual
     }
-    /// Compare with pinned rg: its stream reader, then its file reader. A row of
-    /// `RG_DIFFERS` instead pins ferret's owned output and requires both
+    /// Compare with pinned rg: its stream reader, then its file reader. A row
+    /// of `RG_DIFFERS` instead pins ferret's owned output and requires both
     /// readers still to differ from it.
     fn differential(
         &self,
@@ -150,7 +150,11 @@ impl Fixture {
             .iter()
             .find(|row| row.json == json && row.args == lookup && row.stdin == input)
         {
-            assert_eq!(actual.status.code(), Some(row.status), "{args:?}: {actual:?}");
+            assert_eq!(
+                actual.status.code(),
+                Some(row.status),
+                "{args:?}: {actual:?}"
+            );
             owned(row);
             let mut oracles = vec![self.oracle(args, input)];
             oracles.extend(input.map(|input| self.oracle_file(args, input)));
@@ -168,15 +172,6 @@ impl Fixture {
             && !(oracle.status.code() == actual.status.code() && same(&oracle))
         {
             oracle = self.oracle_file(args, input);
-        }
-        if let Some(harvest) = std::env::var_os("FERRET_HARVEST")
-            && !(actual.status.code() == oracle.status.code() && same(&oracle))
-        {
-            use std::io::Write;
-            let mut file = fs::OpenOptions::new().append(true).create(true).open(harvest).unwrap();
-            let stdin: Option<Vec<u32>> = input.map(|i| i.iter().map(|&b| u32::from(b)).collect());
-            file.write_all(format!("{json}\t{lookup:?}\t{stdin:?}\n").as_bytes()).unwrap();
-            return;
         }
         assert_eq!(
             actual.status.code(),
@@ -255,56 +250,7 @@ const fn json(
     }
 }
 
-// Why ferret differs, by D98 cluster (docs/DECISIONS.md) or rg-issues row.
-const D79: &str = "D79 D: -o never prints an empty record (GNU); rg prints one per empty match";
-const D80: &str = "D80 A: -U -v -m selects lines no match touches (rg-issues rows 9 and 10)";
-const D81: &str = "D81 C: one pass over the whole input; -m counts line groups, nothing clipped (rg-issues row 11)";
-const D83: &str = "D83 A: -r expands every ordinary span; rg falls back to the unchanged line";
-const D91: &str = "D91 A: quiet JSON reports the same stats as its events (rg-issues row 14)";
-const TAIL: &str = "D89/D90: lines after -m are context and never searched (GNU; rg-issues rows 12 and 13)";
-const EOF: &str = "D98: the end of an unterminated last line is a match position, as before an LF";
-
-const RG_DIFFERS: &[Differs] = &[
-    plain(&["-o", "-e", "", "-e", "red", "one.rs"], None, 0, b"", D79),
-    plain(&["-o", "", "-"], Some(b"abc\n"), 0, b"", D79),
-    plain(&["-o", "", "-"], Some(b"\xc3\xa9\xe7\x95\x8cx\n"), 0, b"", D79),
-    plain(&["-o", "(?u:)", "-"], Some(b"\xc3\xa9\xe7\x95\x8cx\n"), 0, b"", D79),
-    plain(&["-o", "(?-u:)", "-"], Some(b"\xffx\n"), 0, b"", D79),
-    plain(&["-o", "a*", "-"], Some(b"abc\n"), 0, b"a\n", D79),
-    plain(&["-o", "\\b", "-"], Some(b"cedar stone\n"), 0, b"", D79),
-    plain(&["-o", "^|$", "one.rs"], None, 0, b"", D79),
-    plain(&["-wo", "", "-"], Some(b"a ! b\n"), 0, b"", D79),
-    plain(&["-xo", "", "-"], Some(b"\nred\n"), 0, b"", D79),
-    plain(&["--color=always", "-no", "", "one.rs"], None, 0, b"", D79),
-    plain(&["-m1", "-onA2", "red", "one.rs"], None, 0, b"1:red\n2-BLUE\n3-red red\n", TAIL),
-    plain(&["-m1", "-nA2", "red", "one.rs"], None, 0, b"1:red lantern\n2-BLUE\n3-red red\n", TAIL),
-    plain(&["-Ucm2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nfoo\n"), 0, b"3\n", D81),
-    plain(&["-Uom1", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"foo\nfoo\nbar\n", D81),
-    plain(&["-Unm1", "-A2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"1:foo foo\n2:bar\n3-foo\n", D81),
-    plain(&["-Uonm1", "-A2", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 0, b"1:foo\n1:foo\n2:bar\n3-foo\n", D81),
-    plain(&["-Uon", "", "-"], Some(b"abc\n"), 0, b"", D79),
-    plain(&["-Uo", "", "-"], Some(b"abc"), 0, b"", D79),
-    plain(&["-Uvnm1", "foo(?:\\nbar)?", "-"], Some(b"foo foo\nbar\nfoo\n"), 1, b"", D80),
-    plain(&["-Un", "\\A", "-"], Some(b"abc\nabc\n"), 0, b"1:abc\n", D81),
-    plain(&["-Unm1", "-A2", "\\A", "-"], Some(b"abc\nabc\nabc\n"), 0, b"1:abc\n2-abc\n3-abc\n", D81),
-    plain(&["-Uonm1", "-A2", "\\A", "-"], Some(b"abc\nabc\nabc\n"), 0, b"2-abc\n3-abc\n", D81),
-    plain(&["-Uon", "\\z", "-"], Some(b"abc"), 0, b"", D79),
-    plain(&["-Unm1", "-A1", "(?s:.*?)", "-"], Some(b"abc\nabc\n"), 0, b"1:abc\n2-abc\n", TAIL),
-    plain(&["-or", "<$0>", "", "last"], None, 0, b"<>\n<>\n<>\n<>\n<>\n<>\n<>\n<>\n<>\n<>\n", EOF),
-    plain(&["-or", "", "red", "one.rs"], None, 0, b"", D79),
-    plain(&["-or", "$999999999999999999999999", "red", "one.rs"], None, 0, b"", D79),
-    plain(&["-nm1", "-A2", "-r<$0>", "red", "one.rs"], None, 0, b"1:<red> lantern\n2-BLUE\n3-red red\n", TAIL),
-    plain(&["--color=always", "-or<$0>", "", "last"], None, 0, b"\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n\x1b[0m\x1b[1m\x1b[31m<>\x1b[0m\n", EOF),
-    plain(&["-UnrX", "\\A", "one.rs"], None, 0, b"1:Xred lantern\n", D81),
-    plain(&["-UnorX", "\\z", "last"], None, 0, b"1:X\n", D83),
-    plain(&["-Unm1", "-A2", "-rX", "red(?:\nBLUE)?", "one.rs"], None, 0, b"1:X lantern\n2-BLUE\n3-red red\n", D81),
-    json(&["\\z", "last"], None, 0, r#"[["begin", "last"], ["match", "red final", 1, 0, [[9, 9, ""]]], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, EOF),
-    json(&["-m1", "-A2", "red", "one.rs"], None, 0, r#"[["begin", "one.rs"], ["match", "red lantern\n", 1, 0, [[0, 3, "red"]]], ["context", "BLUE\n", 2, 12, []], ["context", "red red\n", 3, 17, []], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, TAIL),
-    json(&["-q", "-v", "red", "one.rs"], None, 0, r#"[["summary", [1, 0, 1]]]"#, D91),
-    json(&["-U", "\\A", "one.rs"], None, 0, r#"[["begin", "one.rs"], ["match", "red lantern\n", 1, 0, [[0, 0, ""]]], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, D81),
-    json(&["-U", "\\z", "last"], None, 0, r#"[["begin", "last"], ["match", "red final", 1, 0, [[9, 9, ""]]], ["end", null, [1, 1, 1]], ["summary", [1, 1, 1]]]"#, EOF),
-    json(&["-Uvm1", "red|\n", "one.rs"], None, 1, r#"[["summary", [0, 0, 0]]]"#, D80),
-];
+include!("support/rg_differs.rs");
 
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -356,7 +302,6 @@ fn groups(bytes: &[u8], root: &Path) -> Vec<Vec<u8>> {
     groups.sort_by(|a, b| a.0.cmp(&b.0));
     groups.into_iter().map(|(_, v)| v).collect()
 }
-
 
 macro_rules! differential {
     ($($name:ident: [$($arg:expr),*] $(, stdin = $input:expr)?;)+) => { $(
@@ -3450,14 +3395,38 @@ fn m7_r2_lines_after_the_limit_are_context() {
     // nothing but still anchors the context window.
     let fixture = Fixture::new("m7-r2-terminal-tail");
     for (pattern, bytes, after, only, lines) in [
-        (r"\b{end}", b"a\nbc".as_slice(), "-A1", b"2-bc\n".as_slice(), b"1:a\n2-bc\n".as_slice()),
+        (
+            r"\b{end}",
+            b"a\nbc".as_slice(),
+            "-A1",
+            b"2-bc\n".as_slice(),
+            b"1:a\n2-bc\n".as_slice(),
+        ),
         (r"a|\z", b"a\nbc", "-A1", b"1:a\n2-bc\n", b"1:a\n2-bc\n"),
         (r"\b", b"a\nbc", "-A1", b"2-bc\n", b"1:a\n2-bc\n"),
-        (r"\b{end}", b"a\nbc def", "-A1", b"2-bc def\n", b"1:a\n2-bc def\n"),
+        (
+            r"\b{end}",
+            b"a\nbc def",
+            "-A1",
+            b"2-bc def\n",
+            b"1:a\n2-bc def\n",
+        ),
         (r"\b{end}", b"a\nbc\n", "-A1", b"2-bc\n", b"1:a\n2-bc\n"),
         (r"\b{end}", b"a\nx\nbc", "-A1", b"2-x\n", b"1:a\n2-x\n"),
-        (r"a|\z", b"a\na\nbc", "-A2", b"1:a\n2-a\n3-bc\n", b"1:a\n2-a\n3-bc\n"),
-        (r"\b{end}", b"a\nx\nbc", "-A2", b"2-x\n3-bc\n", b"1:a\n2-x\n3-bc\n"),
+        (
+            r"a|\z",
+            b"a\na\nbc",
+            "-A2",
+            b"1:a\n2-a\n3-bc\n",
+            b"1:a\n2-a\n3-bc\n",
+        ),
+        (
+            r"\b{end}",
+            b"a\nx\nbc",
+            "-A2",
+            b"2-x\n3-bc\n",
+            b"1:a\n2-x\n3-bc\n",
+        ),
         (r"a|\z", b"a\nbc\n", "-A1", b"1:a\n2-bc\n", b"1:a\n2-bc\n"),
         (r"a|\z", b"a\nbc\n", "-A2", b"1:a\n2-bc\n", b"1:a\n2-bc\n"),
     ] {
@@ -3466,7 +3435,10 @@ fn m7_r2_lines_after_the_limit_are_context() {
         assert_eq!(output.stdout, only, "-o {pattern} {bytes:?}");
         let output = fixture.compare_raw(&["-Unm1", after, pattern, "-"], Some(bytes));
         assert_eq!(output.stdout, lines, "{pattern} {bytes:?}");
-        fixture.compare_raw(&["-Uonm1", "--color=always", after, pattern, "-"], Some(bytes));
+        fixture.compare_raw(
+            &["-Uonm1", "--color=always", after, pattern, "-"],
+            Some(bytes),
+        );
     }
     // The limit stops the count at line 1's group, which holds one span.
     let output = fixture.compare_raw(&["-Ucom1", "-A1", r"\b{end}", "-"], Some(b"a\nbc"));
@@ -3916,7 +3888,11 @@ fn m8_r1_replacement_crosses_m7_terminal_publication_matrix() {
         (vec!["-Ucm1", "--include-zero"], b"a\nb\n"),
         (vec!["-Ucom1", "-A1"], b"a\nbc"),
     ] {
-        let pattern = if bytes == b"a\nbc" { r"\b{end}" } else { r"a\n\b" };
+        let pattern = if bytes == b"a\nbc" {
+            r"\b{end}"
+        } else {
+            r"a\n\b"
+        };
         let mut args = flags;
         args.extend(["-rX", pattern, "-"]);
         let output = fixture.compare_raw(&args, Some(bytes));
@@ -4420,7 +4396,12 @@ fn assert_json_stream(output: &Output, expected: &str, quiet: bool) {
     let python = std::env::var_os("FERRET_PYTHON").unwrap_or_else(|| panic!("nix supplies Python"));
     let mut command = Command::new(python);
     command
-        .args(["-c", include_str!("support/grep_json.py"), "--expect", expected])
+        .args([
+            "-c",
+            include_str!("support/grep_json.py"),
+            "--expect",
+            expected,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if quiet {
@@ -4569,7 +4550,12 @@ fn m9_r1_quiet_decision_has_independent_summary_expectations() {
             0,
             r#"[["summary",[2,1,1]]]"#,
         ),
-        (vec!["-q", r"\z", "-"], &b"abc"[..], 0, r#"[["summary",[1,1,1]]]"#),
+        (
+            vec!["-q", r"\z", "-"],
+            &b"abc"[..],
+            0,
+            r#"[["summary",[1,1,1]]]"#,
+        ),
         // D80 A: every line holds an LF match, so none is selected.
         (
             vec!["-q", "-Uvm1", r"a|\n", "-"],
@@ -4637,7 +4623,9 @@ fn d98_line_after_the_limit_is_context_though_it_matches() {
     // Fuzz D1: two empty lines take the limit; the third line is context and
     // is not replaced.
     let output = fixture.compare_raw(
-        &["-n", "-m2", "-C3", "-r", "<$0>", "-e", r"(\z)", "-e", "", "-"],
+        &[
+            "-n", "-m2", "-C3", "-r", "<$0>", "-e", r"(\z)", "-e", "", "-",
+        ],
         Some(b"\n\n "),
     );
     assert_eq!(output.stdout, b"1:<>\n2:<>\n3- \n");

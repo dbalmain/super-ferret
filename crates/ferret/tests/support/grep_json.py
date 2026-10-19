@@ -104,6 +104,12 @@ def normalize(raw, quiet=False):
                       sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode()
 
 
+def shown(value):
+    """A field's text, or `B64:` and its base64 when it is not UTF-8."""
+    byte_field(value)
+    return value['text'] if 'text' in value else 'B64:' + value['bytes']
+
+
 def projection(raw):
     """Readable event signatures for independent, literal stream expectations."""
     result = []
@@ -111,15 +117,15 @@ def projection(raw):
         event = json.loads(line)
         kind, data = event['type'], event['data']
         if kind == 'begin':
-            result.append([kind, byte_field(data['path']).decode('utf-8')])
+            result.append([kind, shown(data['path'])])
         elif kind in ('match', 'context'):
             spans = []
             for span in data['submatches']:
-                item = [span['start'], span['end'], byte_field(span['match']).decode('utf-8')]
+                item = [span['start'], span['end'], shown(span['match'])]
                 if 'replacement' in span:
-                    item.append(byte_field(span['replacement']).decode('utf-8'))
+                    item.append(shown(span['replacement']))
                 spans.append(item)
-            result.append([kind, byte_field(data['lines']).decode('utf-8'),
+            result.append([kind, shown(data['lines']),
                            data['line_number'], data['absolute_offset'], spans])
         elif kind in ('end', 'summary'):
             counts = [data['stats'][key] for key in ('matched_lines', 'matches', 'searches_with_match')]
