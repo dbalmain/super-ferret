@@ -865,9 +865,12 @@ route described above.
 ### M2 seam as built (2026-10-17)
 
 The same query verifier Pool, ring, byte reservation, spawn path and stop guards
-carry either document rows or completed file groups. A worker claims from the
-host's streaming CatalogSource producer, selects candidates with grep policy,
-reads/validates, matches and renders one file. One-file batches bound queued
+carry either document rows or completed file groups. The host's streaming
+CatalogSource producer selects candidates with grep policy; a worker claims
+one file from it, reads/validates, matches and renders it. **P2 (2026-10-19):**
+completion-order grep runs that producer on its own thread, filling a queue of
+at most four paths per worker that idle workers sleep on, so workers no longer
+convoy on a producer lock and none holds a path while the producer blocks. One-file batches bound queued
 groups; no array of every path or second concurrent pool is introduced. The
 calling thread publishes whole groups. Stdin is a direct operand barrier;
 workers never wait for its producer. Explicit operands resolve before searching,
