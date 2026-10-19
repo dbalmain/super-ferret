@@ -5480,6 +5480,14 @@ saturates a core (a live walk over many small files is the likely case), use
 T − 1 workers. P2's measurements record the producer thread's CPU share per
 corpus shape to find where that happens.
 
+**Measured 2026-10-20** (P2 + P5 and the D98 stack, kernel 6.18.56, turbo off):
+the producer thread peaks at about 66% of one core, on a deep tree of small
+files at 8 threads, and uses 14–46% on the flat 4 GB corpus. It never nears
+saturation, so T − 1 is not needed for any shape measured. A live (`-u`) walk
+was not measured. Separately, 32 workers run 13–26% slower than 8 on every
+case; that extra CPU is in the workers, not the producer. The query matrix
+will establish where the thread-count knee is.
+
 ## D97 — When GNU grep and rg disagree
 
 **Status: answered, 2026-10-19 (a principle, not a brief).**
