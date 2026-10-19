@@ -1618,113 +1618,9 @@ impl<T: Placed> Drop for LostOnPanic<'_, T> {
     }
 }
 
-/// Runs file work on the existing bounded verification scheduler, with one
-/// file per batch. Workers claim from a streaming producer so the host need
-/// not accumulate a path queue. Only the calling thread emits finished groups.
-/// Each task carries the same input-byte reservation as document verification;
-/// callers discard oversized input buffers before returning bounded/spilled
-/// groups. A stop wakes the ring and budget and reaches active reads. The
-/// producer receives the same stop predicate and must poll it during filtering
-/// or traversal before returning its next task.
-pub fn file_groups<Task, State, Group: Send>(
-    threads: usize,
-    cancelled: &AtomicBool,
-    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
-    make: impl Fn() -> State + Sync,
-    work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
-    mut emit: impl FnMut(Group) -> ControlFlow<()>,
-) -> io::Result<()> {
-    if threads <= 1 {
-        groups_alone(next, cancelled, &make, &work, &mut emit);
-        return Ok(());
-    }
-    let external = || cancelled.load(Ordering::Acquire);
-    let pool = Pool::<GroupItem<Group>>::schedule(0, threads);
-    let source = Mutex::new((next, false));
-    std::thread::scope(|scope| {
-        let _stop = StopOnDrop(&pool);
-        let started = (0..threads)
-            .take_while(|&i| {
-                spawn(scope, i, || {
-                    let _lost = LostOnPanic(&pool);
-                    let mut state = make();
-                    let stopped = || pool.halted() || external();
-                    loop {
-                        if pool.halted() {
-                            return;
-                        }
-                        // Assign the position with the task, so EOF cannot
-                        // precede a task already
-                        // claimed by a descheduled worker.
-                        let mut source = lock(&source);
-                        if source.1 {
-                            return;
-                        }
-                        let at = pool.next.fetch_add(1, Ordering::Relaxed);
-                        if !pool.room_for(at) {
-                            return;
-                        }
-                        let task = if external() { None } else { source.0(&stopped) };
-                        let Some((size, task)) = task else {
-                            source.1 = true;
-                            drop(source);
-                            pool.post(at, at, GroupItem::End, &[], true);
-                            return;
-                        };
-                        drop(source);
-                        // Cancellation has a slot too, waking a caller already
-                        // asleep here when another worker finds a quiet match.
-                        let item =
-                            match pool.reserve(size.max(crate::scan::BUFFER as u64), &stopped) {
-                                Some(size) => {
-                                    let item = work(&mut state, task, &stopped);
-                                    pool.release(size);
-                                    Some(item)
-                                }
-                                None => None,
-                            };
-                        pool.post(at, at, GroupItem::Ready(item), &[], true);
-                    }
-                })
-                .is_ok()
-            })
-            .count();
-        if started == 0 {
-            groups_alone(&mut lock(&source).0, cancelled, &make, &work, &mut emit);
-            return Ok(());
-        }
-        let mut batch = Batch::default();
-        let mut at = 0;
-        loop {
-            if external() {
-                return Ok(());
-            }
-            if pool.take(at, &mut batch).is_none() {
-                return Err(io::Error::other("a file-group worker was lost"));
-            }
-            for item in batch.items.drain(..) {
-                if external() {
-                    return Ok(());
-                }
-                match item {
-                    GroupItem::End => return Ok(()),
-                    GroupItem::Ready(Some(item)) => {
-                        if emit(item).is_break() {
-                            return Ok(());
-                        }
-                    }
-                    GroupItem::Ready(None) => {}
-                }
-            }
-            batch.clear();
-            at += 1;
-        }
-    })
-}
-
 // A panicking file worker may still own a byte reservation. Stop and wake
 // its peers before the scope joins, rather than waiting on those leaked bytes.
-struct StopOnPanic<'p>(&'p Pool<GroupItem<()>>);
+struct StopOnPanic<'p>(&'p Pool<()>);
 
 impl Drop for StopOnPanic<'_> {
     fn drop(&mut self) {
@@ -1940,8 +1836,13 @@ impl<G> Held<G> {
 /// caller takes every held batch; a worker that then completes a group finds
 /// it idle and hands off at once. So a held group waits only while the caller
 /// has other groups to publish, never on its worker's next file, nor on a
-/// worker asleep waiting for the producer. Input reservations and producer
-/// cancellation match [`file_groups`].
+/// worker asleep waiting for the producer.
+///
+/// Each task carries the same input-byte reservation as document
+/// verification; callers discard oversized input buffers before returning
+/// bounded or spilled groups. A stop wakes the feed and the budget and reaches
+/// active reads. The producer receives the same stop predicate and must poll
+/// it during filtering or traversal before returning its next task.
 pub fn completion_groups<Task: Send, State, Group: Send>(
     threads: usize,
     cancelled: &AtomicBool,
@@ -1955,7 +1856,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
         groups_alone(next, cancelled, &make, &work, &mut emit);
         return;
     }
-    let pool = Pool::<GroupItem<()>>::schedule(0, threads);
+    let pool = Pool::<()>::schedule(0, threads);
     let source = Mutex::new(next);
     let feed = Feed::new(threads);
     let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
@@ -2123,11 +2024,8 @@ fn groups_alone<Task, State, Group>(
     }
 }
 
-enum GroupItem<T> {
-    Ready(Option<T>),
-    End,
-}
-impl<T> Placed for GroupItem<T> {
+// File groups use the pool only for its input budget and stop flag.
+impl Placed for () {
     fn place(&mut self, _: Range<usize>) {}
 }
 
@@ -2686,7 +2584,7 @@ mod streamed {
 #[cfg(test)]
 mod group_tests {
     use super::*;
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::Barrier;
 
     fn completion_child(name: &str) -> bool {
         const MARKER: &str = "FERRET_TEST_COMPLETION_CHILD";
@@ -2824,36 +2722,6 @@ mod group_tests {
             |()| ControlFlow::Continue(()),
         );
         assert!(cancelled.load(Ordering::Acquire));
-    }
-
-    // Without a producer thread the workers must not wait for tasks, and the
-    // caller still emits every group.
-    #[test]
-    fn producer_spawn_failure_uses_the_caller() {
-        if completion_child("producer_spawn_failure_uses_the_caller") {
-            return;
-        }
-        let threads = 4;
-        let _seams = seam::Seams {
-            fail_spawn_at: Some(threads),
-            ..Default::default()
-        }
-        .set();
-        let mut tasks = (0..8).map(|task| (1, task));
-        let mut emitted = Vec::new();
-        completion_groups(
-            threads,
-            &AtomicBool::new(false),
-            |_| tasks.next(),
-            || (),
-            |_, task, _| task,
-            |_| 0,
-            |task| {
-                emitted.push(task);
-                ControlFlow::Continue(())
-            },
-        );
-        assert_eq!(emitted, (0..8).collect::<Vec<_>>());
     }
 
     // Small groups travel in batches, so more are prepared before the queue
@@ -3036,12 +2904,18 @@ mod group_tests {
         assert_eq!(held.take(), None);
     }
 
+    // Four workers each hold their first task at a barrier, so the groups
+    // are prepared in parallel; each payload arrives whole, once, and small
+    // ones travel through the held batches.
     #[test]
     fn groups_use_parallel_workers_and_preserve_each_payload() {
+        if completion_child("groups_use_parallel_workers_and_preserve_each_payload") {
+            return;
+        }
         let barrier = Barrier::new(4);
         let mut emitted = Vec::new();
         let mut tasks = (0..80).map(|at| (1, at));
-        file_groups(
+        completion_groups(
             4,
             &AtomicBool::new(false),
             move |_| tasks.next(),
@@ -3053,12 +2927,13 @@ mod group_tests {
                 }
                 (at, vec![at as u8; 1000])
             },
+            |(_, payload)| payload.len() as u64,
             |item| {
                 emitted.push(item);
                 ControlFlow::Continue(())
             },
-        )
-        .unwrap();
+        );
+        emitted.sort();
         assert_eq!(
             emitted,
             (0..80)
@@ -3067,11 +2942,17 @@ mod group_tests {
         );
     }
 
+    // Every task but the first waits for the stop. The caller's Break must
+    // reach those workers and the producer, blocked on a full feed, before
+    // the scope joins; isolate a regression's deadlock.
     #[test]
     fn a_group_emission_break_cancels_in_progress_work() {
+        if completion_child("a_group_emission_break_cancels_in_progress_work") {
+            return;
+        }
         let mut emitted = Vec::new();
         let mut tasks = (0..80).map(|at| (1, at));
-        file_groups(
+        completion_groups(
             4,
             &AtomicBool::new(false),
             move |_| tasks.next(),
@@ -3084,67 +2965,61 @@ mod group_tests {
                 }
                 at
             },
+            |_| 0,
             |at| {
                 emitted.push(at);
                 ControlFlow::Break(())
             },
-        )
-        .unwrap();
+        );
         assert_eq!(emitted, [0]);
     }
 
+    // A refused spawn still emits every group: with no worker or no producer
+    // the caller works alone, in source order; with some workers started,
+    // they share the work in completion order.
     #[test]
-    fn group_queue_is_bounded_and_spawn_failure_uses_the_caller() {
-        let (published, progress) = mpsc::channel();
-        let published = Mutex::new(published);
-        let _seams = seam::Seams {
-            on_publish: Some(Arc::new(move |finished| {
-                lock(&published).send(finished()).unwrap();
-            })),
-            ..Default::default()
+    fn spawn_failure_still_emits_every_group() {
+        if completion_child("spawn_failure_still_emits_every_group") {
+            return;
         }
-        .set();
-        let mut seen = 0;
-        let mut tasks = (0..200).map(|at| (1, at));
-        file_groups(
-            2,
-            &AtomicBool::new(false),
-            move |_| tasks.next(),
-            || (),
-            |_, at, _| at,
-            |_| {
-                loop {
-                    let count = progress.recv_timeout(Duration::from_secs(5)).unwrap();
-                    if count >= (2 * RING_PER_THREAD + 1) as u64 {
-                        seen = count;
-                        break;
+        let threads = 4;
+        // (thread whose spawn fails, whether the caller works alone)
+        for (fail, alone) in [(0, true), (1, false), (3, false), (threads, true)] {
+            let _seams = seam::Seams {
+                fail_spawn_at: Some(fail),
+                ..Default::default()
+            }
+            .set();
+            let caller = std::thread::current().id();
+            let mut tasks = (0..32).map(|task| (1, task));
+            let mut emitted = Vec::new();
+            let on_caller = AtomicUsize::new(0);
+            completion_groups(
+                threads,
+                &AtomicBool::new(false),
+                |_| tasks.next(),
+                || (),
+                |_, task, _| {
+                    if std::thread::current().id() == caller {
+                        on_caller.fetch_add(1, Ordering::Relaxed);
                     }
-                }
-                ControlFlow::Break(())
-            },
-        )
-        .unwrap();
-        assert_eq!(seen, (2 * RING_PER_THREAD + 1) as u64);
-        drop(_seams);
-        let _seams = seam::Seams {
-            fail_spawn_at: Some(0),
-            ..Default::default()
+                    task
+                },
+                |_| 0,
+                |task| {
+                    emitted.push(task);
+                    ControlFlow::Continue(())
+                },
+            );
+            let on_caller = on_caller.into_inner();
+            if alone {
+                assert_eq!(emitted, (0..32).collect::<Vec<_>>(), "fail at {fail}");
+                assert_eq!(on_caller, 32, "fail at {fail}");
+            } else {
+                emitted.sort_unstable();
+                assert_eq!(emitted, (0..32).collect::<Vec<_>>(), "fail at {fail}");
+                assert_eq!(on_caller, 0, "fail at {fail}");
+            }
         }
-        .set();
-        let mut emitted = Vec::new();
-        let mut tasks = (0..4).map(|at| (1, at));
-        file_groups(
-            4,
-            &AtomicBool::new(false),
-            move |_| tasks.next(),
-            || (),
-            |_, at, _| at,
-            |at| {
-                emitted.push(at);
-                ControlFlow::Continue(())
-            },
-        )
-        .unwrap();
-        assert_eq!(emitted, [0, 1, 2, 3]);
     }
 }
