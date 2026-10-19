@@ -191,8 +191,9 @@ impl OutputBuffer {
         self.len == 0
     }
 
-    #[cfg(test)]
-    pub(crate) fn memory_bytes(&self) -> usize {
+    /// Bytes the capture holds in memory: its buffer's allocation, which a
+    /// spilled capture keeps for staging.
+    pub fn memory_bytes(&self) -> usize {
         self.bytes.capacity()
     }
 

@@ -1724,16 +1724,81 @@ impl Drop for StopOnPanic<'_> {
     }
 }
 
+/// A group whose capture holds this many bytes or more is handed to the caller
+/// alone; smaller groups travel together up to this many bytes in all. Keeps
+/// D93's capture bound to within one batch per worker.
+const HANDOFF_BYTES: u64 = 64 << 10;
+/// At most this many groups travel in one handoff.
+const HANDOFF_GROUPS: usize = 16;
+
+/// A worker's completed groups not yet handed to the caller: at most
+/// [`HANDOFF_BYTES`] and [`HANDOFF_GROUPS`] of them.
+struct Held<G> {
+    groups: Vec<G>,
+    bytes: u64,
+}
+
+impl<G> Default for Held<G> {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<G> Held<G> {
+    /// Holds a completed group of `weight` bytes and returns the batches to
+    /// hand off now, in completion order: first the held batch, when this
+    /// group would push it past [`HANDOFF_BYTES`] or reaches that size alone;
+    /// then the large group alone, or the batch this group filled to
+    /// [`HANDOFF_GROUPS`].
+    fn add(&mut self, group: G, weight: u64) -> [Option<Vec<G>>; 2] {
+        if weight >= HANDOFF_BYTES {
+            return [self.take(), Some(vec![group])];
+        }
+        let crossed = if self.bytes + weight > HANDOFF_BYTES {
+            self.take()
+        } else {
+            None
+        };
+        self.bytes += weight;
+        self.groups.push(group);
+        let full = if self.groups.len() >= HANDOFF_GROUPS {
+            self.take()
+        } else {
+            None
+        };
+        [crossed, full]
+    }
+
+    /// The held batch, if any, leaving the slot empty.
+    fn take(&mut self) -> Option<Vec<G>> {
+        self.bytes = 0;
+        (!self.groups.is_empty()).then(|| std::mem::take(&mut self.groups))
+    }
+}
+
 /// Prepares checked file groups on workers and emits them on the caller in
-/// completion order. One thread keeps source order. A bounded queue holds at
-/// most `threads` groups; workers own at most one each, and the caller one.
-/// Input reservations and producer cancellation match [`file_groups`].
+/// completion order. One thread keeps source order. Workers hand groups over
+/// in batches through a bounded queue of `threads` handoffs: a group whose
+/// `weight` (its capture's allocation) reaches [`HANDOFF_BYTES`] goes alone,
+/// smaller ones together up to that many bytes. So the queue holds at most
+/// `threads` large groups; each worker owns one in progress and a held batch
+/// of at most [`HANDOFF_BYTES`]; the caller owns one handoff.
+///
+/// Workers hold groups only while the caller is busy. Before it sleeps, the
+/// caller takes every held batch; a worker that then completes a group finds
+/// it idle and hands off at once. So a held group waits only while the caller
+/// has other groups to publish, never on its worker's next file. Input
+/// reservations and producer cancellation match [`file_groups`].
 pub fn completion_groups<Task, State, Group: Send>(
     threads: usize,
     cancelled: &AtomicBool,
     next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
     make: impl Fn() -> State + Sync,
     work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
+    weight: impl Fn(&Group) -> u64 + Sync,
     mut emit: impl FnMut(Group) -> ControlFlow<()>,
 ) {
     if threads <= 1 {
@@ -1742,11 +1807,18 @@ pub fn completion_groups<Task, State, Group: Send>(
     }
     let pool = Pool::<GroupItem<()>>::schedule(0, threads);
     let source = Mutex::new((next, false));
-    let (sender, receiver) = std::sync::mpsc::sync_channel(threads);
+    let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
+    // Set by the caller before its last look at the slots ahead of sleeping;
+    // cleared by the first worker to hand it work, or by the caller on waking.
+    let idle = AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Group>>(threads);
     std::thread::scope(|scope| {
         let _stop = StopOnDrop(&pool);
         let make = &make;
         let work = &work;
+        let weight = &weight;
+        let held = &held;
+        let idle = &idle;
         let started = (0..threads)
             .take_while(|&i| {
                 let sender = sender.clone();
@@ -1756,7 +1828,8 @@ pub fn completion_groups<Task, State, Group: Send>(
                     let _panic = StopOnPanic(pool);
                     let mut state = make();
                     let stopped = || pool.halted() || cancelled.load(Ordering::Acquire);
-                    while !stopped() {
+                    let slot = &held[i];
+                    'tasks: while !stopped() {
                         let task = {
                             let mut source = lock(source);
                             if source.1 || stopped() {
@@ -1775,9 +1848,43 @@ pub fn completion_groups<Task, State, Group: Send>(
                         };
                         let group = work(&mut state, task, &stopped);
                         pool.release(size);
-                        if stopped() || sender.send(group).is_err() {
+                        if stopped() {
                             break;
                         }
+                        let bytes = weight(&group);
+                        let handoffs = {
+                            let mut slot = lock(slot);
+                            let mut handoffs = slot.add(group, bytes);
+                            // Read under the slot lock, which orders it after
+                            // the caller's last look at this slot. Any send
+                            // wakes the caller, who looks at every slot again
+                            // before sleeping, so only one worker need flush.
+                            if handoffs.iter().all(Option::is_none)
+                                && idle.load(Ordering::SeqCst)
+                                && idle.swap(false, Ordering::SeqCst)
+                            {
+                                handoffs[1] = slot.take();
+                            }
+                            handoffs
+                        };
+                        // Send outside the slot lock: the caller takes that
+                        // lock to collect, and a full queue waits on the
+                        // caller.
+                        for batch in handoffs.into_iter().flatten() {
+                            if sender.send(batch).is_err() {
+                                break 'tasks;
+                            }
+                        }
+                    }
+                    // Out of files, hand over what is held. A stopped run
+                    // drops it, as the caller drops queued groups.
+                    // Take first: a guard in the condition would live
+                    // through a send that may wait on the collecting caller.
+                    let batch = lock(slot).take();
+                    if !stopped()
+                        && let Some(batch) = batch
+                    {
+                        let _ = sender.send(batch);
                     }
                 })
                 .is_ok()
@@ -1788,14 +1895,58 @@ pub fn completion_groups<Task, State, Group: Send>(
             groups_alone(&mut lock(&source).0, cancelled, make, work, &mut emit);
             return;
         }
-        // The owning iterator drops the receiver on break, unblocking senders
-        // before scope join. The stop guard also wakes input-budget waiters.
-        for group in receiver {
-            if pool.halted() || cancelled.load(Ordering::Acquire) || emit(group).is_break() {
-                break;
+        let halted = || pool.halted() || cancelled.load(Ordering::Acquire);
+        // Slots seen empty in a row since `idle` was last set, and the next
+        // slot to look at. Sleeping needs a full clean pass after setting it.
+        let mut clean = 0;
+        let mut at = 0;
+        loop {
+            let batch = match receiver.try_recv() {
+                Ok(batch) => Some(batch),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) if clean < held.len() => {
+                    if clean == 0 {
+                        idle.store(true, Ordering::SeqCst);
+                    }
+                    let batch = lock(&held[at]).take();
+                    at = (at + 1) % held.len();
+                    clean += 1;
+                    batch
+                }
+                // Every slot was empty after `idle` was set: a group completed
+                // from here on is sent, which wakes this receive.
+                Err(std::sync::mpsc::TryRecvError::Empty) => match receiver.recv() {
+                    Ok(batch) => Some(batch),
+                    Err(_) => break,
+                },
+            };
+            if let Some(batch) = batch {
+                idle.store(false, Ordering::SeqCst);
+                clean = 0;
+                if publish(batch, &halted, &mut emit).is_break() {
+                    break;
+                }
             }
         }
+        // Dropping the receiver unblocks senders before scope join. The stop
+        // guard also wakes input-budget waiters.
+        drop(receiver);
     });
+}
+
+/// Emits a handoff's groups in order until the run stops or `emit` breaks.
+fn publish<Group>(
+    batch: Vec<Group>,
+    halted: &dyn Fn() -> bool,
+    emit: &mut impl FnMut(Group) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    for group in batch {
+        if halted() {
+            return ControlFlow::Break(());
+        }
+        emit(group)?;
+    }
+    ControlFlow::Continue(())
 }
 
 fn groups_alone<Task, State, Group>(
@@ -2411,6 +2562,8 @@ mod group_tests {
 
     // A full queue must bound captures, and dropping its receiver on Break
     // must unblock senders before scope join. Isolate a regression's deadlock.
+    // Groups exactly at the handoff threshold go alone, so the bound stays
+    // one group per queue slot, per worker and on the caller.
     #[test]
     fn completion_queue_bounds_captures_and_releases_blocked_senders() {
         if completion_child("completion_queue_bounds_captures_and_releases_blocked_senders") {
@@ -2429,6 +2582,7 @@ mod group_tests {
                 prepared.fetch_add(1, Ordering::Release);
                 task
             },
+            |_| HANDOFF_BYTES,
             |_| {
                 emitted += 1;
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -2478,10 +2632,191 @@ mod group_tests {
                     assert!(reached.load(Ordering::Acquire));
                     panic!("injected worker panic with a live reservation");
                 },
+                |_| 0,
                 |_: ()| ControlFlow::Continue(()),
             );
         });
         assert!(result.is_err());
+    }
+
+    // Small groups travel in batches, so more are prepared before the queue
+    // stalls than one per slot, but never more than the batch rules allow:
+    // with quarter-threshold groups, four per batch, each worker may hold a
+    // full batch it is sending plus one group, the queue a full batch per
+    // slot and the caller one batch.
+    #[test]
+    fn completion_queue_bounds_small_groups_by_batch() {
+        if completion_child("completion_queue_bounds_small_groups_by_batch") {
+            return;
+        }
+        let threads = 4;
+        let prepared = AtomicUsize::new(0);
+        let mut tasks = (0..1024).map(|task| (1, task));
+        completion_groups(
+            threads,
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                prepared.fetch_add(1, Ordering::Release);
+                task
+            },
+            |_| HANDOFF_BYTES / 4,
+            |_| {
+                // Wait for preparation to stall, then never consume more.
+                let mut seen = prepared.load(Ordering::Acquire);
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let now = prepared.load(Ordering::Acquire);
+                    if now == seen {
+                        break;
+                    }
+                    seen = now;
+                }
+                assert!(seen > 2 * threads + 1, "groups were not batched: {seen}");
+                assert!(
+                    seen <= 9 * threads + 4,
+                    "batches exceeded the bound: {seen}"
+                );
+                ControlFlow::Break(())
+            },
+        );
+    }
+
+    // A worker that completes a group while the caller is idle must hand it
+    // off before taking its next task, which here is slow.
+    #[test]
+    fn group_completed_while_the_caller_is_idle_publishes_before_a_slow_task() {
+        let published = AtomicBool::new(false);
+        let waited_out = AtomicBool::new(false);
+        let mut tasks = (0..3).map(|task| (1, task));
+        let mut emitted = Vec::new();
+        completion_groups(
+            2,
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                // Tasks 0 and 2 finish only once something is published;
+                // task 1 is the fast one its worker holds.
+                if task != 1 {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !published.load(Ordering::Acquire) {
+                        if Instant::now() >= deadline {
+                            waited_out.store(true, Ordering::Release);
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+                task
+            },
+            |_| 0,
+            |task| {
+                emitted.push(task);
+                published.store(true, Ordering::Release);
+                ControlFlow::Continue(())
+            },
+        );
+        assert!(!waited_out.load(Ordering::Acquire));
+        assert_eq!(emitted[0], 1);
+        emitted.sort_unstable();
+        assert_eq!(emitted, [0, 1, 2]);
+    }
+
+    // A worker that completes a group while the caller is busy holds it, then
+    // blocks on a slow task. When the caller runs out of queued groups it
+    // must collect the held one rather than sleep: both other tasks finish
+    // only once that group is published.
+    #[test]
+    fn group_held_while_the_caller_is_busy_publishes_before_a_slow_task() {
+        let emitting = AtomicBool::new(false);
+        let held_done = AtomicBool::new(false);
+        let published = AtomicBool::new(false);
+        let waited_out = AtomicBool::new(false);
+        let wait_for = |flag: &AtomicBool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !flag.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    waited_out.store(true, Ordering::Release);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        };
+        let mut tasks = (0..4).map(|task| (1, task));
+        let mut emitted = Vec::new();
+        completion_groups(
+            2,
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                match task {
+                    // Task 0 keeps the caller busy, below.
+                    0 => {}
+                    // Task 1 completes while the caller publishes task 0.
+                    1 => {
+                        wait_for(&emitting);
+                        held_done.store(true, Ordering::Release);
+                    }
+                    // Whichever worker takes 2 and 3 is stuck until task 1
+                    // is published, so neither can hand it off.
+                    _ => wait_for(&published),
+                }
+                task
+            },
+            |_| 0,
+            |task| {
+                if task == 0 {
+                    emitting.store(true, Ordering::Release);
+                    wait_for(&held_done);
+                    // Let task 1's worker hold it and start its next task.
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if task == 1 {
+                    published.store(true, Ordering::Release);
+                }
+                emitted.push(task);
+                ControlFlow::Continue(())
+            },
+        );
+        assert!(!waited_out.load(Ordering::Acquire));
+        assert_eq!(emitted[..2], [0, 1]);
+        emitted.sort_unstable();
+        assert_eq!(emitted, [0, 1, 2, 3]);
+    }
+
+    // The batch rules, as the workers apply them: the threshold is inclusive,
+    // a group that would cross it flushes the held batch first, a large group
+    // follows the batch it overtakes, and a batch is capped in count.
+    #[test]
+    fn held_batches_follow_the_handoff_rules() {
+        let mut held = Held::<u32>::default();
+        // Just under the threshold is held; exactly at it goes alone.
+        assert_eq!(held.add(0, HANDOFF_BYTES - 1), [None, None]);
+        assert_eq!(held.add(1, HANDOFF_BYTES), [Some(vec![0]), Some(vec![1])]);
+        assert_eq!(held.take(), None);
+        // Just over goes alone too, with nothing held before it.
+        assert_eq!(held.add(2, HANDOFF_BYTES + 1), [None, Some(vec![2])]);
+        // Filling the batch to exactly the threshold holds it; one more byte
+        // flushes it and starts the next batch.
+        assert_eq!(held.add(3, HANDOFF_BYTES / 2), [None, None]);
+        assert_eq!(held.add(4, HANDOFF_BYTES / 2), [None, None]);
+        assert_eq!(held.add(5, 1), [Some(vec![3, 4]), None]);
+        assert_eq!(held.bytes, 1);
+        // A batch that would cross by its last group flushes before it.
+        assert_eq!(held.add(6, HANDOFF_BYTES - 2), [None, None]);
+        assert_eq!(held.add(7, 2), [Some(vec![5, 6]), None]);
+        assert_eq!(held.take(), Some(vec![7]));
+        // Count cap: the sixteenth small group hands the batch off.
+        for group in 0..HANDOFF_GROUPS as u32 - 1 {
+            assert_eq!(held.add(group, 0), [None, None]);
+        }
+        let full = held.add(99, 0);
+        assert_eq!(full[0], None);
+        assert_eq!(full[1].as_ref().map(Vec::len), Some(HANDOFF_GROUPS));
+        assert_eq!(held.take(), None);
     }
 
     #[test]

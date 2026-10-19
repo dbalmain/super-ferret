@@ -65,9 +65,13 @@ backlog; workers own checked reads and line rendering. Grep workers send
 completed groups through a bounded completion queue (D92 B); the calling host
 publishes each whole group. One thread keeps walk order. A publication mutex
 excludes live policy warnings from groups; per-file diagnostics share the host.
-For configured concurrency T, the queue holds at most T groups, workers one
-each, and the host one: rendered capture allocation is bounded by
-(2T + 1) × 4 MiB, 260 MiB at 32 threads, inside rg's own peak there (D93).
+Workers batch groups only while the host is busy: a group whose capture holds
+64 KiB or more goes alone, smaller ones travel together up to 64 KiB, and the
+host takes every held batch before it sleeps, so a held group waits only on
+other output, never on its worker's next file. For configured concurrency T, the queue holds at most T handoffs, each
+worker one group in progress and a batch of at most 64 KiB, and the host one
+handoff: rendered capture allocation is bounded by (2T + 1) × 4 MiB +
+T × 64 KiB, 262 MiB at 32 threads, inside rg's own peak there (D93).
 Spill staging reuses that allocation in 64 KiB blocks with
 cancellation polls. Find retains its ordered publication path. The queue lets
 workers prepare ahead while the host waits on stdout; direct worker publication

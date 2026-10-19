@@ -601,7 +601,9 @@ palettes and hyperlinks are outside this tier; exact escape placement remains
 an accepted-difference class, with no such difference found in M5's covered
 profiles. With multiple threads, finished checked groups enter a bounded
 completion queue and are published as soon as the destination is available
-(D92 B); their groups never interleave.
+(D92 B); their groups never interleave. While the host is busy, workers hold
+groups under 64 KiB in batches of up to 64 KiB; the host takes every held
+batch before it sleeps, so a held group never waits on its worker's next file.
 With one thread, groups retain walk order. Cross-file diagnostics follow
 completion order too, and cannot split another file’s group. Grep reuses find’s
 bounded output/spill machinery.
