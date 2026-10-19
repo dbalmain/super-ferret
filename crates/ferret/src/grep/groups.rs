@@ -9,6 +9,9 @@ use std::io::{BufRead, IoSlice};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use ferret_query::Lane;
+use ferret_query::find::LiveWalk;
+use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
 
 pub(super) const GROUP_BYTES: usize = 4 << 20;
 const ENTRY_BYTES: usize = 64 << 10;
@@ -620,7 +623,7 @@ pub(super) fn run<'a, W: Write>(
     threads: usize,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    let search = Search::new(host, names, cancelled);
+    let search = Search::new(host, cancelled);
     ferret_query::completion_groups(
         threads,
         cancelled,
@@ -671,11 +674,7 @@ struct Search<'s> {
 }
 
 impl<'s> Search<'s> {
-    fn new<W>(
-        host: &Host<'s, W>,
-        _names: Option<&ferret_query::DocNames>,
-        cancelled: &'s AtomicBool,
-    ) -> Self {
+    fn new<W>(host: &Host<'s, W>, cancelled: &'s AtomicBool) -> Self {
         Self {
             plan: host.plan,
             filename: host.filename,
@@ -762,6 +761,209 @@ impl<'s> Search<'s> {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+/// Searches `source`'s operands with the walk itself spread over `threads`
+/// workers (D105): find's walk schedule lends subtrees of each live
+/// directory operand between workers, each searching the files it reaches
+/// and handing groups to this thread in completion order, under the same
+/// handoff and input bounds as [`run`]. File operands are searched in order
+/// by the first worker. Sets `searched` if any walk selected a file (D99).
+pub(super) fn walk<W: Write>(
+    host: &mut Host<'_, W>,
+    source: Source<'_>,
+    threads: usize,
+    cancelled: &AtomicBool,
+    searched: &mut bool,
+) -> io::Result<()> {
+    let search = Search::new(host, cancelled);
+    let found = AtomicBool::new(false);
+    let Source {
+        inputs,
+        filter,
+        live,
+        ..
+    } = source;
+    ferret_query::lane_groups(
+        threads,
+        cancelled,
+        |lanes, stopped| {
+            let walker = |i: usize| Walker {
+                search: &search,
+                filter: &filter,
+                lane: &lanes[i],
+                stopped,
+                found: &found,
+                live: live.is_some(),
+                plan: search.plan.clone(),
+                buffer: Vec::new(),
+            };
+            let mut first = walker(0);
+            for input in inputs {
+                if stopped() {
+                    break;
+                }
+                let go = match input {
+                    Input::File(path, size) => first.search(size, Job::Direct(path, false)),
+                    Input::Failed(path, error) => {
+                        first.search(0, Job::Failed(path, error.to_string()))
+                    }
+                    Input::Directory(path) => {
+                        let policy = {
+                            // The root's rules may warn, as in the serial
+                            // source.
+                            let _publication = live.is_some().then(|| lock(&search.publication));
+                            live.map(|anchors| anchors.start(&path, stopped))
+                                .transpose()
+                        };
+                        match policy {
+                            Ok(policy) => {
+                                let quit = AtomicBool::new(false);
+                                let schedule = Schedule {
+                                    workers: threads,
+                                    starts: false,
+                                    quit: &quit,
+                                };
+                                schedule::run(
+                                    &schedule,
+                                    sources::live(&path, &filter.cwd),
+                                    Walked {
+                                        descend: true,
+                                        policy,
+                                    },
+                                    &mut first,
+                                    |_| true,
+                                    walker,
+                                );
+                                !quit.load(Ordering::Acquire)
+                            }
+                            Err(error) => first.search(0, Job::Failed(path, error.to_string())),
+                        }
+                    }
+                    // The parent splits operands at stdin barriers.
+                    Input::Stdin => false,
+                };
+                if !go {
+                    break;
+                }
+            }
+            for lane in &lanes {
+                lane.flush(stopped());
+            }
+        },
+        |group| search.publish(host, group),
+    );
+    *searched |= found.load(Ordering::Acquire);
+    search.finish(host)
+}
+
+/// A walk task's own state: whether to enter the directory it last
+/// yielded, and its copy of the live policy stack (D13), cloned when the
+/// task lends part of its walk.
+struct Walked {
+    descend: bool,
+    policy: Option<live::Policy>,
+}
+
+/// One worker of [`walk`]: filters each entry its task reaches and searches
+/// the selected files.
+struct Walker<'w, 's> {
+    search: &'w Search<'s>,
+    filter: &'w Filter<'w>,
+    lane: &'w Lane<'w, Searched>,
+    stopped: &'w (dyn Fn() -> bool + Sync),
+    found: &'w AtomicBool,
+    live: bool,
+    plan: Plan,
+    buffer: Vec<u8>,
+}
+
+impl Walker<'_, '_> {
+    /// Searches one job and hands its group over; false once the run stops.
+    fn search(&mut self, size: u64, job: Job) -> bool {
+        if matches!(job, Job::Failed(..)) {
+            return self.lane.hand((job, Observed::Skipped), 0).is_continue();
+        }
+        let Some(size) = self.lane.reserve(size, self.stopped) else {
+            return false;
+        };
+        let result = prepare(
+            &self.plan,
+            &mut self.buffer,
+            None,
+            &job,
+            self.search.filename,
+            &self.search.cache,
+            false,
+            self.stopped,
+        );
+        if self.buffer.capacity() > ferret_query::KEPT_BUFFER {
+            self.buffer = Vec::new();
+        }
+        let group = self.search.observed(job, result, self.stopped);
+        self.lane.release(size);
+        if (self.stopped)() {
+            return false;
+        }
+        let bytes = weight(&group);
+        self.lane.hand(group, bytes).is_continue()
+    }
+}
+
+impl Visitor<LiveWalk, Walked> for Walker<'_, '_> {
+    fn step(&mut self, walk: &mut LiveWalk, task: &mut Walked) -> Step {
+        let stopped = self.stopped;
+        if stopped() {
+            return Step::Quit;
+        }
+        let Some(entry) = walk.next_with_cancel(task.descend, &mut || Ok(()), &mut || stopped())
+        else {
+            return if stopped() { Step::Quit } else { Step::Done };
+        };
+        task.descend = true;
+        let job = match entry {
+            Ok(entry) => {
+                let mut selected = false;
+                let job = self.filter.entry(
+                    entry,
+                    &mut task.descend,
+                    task.policy.as_mut(),
+                    &mut selected,
+                    self.live.then_some(&self.search.publication),
+                    stopped,
+                );
+                if selected && !self.found.load(Ordering::Relaxed) {
+                    self.found.store(true, Ordering::Relaxed);
+                }
+                job
+            }
+            Err(error) => Some((0, Job::Failed(error.path, error.error.to_string()))),
+        };
+        match job {
+            Some((size, job)) => {
+                if self.search(size, job) {
+                    Step::Next
+                } else {
+                    Step::Quit
+                }
+            }
+            None => Step::Next,
+        }
+    }
+
+    // The lent levels are below a directory on the lender's stack, which the
+    // borrower's first entry unwinds to.
+    fn lend(&mut self, parent: &mut Walked) -> Walked {
+        Walked {
+            descend: true,
+            policy: parent.policy.clone(),
+        }
+    }
+
+    // Errors are published as groups.
+    fn end(&mut self, _task: &mut Walked) -> u64 {
+        0
     }
 }
 
@@ -949,6 +1151,17 @@ impl<'a> Source<'a> {
     pub(super) fn with_absence(mut self, emit: bool) -> Self {
         self.filter.emit_absent = emit;
         self
+    }
+
+    /// Whether a directory operand walks the live tree, which [`walk`] can
+    /// spread over workers.
+    pub(super) fn walks_live(&self) -> bool {
+        (self.filter.traversal.unrestricted || self.live.is_some())
+            && self
+                .inputs
+                .as_slice()
+                .iter()
+                .any(|input| matches!(input, Input::Directory(_)))
     }
 
     /// Whether the walk selected any file: it passed depth, glob, hidden and

@@ -222,6 +222,7 @@ enum State {
     Bypass,
 }
 
+#[derive(Clone)]
 pub(super) struct Policy {
     anchors: Anchors,
     spelling: PathBuf,
