@@ -4861,3 +4861,22 @@ fn d98_json_match_records_always_carry_their_submatches() {
         false,
     );
 }
+
+#[test]
+fn append_during_grep_reads_only_the_opening_size_prefix() {
+    let fixture = Fixture::new("append-during-read");
+    let prefix = b"red original\n".repeat(20_000);
+    let path = fixture.tree().join("growing.log");
+    fs::write(&path, &prefix).unwrap();
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "-I", "red", "growing.log"])
+        .env("FERRET_TEST_GREP_APPEND_PATH", &path)
+        .env("FERRET_TEST_GREP_APPEND_BYTES", "red appended\n");
+    let output = run(command, None);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, prefix);
+    assert!(fs::read(&path).unwrap().ends_with(b"red appended\n"));
+}

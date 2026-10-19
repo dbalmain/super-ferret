@@ -199,9 +199,9 @@ impl Render<'_> {
                 hook();
             }
         });
-        #[cfg(test)]
-        let mut observed = super::seam::Observed(input);
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
+        let mut observed = super::seam::Observed::new(input);
+        #[cfg(any(test, debug_assertions))]
         let input: &mut dyn Read = &mut observed;
         let mut cursor = Cursor::default();
         let result = line_grep::scan_lines(self.plan, input, size, buffer, self.stopped, |line| {

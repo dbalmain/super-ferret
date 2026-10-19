@@ -74,6 +74,38 @@ impl Stat {
             && (self.mtime_sec, self.mtime_nsec) == (other.mtime_sec, other.mtime_nsec)
             && (self.ctime_sec, self.ctime_nsec) == (other.ctime_sec, other.ctime_nsec)
     }
+
+    /// Whether `other` is the same inode with an extent at least as large.
+    /// Search readers use this only after reading the first stat's byte prefix.
+    pub fn same_inode_and_not_shrunk(&self, other: &Stat) -> bool {
+        (self.dev, self.ino) == (other.dev, other.ino) && other.size >= self.size
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::Stat;
+
+    #[test]
+    fn growth_acceptance_requires_same_inode_and_nonshrinking_size() {
+        let first = Stat {
+            dev: 1,
+            ino: 2,
+            size: 10,
+            mtime_sec: 3,
+            ctime_sec: 4,
+            ..Stat::default()
+        };
+        assert!(first.same_inode_and_not_shrunk(&first));
+        assert!(first.same_inode_and_not_shrunk(&Stat {
+            size: 11,
+            mtime_sec: 9,
+            ctime_sec: 10,
+            ..first
+        }));
+        assert!(!first.same_inode_and_not_shrunk(&Stat { size: 9, ..first }));
+        assert!(!first.same_inode_and_not_shrunk(&Stat { ino: 3, ..first }));
+    }
 }
 
 /// What a worker learnt about a file's content (D37).

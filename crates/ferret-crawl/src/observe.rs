@@ -362,6 +362,25 @@ pub(crate) fn bracket(
     }
 }
 
+/// Search reads have already bounded the stream to `first.size`, so an
+/// append leaves that exact prefix intact. Return the closing stat so callers
+/// cannot mistake it for bytes matching the catalog's older version.
+pub(crate) fn bracket_search(file: &File, first: &Stat) -> Result<Stat, ContentFault> {
+    match fstat(file.as_fd()) {
+        Ok(raw) => {
+            let after = catalog_stat(&raw);
+            if first.same_version(&after)
+                || (first.size != 0 && first.same_inode_and_not_shrunk(&after))
+            {
+                Ok(after)
+            } else {
+                Err(ContentFault::Changed)
+            }
+        }
+        Err(e) => Err(ContentFault::Stat(e.into())),
+    }
+}
+
 /// The catalog's fields of a raw `fstat`.
 pub(crate) fn catalog_stat(stat: &rustix::fs::Stat) -> Stat {
     Stat {

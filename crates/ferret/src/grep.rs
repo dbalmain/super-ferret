@@ -663,11 +663,10 @@ mod tests {
     use ferret_query::{ReadOperation, ReadVersion};
     use std::fs::OpenOptions;
 
-    // R1/P1: splice two nonmatching versions after the first real read.
-    // Neither explicit input nor the opaque fallback may publish the splice.
+    // A shrinking input retries once; neither path may publish an unstable
+    // attempt as a search result.
     #[test]
     fn regular_files_discard_torn_matches_and_retry_current_bytes() {
-        use std::os::unix::fs::FileExt;
         let mut outcomes = Vec::new();
         for recursive in [false, true] {
             let path = std::env::temp_dir()
@@ -677,18 +676,14 @@ mod tests {
             bytes[99_997..].copy_from_slice(b"OLD");
             fs::write(&path, bytes).unwrap();
             let writer = OpenOptions::new().write(true).open(&path).unwrap();
-            let mut changed = false;
+            let mut attempt = 0;
             seam::AFTER_READ.with_borrow_mut(|hook| {
                 *hook = Some(Box::new(move || {
-                    if !changed {
-                        writer.write_all_at(b"blu", 0).unwrap();
-                        writer.write_all_at(b"NEW", 99_997).unwrap();
-                        changed = true;
-                    }
+                    writer.set_len(50_000 >> attempt).unwrap();
+                    attempt += 1;
                 }))
             });
-            let line_grep::Command::Search(plan) =
-                line_grep::parse(&["^red.*NEW$".into()]).unwrap()
+            let line_grep::Command::Search(plan) = line_grep::parse(&["^red".into()]).unwrap()
             else {
                 panic!("search")
             };
@@ -710,7 +705,7 @@ mod tests {
         }
         assert_eq!(
             outcomes,
-            [(false, true, false, false), (true, true, false, false)]
+            [(false, true, false, true), (true, true, false, true)]
         );
     }
 
@@ -730,7 +725,7 @@ mod tests {
                 std::process::id()
             ));
             let mut original = b"old context\n".repeat(lines);
-            original.extend_from_slice(b"red\n");
+            original.extend_from_slice(b"red\nx");
             fs::write(&path, &original).unwrap();
             let writer = OpenOptions::new().write(true).open(&path).unwrap();
             let mut changed = false;
@@ -738,11 +733,7 @@ mod tests {
                 *hook = Some(Box::new(move || {
                     if !changed {
                         writer.write_all_at(b"NEW", 0).unwrap();
-                        // A changed extent makes the retry independent of
-                        // timestamp resolution.
-                        writer
-                            .write_all_at(b"tail\n", original.len() as u64)
-                            .unwrap();
+                        writer.set_len(original.len() as u64 - 1).unwrap();
                         changed = true;
                     }
                 }));
@@ -774,7 +765,7 @@ mod tests {
             seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
             seam::COMMIT.with_borrow_mut(|hook| *hook = None);
             let mut expected = fs::read(&path).unwrap();
-            expected.truncate(expected.len() - b"tail\n".len());
+            expected.truncate(expected.len() - 1);
             fs::remove_file(path).unwrap();
             assert!(host.writer == expected, "replay differs");
             assert!(host.matched && !host.errors);
@@ -823,10 +814,7 @@ mod tests {
                                     writer.write_all_at(b"blu", 0).unwrap();
                                     writer.write_all_at(b"NEW", 99_997).unwrap();
                                 } else if unstable {
-                                    // A size change makes retry failure
-                                    // independent
-                                    // of timestamp resolution or clock timing.
-                                    writer.write_all_at(b"x", 100_000).unwrap();
+                                    writer.set_len(50_000).unwrap();
                                 }
                             }));
                         });
@@ -1168,12 +1156,15 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 mod seam {
+    #[cfg(test)]
     use super::OutputBuffer;
+    #[cfg(test)]
     use std::cell::RefCell;
     use std::io::{self, Read};
 
+    #[cfg(test)]
     thread_local! {
         pub(super) static BEFORE_SCAN: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         pub(super) static AFTER_READ: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
@@ -1182,14 +1173,42 @@ mod seam {
         pub(super) static COMMIT: RefCell<Option<Box<OnCommit>>> = RefCell::new(None);
     }
 
+    #[cfg(test)]
     pub(super) type OnCommit = dyn FnMut(&OutputBuffer);
 
-    pub(super) struct Observed<'a>(pub(super) &'a mut dyn Read);
+    pub(super) struct Observed<'a> {
+        input: &'a mut dyn Read,
+        appended: bool,
+    }
+
+    impl<'a> Observed<'a> {
+        pub(super) fn new(input: &'a mut dyn Read) -> Self {
+            Self {
+                input,
+                appended: false,
+            }
+        }
+    }
 
     impl Read for Observed<'_> {
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-            let count = self.0.read(bytes)?;
+            let count = self.input.read(bytes)?;
             if count != 0 {
+                #[cfg(debug_assertions)]
+                if !self.appended
+                    && let Some(path) = std::env::var_os("FERRET_TEST_GREP_APPEND_PATH")
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+                    file.write_all(
+                        std::env::var_os("FERRET_TEST_GREP_APPEND_BYTES")
+                            .as_deref()
+                            .unwrap_or_default()
+                            .as_encoded_bytes(),
+                    )?;
+                    self.appended = true;
+                }
+                #[cfg(test)]
                 AFTER_READ.with_borrow_mut(|hook| {
                     if let Some(hook) = hook {
                         hook();

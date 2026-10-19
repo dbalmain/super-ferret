@@ -31,7 +31,7 @@ use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 
 use crate::ContentFault;
-use crate::observe::{BulkRead, Opened, Reader, bracket, catalog_stat};
+use crate::observe::{BulkRead, Opened, Reader, bracket, bracket_search, catalog_stat};
 
 /// Streams an explicit regular file or live-fallback file, using the same
 /// current-version bracket as catalogued candidates. `None` imposes no policy
@@ -63,7 +63,7 @@ pub fn stream_file_until(
             cap,
         });
     }
-    checked_file(file, current, &mut |file, size| {
+    checked_search_file(file, current, &mut |file, size| {
         let extent = if size == 0 { u64::MAX } else { size };
         each(&mut Read::take(file, extent), extent).map_err(|error| {
             if cancelled() {
@@ -85,14 +85,13 @@ fn regular_file(fd: OwnedFd) -> Result<(File, ferret_catalog::Stat), ContentFaul
     Ok((File::from(fd), catalog_stat(&stat)))
 }
 
-fn checked_file(
+fn checked_search_file(
     mut file: File,
     current: ferret_catalog::Stat,
     pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
 ) -> Result<ferret_catalog::Stat, ContentFault> {
     pass(&mut file, current.size)?;
-    bracket(&file, &current, ferret_catalog::Content::Binary)?;
-    Ok(current)
+    bracket_search(&file, &current)
 }
 
 /// One catalog view's documents, each with one of its names.
@@ -435,7 +434,7 @@ impl Documents {
             .map_err(|e| ContentFault::Open(e.into()))
         })?;
         let (file, current) = regular_file(fd)?;
-        let current = checked_file(file, current, pass)?;
+        let current = checked_search_file(file, current, pass)?;
         self.files_read += 1;
         Ok(current)
     }
