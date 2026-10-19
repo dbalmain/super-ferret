@@ -832,8 +832,9 @@ fn scan_records(
     let mut limited = false;
     let mut emit = |line: Line<'_>| {
         // A context line matches only under inversion; otherwise it is never
-        // searched, including the lines after `-m`, which are context (GNU).
-        if line.kind == LineKind::Context && !plan.invert {
+        // searched. Lines after `-m` arrive with their highlights resolved
+        // (none): they are context and never searched, also under `-v` (D98).
+        if line.kind == LineKind::Context && (!plan.invert || line.highlights.is_some()) {
             return emit(Line {
                 highlights: Some(&[]),
                 ..line
@@ -972,7 +973,7 @@ fn scan_records(
                             bytes: line,
                             kind: LineKind::Context,
                             fragment: false,
-                            highlights: None,
+                            highlights: Some(&[]),
                         })
                         .map_err(ScanError::Output)?;
                     }

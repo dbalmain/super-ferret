@@ -4746,6 +4746,31 @@ fn d98_inverted_lines_after_the_limit_are_never_searched() {
 }
 
 #[test]
+fn d98_line_mode_inverted_lines_after_the_limit_are_never_searched() {
+    // Review finding 3: under -v, line 1 takes -m1 and `ab` is context after
+    // the limit. It holds a match, but lines after the limit are never
+    // searched (D98), so -o prints it whole, -r leaves it alone and colour and
+    // JSON give it no span. Before the fix -o printed `a`, -r `Xb`.
+    let fixture = Fixture::new("d98-line-inverted-tail");
+    let input = b"x\nab\n";
+    for args in [
+        vec!["-vom1", "-nA1", "a", "-"],
+        vec!["-vm1", "-nA1", "-rX", "a", "-"],
+    ] {
+        let output = fixture.compare_raw(&args, Some(input));
+        assert_eq!(output.stdout, b"1:x\n2-ab\n", "{args:?}");
+    }
+    let output = fixture.compare_raw(&["-vm1", "-A1", "--color=always", "a", "-"], Some(input));
+    assert_eq!(output.stdout, b"x\nab\n");
+    let output = fixture.compare_json(&["-vm1", "-A1", "a", "-"], Some(input));
+    assert_json_stream(
+        &output,
+        r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["context","ab\n",2,2,[]],["end",null,[1,0,1]],["summary",[1,0,1]]]"#,
+        false,
+    );
+}
+
+#[test]
 fn d98_end_of_an_unterminated_line_is_a_match_position() {
     // Fuzz B1. `abc` has four positions, before each byte and at its end;
     // `abc\n` has the same four on line 1 and a fifth after the LF, which is
