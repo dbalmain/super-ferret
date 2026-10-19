@@ -5644,7 +5644,7 @@ with its own `$`. GNU grep has no `--count-matches`: its `-c` counts lines, and
 `-o` prints no empty matches, which ferret now also does (D79 D).
 
 - **A — yes (as built).** The count is the same with or without a final LF, and
-  agrees with where `$` matches. 87 exclusion rows; no special case in code.
+  agrees with where `$` matches. 89 exclusion rows; no special case in code.
 - **B — match rg.** A rule that drops the final empty match only when the file
   has no final LF, and only for patterns that are not anchored with `$`.
 
