@@ -390,7 +390,16 @@ struct Window {
 }
 
 impl Filter {
+    fn start(&self, text: &[u8], at: usize, hit_start: usize) -> usize {
+        text[at..hit_start]
+            .iter()
+            .rposition(|&b| !self.within.bytes[usize::from(b)])
+            .map_or(at, |i| at + i + 1)
+    }
+
     fn window(&self, text: &[u8], at: usize, hit: std::ops::Range<usize>) -> (usize, usize) {
+        #[cfg(test)]
+        WINDOW_SCANNED.with(|scanned| scanned.set(scanned.get() + text.len() - hit.end));
         (
             text[at..hit.start]
                 .iter()
@@ -402,6 +411,21 @@ impl Filter {
                 .map_or(text.len(), |i| hit.end + i),
         )
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WINDOW_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_window_scanned() {
+    WINDOW_SCANNED.with(|scanned| scanned.set(0));
+}
+
+#[cfg(test)]
+fn window_scanned() -> usize {
+    WINDOW_SCANNED.with(std::cell::Cell::get)
 }
 
 impl Search<'_> {
@@ -478,6 +502,7 @@ impl Search<'_> {
                 filter,
                 text,
                 at: 0,
+                window_end: 0,
             }),
         }
     }
@@ -510,6 +535,7 @@ enum Windows<'r, 't> {
         filter: &'r Filter,
         text: &'t [u8],
         at: usize,
+        window_end: usize,
     },
 }
 
@@ -517,14 +543,15 @@ impl Iterator for Spans<'_, '_> {
     type Item = std::ops::Range<usize>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (regex, filter, text, at) = match &mut self.0 {
+        let (regex, filter, text, at, window_end) = match &mut self.0 {
             Windows::Whole(spans) => return spans.next(),
             Windows::Filtered {
                 regex,
                 filter,
                 text,
                 at,
-            } => (*regex, *filter, *text, at),
+                window_end,
+            } => (*regex, *filter, *text, at, window_end),
         };
         // Every match contains an occurrence of the run and lies within one
         // window, whose end byte no match contains; a match is never empty,
@@ -535,7 +562,14 @@ impl Iterator for Spans<'_, '_> {
                 *at = text.len() + 1;
                 return None;
             };
-            let (start, end) = filter.window(text, *at, *at + hit.start..*at + hit.end);
+            let hit = *at + hit.start..*at + hit.end;
+            let (start, end) = if hit.end <= *window_end {
+                (filter.start(text, *at, hit.start), *window_end)
+            } else {
+                let window = filter.window(text, *at, hit.clone());
+                *window_end = window.1;
+                window
+            };
             let context = end.saturating_add(4).min(text.len());
             match regex.find_at(&text[..context], start) {
                 // A span reaching into the added context may owe its match to

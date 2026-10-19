@@ -906,6 +906,7 @@ fn scan_records(
             // The start of the run's next selected line in skip mode, or
             // `usize::MAX` when the rest of the run selects nothing.
             let mut hit_line = None;
+            let mut hit_boundary = None;
             let mut line_start = 0;
             loop {
                 let line = if fast {
@@ -956,6 +957,24 @@ fn scan_records(
                                         + memchr::memrchr(b'\n', &rest[..hit])
                                             .map_or(0, |at| at + 1)
                                 });
+                                hit_boundary = Some(if hit == usize::MAX {
+                                    let end =
+                                        if !terminated && binary.is_none() && text.ends_with(b"\n")
+                                        {
+                                            text.len() - 1
+                                        } else {
+                                            text.len()
+                                        };
+                                    start
+                                        + context::tail_start(
+                                            &text[start..end.max(start)],
+                                            before_lines.max(1),
+                                        )
+                                } else if hit == start {
+                                    start
+                                } else {
+                                    start + context::tail_start(&text[start..hit - 1], before_lines)
+                                });
                                 hit_line = Some(hit);
                                 hit
                             }
@@ -965,20 +984,8 @@ fn scan_records(
                         // before the next selected line or the run's end.
                         let jump = if number < trailing || hit == start {
                             start
-                        } else if hit == usize::MAX {
-                            // A final empty piece without LF is no line.
-                            let end = if !terminated && binary.is_none() && text.ends_with(b"\n") {
-                                text.len() - 1
-                            } else {
-                                text.len()
-                            };
-                            start
-                                + context::tail_start(
-                                    &text[start..end.max(start)],
-                                    before_lines.max(1),
-                                )
                         } else {
-                            start + context::tail_start(&text[start..hit - 1], before_lines)
+                            hit_boundary.unwrap_or(start)
                         };
                         if jump > start {
                             if stopped() {
@@ -1221,6 +1228,8 @@ mod tests {
     #[test]
     fn run_search_and_per_line_search_emit_identical_records_and_results() {
         let documents: &[&[u8]] = &[
+            // Pins the bounded-context skip path at a distant match.
+            b"x\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nred\n",
             b"red\ngap\nred\n",
             b"red\ngap\nred",
             b"gap\nred\n",
@@ -1385,6 +1394,34 @@ mod tests {
                 compare_scanners(&plan, bytes);
             }
         }
+    }
+
+    #[test]
+    fn before_context_boundary_work_is_linear() {
+        let count = 256;
+        let mut bytes = b"x\n".repeat(count);
+        bytes.extend_from_slice(b"red\n");
+        let args = ["-n", "-B256", "red"];
+        let Command::Search(plan) = parse(&args.map(OsString::from)).unwrap() else {
+            panic!("search")
+        };
+        compare_scanners(&plan, &bytes);
+        context::reset_tail_start_scanned();
+        scan_lines(
+            &plan,
+            &mut &bytes[..],
+            bytes.len() as u64,
+            &mut Vec::new(),
+            &|| false,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(
+            context::tail_start_scanned() <= bytes.len() * 2,
+            "tail_start scanned {} bytes for {} input bytes",
+            context::tail_start_scanned(),
+            bytes.len()
+        );
     }
 
     #[test]

@@ -159,6 +159,18 @@ impl Fixture {
             let mut oracles = vec![self.oracle(args, input)];
             oracles.extend(input.map(|input| self.oracle_file(args, input)));
             for oracle in oracles {
+                match row.diagnostics_differ {
+                    None => assert_eq!(
+                        actual.stderr.is_empty(),
+                        oracle.stderr.is_empty(),
+                        "{args:?}: diagnostic presence differs without a row marker ({}): {actual:?} vs {oracle:?}",
+                        row.why
+                    ),
+                    Some(reason) => {
+                        assert!(actual.stderr.is_empty(), "{args:?}: {reason}: {actual:?}");
+                        assert!(!oracle.stderr.is_empty(), "{args:?}: {reason}: {oracle:?}");
+                    }
+                }
                 assert!(
                     oracle.status.code() != actual.status.code() || !same(&oracle),
                     "{args:?} is listed as differing from rg ({}), but rg agrees: {oracle:?}",
@@ -214,6 +226,12 @@ struct Differs {
     status: i32,
     owned: &'static [u8],
     why: &'static str,
+    diagnostics_differ: Option<&'static str>,
+}
+
+const fn diagnostic_difference(mut row: Differs, reason: &'static str) -> Differs {
+    row.diagnostics_differ = Some(reason);
+    row
 }
 
 const fn plain(
@@ -230,6 +248,7 @@ const fn plain(
         status,
         owned,
         why,
+        diagnostics_differ: None,
     }
 }
 
@@ -247,6 +266,7 @@ const fn json(
         status,
         owned: owned.as_bytes(),
         why,
+        diagnostics_differ: None,
     }
 }
 

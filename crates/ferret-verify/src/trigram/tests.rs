@@ -1154,6 +1154,27 @@ fn borrowed_and_owned_searches_agree_across_reused_inputs() {
     }
 }
 
+#[test]
+fn filtered_spans_keep_matches_and_scan_one_window_once() {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    let count = 128;
+    let mut bytes = b"ing".repeat(count);
+    bytes.push(b'\n');
+    let grep = flags.compile_lines(r"[a-z]*?ing").unwrap();
+    let spans = grep.search().spans(&bytes).collect::<Vec<_>>();
+    assert_eq!(spans, grep.regex().spans(&bytes).collect::<Vec<_>>());
+    super::reset_window_scanned();
+    grep.search().spans(&bytes).for_each(drop);
+    assert!(
+        super::window_scanned() <= bytes.len() * 2,
+        "window boundary scans examined {} bytes for {} input bytes",
+        super::window_scanned(),
+        bytes.len()
+    );
+}
+
 // Selection needs the first matching source line even when an earliest end
 // belongs to a different alternative than the full leftmost-first span.
 #[test]

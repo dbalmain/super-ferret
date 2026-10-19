@@ -10,6 +10,8 @@ use crate::find::OutputBuffer;
 /// Where the last `lines` LF-separated lines of `text` begin. Zero lines
 /// begin past the LF that follows `text`; fewer lines than asked begin at 0.
 pub(super) fn tail_start(text: &[u8], lines: u64) -> usize {
+    #[cfg(test)]
+    TAIL_START_SCANNED.with(|scanned| scanned.set(scanned.get() + text.len()));
     let Some(skip) = lines.checked_sub(1) else {
         return text.len() + 1;
     };
@@ -17,6 +19,21 @@ pub(super) fn tail_start(text: &[u8], lines: u64) -> usize {
         .ok()
         .and_then(|skip| memchr::memrchr_iter(b'\n', text).nth(skip))
         .map_or(0, |at| at + 1)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TAIL_START_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_tail_start_scanned() {
+    TAIL_START_SCANNED.with(|scanned| scanned.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn tail_start_scanned() -> usize {
+    TAIL_START_SCANNED.with(std::cell::Cell::get)
 }
 
 pub(super) struct Before<'a> {
