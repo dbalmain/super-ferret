@@ -5614,3 +5614,52 @@ expect an empty result to exit 1.
 > Dave: Agree, option A
 
 **Answer: A.**
+
+## D100 — Empty matches at the end of an unterminated last line
+
+**Status: open, 2026-10-20.**
+
+Question: is the end of a last line that has no final LF a position where an
+empty match can occur?
+
+Built on `wt/grep-d98` as yes. Probed with rg 15.2.0, `--count-matches`:
+
+| Input   | Pattern | rg | ferret |
+| ------- | ------- | -: | -----: |
+| `abc`   | `''`    |  3 |      4 |
+| `abc`   | `x*`    |  3 |      4 |
+| `abc`   | `$`     |  1 |      1 |
+| `abc\n` | `''`    |  4 |      4 |
+
+rg already matches `$` at that position, so its 3 for `''` is inconsistent
+with its own `$`. GNU grep has no `--count-matches`: its `-c` counts lines, and
+`-o` prints no empty matches, which ferret now also does (D79 D).
+
+- **A — yes (as built).** The count is the same with or without a final LF, and
+  agrees with where `$` matches. 87 exclusion rows; no special case in code.
+- **B — match rg.** A rule that drops the final empty match only when the file
+  has no final LF, and only for patterns that are not anchored with `$`.
+
+Recommendation: A, under D97 (simpler, and consistent). Would change it: a
+tool that depends on rg's count for unterminated files.
+
+## D101 — Multiline `-c` for patterns that can match LF
+
+**Status: open, 2026-10-20.**
+
+Question: under `-U`, should `-c` keep counting matches for a pattern that can
+match LF, as GREP.md documents since M7, or count selected lines?
+
+On `foo foo\nfoo\n` with `foo(?:\nbar)?`: ferret and rg both give 3 for
+`-Uc` and 2 for `-Ucm1`. With `-Ucm2` ferret gives 3, because D98 takes whole
+line groups; rg gives 2, because it stops after two matches. Patterns that
+cannot match LF count lines in both tools.
+
+- **A — keep match counts (as built).** No change; agrees with rg on `-Uc` and
+  `-Ucm1`; `-c` equals `--count-matches` for this class.
+- **B — always count lines.** `-c` means lines everywhere, as in GNU grep.
+  Costs new differences from rg on `-Uc` and `-Ucm1`, more exclusion rows, and
+  edits to GREP.md and the M7 spec test.
+
+Recommendation: A. Would change it: wanting `-c` to mean lines everywhere more
+than agreement with rg.
