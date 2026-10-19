@@ -2001,38 +2001,38 @@ fn collect<Group>(
     stopped: &dyn Fn() -> bool,
     emit: &mut impl FnMut(Group) -> ControlFlow<()>,
 ) {
-        // Slots seen empty in a row since `idle` was last set, and the next
-        // slot to look at. Sleeping needs a full clean pass after setting it.
-        let mut clean = 0;
-        let mut at = 0;
-        loop {
-            let batch = match receiver.try_recv() {
+    // Slots seen empty in a row since `idle` was last set, and the next
+    // slot to look at. Sleeping needs a full clean pass after setting it.
+    let mut clean = 0;
+    let mut at = 0;
+    loop {
+        let batch = match receiver.try_recv() {
+            Ok(batch) => Some(batch),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) if clean < held.len() => {
+                if clean == 0 {
+                    idle.store(true, Ordering::SeqCst);
+                }
+                let batch = lock(&held[at]).take();
+                at = (at + 1) % held.len();
+                clean += 1;
+                batch
+            }
+            // Every slot was empty after `idle` was set: a group completed
+            // from here on is sent, which wakes this receive.
+            Err(std::sync::mpsc::TryRecvError::Empty) => match receiver.recv() {
                 Ok(batch) => Some(batch),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                Err(std::sync::mpsc::TryRecvError::Empty) if clean < held.len() => {
-                    if clean == 0 {
-                        idle.store(true, Ordering::SeqCst);
-                    }
-                    let batch = lock(&held[at]).take();
-                    at = (at + 1) % held.len();
-                    clean += 1;
-                    batch
-                }
-                // Every slot was empty after `idle` was set: a group completed
-                // from here on is sent, which wakes this receive.
-                Err(std::sync::mpsc::TryRecvError::Empty) => match receiver.recv() {
-                    Ok(batch) => Some(batch),
-                    Err(_) => break,
-                },
-            };
-            if let Some(batch) = batch {
-                idle.store(false, Ordering::SeqCst);
-                clean = 0;
-                if publish(batch, stopped, emit).is_break() {
-                    break;
-                }
+                Err(_) => break,
+            },
+        };
+        if let Some(batch) = batch {
+            idle.store(false, Ordering::SeqCst);
+            clean = 0;
+            if publish(batch, stopped, emit).is_break() {
+                break;
             }
         }
+    }
 }
 
 /// Like [`completion_groups`], for workers that find their own tasks: `run`

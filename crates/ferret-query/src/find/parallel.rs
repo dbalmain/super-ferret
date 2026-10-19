@@ -199,7 +199,10 @@ pub(super) fn run(
 impl Split for LiveWalk {
     // Read-only starts may overlap. Effectful starts stay in the lender and
     // advance only after all lent descendants have completed.
-    fn split(&mut self, starts: bool) -> Option<(Self, Option<Arc<std::sync::atomic::AtomicUsize>>)> {
+    fn split(
+        &mut self,
+        starts: bool,
+    ) -> Option<(Self, Option<Arc<std::sync::atomic::AtomicUsize>>)> {
         if starts && let Some(walk) = self.split_start() {
             return Some((walk, None));
         }
@@ -227,7 +230,12 @@ struct Worker<'p, E> {
 }
 
 impl<'p, E: Effects> Worker<'p, E> {
-    fn new(plan: &'p Plan, expression: &'p Expression, effects: E, quit: &'p Arc<AtomicBool>) -> Self {
+    fn new(
+        plan: &'p Plan,
+        expression: &'p Expression,
+        effects: E,
+        quit: &'p Arc<AtomicBool>,
+    ) -> Self {
         Self {
             plan,
             expression,
@@ -241,7 +249,13 @@ impl<'p, E: Effects> Worker<'p, E> {
 
 impl<E: Effects> Visitor<LiveWalk, Task> for Worker<'_, E> {
     fn step(&mut self, walk: &mut LiveWalk, task: &mut Task) -> Step {
-        let more = task.step(walk, self.plan, self.expression, &mut self.effects, self.policy);
+        let more = task.step(
+            walk,
+            self.plan,
+            self.expression,
+            &mut self.effects,
+            self.policy,
+        );
         if task.control.quit {
             Step::Quit
         } else if more {
@@ -336,9 +350,7 @@ impl Plan {
             source,
             task,
             &mut Worker::new(self, &expression, effects.clone(), &quit),
-            |walk| {
-                !shallow_catalog || walk.in_live_directory() || !sequential && walk.has_starts()
-            },
+            |walk| !shallow_catalog || walk.in_live_directory() || !sequential && walk.has_starts(),
             |_| Worker::new(self, &expression, effects.clone(), &quit),
         );
         let errors = errors

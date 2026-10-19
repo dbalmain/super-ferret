@@ -64,8 +64,9 @@ const STEPS_PER_LOAN: usize = 64;
 /// Walks `walk` from task state `task` on the calling thread with `caller`,
 /// lending work once `first` allows a split and more than one worker is
 /// scheduled; then `workers - 1` threads join, worker `i` visiting with
-/// `visitor(i)`, made on the calling thread. Every task ends on some visitor; those left queued by a quit
-/// end on `caller`. Returns the errors the tasks counted.
+/// `visitor(i)`, made on the calling thread. Every task ends on some visitor;
+/// those left queued by a quit end on `caller`. Returns the errors the tasks
+/// counted.
 pub fn run<S: Split, T: Send, V: Visitor<S, T> + Send>(
     schedule: &Schedule<'_>,
     mut walk: S,
@@ -186,7 +187,10 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
             }
             errors
         });
-        let queue = self.queue.into_inner().unwrap_or_else(PoisonError::into_inner);
+        let queue = self
+            .queue
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
         errors
             + queue
                 .tasks

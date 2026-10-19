@@ -3,15 +3,15 @@
 //! parallelism. A bounded completion queue feeds the calling publisher.
 
 use super::*;
+use ferret_query::Lane;
+use ferret_query::find::LiveWalk;
+use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
 use ferret_query::{ReadOperation, ReadVersion};
 use std::collections::HashMap;
 use std::io::{BufRead, IoSlice};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use ferret_query::Lane;
-use ferret_query::find::LiveWalk;
-use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
 
 pub(super) const GROUP_BYTES: usize = 4 << 20;
 const ENTRY_BYTES: usize = 64 << 10;
@@ -525,88 +525,87 @@ fn prepare(
     eligible: bool,
     stopped: &dyn Fn() -> bool,
 ) -> io::Result<Observed> {
-        let render = Render {
-            plan,
-            prefix: (filename || plan.json)
-                .then(|| label(job.path(), plan.paths.is_empty())),
-            stopped,
-        };
-        let observed = match job {
-            Job::Checked(_, name, doc) => {
-                let Some(read) = read else {
-                    return Err(io::Error::other("catalogued input has no checked reader"));
-                };
-                let cached = eligible.then(|| lock(cache).get(*doc)).flatten();
-                if let Some(cached) = cached {
-                    match read(*name, ReadRequest::Stat) {
-                        ReadOutcome::Stable(ReadVersion::Catalogued) => {
-                            let mut output = OutputBuffer::default()
-                                .with_memory_limit(GROUP_BYTES)
-                                .with_buffered_spill();
-                            let mut cursor = Cursor::default();
-                            for record in &cached.records {
-                                render.line(
-                                    &mut output,
-                                    line_grep::Line {
-                                        offset: record.offset,
-                                        source_lines: record.source_lines,
-                                        terminated: record.terminated,
-                                        number: record.number,
-                                        bytes: &record.bytes,
-                                        kind: record.kind,
-                                        fragment: record.fragment,
-                                        highlights: record.highlights.as_deref(),
-                                    },
-                                    &mut cursor,
-                                )?;
-                            }
-                            output.flush()?;
-                            return Ok(Observed::Ready(Group {
-                                result: cached.result,
-                                output,
-                                version: ReadVersion::Catalogued,
-                                records: None,
-                            }));
+    let render = Render {
+        plan,
+        prefix: (filename || plan.json).then(|| label(job.path(), plan.paths.is_empty())),
+        stopped,
+    };
+    let observed = match job {
+        Job::Checked(_, name, doc) => {
+            let Some(read) = read else {
+                return Err(io::Error::other("catalogued input has no checked reader"));
+            };
+            let cached = eligible.then(|| lock(cache).get(*doc)).flatten();
+            if let Some(cached) = cached {
+                match read(*name, ReadRequest::Stat) {
+                    ReadOutcome::Stable(ReadVersion::Catalogued) => {
+                        let mut output = OutputBuffer::default()
+                            .with_memory_limit(GROUP_BYTES)
+                            .with_buffered_spill();
+                        let mut cursor = Cursor::default();
+                        for record in &cached.records {
+                            render.line(
+                                &mut output,
+                                line_grep::Line {
+                                    offset: record.offset,
+                                    source_lines: record.source_lines,
+                                    terminated: record.terminated,
+                                    number: record.number,
+                                    bytes: &record.bytes,
+                                    kind: record.kind,
+                                    fragment: record.fragment,
+                                    highlights: record.highlights.as_deref(),
+                                },
+                                &mut cursor,
+                            )?;
                         }
-                        ReadOutcome::Failed(error) => return Ok(Observed::Failed(error)),
-                        ReadOutcome::Cancelled | ReadOutcome::Vanished => {
-                            return Ok(Observed::Skipped);
-                        }
-                        ReadOutcome::Stable(ReadVersion::Current) | ReadOutcome::RetryChanged => {}
+                        output.flush()?;
+                        return Ok(Observed::Ready(Group {
+                            result: cached.result,
+                            output,
+                            version: ReadVersion::Catalogued,
+                            records: None,
+                        }));
                     }
-                }
-                let observed = observe(
-                    &render,
-                    buffer,
-                    &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
-                    eligible,
-                )?;
-                if let Observed::Ready(mut group) = observed {
-                    if eligible {
-                        lock(cache).remember(*doc, &mut group);
+                    ReadOutcome::Failed(error) => return Ok(Observed::Failed(error)),
+                    ReadOutcome::Cancelled | ReadOutcome::Vanished => {
+                        return Ok(Observed::Skipped);
                     }
-                    Observed::Ready(group)
-                } else {
-                    observed
+                    ReadOutcome::Stable(ReadVersion::Current) | ReadOutcome::RetryChanged => {}
                 }
             }
-            Job::Direct(path, recursive) => observe(
+            let observed = observe(
                 &render,
                 buffer,
-                &mut |each| read_file(path, *recursive, plan, each, stopped),
-                false,
-            )?,
-            Job::Absent(_) => Observed::Ready(Group {
-                result: InputResult::empty(plan),
-                output: OutputBuffer::default()
-                    .with_memory_limit(GROUP_BYTES)
-                    .with_buffered_spill(),
-                version: ReadVersion::Catalogued,
-                records: None,
-            }),
-            Job::Failed(_, _) => Observed::Skipped,
-        };
-        Ok(observed)
+                &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
+                eligible,
+            )?;
+            if let Observed::Ready(mut group) = observed {
+                if eligible {
+                    lock(cache).remember(*doc, &mut group);
+                }
+                Observed::Ready(group)
+            } else {
+                observed
+            }
+        }
+        Job::Direct(path, recursive) => observe(
+            &render,
+            buffer,
+            &mut |each| read_file(path, *recursive, plan, each, stopped),
+            false,
+        )?,
+        Job::Absent(_) => Observed::Ready(Group {
+            result: InputResult::empty(plan),
+            output: OutputBuffer::default()
+                .with_memory_limit(GROUP_BYTES)
+                .with_buffered_spill(),
+            version: ReadVersion::Catalogued,
+            records: None,
+        }),
+        Job::Failed(_, _) => Observed::Skipped,
+    };
+    Ok(observed)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -628,7 +627,11 @@ pub(super) fn run<'a, W: Write>(
         threads,
         cancelled,
         |stopped| {
-            let _publication = search.plan.traversal.live.then(|| lock(&search.publication));
+            let _publication = search
+                .plan
+                .traversal
+                .live
+                .then(|| lock(&search.publication));
             next(stopped)
         },
         || Worker {
@@ -730,7 +733,11 @@ impl<'s> Search<'s> {
     }
 
     /// Publishes one group on the output thread.
-    fn publish<W: Write>(&self, host: &mut Host<'_, W>, (job, observed): Searched) -> ControlFlow<()> {
+    fn publish<W: Write>(
+        &self,
+        host: &mut Host<'_, W>,
+        (job, observed): Searched,
+    ) -> ControlFlow<()> {
         let _publication = lock(&self.publication);
         if let Job::Failed(_, message) = &job {
             host.error(job.path(), message);
@@ -755,9 +762,16 @@ impl<'s> Search<'s> {
 
     fn finish<W>(self, host: &mut Host<'_, W>) -> io::Result<()> {
         host.matched |= self.hit.load(Ordering::Acquire);
-        host.json_stats
-            .merge(self.quiet_stats.into_inner().unwrap_or_else(PoisonError::into_inner));
-        match self.fatal.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        host.json_stats.merge(
+            self.quiet_stats
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        match self
+            .fatal
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -992,98 +1006,85 @@ impl Filter<'_> {
         publication: Option<&Mutex<()>>,
         stopped: &dyn Fn() -> bool,
     ) -> Option<(u64, Job)> {
-            let kind = match entry.kind() {
-                Ok(kind) => kind,
-                Err(error) => {
-                    return Some((
-                        0,
-                        Job::Failed(entry.path().to_owned(), error.to_string()),
-                    ));
-                }
-            };
-            let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
-            if self
+        let kind = match entry.kind() {
+            Ok(kind) => kind,
+            Err(error) => {
+                return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+            }
+        };
+        let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
+        if self
+            .traversal
+            .max_depth
+            .is_some_and(|limit| entry.depth() > limit)
+        {
+            *descend = false;
+            return None;
+        }
+        if kind == FileKind::Directory {
+            *descend = self
                 .traversal
                 .max_depth
-                .is_some_and(|limit| entry.depth() > limit)
-            {
-                *descend = false;
-                return None;
-            }
-            if kind == FileKind::Directory {
-                *descend = self
-                    .traversal
-                    .max_depth
-                    .is_none_or(|limit| entry.depth() < limit)
-                    && self
-                        .selection
-                        .descend(relative.as_os_str().as_bytes(), entry.depth());
-                if *descend
-                    && let Some(policy) = policy
-                {
-                    // Loading a directory's rules may warn: not inside
-                    // another file's group.
-                    let _publication = publication.map(lock);
-                    match policy.accepts(entry, true, stopped) {
-                        Ok(allowed) => *descend = allowed,
-                        Err(error) => {
-                            *descend = false;
-                            return Some((
-                                0,
-                                Job::Failed(entry.path().to_owned(), error.to_string()),
-                            ));
-                        }
-                    }
-                }
-                return None;
-            }
-            if kind != FileKind::File
-                || !self
+                .is_none_or(|limit| entry.depth() < limit)
+                && self
                     .selection
-                    .allows(relative.as_os_str().as_bytes(), entry.depth())
+                    .descend(relative.as_os_str().as_bytes(), entry.depth());
+            if *descend && let Some(policy) = policy {
+                // Loading a directory's rules may warn: not inside
+                // another file's group.
+                let _publication = publication.map(lock);
+                match policy.accepts(entry, true, stopped) {
+                    Ok(allowed) => *descend = allowed,
+                    Err(error) => {
+                        *descend = false;
+                        return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+                    }
+                }
+            }
+            return None;
+        }
+        if kind != FileKind::File
+            || !self
+                .selection
+                .allows(relative.as_os_str().as_bytes(), entry.depth())
+        {
+            return None;
+        }
+        if let Some(policy) = policy {
+            match policy.accepts(entry, true, stopped) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(error) => {
+                    return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+                }
+            }
+        }
+        *searched = true;
+        if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
+            let inode = catalog.name(name).child;
+            let Some(doc) = catalog.doc(inode) else {
+                if self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary {
+                    return Some((
+                        catalog.inode(inode).stat.size,
+                        Job::Direct(entry.path().to_owned(), true),
+                    ));
+                }
+                return None;
+            };
+            if self
+                .candidates
+                .is_some_and(|candidates| !candidates.contains(doc.0))
             {
+                if self.emit_absent {
+                    return Some((0, Job::Absent(entry.path().to_owned())));
+                }
                 return None;
             }
-            if let Some(policy) = policy {
-                match policy.accepts(entry, true, stopped) {
-                    Ok(true) => {}
-                    Ok(false) => return None,
-                    Err(error) => {
-                        return Some((
-                            0,
-                            Job::Failed(entry.path().to_owned(), error.to_string()),
-                        ));
-                    }
-                }
-            }
-            *searched = true;
-            if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
-                let inode = catalog.name(name).child;
-                let Some(doc) = catalog.doc(inode) else {
-                    if self.text
-                        && catalog.state(inode) == ferret_catalog::ContentState::Binary
-                    {
-                        return Some((
-                            catalog.inode(inode).stat.size,
-                            Job::Direct(entry.path().to_owned(), true),
-                        ));
-                    }
-                    return None;
-                };
-                if self
-                    .candidates
-                    .is_some_and(|candidates| !candidates.contains(doc.0))
-                {
-                    if self.emit_absent {
-                        return Some((0, Job::Absent(entry.path().to_owned())));
-                    }
-                    return None;
-                }
-                return Some((
-                    catalog.inode(inode).stat.size,
-                    Job::Checked(entry.path().to_owned(), name, doc.0),
-                ));
-            }
+            return Some((
+                catalog.inode(inode).stat.size,
+                Job::Checked(entry.path().to_owned(), name, doc.0),
+            ));
+        }
         Some((0, Job::Direct(entry.path().to_owned(), true)))
     }
 }

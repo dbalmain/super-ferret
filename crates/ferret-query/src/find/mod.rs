@@ -6,9 +6,9 @@ mod action;
 mod glob;
 mod output;
 mod parallel;
-pub mod schedule;
 mod parse;
 mod printf;
+pub mod schedule;
 mod test;
 mod walk;
 
