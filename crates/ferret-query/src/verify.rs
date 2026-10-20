@@ -1704,41 +1704,76 @@ impl<Task> Feed<Task> {
     }
 
     /// Runs `next` without holding a feed or run lock.
+    ///
+    /// An indexed producer gathers up to [`RUN_TASKS`] tasks between takes of
+    /// the feed lock, which it takes once per batch to publish it and find the
+    /// room for the next. Catalog enumeration makes no syscalls, so a gathered
+    /// task waits behind at most 15 cheap entries, and D107 wakes no worker
+    /// before 16 are queued anyway; a lock per task was 10% of the producer's
+    /// time (kdiag, 2026-10-20). A streaming producer may block after any task
+    /// whose execution releases it, so it publishes each one at once.
     fn produce(
         &self,
         next: &mut impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
         stopped: &dyn Fn() -> bool,
     ) {
+        let most = if self.indexed { RUN_TASKS } else { 1 };
+        let mut batch = Vec::with_capacity(most);
+        let mut ended = false;
         loop {
-            {
-                let mut state = lock(&self.state);
-                while state.tasks.len() >= self.capacity && !state.closed {
-                    state.full = true;
-                    state = wait(&self.room, state);
-                }
-                state.full = false;
-                if state.closed {
-                    return;
-                }
-            }
-            if stopped() {
-                return;
-            }
-            let Some(task) = next(stopped) else { return };
             let mut state = lock(&self.state);
             if state.closed {
                 return;
             }
-            state.tasks.push_back(task);
-            let wake = if self.indexed {
-                state.sleeping > 0 && state.tasks.len().is_multiple_of(RUN_TASKS)
-            } else {
-                state.sleeping >= state.tasks.len()
-            };
+            let mut wake = self.publish(&mut state, &mut batch);
+            if !ended && wake && state.tasks.len() >= self.capacity {
+                // Wake before sleeping on `room`, or nobody makes room.
+                self.ready.notify_one();
+                wake = false;
+            }
+            while !ended && state.tasks.len() >= self.capacity && !state.closed {
+                state.full = true;
+                state = wait(&self.room, state);
+            }
+            state.full = false;
+            let closed = state.closed;
+            // Only this thread pushes, so the room only grows until the next
+            // publication: the batch keeps the queue within its bound.
+            let room = self.capacity.saturating_sub(state.tasks.len()).min(most);
             drop(state);
             if wake {
                 self.ready.notify_one();
             }
+            if ended || closed {
+                return;
+            }
+            while batch.len() < room {
+                if stopped() {
+                    return;
+                }
+                let Some(task) = next(stopped) else {
+                    ended = true;
+                    break;
+                };
+                batch.push(task);
+            }
+        }
+    }
+
+    /// Queues the gathered batch under the feed lock, and says whether to
+    /// wake a sleeping worker: in indexed mode when the queue passes a
+    /// multiple of [`RUN_TASKS`], as one push at a time would have; in
+    /// streaming mode while sleepers outnumber queued tasks.
+    fn publish(&self, state: &mut FeedState<Task>, batch: &mut Vec<(u64, Task)>) -> bool {
+        if batch.is_empty() {
+            return false;
+        }
+        let before = state.tasks.len();
+        state.tasks.extend(batch.drain(..));
+        if self.indexed {
+            state.sleeping > 0 && state.tasks.len() / RUN_TASKS > before / RUN_TASKS
+        } else {
+            state.sleeping >= state.tasks.len()
         }
     }
 
