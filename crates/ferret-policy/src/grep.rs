@@ -83,10 +83,22 @@ impl GrepSelection {
     /// overrides and hidden filtering. Descendant directories must each pass
     /// before a file can be selected.
     pub fn allows(&self, path: &[u8], depth: usize) -> bool {
-        let components: Vec<_> = path
-            .split(|&b| b == b'/')
-            .filter(|p| !p.is_empty() && *p != b".")
-            .collect();
+        if self.rules.is_empty() {
+            // Without overrides only hidden filtering applies: to the name and
+            // the descendant directories above it, the last `max(depth, 1)`
+            // components. Checking them in place keeps the index producer,
+            // which asks once per catalog entry, off the allocator:
+            // collecting every component cost 43% of its time on a
+            // 300k-file tree (kdiag, 2026-10-20).
+            return self.hidden
+                || components_from_end(path)
+                    .take(depth.max(1))
+                    .all(|name| !name.starts_with(b"."));
+        }
+        with_components(path, |components| self.allows_components(components, depth))
+    }
+
+    fn allows_components(&self, components: &[&[u8]], depth: usize) -> bool {
         for end in components.len().saturating_sub(depth) + 1..components.len() {
             let matched = self.decision(&components[..end], true);
             if matched == Some(false)
@@ -95,7 +107,7 @@ impl GrepSelection {
                 return false;
             }
         }
-        self.decision(&components, false).unwrap_or_else(|| {
+        self.decision(components, false).unwrap_or_else(|| {
             !self.positive
                 && (self.hidden || !components.last().is_some_and(|p| p.starts_with(b".")))
         })
@@ -107,11 +119,18 @@ impl GrepSelection {
         if depth == 0 {
             return true;
         }
-        let components: Vec<_> = path
-            .split(|&b| b == b'/')
-            .filter(|p| !p.is_empty() && *p != b".")
-            .collect();
-        let matched = self.decision(&components, true);
+        if self.rules.is_empty() {
+            // As in `allows`: only the directory's own name can hide it.
+            return self.hidden
+                || !components_from_end(path)
+                    .next()
+                    .is_some_and(|name| name.starts_with(b"."));
+        }
+        with_components(path, |components| self.descend_components(components))
+    }
+
+    fn descend_components(&self, components: &[&[u8]]) -> bool {
+        let matched = self.decision(components, true);
         matched != Some(false)
             && (matched == Some(true)
                 || self.hidden
@@ -126,6 +145,35 @@ impl GrepSelection {
                 .then_some(*include)
         })
     }
+}
+
+/// A path's components, last first, without empty or `.` components.
+fn components_from_end(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.rsplit(|&b| b == b'/')
+        .filter(|p| !p.is_empty() && *p != b".")
+}
+
+/// Calls `f` with a path's components, skipping empty and `.` components.
+/// Paths up to 32 components deep are split on the stack; only deeper
+/// ones allocate.
+fn with_components<R>(path: &[u8], f: impl FnOnce(&[&[u8]]) -> R) -> R {
+    const INLINE_COMPONENTS: usize = 32;
+    let mut parts = path
+        .split(|&b| b == b'/')
+        .filter(|p| !p.is_empty() && *p != b".");
+    let mut inline: [&[u8]; INLINE_COMPONENTS] = [&[]; INLINE_COMPONENTS];
+    let mut len = 0;
+    for part in parts.by_ref() {
+        if len == INLINE_COMPONENTS {
+            let mut spilled = inline.to_vec();
+            spilled.push(part);
+            spilled.extend(parts);
+            return f(&spilled);
+        }
+        inline[len] = part;
+        len += 1;
+    }
+    f(&inline[..len])
 }
 
 fn braces(pattern: &str, out: &mut Vec<String>) -> Result<(), GrepGlobError> {
@@ -229,4 +277,111 @@ fn class_end(bytes: &[u8], start: usize) -> Result<usize, GrepGlobError> {
         }
     }
     Err(GrepGlobError::UnclosedClass)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths() -> Vec<Vec<u8>> {
+        let mut paths: Vec<Vec<u8>> = [
+            &b""[..],
+            b".",
+            b"/",
+            b"a",
+            b".a",
+            b"./a",
+            b"./.a",
+            b"a/.b",
+            b".a/b",
+            b"a//b/",
+            b"a/./.b/c",
+            b"/abs/.h/x/y",
+            b"x/y/.z",
+            b"..",
+            b"a/../b",
+            b"x/\xff.h/y",
+            b"x/.\xff/y",
+            b"\xff\xfe/.q",
+        ]
+        .iter()
+        .map(|p| p.to_vec())
+        .collect();
+        // Deeper than the 32 components split on the stack, with a hidden
+        // component near each end.
+        for hidden in [0, 3, 38, 39] {
+            let deep: Vec<String> = (0..40)
+                .map(|i| {
+                    if i == hidden {
+                        ".h".into()
+                    } else {
+                        format!("d{i}")
+                    }
+                })
+                .collect();
+            paths.push(deep.join("/").into_bytes());
+        }
+        paths
+    }
+
+    /// The no-rules fast paths answer exactly as the general paths do, for
+    /// every depth up to past the path's length.
+    #[test]
+    fn no_rules_fast_path_matches_the_general_path() {
+        for hidden in [false, true] {
+            let selection = GrepSelection::default().with_hidden(hidden);
+            for path in paths() {
+                for depth in (0..=6).chain([39, 40, 41, 100]) {
+                    let general = with_components(&path, |c| selection.allows_components(c, depth));
+                    assert_eq!(
+                        selection.allows(&path, depth),
+                        general,
+                        "allows {:?} depth {depth} hidden {hidden}",
+                        path.escape_ascii().to_string(),
+                    );
+                    let general =
+                        depth == 0 || with_components(&path, |c| selection.descend_components(c));
+                    assert_eq!(
+                        selection.descend(&path, depth),
+                        general,
+                        "descend {:?} depth {depth} hidden {hidden}",
+                        path.escape_ascii().to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A rule that never matches leaves the answer to hidden filtering, so a
+    /// selection holding one takes the general path and must agree with the
+    /// fast path of an empty selection.
+    #[test]
+    fn a_rule_that_never_matches_changes_nothing() {
+        for hidden in [false, true] {
+            let fast = GrepSelection::default().with_hidden(hidden);
+            let mut ruled = fast.clone();
+            ruled.push("!no-such-name").unwrap();
+            for path in paths() {
+                for depth in [0, 1, 2, 3, 40] {
+                    assert_eq!(fast.allows(&path, depth), ruled.allows(&path, depth));
+                    assert_eq!(fast.descend(&path, depth), ruled.descend(&path, depth));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_filtering_covers_only_the_walked_components() {
+        let held = GrepSelection::default();
+        assert!(held.allows(b".hidden/x", 1));
+        assert!(!held.allows(b".hidden/x", 2));
+        assert!(!held.allows(b"a/.x", 0));
+        assert!(held.allows(b"", 0));
+        assert!(held.descend(b".hidden", 0));
+        assert!(!held.descend(b"a/.hidden", 1));
+        assert!(held.descend(b".hidden/a", 1));
+        let shown = GrepSelection::default().with_hidden(true);
+        assert!(shown.allows(b".hidden/x", 2));
+        assert!(shown.descend(b"a/.hidden", 1));
+    }
 }
