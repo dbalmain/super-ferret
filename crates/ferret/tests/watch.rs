@@ -189,6 +189,32 @@ impl Tree {
             .unwrap_or_else(|error| panic!("event: {error:?}"));
         line
     }
+    /// Opens a connection and waits for its hello, so the daemon has counted
+    /// it as a client: until it is dropped, the daemon cannot idle out.
+    fn hold(&self) -> UnixStream {
+        let stream = UnixStream::connect(self.socket().unwrap_or_else(|| panic!("socket")))
+            .unwrap_or_else(|error| panic!("hold connect: {error:?}"));
+        stream
+            .set_read_timeout(Some(BOUND))
+            .unwrap_or_else(|error| panic!("hold timeout: {error:?}"));
+        let mut hello = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut hello)
+            .unwrap_or_else(|error| panic!("hold hello: {error:?}"));
+        assert!(
+            hello.contains("\"event\":\"hello\""),
+            "hold hello: {hello:?}"
+        );
+        stream
+    }
+    fn exited(&mut self) -> bool {
+        self.daemon
+            .as_mut()
+            .unwrap_or_else(|| panic!("daemon"))
+            .try_wait()
+            .unwrap_or_else(|error| panic!("try wait: {error:?}"))
+            .is_some()
+    }
     fn status(&self) -> String {
         self.event("{\"id\":\"s\",\"op\":\"status\"}\n")
     }
@@ -741,35 +767,66 @@ fn hourly_backstop_observes_an_unwatched_tree() {
     tree.converges();
 }
 
+/// Idle exit is driven by events, not sleeps: a held connection keeps the
+/// daemon from idling out while the test looks, and each check is anchored to
+/// a refresh the test saw begin. The only sleep is the negative check, which
+/// spans many idle periods inside that refresh.
 #[test]
 fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
+    let env = [
+        ("FERRET_DAEMON_IDLE_MS", "20"),
+        // Loading counts as busy, so the first held connection lands before
+        // idle can expire even if this thread stalls after the bind probe.
+        ("FERRET_DAEMON_LOAD_DELAY_MS", "500"),
+        ("FERRET_WATCH_TEST_REFRESH_DELAY_MS", "2000"),
+    ];
     let mut tree = Tree::new();
-    tree.spawn(&[
-        ("FERRET_DAEMON_IDLE_MS", "80"),
-        ("FERRET_WATCH_TEST_REFRESH_DELAY_MS", "300"),
-    ]);
-    assert!(tree.status().contains("\"writer_busy\":true"));
-    std::thread::sleep(Duration::from_millis(150));
+    tree.spawn(&env);
+    let hold = tree.hold();
+    let refreshing = |s: &str| {
+        s.contains("\"current_operation\":\"refresh\"") && s.contains("\"writer_busy\":true")
+    };
+    let mut seen = tree.status();
+    let until = Instant::now() + BOUND;
+    while !refreshing(&seen) {
+        assert!(Instant::now() < until, "refresh never began: {seen}");
+        std::thread::sleep(Duration::from_millis(10));
+        seen = tree.status();
+    }
+    drop(hold);
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(!tree.exited(), "daemon idled out during a refresh");
+    let after = tree.status();
     assert!(
-        tree.daemon
-            .as_mut()
-            .unwrap_or_else(|| panic!("daemon"))
-            .try_wait()
-            .unwrap_or_else(|error| panic!("try wait: {error:?}"))
-            .is_none()
+        refreshing(&after) && number(&after, "refreshes") == number(&seen, "refreshes"),
+        "the refresh ended before the check, so the check proved nothing; \
+         raise the refresh delay: {after}"
     );
-    tree.quiet();
-    write(tree.path("src/left/deep/pending.txt"), "pending");
-    std::thread::sleep(Duration::from_millis(150));
-    assert!(
-        tree.daemon
-            .as_mut()
-            .unwrap_or_else(|| panic!("daemon"))
-            .try_wait()
-            .unwrap_or_else(|error| panic!("try wait: {error:?}"))
-            .is_some()
-    );
-    tree.stop();
+    // Debounced hints are not busy work: the daemon may exit with one pending,
+    // and the next start's backstop must pick it up. Whether the debounce
+    // (200 ms) fires before the idle exit (20 ms) is a race the product
+    // allows, so retry until an exit leaves the hint unpublished.
+    for attempt in 0.. {
+        let hold = tree.hold();
+        tree.quiet();
+        drop(hold);
+        let name = format!("pending-{attempt}.txt");
+        write(tree.path(&format!("src/left/deep/{name}")), "pending");
+        let until = Instant::now() + BOUND;
+        while !tree.exited() {
+            assert!(Instant::now() < until, "daemon did not idle out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tree.stop();
+        let published = records(tree.local(&["search", "*"]), b'\n')
+            .iter()
+            .any(|path| path.ends_with(name.as_bytes()));
+        if !published {
+            break;
+        }
+        assert!(attempt < 5, "every idle exit waited for the debounced hint");
+        tree.spawn(&env);
+    }
     tree.start(&[]);
     tree.converges();
 }
