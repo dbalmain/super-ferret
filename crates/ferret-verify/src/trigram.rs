@@ -429,6 +429,15 @@ fn window_scanned() -> usize {
 }
 
 impl Search<'_> {
+    /// Uses the same regex and span iterator without the required-run windows.
+    #[cfg(test)]
+    fn without_windowing(&self) -> Search<'_> {
+        Search {
+            regex: Cow::Borrowed(&self.regex),
+            filter: None,
+        }
+    }
+
     /// Offset of the first match's start in `text`.
     pub fn find(&self, text: &[u8]) -> Option<usize> {
         let Some(filter) = &self.filter else {
