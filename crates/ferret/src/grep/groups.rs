@@ -369,45 +369,48 @@ pub(super) fn observe_streaming(
     })
 }
 
+/// Reads an explicit operand by `path`, following symlinks, or, given the
+/// `listed` directory a walk found it in, a walked file by its name beneath
+/// that directory without following one (D21).
 pub(super) fn read_file(
     path: &Path,
-    recursive: bool,
+    listed: Option<&engine::reader::Parent>,
     plan: &Plan,
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
 ) -> ReadOutcome {
+    let recursive = listed.is_some();
     let cap = (recursive && !plan.traversal.unrestricted)
         .then(|| ferret_policy::Config::default().size_cap);
-    engine::reader::direct(
-        path,
-        cap,
-        &mut |input, size| {
-            if recursive && !plan.text {
-                // Unrestricted recursion follows rg's initial scan-window
-                // binary gate, including early quiet/name modes. Policy walks
-                // retain D13's indexing sniffer; explicit files bypass both.
-                let probe = if plan.traversal.unrestricted {
-                    CHUNK
-                } else {
-                    ferret_policy::SNIFF_LEN
-                };
-                let mut buffered = io::BufReader::with_capacity(probe, input);
-                let head = buffered.fill_buf()?;
-                let binary = if plan.traversal.unrestricted {
-                    head.contains(&0)
-                } else {
-                    ferret_policy::sniff(head) == ferret_policy::Content::Binary
-                };
-                if binary {
-                    return Ok(());
-                }
-                each(&mut buffered, size)
+    let mut pass = |input: &mut dyn Read, size| {
+        if recursive && !plan.text {
+            // Unrestricted recursion follows rg's initial scan-window
+            // binary gate, including early quiet/name modes. Policy walks
+            // retain D13's indexing sniffer; explicit files bypass both.
+            let probe = if plan.traversal.unrestricted {
+                CHUNK
             } else {
-                each(input, size)
+                ferret_policy::SNIFF_LEN
+            };
+            let mut buffered = io::BufReader::with_capacity(probe, input);
+            let head = buffered.fill_buf()?;
+            let binary = if plan.traversal.unrestricted {
+                head.contains(&0)
+            } else {
+                ferret_policy::sniff(head) == ferret_policy::Content::Binary
+            };
+            if binary {
+                return Ok(());
             }
-        },
-        stopped,
-    )
+            each(&mut buffered, size)
+        } else {
+            each(input, size)
+        }
+    };
+    match listed {
+        None => engine::reader::direct(path, cap, &mut pass, stopped),
+        Some(parent) => engine::reader::listed(parent, path, cap, &mut pass, stopped),
+    }
 }
 
 pub(super) fn stream(
@@ -501,8 +504,15 @@ pub(super) fn emit(
 }
 
 pub(super) enum Job {
-    Direct(PathBuf, bool),
+    /// An explicit file operand, opened by its path.
+    Direct(PathBuf),
+    /// A walked file and the directory it was listed in, which it is opened
+    /// beneath, never through a symlink.
+    Listed(PathBuf, engine::reader::Parent),
     Checked(PathBuf, NameId, u32),
+    /// A catalogued name with no document, searched under `-a` because it is
+    /// binary: read through the checked catalog walk, uncached.
+    Binary(PathBuf, NameId),
     Failed(PathBuf, String),
     // Catalog posting absence only: explicit/live inputs always read bytes.
     Absent(PathBuf),
@@ -510,7 +520,22 @@ pub(super) enum Job {
 impl Job {
     fn path(&self) -> &Path {
         match self {
-            Self::Direct(p, _) | Self::Checked(p, _, _) | Self::Failed(p, _) | Self::Absent(p) => p,
+            Self::Direct(p)
+            | Self::Listed(p, _)
+            | Self::Checked(p, _, _)
+            | Self::Binary(p, _)
+            | Self::Failed(p, _)
+            | Self::Absent(p) => p,
+        }
+    }
+
+    /// What publication keeps of a finished job: no open directory. Finished
+    /// groups can wait in held batches behind a blocked writer, and each
+    /// would otherwise keep its directory's descriptor open.
+    fn finished(self) -> Self {
+        match self {
+            Self::Listed(path, _) => Self::Direct(path),
+            job => job,
         }
     }
 }
@@ -661,10 +686,29 @@ fn prepare(
                 observed
             }
         }
-        Job::Direct(path, recursive) => observe_streaming(
+        Job::Binary(_, name) => {
+            let Some(read) = read else {
+                return Err(io::Error::other("catalogued input has no checked reader"));
+            };
+            observe_streaming(
+                &render,
+                buffer,
+                &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
+                false,
+                target,
+            )?
+        }
+        Job::Direct(path) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file(path, *recursive, plan, each, stopped),
+            &mut |each| read_file(path, None, plan, each, stopped),
+            false,
+            target,
+        )?,
+        Job::Listed(path, directory) => observe_streaming(
+            &render,
+            buffer,
+            &mut |each| read_file(path, Some(directory), plan, each, stopped),
             false,
             target,
         )?,
@@ -982,7 +1026,7 @@ impl<'s> Search<'s> {
                     self.hit.store(true, Ordering::Release);
                     self.cancelled.store(true, Ordering::Release);
                 }
-                Handoff::Complete(job, observed)
+                Handoff::Complete(job.finished(), observed)
             }
             Err(error) => {
                 if !stopped()
@@ -992,7 +1036,7 @@ impl<'s> Search<'s> {
                 {
                     self.fail(error);
                 }
-                Handoff::Complete(job, Observed::Skipped)
+                Handoff::Complete(job.finished(), Observed::Skipped)
             }
         }
     }
@@ -1079,7 +1123,7 @@ pub(super) fn walk<W: Write>(
                     break;
                 }
                 let go = match input {
-                    Input::File(path, size) => first.search(size, Job::Direct(path, false)),
+                    Input::File(path, size) => first.search(size, Job::Direct(path)),
                     Input::Failed(path, error) => {
                         first.search(0, Job::Failed(path, error.to_string()))
                     }
@@ -1102,7 +1146,7 @@ pub(super) fn walk<W: Write>(
                                 };
                                 schedule::run(
                                     &schedule,
-                                    sources::live(&path, &filter.cwd),
+                                    sources::live(&path, &filter.cwd).retaining_parents(),
                                     Walked {
                                         descend: true,
                                         policy: policy.map(live::Policy::deferring),
@@ -1379,7 +1423,7 @@ impl Filter<'_> {
                 if self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary {
                     return Some((
                         catalog.inode(inode).stat.size,
-                        Job::Direct(entry.path().to_owned(), true),
+                        Job::Binary(entry.path().to_owned(), name),
                     ));
                 }
                 return None;
@@ -1398,7 +1442,23 @@ impl Filter<'_> {
                 Job::Checked(entry.path().to_owned(), name, doc.0),
             ));
         }
-        Some((0, Job::Direct(entry.path().to_owned(), true)))
+        // Content walks retain parents or, past their budget, the parent's
+        // identity; every name a catalogued listing, which opens no
+        // directory, yields is catalogued.
+        let parent = match (entry.directory_handle(), entry.directory_identity()) {
+            (Some(directory), _) => engine::reader::Parent::Open(directory),
+            (None, Some((dev, ino))) => engine::reader::Parent::Closed(dev, ino),
+            (None, None) => {
+                return Some((
+                    0,
+                    Job::Failed(
+                        entry.path().to_owned(),
+                        "walked without its directory".into(),
+                    ),
+                ));
+            }
+        };
+        Some((0, Job::Listed(entry.path().to_owned(), parent)))
     }
 }
 
@@ -1535,7 +1595,7 @@ impl<'a> Source<'a> {
                 self.source = None;
             }
             match self.inputs.next()? {
-                Input::File(path, size) => return Some((size, Job::Direct(path, false))),
+                Input::File(path, size) => return Some((size, Job::Direct(path))),
                 Input::Failed(path, error) => {
                     return Some((0, Job::Failed(path, error.to_string())));
                 }
@@ -1554,7 +1614,7 @@ impl<'a> Source<'a> {
                         &self.filter.cwd,
                         self.filter.traversal.unrestricted || self.live.is_some(),
                     ) {
-                        Ok(source) => self.source = Some(source),
+                        Ok(source) => self.source = Some(source.retaining_parents()),
                         Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
                     }
                     self.descend = true;
@@ -2751,23 +2811,56 @@ mod tests {
 
     // A checked reader can panic after streaming has acquired the publisher.
     // Its sender must drop so the writer leaves its receive loop before join.
+    // The scope re-raises a worker's panic as its own, so the injected one is
+    // seen by a panic hook, which is process-wide: run in a child process.
     #[test]
     fn panicking_stream_worker_releases_the_publisher() {
+        const MARKER: &str = "FERRET_TEST_STREAM_PANIC";
+        const INJECTED: &str = "injected panic after streaming";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "grep::groups::tests::panicking_stream_worker_releases_the_publisher",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
         let plan = plan(&["red"]);
         let mut bytes = b"red ".to_vec();
         bytes.resize(GROUP_BYTES + CHUNK, b'x');
         bytes.push(b'\n');
+        let reached = AtomicBool::new(false);
         let fork = || -> Option<Box<CheckedReader<'_>>> {
             Some(Box::new(|_, request| {
                 let ReadRequest::Stream(each, _) = request else {
                     panic!("stream")
                 };
                 each(&mut &bytes[..], bytes.len() as u64).unwrap();
-                panic!("injected panic after streaming")
+                reached.store(true, Ordering::SeqCst);
+                panic!("{INJECTED}")
             }))
         };
         let mut host = host(&plan, Vec::new());
         let mut jobs = [Job::Checked("panic-file".into(), NameId(0), 0)].into_iter();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new({
+            let seen = seen.clone();
+            move |info| {
+                let payload = info.payload();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                lock(&seen).push(message);
+            }
+        }));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run(
                 &mut host,
@@ -2779,7 +2872,21 @@ mod tests {
             )
             .unwrap();
         }));
-        assert!(result.is_err());
+        std::panic::set_hook(previous);
+        let seen = std::mem::take(&mut *lock(&seen));
+        assert!(result.is_err(), "the run did not panic");
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "the injection was not reached: {seen:?}"
+        );
+        // The injected panic first, then only the scopes re-raising it.
+        assert!(
+            seen.first().is_some_and(|first| first == INJECTED)
+                && seen[1..]
+                    .iter()
+                    .all(|rest| rest == "a scoped thread panicked"),
+            "expected only {INJECTED:?}, saw {seen:?}"
+        );
         assert!(host.errors);
         assert!(host.writer.starts_with(b"panic-file:red "));
     }

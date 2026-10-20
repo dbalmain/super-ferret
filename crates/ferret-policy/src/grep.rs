@@ -130,7 +130,12 @@ impl GrepSelection {
     }
 
     fn descend_components(&self, components: &[&[u8]]) -> bool {
-        let matched = self.decision(components, true);
+        // No components: the directory is cwd itself.
+        let matched = if components.is_empty() {
+            self.cwd_decision()
+        } else {
+            self.decision(components, true)
+        };
         matched != Some(false)
             && (matched == Some(true)
                 || self.hidden
@@ -143,15 +148,34 @@ impl GrepSelection {
     /// below the operand, stripping it removes names the walk passed through,
     /// and [`Self::allows`] and [`Self::descend`] never see them; hiddenness
     /// depends on the names below the operand, never on where cwd is.
+    ///
+    /// Only cwd's own name is lost. A proper ancestor of cwd is not below
+    /// it, so it kept its whole spelling and was judged, globs included,
+    /// when the walk visited it. cwd itself was visited with an empty
+    /// relative path, which is what the globs see, as in rg: `*` matches it
+    /// and so whitelists a hidden cwd, `?*` does not.
     pub fn hides_stripped(&self, walked: &[u8], relative: &[u8], depth: usize) -> bool {
         if self.hidden || walked.len() == relative.len() {
             return false;
         }
         let kept = components_from_end(relative).take(depth).count();
-        components_from_end(walked)
-            .skip(kept)
-            .take(depth - kept)
-            .any(|name| name.starts_with(b"."))
+        kept < depth
+            && components_from_end(walked)
+                .nth(kept)
+                .is_some_and(|name| name.starts_with(b"."))
+            && self.cwd_decision() != Some(true)
+    }
+
+    /// The last rule matching cwd's own path relative to itself, the empty
+    /// path. The component matcher never sees an empty name, so this asks
+    /// each pattern directly.
+    fn cwd_decision(&self) -> Option<bool> {
+        self.rules.iter().rev().find_map(|(include, alternatives)| {
+            alternatives
+                .iter()
+                .any(Pattern::matches_empty_path)
+                .then_some(*include)
+        })
     }
 
     fn decision(&self, components: &[&[u8]], directory: bool) -> Option<bool> {

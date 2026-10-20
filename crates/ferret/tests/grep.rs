@@ -833,10 +833,14 @@ fn large_rendered_groups_need_no_temporary_directory() {
     fixture.write("ordered/small.txt", b"red small\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let mut outcomes = Vec::new();
-    for args in [
-        vec!["grep", "red", "ordered/big.txt", "ordered/small.txt"],
-        vec!["grep", "red", "ordered"],
-        vec!["grep", "red", "-", "ordered/small.txt"],
+    let mut expected = Vec::new();
+    for (args, big) in [
+        (
+            vec!["grep", "red", "ordered/big.txt", "ordered/small.txt"],
+            "ordered/big.txt",
+        ),
+        (vec!["grep", "red", "ordered"], "ordered/big.txt"),
+        (vec!["grep", "red", "-", "ordered/small.txt"], "<stdin>"),
     ] {
         let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
         if args.contains(&"-") {
@@ -852,17 +856,27 @@ fn large_rendered_groups_need_no_temporary_directory() {
             .env("FERRET_SEARCH_THREADS", "1")
             .env("TMPDIR", fixture.base.join("unavailable-spill-directory"));
         let output = run(command, None);
+        // The large group whole, then the small one: its length, ends and
+        // bytes, so a group dropped or cut short is seen without printing
+        // 24 MB.
+        let mut whole = format!("{big}:red\n").repeat(1_200_000).into_bytes();
+        whole.extend_from_slice(b"ordered/small.txt:red small\n");
+        let summary = |bytes: &[u8]| {
+            (
+                bytes.len(),
+                String::from_utf8_lossy(&bytes[..bytes.len().min(64)]).into_owned(),
+                String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(64)..]).into_owned(),
+                bytes == whole,
+            )
+        };
         outcomes.push((
             output.status.code(),
-            output.stderr.is_empty(),
-            output.stdout.ends_with(b"ordered/small.txt:red small\n"),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            summary(&output.stdout),
         ));
+        expected.push((Some(0), String::new(), summary(&whole)));
     }
-    assert_eq!(
-        outcomes,
-        [(Some(0), true, true); 3],
-        "rendered output must not spill"
-    );
+    assert_eq!(outcomes, expected, "rendered output must not spill");
 }
 
 // A spill fault is a temporary-file fault: the message names the spill
@@ -5241,6 +5255,173 @@ fn streaming_replacement_with_a_surviving_hard_link_is_rejected() {
     }
 }
 
+// Review R2-1: a walked file is opened beneath the directory it was listed
+// in, never through a symlink (GREP.md: recursive symlinks are skipped). A
+// listed regular file swapped for a symlink before its open was once read
+// through the link, printing the target's bytes under the walked name. It
+// now reads as changed: exit 2, nothing from the target. The first walked
+// file streams over 4 MiB into a paused stdout, so the swap lands between
+// the listing and the open. Covers the index's opaque fallback, `-uu` and
+// `--live` on one thread, and the parallel walk `-uu` and `--live` take on
+// four. The index's other workers read ahead of a paused stdout, so it has
+// no deterministic swap there; its jobs are the one-thread ones.
+#[test]
+fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
+    let fixture = Fixture::new("walked-symlink-swap");
+    fs::create_dir(fixture.tree().join("d")).unwrap();
+    fixture.write("d/a", b"hit\n");
+    fixture.write("d/b", b"hit\n");
+    let failed = swap_after_listing(&fixture, None);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+// The same swap where the walk is past its parent descriptor budget: under
+// `ulimit -n 64` a quarter, 16, is retained, so a directory 40 deep was
+// closed after listing and is reopened by path, checked by identity.
+#[test]
+fn walked_name_swapped_past_the_parent_budget_is_not_followed() {
+    let fixture = Fixture::new("walked-symlink-swap-deep");
+    let deep = format!("d{}", "/s".repeat(40));
+    fs::create_dir_all(fixture.tree().join(&deep)).unwrap();
+    fixture.write(&format!("{deep}/a"), b"hit\n");
+    fixture.write(&format!("{deep}/b"), b"hit\n");
+    let failed = swap_after_listing(&fixture, Some(64));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Searches `d`, whose only files are two in one directory, in each content
+/// walk mode, swapping the second-listed for a symlink to a file outside
+/// the walk once the first has started printing, optionally under an
+/// open-file `limit`; returns the cases that read through the link or did
+/// not report the change.
+fn swap_after_listing(fixture: &Fixture, limit: Option<u32>) -> Vec<String> {
+    use std::io::Read;
+    fixture.write(".ferretignore", b"/d/\n");
+    fixture.write("outside", b"hit OUTSIDE\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    // Walk order is directory order, so ask a walk for it.
+    let listed = fixture.ferret(&["grep", "--files", "-uu", "d"], None);
+    let order = String::from_utf8(listed.stdout).unwrap();
+    let [first, victim] = order.lines().collect::<Vec<_>>()[..] else {
+        panic!("listed {order:?}");
+    };
+    let target = format!("{}outside", "../".repeat(victim.matches('/').count()));
+    let bytes = b"hit first\n".repeat(500_000);
+    let mut checked = 0;
+    let mut failed = Vec::new();
+    let cases: [(&[&str], &str); 5] = [
+        (&[], "1"),
+        (&["-uu"], "1"),
+        (&["-uu"], "4"),
+        (&["--live"], "1"),
+        (&["--live"], "4"),
+    ];
+    for (mode, threads) in cases {
+        fixture.write(first, &bytes);
+        let link = fixture.tree().join(victim);
+        fs::remove_file(&link).unwrap();
+        fixture.write(victim, b"hit victim\n");
+        let mut command = fixture.command(OsStr::new("sh"));
+        command
+            .arg("-c")
+            .arg(match limit {
+                Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+                None => "exec \"$0\" \"$@\"".to_owned(),
+            })
+            .arg(env!("CARGO_BIN_EXE_ferret"))
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(mode)
+            .args(["hit", "d"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let mut child = command.spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let mut start = [0; 1024];
+        pipe.read_exact(&mut start).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        child.stdout = Some(pipe);
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let changed = format!("{victim}: changed during both read attempts");
+        if stdout.contains("OUTSIDE")
+            || output.status.code() != Some(2)
+            || !stderr.contains(&changed)
+        {
+            failed.push(format!(
+                "{mode:?} on {threads} threads: {:?}, through the link: {}, {stderr}",
+                output.status.code(),
+                stdout.contains("OUTSIDE")
+            ));
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 5);
+    failed
+}
+
+// Retained parents are budgeted: a chain 300 deep under `ulimit -n 64`
+// searches as it does with no limit, in every content walk mode. Retaining
+// one descriptor per level without a budget ran out at depth 59.
+#[test]
+fn deep_walk_under_a_low_open_file_limit_searches_every_level() {
+    let fixture = Fixture::new("deep-walk-descriptors");
+    let mut dir = "d".to_owned();
+    for level in 0..300 {
+        fs::create_dir_all(fixture.tree().join(&dir)).unwrap();
+        fixture.write(&format!("{dir}/f"), format!("hit {level}\n").as_bytes());
+        dir.push_str("/s");
+    }
+    fixture.write(".ferretignore", b"/d/\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let run = |mode: &[&str], threads: &str, limit: Option<u32>| {
+        let mut command = fixture.command(OsStr::new("sh"));
+        command
+            .arg("-c")
+            .arg(match limit {
+                Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+                None => "exec \"$0\" \"$@\"".to_owned(),
+            })
+            .arg(env!("CARGO_BIN_EXE_ferret"))
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(mode)
+            .args(["hit", "d"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let output = command.output().unwrap();
+        // Several threads print files in completion order.
+        let mut lines: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort_unstable();
+        (
+            output.status.code(),
+            lines,
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let mut checked = 0;
+    for mode in [&[][..], &["-uu"], &["--live"]] {
+        for threads in ["1", "4"] {
+            let unlimited = run(mode, threads, None);
+            assert_eq!(unlimited.0, Some(0), "{mode:?} {threads}: {}", unlimited.2);
+            assert_eq!(unlimited.1.len(), 300);
+            assert_eq!(
+                run(mode, threads, Some(64)),
+                unlimited,
+                "{mode:?} on {threads}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 6);
+}
+
 // D102 + D103: the first spool can fail after the matching prefix streamed.
 // Keep that prefix, finish JSON if begun, and publish both neighboring files.
 #[test]
@@ -5438,6 +5619,12 @@ fn streaming_late_binary_sentinel_keeps_prefix_and_original_warning_label() {
 /// cwd inside a hidden directory below an absolute operand, stripping cwd
 /// once erased that directory's name, so its files were listed; rg lists
 /// none. A cwd inside a visible directory is the control.
+///
+/// Review R2-2: the fix then hid that directory even when a positive glob
+/// whitelists it. rg matches the cwd directory's own (empty) relative path
+/// against the globs, so `*`, `**`, `**/*` and `/*` reveal it while `?*`
+/// and `*/**` do not. Crosses positive and negative globs with `-u` and
+/// `--hidden`.
 #[test]
 fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
     let fixture = Fixture::new("hidden-cwd");
@@ -5451,49 +5638,68 @@ fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let tree = fixture.tree();
     let operand = tree.join("a").into_os_string().into_string().unwrap();
+    let globs: [&[&str]; 10] = [
+        &[],
+        &["**"],
+        &["*"],
+        &["**/*"],
+        &["/*"],
+        &["?*"],
+        &["*/**"],
+        &["*.rs"],
+        &["!*.rs"],
+        &["*", "!.g"],
+    ];
     let mut checked = 0;
+    let mut diverged = Vec::new();
     for cwd in ["a/.g", "a/.g/k", "a/b"] {
         for mode in [&["-l", "red"][..], &["--live", "-l", "red"], &["--files"]] {
-            for hidden in [false, true] {
-                let mut args = mode.to_vec();
-                if hidden {
-                    args.push("--hidden");
-                }
-                args.push(&operand);
-                let listed = |binary: &OsStr, grep: bool| {
-                    let mut command = fixture.command(binary);
-                    command.current_dir(tree.join(cwd));
-                    if grep {
-                        command
-                            .arg("--index")
-                            .arg(fixture.base.join("index"))
-                            .arg("grep");
+            for flag in [None, Some("-u"), Some("--hidden")] {
+                for glob in globs {
+                    let mut args = mode.to_vec();
+                    args.extend(flag);
+                    for glob in glob {
+                        args.extend(["-g", glob]);
                     }
-                    // rg has no --live: it always reads the live tree.
-                    command.args(args.iter().filter(|&&arg| grep || arg != "--live"));
-                    let output = run(command, None);
-                    let mut lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
-                    lines.sort();
-                    (
-                        output.status.code(),
-                        lines.join(&b'\n'),
-                        output.stderr.is_empty(),
-                    )
-                };
-                let ferret = listed(OsStr::new(env!("CARGO_BIN_EXE_ferret")), true);
-                let rg = listed(&std::env::var_os("FERRET_RG").unwrap(), false);
-                assert_eq!(
-                    ferret,
-                    rg,
-                    "cwd {cwd:?} {args:?}: {:?} vs {:?}",
-                    String::from_utf8_lossy(&ferret.1),
-                    String::from_utf8_lossy(&rg.1)
-                );
-                checked += 1;
+                    args.push(&operand);
+                    let listed = |binary: &OsStr, grep: bool| {
+                        let mut command = fixture.command(binary);
+                        command.current_dir(tree.join(cwd));
+                        if grep {
+                            command
+                                .arg("--index")
+                                .arg(fixture.base.join("index"))
+                                .arg("grep");
+                        }
+                        // rg has no --live: it always reads the live tree.
+                        command.args(args.iter().filter(|&&arg| grep || arg != "--live"));
+                        let output = run(command, None);
+                        let mut lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
+                        lines.sort();
+                        (
+                            output.status.code(),
+                            lines.join(&b'\n'),
+                            output.stderr.is_empty(),
+                        )
+                    };
+                    let ferret = listed(OsStr::new(env!("CARGO_BIN_EXE_ferret")), true);
+                    let rg = listed(&std::env::var_os("FERRET_RG").unwrap(), false);
+                    if ferret != rg {
+                        diverged.push(format!(
+                            "cwd {cwd:?} {args:?}: {:?} {:?} vs rg {:?} {:?}",
+                            ferret.0,
+                            String::from_utf8_lossy(&ferret.1),
+                            rg.0,
+                            String::from_utf8_lossy(&rg.1)
+                        ));
+                    }
+                    checked += 1;
+                }
             }
         }
     }
-    assert_eq!(checked, 18);
+    assert!(diverged.is_empty(), "{}", diverged.join("\n"));
+    assert_eq!(checked, 3 * 3 * 3 * 10);
 }
 
 /// `-g` globs match the path rg would print, with cwd stripped where the
