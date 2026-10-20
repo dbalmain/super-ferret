@@ -5273,6 +5273,75 @@ fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+// A spilled parent replaced by a FIFO must be treated as changed. Opening it
+// without O_DIRECTORY|O_NONBLOCK used to hang after the first matching file.
+#[test]
+fn walked_parent_swapped_for_a_fifo_after_output_is_changed_not_a_hang() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let fixture = Fixture::new("walked-parent-fifo");
+    let deep = format!("d{}", "/s".repeat(40));
+    fs::create_dir_all(fixture.tree().join(&deep)).unwrap();
+    fixture.write(".ferretignore", b"/d/\n");
+    let mut line = b"hit ".to_vec();
+    line.resize(5 << 20, b'x');
+    line.push(b'\n');
+    for name in ["a", "b", "c", "d"] {
+        fixture.write(&format!("{deep}/{name}"), &line);
+    }
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+
+    let mut command = fixture.command(OsStr::new("sh"));
+    command
+        .arg("-c")
+        .arg("ulimit -n 64 && exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_ferret"))
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "-uu", "hit", "d"])
+        .env("FERRET_SEARCH_THREADS", "1");
+    let mut child = command.spawn().unwrap();
+    let mut pipe = child.stdout.take().unwrap();
+    let mut first = [0; 32];
+    pipe.read_exact(&mut first).unwrap();
+
+    let parent = fixture.tree().join(&deep);
+    fs::rename(&parent, parent.with_extension("moved")).unwrap();
+    let fifo = Command::new("mkfifo").arg(&parent).status().unwrap();
+    assert!(fifo.success());
+
+    let output = std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        pipe.read_to_end(&mut rest).unwrap();
+        rest
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("grep hung reopening a FIFO as a parent directory");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let rest = output.join().unwrap();
+    let mut stdout = first.to_vec();
+    stdout.extend(rest);
+    let mut stderr = Vec::new();
+    child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
+    assert_eq!(status.code(), Some(2), "{}", String::from_utf8_lossy(&stderr));
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("changed during both read attempts"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stdout.starts_with(b"d"));
+}
+
 // The same swap where the walk is past its parent descriptor budget: under
 // `ulimit -n 64` a quarter, 16, is retained, so a directory 40 deep was
 // closed after listing and is reopened by path, checked by identity.

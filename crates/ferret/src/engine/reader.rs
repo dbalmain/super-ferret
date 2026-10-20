@@ -6,6 +6,12 @@ use ferret_crawl::{ContentFault, Documents};
 use ferret_query::{
     CheckedReader, ReadFault, ReadOperation, ReadOutcome, ReadRequest, ReadVersion,
 };
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
+
+// Linux open flags: a spilled parent must never block on a replacement FIFO.
+const NONBLOCK: i32 = 0x800;
+const DIRECTORY: i32 = 0o200000;
 
 pub(crate) fn checked<'a>(
     catalog: &'a Catalog,
@@ -91,12 +97,18 @@ pub(crate) fn listed(
             let spelled = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty());
-            let opened = std::fs::File::open(spelled.unwrap_or(".".as_ref()))
-                .and_then(|directory| Ok((directory.metadata()?, directory)));
+            let opened = OpenOptions::new()
+                .read(true)
+                .custom_flags(DIRECTORY | NONBLOCK)
+                .open(spelled.unwrap_or(".".as_ref()))
+            .and_then(|directory| Ok((directory.metadata()?, directory)));
             reopened = match opened {
                 Ok((stat, directory)) if (stat.dev(), stat.ino()) == (dev, ino) => directory,
                 Ok(_) => return ReadOutcome::RetryChanged,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.kind() == std::io::ErrorKind::NotADirectory =>
+                {
                     return ReadOutcome::RetryChanged;
                 }
                 Err(error) => {
