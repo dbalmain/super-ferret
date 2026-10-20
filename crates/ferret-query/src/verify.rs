@@ -1577,7 +1577,8 @@ fn spawn<'scope>(
     spawn_named(scope, i, "ferret-verify", work).map(drop)
 }
 
-/// Starts thread `i` on the scope, named so profiles can tell it apart.
+/// Starts thread `i` on the scope, named so profiles can tell it apart. The
+/// process's first spawn reserves the descriptor table its workers share.
 pub(crate) fn spawn_named<'scope, R: Send + 'scope>(
     scope: &'scope Scope<'scope, '_>,
     i: usize,
@@ -1590,9 +1591,31 @@ pub(crate) fn spawn_named<'scope, R: Send + 'scope>(
     }
     #[cfg(not(test))]
     let _ = i;
+    static RESERVED: std::sync::Once = std::sync::Once::new();
+    RESERVED.call_once(reserve_descriptor_table);
     std::thread::Builder::new()
         .name(name.into())
         .spawn_scoped(scope, work)
+}
+
+/// Grows the process's descriptor table to 1024 slots before the first worker
+/// shares it. Growing a table that several threads share waits out an RCU grace
+/// period while every other opener waits on the resize, and a deep tree's held
+/// directory chains (D21) reach a few hundred descriptors, so the table used to
+/// grow several times mid-search: 46–49 ms of a 520 ms index grep at 32
+/// threads on a 300k-file tree (kdiag, 2026-10-20). Best effort: under a low
+/// open-file limit, or with no descriptor 2 to duplicate, the table grows as
+/// it did before.
+fn reserve_descriptor_table() {
+    use std::os::fd::AsFd;
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .unwrap_or(u64::MAX);
+    let Ok(top) = i32::try_from(limit.saturating_sub(1).min(1023)) else {
+        return;
+    };
+    // Dropped at once: the table keeps its size after the slot is freed.
+    let _ = rustix::io::fcntl_dupfd_cloexec(std::io::stderr().as_fd(), top);
 }
 
 /// Stops the pool when the calling thread leaves the scope, by any path.
