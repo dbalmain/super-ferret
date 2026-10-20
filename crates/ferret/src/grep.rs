@@ -277,9 +277,23 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .with_traversal(plan.traversal, plan.text)
             .with_live(live.as_ref())
             .with_absence(plan.universe() == line_grep::Universe::Searchable);
-            let result = if threads > 1 && source.walks_live() {
-                groups::walk(&mut host, source, threads, &cancelled, &mut searched)
-            } else {
+            let walked = (threads > 1 && source.walks_live())
+                .then(|| groups::walk(&mut host, &mut source, threads, &cancelled, &mut searched));
+            let serial = match walked {
+                None => Some(threads),
+                Some(Ok(groups::Walk::Done)) => None,
+                // D108 B: the calling thread searches the operands alone.
+                Some(Ok(groups::Walk::Refused(cause))) => {
+                    groups::report_shortfall(&ferret_query::Shortfall {
+                        running: 1,
+                        asked: threads,
+                        cause,
+                    });
+                    Some(1)
+                }
+                Some(Err(error)) => return output_failure(&error),
+            };
+            if let Some(threads) = serial {
                 let result = groups::run(
                     &mut host,
                     |stopped| source.next(stopped),
@@ -289,10 +303,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                     &cancelled,
                 );
                 searched |= source.searched();
-                result
-            };
-            if let Err(error) = result {
-                return output_failure(&error);
+                if let Err(error) = result {
+                    return output_failure(&error);
+                }
             }
             if plan.quiet && host.matched {
                 if !plan.json {
@@ -362,12 +375,9 @@ fn print(bytes: &[u8]) -> Exit {
 }
 
 /// D94: a reader that closes the pipe ends grep quietly with success. File
-/// staging faults have already been diagnosed by the per-file transaction;
-/// a refused search thread is reported as such.
+/// staging faults have already been diagnosed by the per-file transaction.
 fn output_failure(error: &io::Error) -> Exit {
-    if let Some(unstarted) = groups::unstarted(error) {
-        failure(&unstarted.to_string())
-    } else if error.kind() == io::ErrorKind::BrokenPipe {
+    if error.kind() == io::ErrorKind::BrokenPipe {
         Exit::Ok
     } else {
         failure(&format!("writing stdout: {error}"))

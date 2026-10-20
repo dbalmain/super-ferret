@@ -364,6 +364,7 @@ fn a_batch_boundary_output_failure_cancels_queued_workers() {
         starts: false,
         quit: &quit,
         on_panic: None,
+        on_refused: None,
     };
     let errors = super::schedule::queued(
         &schedule,
@@ -537,6 +538,7 @@ fn long_steps_in_one_directory_run_at_once() {
         starts: true,
         quit: &quit,
         on_panic: None,
+        on_refused: None,
     };
     super::schedule::run(
         &schedule,

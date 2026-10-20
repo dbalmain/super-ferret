@@ -346,6 +346,7 @@ impl Plan {
             starts: !sequential,
             quit: &quit,
             on_panic: None,
+            on_refused: None,
         };
         let errors = schedule::run(
             &schedule,

@@ -1591,11 +1591,45 @@ pub(crate) fn spawn_named<'scope, R: Send + 'scope>(
     }
     #[cfg(not(test))]
     let _ = i;
+    #[cfg(debug_assertions)]
+    if refused_for_tests(name) {
+        return Err(rustix::io::Errno::AGAIN.into());
+    }
     static RESERVED: std::sync::Once = std::sync::Once::new();
     RESERVED.call_once(reserve_descriptor_table);
     std::thread::Builder::new()
         .name(name.into())
         .spawn_scoped(scope, work)
+}
+
+/// Whether `FERRET_TEST_REFUSE_THREADS=NAME=K` refuses this spawn, as
+/// `pthread_create` does under `RLIMIT_NPROC`: the first `K` threads named
+/// `NAME` start, and later ones are refused. Debug builds only, so the CLI's
+/// tests can refuse one kind of thread at a time.
+#[cfg(debug_assertions)]
+fn refused_for_tests(name: &str) -> bool {
+    static LIMIT: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+    let limit = LIMIT.get_or_init(|| {
+        let value = std::env::var("FERRET_TEST_REFUSE_THREADS").ok()?;
+        let (name, count) = value.rsplit_once('=')?;
+        Some((name.to_owned(), count.parse().ok()?))
+    });
+    limit.as_ref().is_some_and(|(refused, count)| {
+        refused == name && STARTED.fetch_add(1, Ordering::Relaxed) >= *count
+    })
+}
+
+/// Search threads the system refused to start: the run went on with
+/// `running` of the `asked` threads.
+#[derive(Debug)]
+pub struct Shortfall {
+    /// Threads searching, the calling thread included when it searches.
+    pub running: usize,
+    /// Threads the run asked for.
+    pub asked: usize,
+    /// The first refusal.
+    pub cause: std::io::Error,
 }
 
 /// Grows the process's descriptor table to 1024 slots before the first worker
@@ -1938,7 +1972,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
     work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
     weight: impl Fn(&Group) -> u64 + Sync,
     emit: impl FnMut(Group) -> ControlFlow<()>,
-) {
+) -> Option<Shortfall> {
     completion_groups_with_handoff(
         schedule,
         cancelled,
@@ -1947,7 +1981,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
         |state, task, stopped, _, _| work(state, task, stopped),
         weight,
         emit,
-    );
+    )
 }
 
 /// Like [`completion_groups`], with handoffs during an active task. A handoff
@@ -1964,14 +1998,14 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
     work: impl Fn(&mut State, Task, &dyn Fn() -> bool, &dyn Fn(Group) -> bool, bool) -> Group + Sync,
     weight: impl Fn(&Group) -> u64 + Sync,
     mut emit: impl FnMut(Group) -> ControlFlow<()>,
-) {
+) -> Option<Shortfall> {
     let (threads, indexed) = match schedule {
         GroupSchedule::Streaming(threads) => (threads, false),
         GroupSchedule::Indexed(threads) => (threads, true),
     };
     if threads <= 1 {
         groups_alone_with_handoff(next, cancelled, &make, &work, &mut emit);
-        return;
+        return None;
     }
     let pool = Pool::<()>::schedule(0, threads);
     let source = Mutex::new(next);
@@ -1992,10 +2026,11 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
         let weight = &weight;
         let held = &held;
         let idle = &idle;
+        let mut refused = None;
         let started = (0..threads)
             .take_while(|&i| {
                 let sender = sender.clone();
-                spawn(scope, i, move || {
+                let started = spawn(scope, i, move || {
                     let _panic = StopOnPanic(pool);
                     let _close = CloseOnDrop(feed);
                     let mut state = make();
@@ -2024,8 +2059,8 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
                         }
                     }
                     lane.flush(stopped());
-                })
-                .is_ok()
+                });
+                started.map_err(|error| refused = Some(error)).is_ok()
             })
             .count();
         drop(sender);
@@ -2036,18 +2071,25 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
                 let _close = CloseOnDrop(feed);
                 feed.produce(&mut *lock(source), &stopped);
             })
+            .map_err(|error| refused.get_or_insert(error))
             .is_ok();
+        let shortfall = refused.map(|cause| Shortfall {
+            running: if fed { started } else { 1 },
+            asked: threads,
+            cause,
+        });
         if !fed {
             // Any started workers find the feed closed and empty, and leave.
             feed.close();
             groups_alone_with_handoff(&mut *lock(source), cancelled, make, work, &mut emit);
-            return;
+            return shortfall;
         }
         collect(&receiver, held, idle, &stopped, &mut emit);
         // Dropping the receiver unblocks senders before scope join. The stop
         // guard also wakes input-budget waiters.
         drop(receiver);
-    });
+        shortfall
+    })
 }
 
 /// A worker's way to the caller: its slot of held groups, and the bounded
@@ -3572,6 +3614,7 @@ mod group_tests {
                         starts: false,
                         quit: &quit,
                         on_panic: Some(&stop),
+                        on_refused: None,
                     };
                     let jobber = |i: usize| Jobber {
                         lane: &lanes[i],

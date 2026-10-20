@@ -5,7 +5,7 @@
 use super::*;
 use ferret_query::find::LiveWalk;
 use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
-use ferret_query::{GroupSchedule, Lane};
+use ferret_query::{GroupSchedule, Lane, Shortfall};
 use ferret_query::{ReadOperation, ReadVersion};
 use std::collections::HashMap;
 use std::io::{BufRead, BufWriter, IoSlice};
@@ -888,7 +888,7 @@ pub(super) fn run<'a, W: Write>(
 ) -> io::Result<()> {
     let search = Search::new(host, cancelled, threads);
     let mut current = None;
-    ferret_query::completion_groups_with_handoff(
+    let shortfall = ferret_query::completion_groups_with_handoff(
         if names.is_some() {
             GroupSchedule::Indexed(threads)
         } else {
@@ -928,7 +928,23 @@ pub(super) fn run<'a, W: Write>(
         weight,
         |group| search.publish(host, &mut current, group),
     );
+    if let Some(shortfall) = shortfall {
+        report_shortfall(&shortfall);
+    }
     search.finish(host)
+}
+
+/// Warns, once per process, that the system refused search threads (D108
+/// B). The search goes on with fewer, so the exit status still describes the
+/// search alone.
+pub(super) fn report_shortfall(shortfall: &Shortfall) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::AcqRel) {
+        cli::error(&format!(
+            "grep: searching with {} of {} threads: {}",
+            shortfall.running, shortfall.asked, shortfall.cause
+        ));
+    }
 }
 
 fn weight(handoff: &Handoff) -> u64 {
@@ -1088,31 +1104,35 @@ impl<'s> Search<'s> {
 /// and handing groups to this thread in completion order, under the same
 /// handoff and input bounds as [`run`]. File operands are searched in order
 /// by the first worker. Sets `searched` if any walk selected a file (D99).
-/// Fails with [`Unstarted`], having searched nothing, if the walk's own
-/// thread cannot start.
+/// If the walk's own thread cannot start, returns [`Walk::Refused`] having
+/// taken no operand from `source`, for the caller to search them itself.
 pub(super) fn walk<W: Write>(
     host: &mut Host<'_, W>,
-    source: Source<'_>,
+    source: &mut Source<'_>,
     threads: usize,
     cancelled: &AtomicBool,
     searched: &mut bool,
-) -> io::Result<()> {
+) -> io::Result<Walk> {
     let search = Search::new(host, cancelled, threads);
     let found = AtomicBool::new(false);
     let mut current = None;
-    let Source {
-        inputs,
-        filter,
-        live,
-        ..
-    } = source;
+    // Borrowed, not moved, into the walk's thread: a refused thread drops
+    // its closure unrun and leaves every operand here.
+    let inputs = &mut source.inputs;
+    let filter = &source.filter;
+    let live = source.live;
+    let on_refused = |shortfall: Shortfall| {
+        // Not inside another file's group.
+        let _publication = lock(&search.publication);
+        report_shortfall(&shortfall);
+    };
     let started = ferret_query::lane_groups(
         threads,
         cancelled,
         |lanes, stopped| {
             let walker = |i: usize| Walker {
                 search: &search,
-                filter: &filter,
+                filter,
                 lane: &lanes[i],
                 stopped,
                 found: &found,
@@ -1149,6 +1169,7 @@ pub(super) fn walk<W: Write>(
                                     starts: false,
                                     quit: &quit,
                                     on_panic: Some(&stop),
+                                    on_refused: Some(&on_refused),
                                 };
                                 schedule::run(
                                     &schedule,
@@ -1180,29 +1201,19 @@ pub(super) fn walk<W: Write>(
         },
         |group| search.publish(host, &mut current, group),
     );
-    if let Err(error) = started {
-        return Err(io::Error::other(Unstarted(error)));
+    if let Err(cause) = started {
+        return Ok(Walk::Refused(cause));
     }
     *searched |= found.load(Ordering::Acquire);
-    search.finish(host)
+    search.finish(host).map(|()| Walk::Done)
 }
 
-/// A search thread the system refused to start, so that nothing of the
-/// operands was searched.
-#[derive(Debug)]
-pub(super) struct Unstarted(io::Error);
-
-impl std::fmt::Display for Unstarted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "starting a search thread: {}", self.0)
-    }
-}
-
-impl std::error::Error for Unstarted {}
-
-/// The refused spawn an error from [`walk`] carries, if it is one.
-pub(super) fn unstarted(error: &io::Error) -> Option<&Unstarted> {
-    error.get_ref()?.downcast_ref()
+/// How [`walk`] ended.
+pub(super) enum Walk {
+    /// The operands were searched.
+    Done,
+    /// The system refused the walk's thread; nothing was searched.
+    Refused(io::Error),
 }
 
 /// A walk task's own state: whether to enter the directory it last
