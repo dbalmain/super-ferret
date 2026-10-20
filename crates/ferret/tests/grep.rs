@@ -199,6 +199,60 @@ impl Fixture {
     }
 }
 
+#[test]
+fn names_output_is_flushed_before_a_later_read_diagnostic() {
+    let fixture = Fixture::new("names-diagnostic-order");
+    fixture.write("a-match", b"needle\n");
+    fixture.write("z-unreadable", b"needle\n");
+    fs::set_permissions(
+        fixture.tree().join("z-unreadable"),
+        fs::Permissions::from_mode(0),
+    )
+    .unwrap();
+
+    // The same pipe captures stdout and stderr so this asserts their actual
+    // publication order, rather than merely comparing two collected streams.
+    let binary = OsStr::new(env!("CARGO_BIN_EXE_ferret"));
+    let script = "exec \"$1\" grep -l -u needle \"$2\" 2>&1";
+    let command = if Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.stdout == b"0\n")
+    {
+        let mut command = fixture.command(OsStr::new("setpriv"));
+        command.args([
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+        ]);
+        command.arg(binary).arg(fixture.tree());
+        command
+    } else {
+        let mut command = fixture.command(OsStr::new("sh"));
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("sh")
+            .arg(binary)
+            .arg(fixture.tree());
+        command
+    };
+    let output = run(command, None);
+    let combined = String::from_utf8_lossy(&output.stdout);
+    let record = combined
+        .find("a-match")
+        .expect("matching name is published");
+    let diagnostic = combined
+        .find("z-unreadable")
+        .expect("unreadable input is diagnosed");
+    assert!(record < diagnostic, "{combined}");
+}
+
 fn replace(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;

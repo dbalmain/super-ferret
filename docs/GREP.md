@@ -206,10 +206,12 @@ Redirected grep stdout uses a 64 KiB block buffer
 written to descriptor 1 itself, with no second descriptor (preserving shared
 stdout/stderr offsets); terminal stdout retains line buffering. NUL-terminated
 name modes and `--live`, whose policy warnings come from search workers, also
-retain the original line buffer and its diagnostic ordering. Each other published group
-and names-only record is flushed before the next operand or diagnostic, and
-help/version and the final JSON summary also flush explicitly. A publication
-fault also drains its previously accepted prefix before reporting the error.
+retain the original line buffer and its diagnostic ordering. Each other
+published group is flushed before the next operand or diagnostic. Redirected
+path-only output may batch records, but is flushed at each operand boundary
+and before any diagnostic. Help/version and the final JSON summary also flush
+explicitly. A publication fault also drains its previously accepted prefix
+before reporting the error.
 Failed destinations are discarded without an implicit drop retry. Checked
 publication and the 64 KiB cancellation polling bound remain in force;
 staging faults are file-local, while stdout faults stop the run.

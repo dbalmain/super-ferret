@@ -3,6 +3,7 @@
 
 use ferret_catalog::Catalog;
 use ferret_query::line_grep::Names;
+use std::io::IsTerminal;
 
 use super::*;
 
@@ -24,7 +25,12 @@ fn open_catalog(index: Option<&Path>) -> Result<Catalog, String> {
     let index = index_path(index)?;
     let catalog = Catalog::open(&index)
         .map_err(|error| format!("{}: {error}; re-index this directory", index.display()))?
-        .ok_or_else(|| format!("no index in {}; run ferret index DIR", index.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "no index in {}; run ferret index DIR, use -u, or use --live with a covering catalog root",
+                index.display()
+            )
+        })?;
     catalog
         .load(CatalogSource::sections())
         .map_err(|error| error.to_string())?;
@@ -46,6 +52,7 @@ fn execute(
             .map_err(|error| format!("glob {glob:?}: {error}"))?;
     }
     let inputs = resolve_inputs(&plan.paths, true);
+    let flush_each = plan.presentation.null || plan.traversal.live || io::stdout().is_terminal();
     let catalog = inputs
         .iter()
         .any(|input| {
@@ -83,7 +90,7 @@ fn execute(
                     .next(true)
             {
                 return Err(format!(
-                    "{}: {}; index this directory; live modes arrive in M6",
+                    "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
                     error.path.display(),
                     error.error
                 ));
@@ -93,55 +100,36 @@ fn execute(
     let mut errors = false;
     for input in &inputs {
         if let Input::Failed(path, error) = input {
-            cli::error(&format!("grep: {}: {error}", path.display()));
+            if diagnostic(
+                writer,
+                cancelled,
+                &format!("grep: {}: {error}", path.display()),
+            )? {
+                return Ok(Exit::Ok);
+            }
             errors = true;
         }
     }
     let mut listed = false;
-    let mut emit = |path: &Path| -> Result<bool, String> {
-        listed = true;
-        if plan.quiet {
-            cancelled.store(true, Ordering::Release);
-            return Ok(true);
-        }
-        presentation::path(
-            &plan.presentation,
-            writer,
-            label(path, plan.paths.is_empty()),
-        )
-        .and_then(|()| writer.write_all(if plan.presentation.null { b"\0" } else { b"\n" }))
-        .and_then(|()| {
-            if plan.presentation.null {
-                Ok(())
-            } else {
-                writer.flush()
-            }
-        })
-        .map_or_else(
-            |error| {
-                cancelled.store(true, Ordering::Release);
-                // D94: a closed pipe stops the listing quietly, as in rg.
-                if error.kind() == io::ErrorKind::BrokenPipe {
-                    Ok(true)
-                } else {
-                    Err(format!("writing stdout: {error}"))
-                }
-            },
-            |()| Ok(false),
-        )
-    };
     for input in inputs {
         if cancelled.load(Ordering::Acquire) {
             break;
         }
         match input {
             Input::File(path, _) => {
-                if emit(&path)? {
+                if emit(plan, writer, cancelled, &path, flush_each, &mut listed)? {
                     return Ok(Exit::Ok);
                 }
             }
             Input::Stdin => {
-                if emit(Path::new("-"))? {
+                if emit(
+                    plan,
+                    writer,
+                    cancelled,
+                    Path::new("-"),
+                    flush_each,
+                    &mut listed,
+                )? {
                     return Ok(Exit::Ok);
                 }
             }
@@ -170,7 +158,13 @@ fn execute(
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
-                            cli::error(&format!("grep: {}: {}", error.path.display(), error.error));
+                            if diagnostic(
+                                writer,
+                                cancelled,
+                                &format!("grep: {}: {}", error.path.display(), error.error),
+                            )? {
+                                return Ok(Exit::Ok);
+                            }
                             errors = true;
                             continue;
                         }
@@ -206,10 +200,13 @@ fn execute(
                                     Err(error) => {
                                         errors = true;
                                         descend = false;
-                                        cli::error(&format!(
-                                            "grep: {}: {error}",
-                                            entry.path().display()
-                                        ));
+                                        if diagnostic(
+                                            writer,
+                                            cancelled,
+                                            &format!("grep: {}: {error}", entry.path().display()),
+                                        )? {
+                                            return Ok(Exit::Ok);
+                                        }
                                     }
                                 }
                             }
@@ -228,34 +225,49 @@ fn execute(
                                     Ok(false) => continue,
                                     Err(error) => {
                                         errors = true;
-                                        cli::error(&format!(
-                                            "grep: {}: {error}",
-                                            entry.path().display()
-                                        ));
+                                        if diagnostic(
+                                            writer,
+                                            cancelled,
+                                            &format!("grep: {}: {error}", entry.path().display()),
+                                        )? {
+                                            return Ok(Exit::Ok);
+                                        }
                                         continue;
                                     }
                                 }
                             }
-                            if emit(entry.path())? {
+                            if emit(
+                                plan,
+                                writer,
+                                cancelled,
+                                entry.path(),
+                                flush_each,
+                                &mut listed,
+                            )? {
                                 return Ok(Exit::Ok);
                             }
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            cli::error(&format!("grep: {}: {error}", entry.path().display()));
+                            if diagnostic(
+                                writer,
+                                cancelled,
+                                &format!("grep: {}: {error}", entry.path().display()),
+                            )? {
+                                return Ok(Exit::Ok);
+                            }
                             errors = true;
                         }
                     }
                 }
             }
         }
-    }
-    if let Err(error) = writer.flush() {
-        cancelled.store(true, Ordering::Release);
-        if error.kind() == io::ErrorKind::BrokenPipe {
-            return Ok(Exit::Ok);
+        if !flush_each && let Some(error) = flush_output(writer, cancelled)? {
+            return Ok(error);
         }
-        return Err(format!("writing stdout: {error}"));
+    }
+    if let Some(exit) = flush_output(writer, cancelled)? {
+        return Ok(exit);
     }
     Ok(if errors {
         Exit::Usage
@@ -264,6 +276,68 @@ fn execute(
     } else {
         Exit::NoMatch
     })
+}
+
+/// Flush accepted names before a diagnostic so stderr cannot overtake them.
+/// A closed pipe remains a quiet success (D94).
+fn diagnostic(
+    writer: &mut impl Write,
+    cancelled: &AtomicBool,
+    message: &str,
+) -> Result<bool, String> {
+    if flush_output(writer, cancelled)?.is_some() {
+        return Ok(true);
+    }
+    cli::error(message);
+    Ok(false)
+}
+
+fn emit(
+    plan: &Names,
+    writer: &mut impl Write,
+    cancelled: &AtomicBool,
+    path: &Path,
+    flush_each: bool,
+    listed: &mut bool,
+) -> Result<bool, String> {
+    *listed = true;
+    if plan.quiet {
+        cancelled.store(true, Ordering::Release);
+        return Ok(true);
+    }
+    presentation::path(
+        &plan.presentation,
+        writer,
+        label(path, plan.paths.is_empty()),
+    )
+    .and_then(|()| writer.write_all(if plan.presentation.null { b"\0" } else { b"\n" }))
+    .and_then(|()| if flush_each { writer.flush() } else { Ok(()) })
+    .map_or_else(
+        |error| {
+            cancelled.store(true, Ordering::Release);
+            // D94: a closed pipe stops the listing quietly, as in rg.
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                Ok(true)
+            } else {
+                Err(format!("writing stdout: {error}"))
+            }
+        },
+        |()| Ok(false),
+    )
+}
+
+fn flush_output(writer: &mut impl Write, cancelled: &AtomicBool) -> Result<Option<Exit>, String> {
+    match writer.flush() {
+        Ok(()) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+            cancelled.store(true, Ordering::Release);
+            Ok(Some(Exit::Ok))
+        }
+        Err(error) => {
+            cancelled.store(true, Ordering::Release);
+            Err(format!("writing stdout: {error}"))
+        }
+    }
 }
 
 #[cfg(test)]

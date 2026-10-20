@@ -3,7 +3,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -189,7 +189,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                     };
                 if let Some(Err(error)) = source.next(true) {
                     return failure(&format!(
-                        "{}: {}; index this directory or use --live / --no-ignore",
+                        "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
                         error.path.display(),
                         error.error
                     ));
@@ -214,17 +214,17 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     };
     // rg diagnoses failed explicit operands before searching, even when an
     // earlier operand supplies a quiet match.
-    let inputs: Vec<_> = inputs
-        .into_iter()
-        .filter_map(|input| {
-            if let Input::Failed(path, error) = input {
-                host.error(&path, &error);
-                None
-            } else {
-                Some(input)
+    let mut resolved = Vec::new();
+    for input in inputs {
+        if let Input::Failed(path, error) = input {
+            if let Err(error) = host.error(&path, &error) {
+                return output_failure(&error);
             }
-        })
-        .collect();
+        } else {
+            resolved.push(input);
+        }
+    }
+    let inputs = resolved;
     let threads = pin.as_ref().map_or_else(
         || {
             if let Some(anchors) = &live {
@@ -250,10 +250,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let mut inputs = inputs.into_iter().peekable();
     'inputs: while inputs.peek().is_some() {
         let mut segment = Vec::new();
-        while inputs
-            .peek()
-            .is_some_and(|input| !matches!(input, Input::Stdin))
-        {
+        while inputs.peek().is_some_and(|input| {
+            !matches!(input, Input::Stdin) && (!buffered_path_output(&plan) || segment.is_empty())
+        }) {
             if let Some(input) = inputs.next() {
                 segment.push(input);
             }
@@ -312,6 +311,11 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                     return Exit::Ok;
                 }
                 break 'inputs;
+            }
+            if buffered_path_output(&plan)
+                && let Err(error) = host.writer.flush()
+            {
+                return output_failure(&error);
             }
         }
         if matches!(inputs.peek(), Some(Input::Stdin)) {
@@ -400,7 +404,7 @@ fn open_index(index: Option<&Path>) -> Result<Engine, String> {
         })?
         .ok_or_else(|| {
             format!(
-                "no index in {}; run ferret index DIR; live modes arrive in M6",
+                "no index in {}; run ferret index DIR, use -u, or use --live with a covering catalog root",
                 index.display()
             )
         })?;
@@ -482,6 +486,19 @@ fn block_stdout(plan: &Plan) -> bool {
     !nul_names(plan) && !plan.traversal.live
 }
 
+/// Redirected path/count records may share the block buffer until an operand
+/// or diagnostic boundary. Ttys, NUL names and live policy keep line output.
+fn buffered_path_output(plan: &Plan) -> bool {
+    !io::stdout().is_terminal()
+        && !plan.traversal.live
+        && !nul_names(plan)
+        && !plan.json
+        && matches!(
+            plan.output,
+            Output::Names | Output::WithoutMatch | Output::Count | Output::CountMatches
+        )
+}
+
 fn nul_names(plan: &Plan) -> bool {
     plan.presentation.null
         && matches!(plan.output, Output::Names | Output::WithoutMatch)
@@ -489,9 +506,11 @@ fn nul_names(plan: &Plan) -> bool {
 }
 
 impl<W: Write> Host<'_, W> {
-    fn error(&mut self, path: &Path, error: &dyn std::fmt::Display) {
+    fn error(&mut self, path: &Path, error: &dyn std::fmt::Display) -> io::Result<()> {
+        self.writer.flush()?;
         cli::error(&format!("grep: {}: {error}", path.display()));
         self.errors = true;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -558,11 +577,11 @@ impl<W: Write> Host<'_, W> {
         match observed? {
             groups::Observed::Ready(group) => self.commit(path, group.result, group.output),
             groups::Observed::Failed(error) => {
-                self.error(path, &error);
+                self.error(path, &error)?;
                 Ok(())
             }
             groups::Observed::Spool(error) => {
-                self.error(path, &error);
+                self.error(path, &error)?;
                 Ok(())
             }
             groups::Observed::Skipped => Ok(()),
@@ -611,7 +630,7 @@ impl<W: Write> Host<'_, W> {
         }
         self.writer.flush()?;
         if let Some(error) = error {
-            self.error(path, &error);
+            self.error(path, &error)?;
         }
         Ok(())
     }
@@ -637,7 +656,7 @@ impl<W: Write> Host<'_, W> {
         let published = self.publish(path, result, output);
         // NUL names retain std's existing line buffering and diagnostic
         // ordering, including a pending name when the next operand fails.
-        if nul_names(self.plan) {
+        if nul_names(self.plan) || buffered_path_output(self.plan) {
             return published;
         }
         // Surface even a short final group's write error before another

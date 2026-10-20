@@ -864,7 +864,7 @@ fn publish_handoff<W: Write>(
     match handoff {
         Handoff::Complete(job, observed) => {
             if let Job::Failed(_, message) = &job {
-                host.error(job.path(), message);
+                host.error(job.path(), message)?;
                 return Ok(());
             }
             match observed {
@@ -872,11 +872,11 @@ fn publish_handoff<W: Write>(
                 Observed::Ready(group) => host.commit(job.path(), group.result, group.output),
                 Observed::Skipped => Ok(()),
                 Observed::Failed(error) => {
-                    host.error(job.path(), &error);
+                    host.error(job.path(), &error)?;
                     Ok(())
                 }
                 Observed::Spool(error) => {
-                    host.error(job.path(), &error);
+                    host.error(job.path(), &error)?;
                     Ok(())
                 }
                 Observed::Streamed(..) => unreachable!("streamed results finish their handoff"),
@@ -975,6 +975,7 @@ pub(super) fn run<'a, W: Write>(
         |group| search.publish(host, &mut current, group),
     );
     if let Some(shortfall) = shortfall {
+        host.writer.flush()?;
         report_shortfall(&shortfall);
     }
     search.finish(host)
@@ -1169,10 +1170,16 @@ pub(super) fn walk<W: Write>(
     let inputs = &mut source.inputs;
     let filter = &source.filter;
     let live = source.live;
+    let refused = Mutex::new(None);
     let on_refused = |shortfall: Shortfall| {
-        // Not inside another file's group.
-        let _publication = lock(&search.publication);
-        report_shortfall(&shortfall);
+        if buffered_path_output(search.plan) {
+            *lock(&refused) = Some(shortfall);
+        } else {
+            // Keep live-policy warning order unchanged; only buffered path
+            // output defers this publisher-owned diagnostic.
+            let _publication = lock(&search.publication);
+            report_shortfall(&shortfall);
+        }
     };
     let started = ferret_query::lane_groups(
         threads,
@@ -1249,6 +1256,10 @@ pub(super) fn walk<W: Write>(
         },
         |group| search.publish(host, &mut current, group),
     );
+    if let Some(shortfall) = lock(&refused).take() {
+        host.writer.flush()?;
+        report_shortfall(&shortfall);
+    }
     if let Err(cause) = started {
         return Ok(Walk::Refused(cause));
     }
