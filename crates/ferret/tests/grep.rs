@@ -5524,6 +5524,102 @@ fn deep_walk_under_a_low_open_file_limit_searches_every_level() {
     assert_eq!(checked, 6);
 }
 
+// Astra R4: the retained-parent cap left simultaneous reopened parents,
+// inputs and listings unbounded. A paused publisher kept 32 readers open
+// until they hit EMFILE at limit 64, omitting whole groups. Output must cross
+// the streaming threshold to keep those readers alive while stdout pauses.
+#[test]
+fn many_readers_under_a_low_descriptor_limit_match_one_worker() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let fixture = Fixture::new("many-reader-descriptors");
+    let deep = format!("d{}", "/s".repeat(40));
+    fs::create_dir_all(fixture.tree().join(&deep)).unwrap();
+    let mut line = b"hit ".to_vec();
+    line.resize((4 << 20) + (64 << 10), b'x');
+    line.push(b'\n');
+    fixture.write("body", &line);
+    for number in 0..40 {
+        let dir = fixture.tree().join(format!("{deep}/{number:02}"));
+        fs::create_dir(&dir).unwrap();
+        fs::hard_link(fixture.tree().join("body"), dir.join("f")).unwrap();
+    }
+    // Also exercise the indexed producer's opaque-directory fallback.
+    fixture.write(".ferretignore", b"/d/\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+
+    let run = |mode: &[&str], threads: &str, limit: u32| {
+        let mut command = fixture.command(OsStr::new("sh"));
+        command
+            .arg("-c")
+            .arg(format!("ulimit -n {limit} && exec \"$0\" \"$@\""))
+            .arg(env!("CARGO_BIN_EXE_ferret"))
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(mode)
+            .args(["hit", "d"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let mut child = command.spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let mut errors = child.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            errors.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let stdout = std::thread::spawn(move || {
+            let mut bytes = vec![0; 32];
+            pipe.read_exact(&mut bytes).unwrap();
+            // Keep the first stream blocked while sibling readers start.
+            std::thread::sleep(Duration::from_millis(300));
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("descriptor admission deadlocked: {mode:?}, T={threads}, limit={limit}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let bytes = stdout.join().unwrap();
+        let errors = stderr.join().unwrap();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{mode:?}, T={threads}, limit={limit}: {}",
+            String::from_utf8_lossy(&errors)
+        );
+        assert!(errors.is_empty(), "{}", String::from_utf8_lossy(&errors));
+        bytes
+    };
+    fn groups(bytes: &[u8]) -> Vec<&[u8]> {
+        let mut lines: Vec<_> = bytes.split_inclusive(|&byte| byte == b'\n').collect();
+        lines.sort_unstable();
+        lines
+    }
+    let baseline = run(&["-uu"], "1", 64);
+    let expected = groups(&baseline);
+    assert_eq!(expected.len(), 40);
+    for group in &expected {
+        let colon = group.iter().position(|&byte| byte == b':').unwrap();
+        assert_eq!(&group[colon + 1..], line);
+    }
+    for (mode, limit) in [(&["-uu"][..], 64), (&["--live"][..], 64), (&[][..], 64), (&["-uu"][..], 24)] {
+        let parallel = run(mode, "32", limit);
+        // Parallel publication may reorder complete groups; every byte of
+        // each group, including its unique path, must match the serial run.
+        assert_eq!(groups(&parallel), expected, "{mode:?}, limit={limit}");
+    }
+}
+
 // Queued indexed jobs retain their listed directory descriptors. Their budget
 // charge must live with the shared descriptor owner, not only with the DFS
 // level that produced each job (EMFILE used to drop matches under RLIMIT 64).

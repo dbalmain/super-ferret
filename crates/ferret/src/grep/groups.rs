@@ -886,7 +886,7 @@ pub(super) fn run<'a, W: Write>(
     threads: usize,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    let search = Search::new(host, cancelled);
+    let search = Search::new(host, cancelled, threads);
     let mut current = None;
     ferret_query::completion_groups_with_handoff(
         if names.is_some() {
@@ -896,6 +896,7 @@ pub(super) fn run<'a, W: Write>(
         },
         cancelled,
         |stopped| {
+            let _descriptors = search.descriptors.acquire(stopped)?;
             let _publication = search
                 .plan
                 .traversal
@@ -949,10 +950,11 @@ struct Search<'s> {
     quiet_stats: Mutex<json::Stats>,
     fatal: Mutex<Option<io::Error>>,
     publication: Mutex<()>,
+    descriptors: line_grep::IoBudget,
 }
 
 impl<'s> Search<'s> {
-    fn new<W>(host: &Host<'s, W>, cancelled: &'s AtomicBool) -> Self {
+    fn new<W>(host: &Host<'s, W>, cancelled: &'s AtomicBool, threads: usize) -> Self {
         Self {
             plan: host.plan,
             filename: host.filename,
@@ -962,6 +964,7 @@ impl<'s> Search<'s> {
             quiet_stats: Mutex::new(json::Stats::default()),
             fatal: Mutex::new(None),
             publication: Mutex::new(()),
+            descriptors: line_grep::IoBudget::new(threads),
         }
     }
 
@@ -983,6 +986,9 @@ impl<'s> Search<'s> {
         concurrent: bool,
         prepare: impl FnOnce(&Job, &mut dyn Write) -> io::Result<Observed>,
     ) -> Handoff {
+        let Some(_descriptors) = self.descriptors.acquire(stopped) else {
+            return Handoff::Complete(job.finished(), Observed::Skipped);
+        };
         let relay = Relay {
             path: job.path(),
             handoff,
@@ -1091,7 +1097,7 @@ pub(super) fn walk<W: Write>(
     cancelled: &AtomicBool,
     searched: &mut bool,
 ) -> io::Result<()> {
-    let search = Search::new(host, cancelled);
+    let search = Search::new(host, cancelled, threads);
     let found = AtomicBool::new(false);
     let mut current = None;
     let Source {
@@ -1275,6 +1281,9 @@ impl Visitor<LiveWalk, Walked> for Walker<'_, '_> {
                 Step::Quit
             };
         }
+        let Some(_descriptors) = self.search.descriptors.acquire(stopped) else {
+            return Step::Quit;
+        };
         let Some(entry) = walk.next_with_cancel(task.descend, &mut || Ok(()), &mut || stopped())
         else {
             return if stopped() { Step::Quit } else { Step::Done };

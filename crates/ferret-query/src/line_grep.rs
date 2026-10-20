@@ -11,9 +11,12 @@ use std::path::{Path, PathBuf};
 use ferret_verify::{Grep, GrepFlags, LineFlags};
 
 mod context;
+mod descriptors;
 mod events;
 mod multiline;
 mod replacement;
+
+pub use descriptors::{IoBudget, IoPermit};
 
 /// Information requests skip environment, index and input resolution.
 #[derive(Debug)]
