@@ -9,8 +9,9 @@ pub(super) fn scan(
     size: u64,
     buffer: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
+    result: &mut InputResult,
     mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
-) -> Result<InputResult, ScanError> {
+) -> Result<(), ScanError> {
     // JSON's quiet summary still needs the selected file's complete stats.
     // The host suppresses records and stops at its first stable matching file.
     let mut stats = EventStats::default();
@@ -35,7 +36,7 @@ pub(super) fn scan(
     let search = plan.grep.borrowed_search();
     let mut bytes = Vec::new();
     let mut spans = Vec::new();
-    let mut result = scan_records(plan, input, size, buffer, stopped, |line| {
+    let outcome = scan_records(plan, input, size, buffer, stopped, result, |line| {
         if plan.multiline {
             return record(line);
         }
@@ -69,9 +70,9 @@ pub(super) fn scan(
             highlights: Some(&spans),
             ..line
         })
-    })?;
+    });
     result.stats = stats;
-    Ok(result)
+    outcome
 }
 
 #[cfg(test)]

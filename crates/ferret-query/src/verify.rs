@@ -1914,6 +1914,32 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
     make: impl Fn() -> State + Sync,
     work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
     weight: impl Fn(&Group) -> u64 + Sync,
+    emit: impl FnMut(Group) -> ControlFlow<()>,
+) {
+    completion_groups_with_handoff(
+        schedule,
+        cancelled,
+        next,
+        make,
+        |state, task, stopped, _, _| work(state, task, stopped),
+        weight,
+        emit,
+    );
+}
+
+/// Like [`completion_groups`], with handoffs during an active task. A handoff
+/// flushes that worker's held batch first and uses the same bounded queue.
+/// The final boolean tells `work` whether publication runs concurrently. On
+/// the single-thread and spawn-fallback paths handoffs publish synchronously;
+/// callers must not wait for that same task to supply more data in that case.
+/// A failed handoff means the publisher stopped and the task must unwind.
+pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
+    schedule: GroupSchedule,
+    cancelled: &AtomicBool,
+    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
+    make: impl Fn() -> State + Sync,
+    work: impl Fn(&mut State, Task, &dyn Fn() -> bool, &dyn Fn(Group) -> bool, bool) -> Group + Sync,
+    weight: impl Fn(&Group) -> u64 + Sync,
     mut emit: impl FnMut(Group) -> ControlFlow<()>,
 ) {
     let (threads, indexed) = match schedule {
@@ -1921,7 +1947,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
         GroupSchedule::Indexed(threads) => (threads, true),
     };
     if threads <= 1 {
-        groups_alone(next, cancelled, &make, &work, &mut emit);
+        groups_alone_with_handoff(next, cancelled, &make, &work, &mut emit);
         return;
     }
     let pool = Pool::<()>::schedule(0, threads);
@@ -1963,7 +1989,8 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
                         let Some(reservation) = lane.reserve(size, &stopped) else {
                             break;
                         };
-                        let group = work(&mut state, task, &stopped);
+                        let handoff = |group| lane.handoff(group, &stopped);
+                        let group = work(&mut state, task, &stopped, &handoff, true);
                         drop(reservation);
                         if stopped() {
                             break;
@@ -1990,7 +2017,7 @@ pub fn completion_groups<Task: Send, State, Group: Send>(
         if !fed {
             // Any started workers find the feed closed and empty, and leave.
             feed.close();
-            groups_alone(&mut *lock(source), cancelled, make, work, &mut emit);
+            groups_alone_with_handoff(&mut *lock(source), cancelled, make, work, &mut emit);
             return;
         }
         collect(&receiver, held, idle, &stopped, &mut emit);
@@ -2026,6 +2053,21 @@ impl<'g, Group> Lane<'g, Group> {
     /// that panics: its siblings poll the stop, not the walker.
     pub fn stop(&self) {
         self.pool.halt();
+    }
+
+    /// Hands over an active task's group after flushing its held batch.
+    /// Sends outside the slot lock: the publisher may consume this task until
+    /// it finishes, so it must never wait on a lock held by the sender.
+    /// False means the publisher stopped and the task must unwind.
+    pub fn handoff(&self, group: Group, stopped: &dyn Fn() -> bool) -> bool {
+        let batch = lock(self.slot).take();
+        if let Some(batch) = batch
+            && self.sender.send(batch).is_err()
+        {
+            return false;
+        }
+        self.idle.store(false, Ordering::SeqCst);
+        !stopped() && self.sender.send(vec![group]).is_ok()
     }
 
     /// Holds a completed group of `bytes`, or hands batches over now (see
@@ -2185,21 +2227,30 @@ fn publish<Group>(
     ControlFlow::Continue(())
 }
 
-fn groups_alone<Task, State, Group>(
+fn groups_alone_with_handoff<Task, State, Group>(
     mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
     cancelled: &AtomicBool,
     make: &impl Fn() -> State,
-    work: &impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group,
+    work: &impl Fn(&mut State, Task, &dyn Fn() -> bool, &dyn Fn(Group) -> bool, bool) -> Group,
     emit: &mut impl FnMut(Group) -> ControlFlow<()>,
 ) {
     let stopped = || cancelled.load(Ordering::Acquire);
+    let emit = std::cell::RefCell::new(emit);
+    let handoff = |group| {
+        if stopped() || emit.borrow_mut()(group).is_break() {
+            cancelled.store(true, Ordering::Release);
+            false
+        } else {
+            true
+        }
+    };
     let mut state = make();
     while !stopped() {
         let Some((_, task)) = next(&stopped) else {
             break;
         };
-        let item = work(&mut state, task, &stopped);
-        if stopped() || emit(item).is_break() {
+        let item = work(&mut state, task, &stopped, &handoff, false);
+        if stopped() || emit.borrow_mut()(item).is_break() {
             break;
         }
     }
@@ -3425,5 +3476,116 @@ mod group_tests {
         }
         assert!(walk_jobs(vec![Job::Lend, Job::Hog, Job::Wait]));
         assert!(walk_jobs(vec![Job::Lend, Job::Panic, Job::Poll]));
+    }
+
+    // Streaming keeps the input reservation while the publisher consumes an
+    // active task. A sibling waiting for that budget must not strand either
+    // thread, including when publication stops or the stream owner panics.
+    #[test]
+    fn active_lane_streams_release_budget_waiters_and_channel_senders() {
+        if completion_child("active_lane_streams_release_budget_waiters_and_channel_senders") {
+            return;
+        }
+        enum Handoff {
+            Held,
+            Stream(std::sync::mpsc::Receiver<usize>),
+        }
+        for mode in 0..3 {
+            let waiting = std::sync::Arc::new(AtomicBool::new(false));
+            let _seams = seam::Seams {
+                on_budget_wait: Some({
+                    let waiting = waiting.clone();
+                    std::sync::Arc::new(move || waiting.store(true, Ordering::SeqCst))
+                }),
+                ..Default::default()
+            }
+            .set();
+            let mut held = false;
+            let mut received = 0;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lane_groups(
+                    2,
+                    &AtomicBool::new(false),
+                    |lanes, stopped| {
+                        std::thread::scope(|scope| {
+                            let _reservation = lanes[0].reserve(u64::MAX, stopped).unwrap();
+                            let sibling = &lanes[1];
+                            scope.spawn(move || {
+                                let _reservation = sibling.reserve(1, stopped);
+                            });
+                            while !waiting.load(Ordering::SeqCst) {
+                                std::thread::yield_now();
+                            }
+                            assert!(lanes[0].hand(Handoff::Held, 0).is_continue());
+                            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                            assert!(lanes[0].handoff(Handoff::Stream(receiver), stopped));
+                            for chunk in 0..32 {
+                                if sender.send(chunk).is_err() {
+                                    break;
+                                }
+                                assert!(mode != 2, "stream owner panics after its first chunk");
+                            }
+                        });
+                    },
+                    |handoff| match handoff {
+                        Handoff::Held => {
+                            held = true;
+                            ControlFlow::Continue(())
+                        }
+                        Handoff::Stream(receiver) => {
+                            assert!(held, "active handoff did not flush the held batch");
+                            for chunk in receiver {
+                                assert_eq!(chunk, received);
+                                received += 1;
+                                if mode == 1 {
+                                    return ControlFlow::Break(());
+                                }
+                            }
+                            ControlFlow::Continue(())
+                        }
+                    },
+                )
+                .unwrap();
+            }));
+            assert_eq!(result.is_err(), mode == 2);
+            assert_eq!(received, if mode == 0 { 32 } else { 1 });
+        }
+    }
+
+    // An active task cannot wait for its own synchronous publisher. Both
+    // worker-start and producer-start fallback must expose that same mode.
+    #[test]
+    fn active_handoffs_publish_synchronously_on_serial_and_spawn_fallback_paths() {
+        if completion_child(
+            "active_handoffs_publish_synchronously_on_serial_and_spawn_fallback_paths",
+        ) {
+            return;
+        }
+        for (threads, fail_spawn_at) in [(1, None), (2, Some(0)), (2, Some(2))] {
+            let _seams = seam::Seams {
+                fail_spawn_at,
+                ..Default::default()
+            }
+            .set();
+            let mut tasks = (0..4).map(|task| (1, task));
+            let mut emitted = Vec::new();
+            completion_groups_with_handoff(
+                GroupSchedule::Streaming(threads),
+                &AtomicBool::new(false),
+                |_| tasks.next(),
+                || (),
+                |_, task, _, handoff, concurrent| {
+                    assert!(!concurrent);
+                    assert!(handoff(task * 2));
+                    task * 2 + 1
+                },
+                |_| 0,
+                |item| {
+                    emitted.push(item);
+                    ControlFlow::Continue(())
+                },
+            );
+            assert_eq!(emitted, (0..8).collect::<Vec<_>>());
+        }
     }
 }

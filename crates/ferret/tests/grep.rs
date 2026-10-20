@@ -283,15 +283,18 @@ fn run(mut command: Command, input: Option<&[u8]>) -> Output {
         command.stdin(Stdio::piped());
     }
     let mut child = command.spawn().unwrap();
-    if let Some(input) = input {
-        // grep may stop reading early (binary input, `-q`, `-m`) and exit
-        // before the whole input is written.
-        match child.stdin.take().unwrap().write_all(input) {
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-            result => result.unwrap(),
+    std::thread::scope(|scope| {
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().unwrap();
+            // Streaming can fill stdout before stdin is exhausted. Drain both
+            // concurrently; early-match modes may close stdin intentionally.
+            scope.spawn(move || match stdin.write_all(input) {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                result => result.unwrap(),
+            });
         }
-    }
-    child.wait_with_output().unwrap()
+        child.wait_with_output().unwrap()
+    })
 }
 
 // Preserve line order within a file. Only groups may move relative to each
@@ -820,10 +823,10 @@ fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
     }
 }
 
-// R1/P3: creating the first group's spill fails. Explicit files, catalogued
-// files and stdin must stop before the subsequent small matching file.
+// D103: rendered output no longer depends on TMPDIR, including explicit
+// files, catalogued files and the direct stdin operand barrier.
 #[test]
-fn spill_failure_stops_before_the_next_matching_file() {
+fn large_rendered_groups_need_no_temporary_directory() {
     let fixture = Fixture::new("spill-failure");
     fs::create_dir_all(fixture.tree().join("ordered")).unwrap();
     fixture.write("ordered/big.txt", &b"red\n".repeat(1_200_000));
@@ -851,33 +854,35 @@ fn spill_failure_stops_before_the_next_matching_file() {
         let output = run(command, None);
         outcomes.push((
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr).contains("output spill"),
-            output.stdout.is_empty(),
+            output.stderr.is_empty(),
+            output.stdout.ends_with(b"ordered/small.txt:red small\n"),
         ));
     }
     assert_eq!(
         outcomes,
-        [(Some(2), true, true); 3],
-        "a later file printed after output failed"
+        [(Some(0), true, true); 3],
+        "rendered output must not spill"
     );
 }
 
 // A spill fault is a temporary-file fault: the message names the spill
 // directory and file, not stdout.
 #[test]
-fn spill_failure_names_the_temporary_directory() {
+fn context_spill_failure_names_the_input_and_temporary_directory() {
     let fixture = Fixture::new("spill-message");
-    fixture.write("big.txt", &b"red\n".repeat(1_200_000));
+    let mut bytes = vec![b'x'; 80 << 10];
+    bytes.extend_from_slice(b"\nred\n");
+    fixture.write("big.txt", &bytes);
     let missing = fixture.base.join("missing-spill-dir");
     let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
     command
-        .args(["grep", "red", "big.txt"])
+        .args(["grep", "-B1", "red", "big.txt"])
         .env("TMPDIR", &missing);
     let output = run(command, None);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
-    let directory = format!("writing temporary output in {}: ", missing.display());
-    assert!(stderr.contains(&directory), "{stderr}");
+    assert!(stderr.contains("grep: big.txt:"), "{stderr}");
+    assert!(output.stdout.is_empty());
     assert!(
         stderr.contains(&format!("{}/ferret-output-", missing.display())),
         "{stderr}"
@@ -1029,7 +1034,7 @@ profile_cases! {
 // M2: compare whole file groups at different D77 settings, with enough output
 // to force spill. Sorting individual lines would conceal interleaving.
 #[test]
-fn parallel_groups_preserve_whole_spilled_files_at_one_and_four_threads() {
+fn parallel_groups_preserve_whole_large_files_at_one_and_eight_threads() {
     let fixture = Fixture::new("parallel-groups");
     fs::create_dir_all(fixture.tree().join("groups")).unwrap();
     for file in 0..12 {
@@ -1047,13 +1052,14 @@ fn parallel_groups_preserve_whole_spilled_files_at_one_and_four_threads() {
         b"version = 1\nsearch_threads = 4\n",
     )
     .unwrap();
-    for threads in ["1", "4"] {
+    for threads in ["1", "8"] {
         let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
         command
             .args(["--index"])
             .arg(fixture.base.join("index"))
             .args(["grep", "-n", "red", "groups"])
-            .env("FERRET_SEARCH_THREADS", threads);
+            .env("FERRET_SEARCH_THREADS", threads)
+            .env("TMPDIR", fixture.base.join("missing"));
         let output = run(command, None);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(output.stderr.is_empty());
@@ -1930,7 +1936,7 @@ fn m5_context_gaps_overlap_adjacency_and_long_spills() {
 }
 
 #[test]
-fn m5_before_context_spill_failure_stops_the_command() {
+fn m5_before_context_spill_failure_discards_only_its_file() {
     let fixture = Fixture::new("before-context-fault");
     let mut bytes = b"blue\n".repeat(20_000);
     bytes.extend_from_slice(b"red\n");
@@ -1947,8 +1953,13 @@ fn m5_before_context_spill_failure_stops_the_command() {
         .env("TMPDIR", fixture.base.join("missing-spill-dir"));
     let output = run(command, None);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
-    assert!(output.stdout.is_empty(), "a later group was published");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("output spill"));
+    assert_eq!(output.stdout, b"small.txt:red small\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("big.txt") && stderr.contains("output spill"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("stdout"), "{stderr}");
 }
 
 // Buffering stdout must not move a completed group past the next operand's
@@ -5073,4 +5084,302 @@ fn append_during_grep_reads_only_the_opening_size_prefix() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(output.stdout, prefix);
     assert!(fs::read(&path).unwrap().ends_with(b"red appended\n"));
+}
+
+// D103: reading the complete file before noticing head's closed pipe was
+// proportional to its size. Inspect bytes read while stdout is blocked: this
+// measures work rather than relying on the machine's timing lock.
+#[test]
+fn streaming_head_stops_before_reading_the_whole_large_file() {
+    use std::io::Read;
+    let fixture = Fixture::new("streaming-head");
+    let mut line = b"hit ".to_vec();
+    line.resize(1023, b'x');
+    line.push(b'\n');
+    fs::create_dir(fixture.tree().join("head")).unwrap();
+    fixture.write("head/large", &line.repeat(32 * 1024));
+    let expected = [b"head/large:".as_slice(), &line].concat();
+    for threads in ["1", "8"] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .args(["grep", "-uu", "hit", "head"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let mut child = command.spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let mut first = vec![0; expected.len()];
+        pipe.read_exact(&mut first).unwrap();
+        let io = fs::read_to_string(format!("/proc/{}/io", child.id())).unwrap();
+        let read: u64 = io
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        drop(pipe);
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        assert!(
+            read < 16 << 20,
+            "read {read} bytes before head received one line"
+        );
+    }
+}
+
+// The pipe blocks the publisher while the test changes the opening bytes.
+// Retrying an already-published attempt would duplicate this complete group.
+#[test]
+fn streaming_changed_file_reports_partial_output_without_retry() {
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::new("streaming-changed");
+    let mut line = b"hit ".to_vec();
+    line.resize(1023, b'x');
+    line.push(b'\n');
+    let bytes = line.repeat(32 * 1024);
+    fs::create_dir(fixture.tree().join("changed")).unwrap();
+    for flags in [vec![], vec!["-U"], vec!["--json"]] {
+        fixture.write("changed/large", &bytes);
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .args(["grep", "-uu", "-I"])
+            .args(&flags)
+            .args(["hit", "changed"])
+            .env("FERRET_SEARCH_THREADS", "8");
+        let mut child = command.spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let mut first = [0; 1024];
+        pipe.read_exact(&mut first).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.tree().join("changed/large"))
+            .unwrap()
+            .write_all_at(b"CHG", 0)
+            .unwrap();
+        // D104 accepts appends and same-size writes; shrink the extent so
+        // the closing search check must reject this streamed attempt.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.tree().join("changed/large"))
+            .unwrap()
+            .set_len(bytes.len() as u64 - 1)
+            .unwrap();
+        child.stdout = Some(pipe);
+        let mut output = child.wait_with_output().unwrap();
+        let mut stdout = first.to_vec();
+        stdout.extend_from_slice(&output.stdout);
+        output.stdout = stdout;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("large") && stderr.contains("changed"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("not retried"), "{stderr}");
+        if flags.contains(&"--json") {
+            let text = std::str::from_utf8(&output.stdout).unwrap();
+            assert_eq!(text.matches("\"type\":\"begin\"").count(), 1);
+            assert_eq!(text.matches("\"type\":\"end\"").count(), 1);
+            // Existing validator checks complete JSON, pairing and byte/stat
+            // totals.
+            normalized_json(&output.stdout, false);
+        } else {
+            assert_eq!(output.stdout, bytes, "a streamed attempt was repeated");
+        }
+    }
+}
+
+// D102 + D103: the first spool can fail after the matching prefix streamed.
+// Keep that prefix, finish JSON if begun, and publish both neighboring files.
+#[test]
+fn streaming_context_spill_fault_preserves_prefix_and_other_files() {
+    let fixture = Fixture::new("streaming-context-fault");
+    let mut bytes = b"hit ".to_vec();
+    bytes.resize(5 << 20, b'x');
+    bytes.push(b'\n');
+    let prefix_len = bytes.len();
+    bytes.extend(vec![b'y'; 80 << 10]);
+    bytes.extend_from_slice(b"\nhit final\n");
+    fixture.write("large", &bytes);
+    fixture.write("before", b"hit small\n");
+    fixture.write("after", b"hit small\n");
+    for json in [false, true] {
+        for threads in ["1", "8"] {
+            let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+            command.arg("grep");
+            if json {
+                command.arg("--json");
+            }
+            command
+                .args(["-B1", "hit", "before", "large", "after"])
+                .env("FERRET_SEARCH_THREADS", threads)
+                .env("TMPDIR", fixture.base.join("missing"));
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{stderr}");
+            assert!(
+                stderr.contains("large") && stderr.contains("output spill"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("stdout"), "{stderr}");
+            if json {
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                assert_eq!(text.matches("\"type\":\"begin\"").count(), 3);
+                assert_eq!(text.matches("\"type\":\"end\"").count(), 3);
+                normalized_json(&output.stdout, false);
+            } else {
+                let records: Vec<u8> = output
+                    .stdout
+                    .split_inclusive(|&byte| byte == b'\n')
+                    .filter(|line| *line != b"--\n")
+                    .flatten()
+                    .copied()
+                    .collect();
+                let actual = groups(&records, &fixture.tree());
+                assert_eq!(actual.len(), 3);
+                let large = actual
+                    .iter()
+                    .find(|group| group.starts_with(b"large:"))
+                    .unwrap();
+                let mut expected = b"large:".to_vec();
+                expected.extend_from_slice(&bytes[..prefix_len]);
+                assert_eq!(large, &expected);
+                assert!(actual.iter().any(|group| group == b"before:hit small\n"));
+                assert!(actual.iter().any(|group| group == b"after:hit small\n"));
+            }
+        }
+    }
+}
+
+// The streaming owner must not wait on queued groups while their workers wait
+// on it. A missing TMPDIR also distinguishes streaming from whole-file spills.
+#[test]
+fn streaming_two_large_groups_and_many_small_groups_stall_without_interleaving() {
+    let fixture = Fixture::new("streaming-stall");
+    fs::create_dir(fixture.tree().join("stream")).unwrap();
+    let mut expected = Vec::new();
+    for file in 0..194 {
+        let path = format!("stream/{file:03}");
+        let mut line = format!("hit file-{file:02} ").into_bytes();
+        line.resize(1023, b'x');
+        line.push(b'\n');
+        let count = if file < 2 { 6144 } else { 1 };
+        fixture.write(&path, &line.repeat(count));
+        expected.push([path.as_bytes(), b":", &line].concat().repeat(count));
+    }
+    // Exercise the indexed feed, explicit-only completion feed, and both
+    // D105 walk modes with the same output and backpressure.
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for mode in [None, Some("explicit"), Some("-uu"), Some("--live")] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep");
+        if let Some(mode @ ("-uu" | "--live")) = mode {
+            command.arg(mode);
+        }
+        command.arg("hit");
+        if mode == Some("explicit") {
+            command.args((0..194).map(|file| format!("stream/{file:03}")));
+        } else {
+            command.arg("stream");
+        }
+        command
+            .env("FERRET_SEARCH_THREADS", "4")
+            .env("TMPDIR", fixture.base.join("missing"));
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{mode:?}: {:?}",
+            output.stderr
+        );
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            groups(&output.stdout, &fixture.tree()),
+            expected,
+            "{mode:?}"
+        );
+    }
+}
+
+// D103: context and -m state must survive the transition in the middle of a
+// rendered line, both for a worker file and for the direct stdin barrier.
+#[test]
+fn streaming_context_and_match_limit_preserve_record_boundaries() {
+    let fixture = Fixture::new("streaming-context-limit");
+    let mut long = b"red ".to_vec();
+    long.resize(5 << 20, b'x');
+    long.push(b'\n');
+    let bytes = [
+        b"before\n".as_slice(),
+        &long,
+        b"red second\nafter\nskipped\nbefore third\nred third\ntail\n",
+    ]
+    .concat();
+    fixture.write("large", &bytes);
+    for stdin in [false, true] {
+        for limited in [false, true] {
+            let mut expected = b"1-before\n2:".to_vec();
+            expected.extend_from_slice(&long);
+            expected.extend_from_slice(if limited {
+                b"3-red second\n"
+            } else {
+                b"3:red second\n4-after\n--\n6-before third\n7:red third\n8-tail\n"
+            });
+            let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+            command.args(["grep", "-nC1"]);
+            if limited {
+                command.arg("-m1");
+            }
+            command
+                .args(["red", if stdin { "-" } else { "large" }])
+                .env("TMPDIR", fixture.base.join("missing"));
+            let output = run(command, stdin.then_some(bytes.as_slice()));
+            assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+            assert!(output.stderr.is_empty());
+            assert!(output.stdout == expected, "context/limit output differs");
+        }
+    }
+    for (flag, expected) in [("-c", b"3\n".as_slice()), ("-l", b"large\n"), ("-q", b"")] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .args(["grep", flag, "red", "large"])
+            .env("TMPDIR", fixture.base.join("missing"));
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, expected);
+    }
+}
+
+// A late binary sentinel cannot withdraw a streamed prefix, but its stdout
+// warning must retain the ordinary file/stdin label and follow the prefix.
+#[test]
+fn streaming_late_binary_sentinel_keeps_prefix_and_original_warning_label() {
+    let fixture = Fixture::new("streaming-late-binary");
+    let mut prefix = b"red ".to_vec();
+    prefix.resize(5 << 20, b'x');
+    prefix.push(b'\n');
+    let bytes = [prefix.as_slice(), b"\0tail"].concat();
+    fixture.write("large", &bytes);
+    for stdin in [false, true] {
+        let path = if stdin { "-" } else { "large" };
+        let output = fixture.ferret(&["grep", "red", path], stdin.then_some(bytes.as_slice()));
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        let label = if stdin {
+            b"(standard input)".as_slice()
+        } else {
+            b"large"
+        };
+        let expected = [prefix.as_slice(), label, b": binary file matches\n"].concat();
+        assert!(
+            output.stdout == expected,
+            "binary warning lost its streamed prefix or label"
+        );
+    }
 }

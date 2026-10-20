@@ -179,11 +179,24 @@ the next required-run occurrence, not from the previous match to the line end,
 which was quadratic on long lines and ran the engine's slow Unicode-`\b`
 fallback over non-ASCII text. Captures and replacement still use the whole
 source line. Uncoloured, unnumbered plain records combine path,
-separator, data and LF through the capture's vectored writer. Grep holds up to 4 MiB per file capture (D93; the formula in DESIGN.md bounds live capture bytes, not RSS), then stages spill
-writes in 64 KiB blocks, finishing them inside the
-checked-read callback before accepting a group. A broken pipe on stdout ends
-grep silently with exit 0, as rg does (D94). Find's default captures retain
-immediate spill-write faults. Redirected grep stdout uses a 64 KiB block buffer
+separator, data and LF through the capture's vectored writer. Grep holds up to
+4 MiB of rendered output per file (D93). On crossing that threshold, it waits
+for the single publisher, sends the captured prefix, and streams the rest of
+that file in 64 KiB chunks (D103 A). The group holds the publisher until its
+closing version check finishes. Other workers fill the bounded completion
+queue and then stall; groups never interleave. T=1 preserves walk order and
+streams on the calling thread. Stdin and cached-record rendering use the same
+threshold. Counts, names and quiet modes create no large capture.
+
+Rendered output never spills, including captures queued behind a streaming
+file. The separate before-context spool still spills past 64 KiB. A spool
+create/write/read-back fault before publication discards the file; after
+publication it retains the prefix. Both cases name the input and temporary-file
+fault, continue with other files, and exit 2 (D102 A). A streamed file is never
+retried. JSON closes a begun group with only observed partial statistics on a
+file error. A broken pipe on stdout still ends silently with exit 0 (D94);
+other stdout faults stop the run with exit 2. Find's capture publication remains transactional.
+Redirected grep stdout uses a 64 KiB block buffer
 written to descriptor 1 itself, with no second descriptor (preserving shared
 stdout/stderr offsets); terminal stdout retains line buffering. NUL-terminated
 name modes and `--live`, whose policy warnings come from search workers, also
@@ -192,8 +205,8 @@ and names-only record is flushed before the next operand or diagnostic, and
 help/version and the final JSON summary also flush explicitly. A publication
 fault also drains its previously accepted prefix before reporting the error.
 Failed destinations are discarded without an implicit drop retry. Checked
-publication, the 64 KiB cancellation bound and output-fault classification
-remain unchanged.
+publication and the 64 KiB cancellation polling bound remain in force;
+staging faults are file-local, while stdout faults stop the run.
 
 ## Freshness and operands
 
@@ -206,7 +219,10 @@ freshness target of about one second is not a deadline or a query barrier.
 Read candidates through S2's bracketed reader. Changed bytes yield path-local
 answers; unchanged copies share content facts after independent full-key stats.
 Drop vanished candidates even under inversion. Other read failures report an
-error, never a negative match. Retry instability once, then continue with exit 2.
+error, never a negative match. Up to 4 MiB of rendered output is transactional:
+retry instability once, then continue with exit 2. Above 4 MiB, the guarantee is
+**one version, or a diagnostic**: a changed closing version or a file error
+keeps the already printed prefix, names the file, exits 2 and does not retry.
 No atomic tree snapshot is promised; default `--files` keeps stale listings.
 **D73 A+D (confirmed 2026-10-16):** `--live` (M6) enumerates current names and reads current
 bytes with D13 policy now, independently of `--no-ignore`. Reconstruct
@@ -565,11 +581,13 @@ LF match, so `-U -vc` selects nothing and exits 1. On `foo foo\nbar\nfoo\n`,
 before matching, including for quiet/name output. Reads and metadata/span
 iteration poll cancellation. Input growth and variable-size line/span metadata
 use fallible allocation; an unrepresentable extent or allocation failure is an
-input error. All bytes and rendered groups remain inside the existing
-bracket/retry transaction; a failed attempt publishes no prefix or zero record.
+input error. Input reads finish before rendering, but the closing version check
+still follows rendering. Up to 4 MiB, a failed attempt publishes no prefix or
+zero record; larger rendered groups follow the same streaming and no-retry
+contract as line mode (D103 A).
 There is **no small peak-memory bound** for explicit files, stdin or unrestricted
 multiline input. The whole input buffer and line/span metadata grow with the
-input and match count; output spills and host-cache budgets do not cap them.
+input and match count; rendered-capture and host-cache budgets do not cap them.
 Indexed and policy-preserving input retain their existing size cap. No extra
 cap is imposed on explicit, stdin or unrestricted input.
 
@@ -614,7 +632,8 @@ groups under 64 KiB in batches of up to 64 KiB; the host takes every held
 batch before it sleeps, so a held group never waits on its worker's next file.
 With one thread, groups retain walk order. Cross-file diagnostics follow
 completion order too, and cannot split another file’s group. Grep reuses find’s
-bounded output/spill machinery.
+bounded capture buffer and query’s completion scheduler for capture/stream
+handoffs.
 
 **M2 output overrides (confirmed 2026-10-17):** the last `-l`/`-c` selects
 name or count output; `-q` independently overrides both, in either argv order.
@@ -657,7 +676,7 @@ adds/removes LF. LF-excluding profiles retain line-oriented replacement output,
 so an embedded replacement LF gets no additional prefix. `-o` never prints an
 empty expansion (D79 D); without `-o` an empty line still prints its LF.
 Expansion is cancellable and fallibly allocated. It keeps one displayed line
-and its highlights; rendered records still use the host's bounded cache/spill
+and its highlights; rendered records still use the host's bounded cache and capture/stream
 path. A source or expanded line can be arbitrarily long, under the existing
 line-sized memory exception. It does not accumulate an expanded multiline
 group. These presentation choices are settled (D84 B, through D98).
@@ -769,10 +788,12 @@ Detect NUL in each read chunk, without waiting for LF or EOF (review R1,
 2026-10-16). A producer that holds its stream open after NUL does not hold the
 query open. For non-binary input with no LF, line buffering grows with the line:
 explicit files and stdin have no invented cap and use fallible allocation;
-recursive input retains its existing file size cap. Output spill bounds output
+recursive input retains its existing file size cap. Capture buffering bounds rendered output
 memory, not this input-line buffer.
 If a selected line preceded it, plain line/span output prints
 `PATH: binary file matches` on stdout instead (stdin label: `(standard input)`).
+If the group has already begun streaming, its printed prefix remains before
+that warning.
 `-l` prints the path and `-q` prints nothing. **M4 review R1 correction
 (2026-10-17):** pinned rg keeps `-c`, `-co` and `--count-matches` output
 numeric, with or without `-m`; the earlier blanket binary-message rule for
@@ -795,13 +816,15 @@ plain warning. An I/O error never becomes a binary skip.
 Exit `0`: selected lines, matching names or listed files; `1`: none; `2`: parse,
 unsupported feature, pattern/index/read/write error. Continue after recoverable
 file errors. `-q` stops on a match and exits 0 even if a read error was already
-reported; a fatal pre-search error is still 2. Broken output stops work, exit 2.
+reported; a fatal pre-search error is still 2. Broken stdout stops work:
+broken pipe exits 0 silently, other destination faults exit 2.
 With no path operand (grep searches `.`), a walk whose depth, glob, hidden and
 ignore filters select no file exits 2 with a "no files were searched"
 diagnostic, after any walk error it reported (D99). A file selected but
 skipped by the index, or failing to open, still counts as searched. An
-explicit path (`.` included) or stdin keeps exit 1, silent. A spill fault
-names the temporary directory (`TMPDIR`) and file, not stdout.
+explicit path (`.` included) or stdin keeps exit 1, silent. A context-spool
+fault names the input and temporary file in `TMPDIR`, never stdout; it fails
+only that file, preserving any prefix already streamed.
 Error wording differs from rg; diagnostic presence and exit status are tested.
 
 ## Shared engine and crate seams
@@ -848,7 +871,7 @@ require a second file read and would mishandle line anchors. M1 instead shares
 the extracted streaming core (`ferret-query/src/scan.rs`). Query owns grep’s
 parser, candidate selection and line records; the local host resolves operands,
 adapts policy/read faults, and renders bounded per-file output using find’s
-spill buffer. The same typed host adapter supplies search’s legacy optional
+capture buffer. The same typed host adapter supplies search’s legacy optional
 read result. There is no query-to-crawl/policy edge or new executor.
 
 M1 emitted file groups sequentially. M2 extends the same verification scheduler
@@ -878,7 +901,12 @@ use D105's scheduler instead.
 at most 64 KiB while it is busy, and the host collects every held batch before
 it sleeps. One-file tasks and bounded handoffs bound queued
 groups; no array of every path or second concurrent pool is introduced. The
-calling thread publishes whole groups. Stdin is a direct operand barrier;
+calling thread publishes whole groups. A worker crossing 4 MiB hands over an
+active stream through the same queue, after flushing its held batch. The
+publisher consumes that stream's bounded chunk channel through completion;
+other handoffs remain bounded in the queue. T=1 and spawn fallback handoffs
+publish synchronously without waiting for their own task to send more data.
+Stdin is a direct operand barrier;
 workers never wait for its producer. The D105 parallel live walk (`-uu`,
 `--live`) has no producer, and orders operands with two more barriers: file
 operands are searched in order by one worker, and each directory operand's walk
@@ -896,14 +924,15 @@ The host keeps bounded, prefix-free records only for duplicated catalogued
 content: at most 64 KiB of accounted records per entry and 16 MiB total before
 cache eviction, plus bounded container overhead. Every alias first passes its
 own full-key catalog-version stat. Current bytes remain path-local and never
-enter this DocId cache. Large groups skip caching and use the ordinary spill
-path; concurrent cache misses may independently read the same document. No
+enter this DocId cache. Large groups skip caching and stream at the threshold;
+even a small cached record set can cross it when an alias's rendered prefix
+expands. Concurrent cache misses may independently read the same document. No
 cache lock is held during file I/O, matching or output.
 
 A shared cancellation flag reaches planning, typed reads, retry acceptance,
-line/span iteration and chunked spill rendering/replay. A worker's stable quiet
+line/span iteration, streaming writes and context-spool replay. A worker's stable quiet
 hit stops work immediately, even while an earlier position is still reading;
-fatal output/spill faults also stop workers. Interrupted writes are not used as
+stdout faults also stop workers; context-spool faults fail only their file. Interrupted writes are not used as
 a cancellation signal because write_all retries them. **2026-10-17 review
 correction:** the scheduler passes its combined pool/external stop predicate
 into the streaming producer, which polls while filtering entries, switching
@@ -916,9 +945,9 @@ Partial listings are discarded on cancellation. The directory-batch callback
 retains its position after names are collected; grep supplies a no-op there
 because it has no directory-batch actions. Cancellation uses the separate
 shared predicate, including in-progress listings.
-Queued groups and spill
-handles are bounded by the ring/workers; spill bytes follow the required output,
-without silent truncation or an invented cap. The existing long-line input
+Queued groups and active stream requests are bounded by the completion queue
+and workers. Only before-context retains spill handles: its rolling disk
+bound remains twice the live context window plus 64 KiB, without truncation. The existing long-line input
 buffer exception still applies. No dependency or index-format change.
 
 ## Differential acceptance

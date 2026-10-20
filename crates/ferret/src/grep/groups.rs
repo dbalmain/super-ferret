@@ -8,9 +8,10 @@ use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
 use ferret_query::{GroupSchedule, Lane};
 use ferret_query::{ReadOperation, ReadVersion};
 use std::collections::HashMap;
-use std::io::{BufRead, IoSlice};
+use std::io::{BufRead, BufWriter, IoSlice};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub(super) const GROUP_BYTES: usize = 4 << 20;
@@ -96,16 +97,56 @@ pub(super) enum Observed {
     Ready(Group),
     Skipped,
     Failed(ReadFault),
+    Spool(io::Error),
+    Streamed(InputResult, Option<String>),
+}
+
+/// Rendered captures never spill in production: crossing the threshold hands
+/// the captured prefix to the single publisher, then keeps writing there.
+struct OutputCapture<'a> {
+    buffer: OutputBuffer,
+    target: &'a mut dyn Write,
+    streamed: bool,
+}
+impl<'a> OutputCapture<'a> {
+    fn new(target: &'a mut dyn Write) -> Self {
+        Self {
+            buffer: OutputBuffer::default().with_memory_limit(GROUP_BYTES),
+            target,
+            streamed: false,
+        }
+    }
+}
+impl Write for OutputCapture<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.streamed && self.buffer.len() + bytes.len() as u64 > GROUP_BYTES as u64 {
+            self.streamed = true;
+            self.buffer.write_to(self.target)?;
+            self.buffer = OutputBuffer::default();
+        }
+        if self.streamed {
+            self.target.write(bytes)
+        } else {
+            self.buffer.write(bytes)
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if self.streamed {
+            self.target.flush()
+        } else {
+            self.buffer.flush()
+        }
+    }
 }
 
 impl Render<'_> {
     fn line(
         &self,
-        output: &mut OutputBuffer,
+        output: &mut dyn Write,
         line: line_grep::Line<'_>,
         cursor: &mut Cursor,
     ) -> io::Result<()> {
-        let mut output = CaptureWriter {
+        let mut output = Cancellable {
             inner: output,
             stopped: self.stopped,
         };
@@ -193,9 +234,9 @@ impl Render<'_> {
         input: &mut dyn Read,
         size: u64,
         buffer: &mut Vec<u8>,
-        output: &mut OutputBuffer,
+        output: &mut OutputCapture<'_>,
         capture: &mut Capture,
-    ) -> Result<InputResult, ScanError> {
+    ) -> Result<InputResult, (InputResult, ScanError)> {
         #[cfg(test)]
         super::seam::BEFORE_SCAN.with_borrow_mut(|hook| {
             if let Some(hook) = hook {
@@ -207,36 +248,50 @@ impl Render<'_> {
         #[cfg(any(test, debug_assertions))]
         let input: &mut dyn Read = &mut observed;
         let mut cursor = Cursor::default();
-        let result = line_grep::scan_lines(self.plan, input, size, buffer, self.stopped, |line| {
-            capture.push(line);
-            self.line(output, line, &mut cursor)
-        });
-        // Complete staging inside the checked-read callback: a late spill
-        // fault must discard the capture, before any group can be published.
-        output.flush().map_err(ScanError::Output)?;
+        let result =
+            line_grep::scan_lines_progress(self.plan, input, size, buffer, self.stopped, |line| {
+                capture.push(line);
+                self.line(output, line, &mut cursor)
+            });
+        let partial = match &result {
+            Ok(result) | Err((result, _)) => *result,
+        };
+        output
+            .flush()
+            .map_err(|error| (partial, ScanError::Output(error)))?;
         result
     }
 }
 
-/// All paths share the same retry and output-fault boundary, including callers
-/// that do not cache. Failed attempts discard both records and rendered bytes.
+/// Test scans still use the production threshold, with a discard destination.
+#[cfg(test)]
 pub(super) fn observe(
     render: &Render<'_>,
     buffer: &mut Vec<u8>,
     read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
     cache: bool,
 ) -> io::Result<Observed> {
-    let mut output = OutputBuffer::default()
-        .with_memory_limit(GROUP_BYTES)
-        .with_buffered_spill();
+    observe_streaming(render, buffer, read, cache, &mut io::sink())
+}
+
+/// Retry an unpublished changed attempt once. Once streaming has started,
+/// retain its prefix and report file faults without retrying. Only actual
+/// destination failures escape as errors that stop the whole run.
+pub(super) fn observe_streaming(
+    render: &Render<'_>,
+    buffer: &mut Vec<u8>,
+    read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
+    cache: bool,
+    target: &mut dyn Write,
+) -> io::Result<Observed> {
+    let mut output = OutputCapture::new(target);
     let mut result = InputResult::default();
     let mut capture = Capture::new(cache);
     let mut output_failure = None;
+    let mut changed_after_publication = false;
     let outcome = ferret_query::retry_read(
         || {
-            output = OutputBuffer::default()
-                .with_memory_limit(GROUP_BYTES)
-                .with_buffered_spill();
+            output.buffer = OutputBuffer::default().with_memory_limit(GROUP_BYTES);
             result = InputResult::default();
             capture = Capture::new(cache);
             let mut each = |input: &mut dyn Read, size| match render.scan(
@@ -250,28 +305,61 @@ pub(super) fn observe(
                     result = scanned;
                     Ok(())
                 }
-                Err(ScanError::Input(error)) => Err(error),
-                Err(ScanError::Output(error)) => {
-                    output_failure = Some(error);
-                    Err(io::Error::other("grep output failed"))
+                Err((partial, error)) => {
+                    result = partial;
+                    match error {
+                        ScanError::Input(error) => Err(error),
+                        ScanError::Output(error) => {
+                            output_failure = Some(error);
+                            Err(io::Error::other("grep rendering failed"))
+                        }
+                    }
                 }
             };
             let outcome = read(&mut each);
             if output_failure.is_some() {
                 ReadOutcome::Cancelled
+            } else if output.streamed && matches!(outcome, ReadOutcome::RetryChanged) {
+                changed_after_publication = true;
+                // Do not let retry_read repeat an irreversible observation.
+                ReadOutcome::Failed(ReadFault::Unstable)
             } else {
                 outcome
             }
         },
         render.stopped,
     );
-    if let Some(error) = output_failure {
-        return Err(error);
+    let spool_failure = if let Some(error) = output_failure {
+        if ferret_query::find::spill_path(&error).is_none() {
+            return Err(error);
+        }
+        Some(error)
+    } else {
+        None
+    };
+    if output.streamed {
+        let error = if let Some(error) = spool_failure {
+            Some(error.to_string())
+        } else if changed_after_publication {
+            Some("changed during read after output began; output is partial (not retried)".into())
+        } else {
+            match outcome {
+                ReadOutcome::Failed(error) => Some(error.to_string()),
+                ReadOutcome::Vanished => {
+                    Some("vanished after output began; output is partial".into())
+                }
+                _ => None,
+            }
+        };
+        return Ok(Observed::Streamed(result, error));
+    }
+    if let Some(error) = spool_failure {
+        return Ok(Observed::Spool(error));
     }
     Ok(match outcome {
         ReadOutcome::Stable(version) => Observed::Ready(Group {
             result,
-            output,
+            output: output.buffer,
             version,
             records: capture.records,
         }),
@@ -383,25 +471,6 @@ impl<W: Write + ?Sized> Write for Cancellable<'_, W> {
     }
 }
 
-// Checked output must poll while moving a larger in-memory capture to disk,
-// as well as between ordinary render writes.
-struct CaptureWriter<'a> {
-    inner: &'a mut OutputBuffer,
-    stopped: &'a dyn Fn() -> bool,
-}
-impl Write for CaptureWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if (self.stopped)() {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        self.inner
-            .write_checked(&bytes[..bytes.len().min(CHUNK)], self.stopped)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 fn write_parts(mut output: impl Write, mut parts: &mut [IoSlice<'_>]) -> io::Result<()> {
     IoSlice::advance_slices(&mut parts, 0);
     while !parts.is_empty() {
@@ -498,7 +567,7 @@ impl Worker<'_> {
         filename: bool,
         cache: &Mutex<Cache>,
         eligible: bool,
-        stopped: &dyn Fn() -> bool,
+        destination: (&dyn Fn() -> bool, &mut dyn Write),
     ) -> io::Result<Observed> {
         prepare(
             &self.plan,
@@ -508,7 +577,7 @@ impl Worker<'_> {
             filename,
             cache,
             eligible,
-            stopped,
+            destination,
         )
     }
 }
@@ -523,8 +592,9 @@ fn prepare(
     filename: bool,
     cache: &Mutex<Cache>,
     eligible: bool,
-    stopped: &dyn Fn() -> bool,
+    destination: (&dyn Fn() -> bool, &mut dyn Write),
 ) -> io::Result<Observed> {
+    let (stopped, target) = destination;
     let render = Render {
         plan,
         prefix: (filename || plan.json).then(|| label(job.path(), plan.paths.is_empty())),
@@ -539,9 +609,7 @@ fn prepare(
             if let Some(cached) = cached {
                 match read(*name, ReadRequest::Stat) {
                     ReadOutcome::Stable(ReadVersion::Catalogued) => {
-                        let mut output = OutputBuffer::default()
-                            .with_memory_limit(GROUP_BYTES)
-                            .with_buffered_spill();
+                        let mut output = OutputCapture::new(target);
                         let mut cursor = Cursor::default();
                         for record in &cached.records {
                             render.line(
@@ -560,9 +628,12 @@ fn prepare(
                             )?;
                         }
                         output.flush()?;
+                        if output.streamed {
+                            return Ok(Observed::Streamed(cached.result, None));
+                        }
                         return Ok(Observed::Ready(Group {
                             result: cached.result,
-                            output,
+                            output: output.buffer,
                             version: ReadVersion::Catalogued,
                             records: None,
                         }));
@@ -574,11 +645,12 @@ fn prepare(
                     ReadOutcome::Stable(ReadVersion::Current) | ReadOutcome::RetryChanged => {}
                 }
             }
-            let observed = observe(
+            let observed = observe_streaming(
                 &render,
                 buffer,
                 &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
                 eligible,
+                target,
             )?;
             if let Observed::Ready(mut group) = observed {
                 if eligible {
@@ -589,17 +661,16 @@ fn prepare(
                 observed
             }
         }
-        Job::Direct(path, recursive) => observe(
+        Job::Direct(path, recursive) => observe_streaming(
             &render,
             buffer,
             &mut |each| read_file(path, *recursive, plan, each, stopped),
             false,
+            target,
         )?,
         Job::Absent(_) => Observed::Ready(Group {
             result: InputResult::empty(plan),
-            output: OutputBuffer::default()
-                .with_memory_limit(GROUP_BYTES)
-                .with_buffered_spill(),
+            output: OutputBuffer::default().with_memory_limit(GROUP_BYTES),
             version: ReadVersion::Catalogued,
             records: None,
         }),
@@ -614,6 +685,155 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 type Fork<'a> = dyn Fn() -> Option<Box<CheckedReader<'a>>> + Sync + 'a;
 
+enum Message {
+    Begin,
+    Chunk(Vec<u8>),
+    Finish(InputResult, Option<String>),
+}
+
+enum Handoff {
+    Complete(Job, Observed),
+    Stream(PathBuf, Receiver<Message>),
+    // Single-thread and spawn fallback publish on the calling thread.
+    Direct(PathBuf, Message),
+}
+
+// A closed relay is an aftermath, not the stdout fault itself. Receiver drop
+// can wake a worker before the publisher records BrokenPipe (D94); that worker
+// must not replace the original error with ConnectionAborted and exit 2.
+#[derive(Debug)]
+struct PublisherStopped;
+impl std::fmt::Display for PublisherStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("grep publisher stopped")
+    }
+}
+impl std::error::Error for PublisherStopped {}
+
+fn publisher_stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, PublisherStopped)
+}
+
+struct Relay<'a> {
+    path: &'a Path,
+    handoff: &'a dyn Fn(Handoff) -> bool,
+    concurrent: bool,
+    stopped: &'a dyn Fn() -> bool,
+    started: bool,
+    sender: Option<SyncSender<Message>>,
+}
+impl Relay<'_> {
+    fn send(&mut self, message: Message) -> io::Result<()> {
+        let accepted = if self.concurrent {
+            if !self.started {
+                let (sender, receiver) = mpsc::sync_channel(1);
+                self.sender = Some(sender);
+                self.started = true;
+                if !(self.handoff)(Handoff::Stream(self.path.to_owned(), receiver)) {
+                    return Err(publisher_stopped());
+                }
+            }
+            self.sender
+                .as_ref()
+                .is_some_and(|sender| sender.send(message).is_ok())
+        } else {
+            if !self.started {
+                self.started = true;
+                if !(self.handoff)(Handoff::Direct(self.path.to_owned(), Message::Begin)) {
+                    return Err(publisher_stopped());
+                }
+            }
+            (self.handoff)(Handoff::Direct(self.path.to_owned(), message))
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err(publisher_stopped())
+        }
+    }
+}
+impl Write for Relay<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if (self.stopped)() {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        let count = bytes.len().min(CHUNK);
+        self.send(Message::Chunk(bytes[..count].to_vec()))?;
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn publish_handoff<W: Write>(
+    host: &mut Host<'_, W>,
+    current: &mut Option<u64>,
+    handoff: Handoff,
+) -> io::Result<()> {
+    match handoff {
+        Handoff::Complete(job, observed) => {
+            if let Job::Failed(_, message) = &job {
+                host.error(job.path(), message);
+                return Ok(());
+            }
+            match observed {
+                Observed::Ready(_) if host.plan.quiet && host.plan.json => Ok(()),
+                Observed::Ready(group) => host.commit(job.path(), group.result, group.output),
+                Observed::Skipped => Ok(()),
+                Observed::Failed(error) => {
+                    host.error(job.path(), &error);
+                    Ok(())
+                }
+                Observed::Spool(error) => {
+                    host.error(job.path(), &error);
+                    Ok(())
+                }
+                Observed::Streamed(_, _) => unreachable!("streamed results finish their handoff"),
+            }
+        }
+        Handoff::Stream(path, receiver) => {
+            let mut printed = host.start_stream(&path)?;
+            for message in receiver {
+                match message {
+                    Message::Chunk(bytes) => {
+                        host.writer.write_all(&bytes)?;
+                        printed += bytes.len() as u64;
+                    }
+                    Message::Finish(result, error) => {
+                        return host.finish_stream(&path, result, printed, error);
+                    }
+                    Message::Begin => unreachable!("channel streams begin at handoff"),
+                }
+            }
+            // A panicking worker drops its sender; never leave the writer
+            // waiting on a completion it can no longer supply.
+            host.finish_stream(
+                &path,
+                InputResult::default(),
+                printed,
+                Some("worker stopped after output began; output is partial".into()),
+            )
+        }
+        Handoff::Direct(path, message) => {
+            match message {
+                Message::Begin => *current = Some(host.start_stream(&path)?),
+                Message::Chunk(bytes) => {
+                    host.writer.write_all(&bytes)?;
+                    if let Some(printed) = current {
+                        *printed += bytes.len() as u64;
+                    }
+                }
+                Message::Finish(result, error) => {
+                    let printed = current.take().unwrap_or(0);
+                    host.finish_stream(&path, result, printed, error)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn run<'a, W: Write>(
     host: &mut Host<'_, W>,
     mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Job)> + Send,
@@ -623,8 +843,8 @@ pub(super) fn run<'a, W: Write>(
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
     let search = Search::new(host, cancelled);
-    // The document-name view is present only for a catalog-backed segment.
-    ferret_query::completion_groups(
+    let mut current = None;
+    ferret_query::completion_groups_with_handoff(
         if names.is_some() {
             GroupSchedule::Indexed(threads)
         } else {
@@ -644,26 +864,32 @@ pub(super) fn run<'a, W: Write>(
             buffer: Vec::new(),
             read: fork(),
         },
-        |worker, job, stopped| {
+        |worker, job, stopped, handoff, concurrent| {
             let eligible = matches!(&job, Job::Checked(_,_,doc) if names.is_some_and(|names| names.names(*doc).len() > 1));
-            let result = worker.prepare(&job, search.filename, &search.cache, eligible, stopped);
+            let group = search.work(job, stopped, handoff, concurrent, |job, target| {
+                worker.prepare(
+                    job,
+                    search.filename,
+                    &search.cache,
+                    eligible,
+                    (stopped, target),
+                )
+            });
             if worker.buffer.capacity() > ferret_query::KEPT_BUFFER {
                 worker.buffer = Vec::new();
             }
-            search.observed(job, result, stopped)
+            group
         },
         weight,
-        |group| search.publish(host, group),
+        |group| search.publish(host, &mut current, group),
     );
     search.finish(host)
 }
 
-type Searched = (Job, Observed);
-
-fn weight((_, observed): &Searched) -> u64 {
-    match observed {
-        Observed::Ready(group) => group.output.memory_bytes() as u64,
-        Observed::Skipped | Observed::Failed(_) => 0,
+fn weight(handoff: &Handoff) -> u64 {
+    match handoff {
+        Handoff::Complete(_, Observed::Ready(group)) => group.output.memory_bytes() as u64,
+        _ => 0,
     }
 }
 
@@ -704,6 +930,36 @@ impl<'s> Search<'s> {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Renders a file through the same relay for feed and live walk workers.
+    fn work(
+        &self,
+        job: Job,
+        stopped: &dyn Fn() -> bool,
+        handoff: &dyn Fn(Handoff) -> bool,
+        concurrent: bool,
+        prepare: impl FnOnce(&Job, &mut dyn Write) -> io::Result<Observed>,
+    ) -> Handoff {
+        let relay = Relay {
+            path: job.path(),
+            handoff,
+            concurrent,
+            stopped,
+            started: false,
+            sender: None,
+        };
+        let mut stream = BufWriter::with_capacity(CHUNK, relay);
+        let result = prepare(&job, &mut stream);
+        // Never retry pending writes implicitly after a destination fault.
+        let (mut relay, _) = stream.into_parts();
+        let result = match result {
+            Ok(Observed::Streamed(result, error)) => relay
+                .send(Message::Finish(result, error))
+                .map(|()| Observed::Skipped),
+            other => other,
+        };
+        self.observed(job, result, stopped)
+    }
+
     /// A worker's outcome for `job`: `-q` stops at the first match, and an
     /// error not caused by stopping is fatal.
     fn observed(
@@ -711,7 +967,7 @@ impl<'s> Search<'s> {
         job: Job,
         result: io::Result<Observed>,
         stopped: &dyn Fn() -> bool,
-    ) -> Searched {
+    ) -> Handoff {
         match result {
             Ok(observed) => {
                 if self.plan.quiet
@@ -726,13 +982,17 @@ impl<'s> Search<'s> {
                     self.hit.store(true, Ordering::Release);
                     self.cancelled.store(true, Ordering::Release);
                 }
-                (job, observed)
+                Handoff::Complete(job, observed)
             }
             Err(error) => {
-                if !stopped() {
+                if !stopped()
+                    && !error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<PublisherStopped>())
+                {
                     self.fail(error);
                 }
-                (job, Observed::Skipped)
+                Handoff::Complete(job, Observed::Skipped)
             }
         }
     }
@@ -741,22 +1001,11 @@ impl<'s> Search<'s> {
     fn publish<W: Write>(
         &self,
         host: &mut Host<'_, W>,
-        (job, observed): Searched,
+        current: &mut Option<u64>,
+        handoff: Handoff,
     ) -> ControlFlow<()> {
         let _publication = lock(&self.publication);
-        if let Job::Failed(_, message) = &job {
-            host.error(job.path(), message);
-            return ControlFlow::Continue(());
-        }
-        let result = match observed {
-            Observed::Ready(_) if self.plan.quiet && self.plan.json => Ok(()),
-            Observed::Ready(group) => host.commit(job.path(), group.result, group.output),
-            Observed::Skipped => Ok(()),
-            Observed::Failed(error) => {
-                host.error(job.path(), &error);
-                Ok(())
-            }
-        };
+        let result = publish_handoff(host, current, handoff);
         if let Err(error) = result {
             self.fail(error);
             ControlFlow::Break(())
@@ -800,6 +1049,7 @@ pub(super) fn walk<W: Write>(
 ) -> io::Result<()> {
     let search = Search::new(host, cancelled);
     let found = AtomicBool::new(false);
+    let mut current = None;
     let Source {
         inputs,
         filter,
@@ -877,7 +1127,7 @@ pub(super) fn walk<W: Write>(
                 lane.flush(stopped());
             }
         },
-        |group| search.publish(host, group),
+        |group| search.publish(host, &mut current, group),
     );
     if let Err(error) = started {
         return Err(io::Error::other(Unstarted(error)));
@@ -917,7 +1167,7 @@ struct Walked {
 struct Walker<'w, 's> {
     search: &'w Search<'s>,
     filter: &'w Filter<'w>,
-    lane: &'w Lane<'w, Searched>,
+    lane: &'w Lane<'w, Handoff>,
     stopped: &'w (dyn Fn() -> bool + Sync),
     found: &'w AtomicBool,
     live: bool,
@@ -929,25 +1179,32 @@ impl Walker<'_, '_> {
     /// Searches one job and hands its group over; false once the run stops.
     fn search(&mut self, size: u64, job: Job) -> bool {
         if matches!(job, Job::Failed(..)) {
-            return self.lane.hand((job, Observed::Skipped), 0).is_continue();
+            return self
+                .lane
+                .hand(Handoff::Complete(job, Observed::Skipped), 0)
+                .is_continue();
         }
         let Some(reservation) = self.lane.reserve(size, self.stopped) else {
             return false;
         };
-        let result = prepare(
-            &self.plan,
-            &mut self.buffer,
-            None,
-            &job,
-            self.search.filename,
-            &self.search.cache,
-            false,
-            self.stopped,
-        );
+        let handoff = |group| self.lane.handoff(group, self.stopped);
+        let group = self
+            .search
+            .work(job, self.stopped, &handoff, true, |job, target| {
+                prepare(
+                    &self.plan,
+                    &mut self.buffer,
+                    None,
+                    job,
+                    self.search.filename,
+                    &self.search.cache,
+                    false,
+                    (self.stopped, target),
+                )
+            });
         if self.buffer.capacity() > ferret_query::KEPT_BUFFER {
             self.buffer = Vec::new();
         }
-        let group = self.search.observed(job, result, self.stopped);
         drop(reservation);
         if (self.stopped)() {
             return false;
@@ -1310,11 +1567,8 @@ mod tests {
         }
     }
 
-    // Drive checked capture and real Host::commit with groups larger than
-    // capture, spill, stdout and replay buffers. Every file must remain whole,
-    // and every published group must have spilled: the fixture is sized from
-    // the capture limit, so raising it cannot silently drop the spill. Eight
-    // threads bound the test's capture memory at (2T+1) * GROUP_BYTES.
+    // Drive the real handoff with groups just over the capture threshold.
+    // All groups must stream, stay whole, and bypass completed-group replay.
     #[test]
     fn parallel_publication_keeps_large_groups_whole() {
         use std::cell::RefCell;
@@ -1378,7 +1632,10 @@ mod tests {
         super::super::seam::COMMIT.with_borrow_mut(|hook| *hook = None);
         result.unwrap();
         assert!(host.writer.carry.is_empty());
-        assert_eq!(*spilled.borrow(), [true; FILES as usize]);
+        assert!(
+            spilled.borrow().is_empty(),
+            "large groups streamed instead of committing a capture"
+        );
         let mut runs = std::mem::take(&mut host.writer.runs);
         runs.sort();
         assert_eq!(
@@ -1463,6 +1720,38 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(cancelled.load(Ordering::Acquire));
         assert_eq!(host.writer.0, 1);
+
+        // Dropping an active stream receiver wakes its sender before the
+        // caller records the stdout fault. That relay error must never win.
+        let mut bytes = b"red ".to_vec();
+        bytes.resize(GROUP_BYTES + CHUNK, b'x');
+        bytes.push(b'\n');
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                let _ = each(&mut &bytes[..], bytes.len() as u64);
+                ReadOutcome::Stable(ReadVersion::Current)
+            }))
+        };
+        for _ in 0..8 {
+            let mut streaming_host = self::host(&plan, Fault::default());
+            let mut jobs = (0..16).map(|n| Job::Checked(format!("file-{n}").into(), NameId(n), n));
+            let cancelled = AtomicBool::new(false);
+            let error = run(
+                &mut streaming_host,
+                |_| jobs.next().map(|job| (bytes.len() as u64, job)),
+                &fork,
+                None,
+                4,
+                &cancelled,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(cancelled.load(Ordering::Acquire));
+            assert_eq!(streaming_host.writer.0, 1);
+        }
     }
 
     // A slow first read cannot hold back another file's completed transaction.
@@ -1644,9 +1933,8 @@ mod tests {
         .unwrap();
     }
 
-    // Isolate RLIMIT_FSIZE in a child: the final four spill bytes must fail
-    // inside the checked-read callback, even if the reader then reports an
-    // input fault. Otherwise a deferred output failure becomes a read error.
+    // D102: a real context write fault wins over a later reader error and
+    // remains file-local. Isolate RLIMIT_FSIZE in a child process.
     #[test]
     fn late_spill_failure_remains_a_capture_fault() {
         const MARKER: &str = "FERRET_TEST_LATE_SPILL";
@@ -1670,7 +1958,9 @@ mod tests {
             assert!(output.status.success(), "{output:?}");
             return;
         }
-        let line_grep::Command::Search(plan) = line_grep::parse(&["red".into()]).unwrap() else {
+        let line_grep::Command::Search(plan) =
+            line_grep::parse(&["-B1".into(), "red".into()]).unwrap()
+        else {
             panic!("search")
         };
         let render = Render {
@@ -1678,10 +1968,9 @@ mod tests {
             prefix: None,
             stopped: &|| false,
         };
-        let mut bytes = b"red ".to_vec();
-        bytes.resize(GROUP_BYTES - 1, b'x');
+        let mut bytes = vec![b'x'; GROUP_BYTES];
         bytes.extend_from_slice(b"\nred\n");
-        let error = observe(
+        let observed = observe(
             &render,
             &mut Vec::new(),
             &mut |each| {
@@ -1693,8 +1982,10 @@ mod tests {
             },
             false,
         )
-        .err()
-        .expect("spill fault takes precedence over the reader's fault");
+        .unwrap();
+        let Observed::Spool(error) = observed else {
+            panic!("context spool fault must fail only the file")
+        };
         assert!(
             error.to_string().starts_with("write output spill "),
             "{error}"
@@ -1705,22 +1996,21 @@ mod tests {
         );
     }
 
-    // Records go through the production capture writer. Three records of a
-    // quarter of the limit stay in memory; three of half the limit spill.
+    // Three quarter-limit records stay in memory; three half-limit records
+    // cross the real streaming transition and never create a rendered spill.
     #[test]
-    fn vectored_plain_records_replay_exactly_before_and_after_spilling() {
-        for (size, spills) in [
+    fn vectored_plain_records_replay_exactly_before_and_after_streaming() {
+        for (size, streams) in [
             (0, false),
             (11, false),
             (GROUP_BYTES / 4, false),
             (GROUP_BYTES / 2, true),
         ] {
             let bytes = vec![b'x'; size];
-            let mut output = OutputBuffer::default()
-                .with_memory_limit(GROUP_BYTES)
-                .with_buffered_spill();
+            let mut replay = Vec::new();
+            let mut output = OutputCapture::new(&mut replay);
             for _ in 0..3 {
-                let mut writer = CaptureWriter {
+                let mut writer = Cancellable {
                     inner: &mut output,
                     stopped: &|| false,
                 };
@@ -1736,14 +2026,10 @@ mod tests {
                 .unwrap();
             }
             output.flush().unwrap();
-            assert_eq!(output.is_spilled(), spills, "{size}-byte records");
-            let mut replay = Vec::new();
-            output.write_to(&mut replay).unwrap();
-            assert!(
-                replay == [b"path:".as_slice(), &bytes, b"\n"].concat().repeat(3),
-                "{size}-byte records replay"
-            );
-            assert_eq!(output.len(), replay.len() as u64);
+            assert_eq!(output.streamed, streams, "{size}-byte records");
+            assert!(!output.buffer.is_spilled());
+            output.buffer.write_to(output.target).unwrap();
+            assert!(replay == [b"path:".as_slice(), &bytes, b"\n"].concat().repeat(3));
         }
     }
 
@@ -1855,7 +2141,7 @@ mod tests {
                     true,
                     &cache,
                     true,
-                    &|| false,
+                    (&|| false, &mut io::sink()),
                 )
                 .unwrap();
             let Observed::Ready(mut group) = observed else {
@@ -1908,7 +2194,7 @@ mod tests {
                     true,
                     &cache,
                     true,
-                    &|| false,
+                    (&|| false, &mut io::sink()),
                 )
                 .unwrap()
             else {
@@ -1954,7 +2240,7 @@ mod tests {
                     false,
                     &cache,
                     true,
-                    &|| false,
+                    (&|| false, &mut io::sink()),
                 )
                 .unwrap()
             else {
@@ -2006,7 +2292,7 @@ mod tests {
                     false,
                     &cache,
                     true,
-                    &|| false,
+                    (&|| false, &mut io::sink()),
                 )
                 .unwrap()
             else {
@@ -2120,10 +2406,10 @@ mod tests {
         assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
 
-    // Cancellation must interrupt spill replay as well as matching. Returning
-    // Interrupted from Write would retry forever instead of stopping here.
+    // Cancellation interrupts the initial in-memory prefix during the real
+    // streaming transition, without Interrupted/write_all retry loops.
     #[test]
-    fn cancellation_interrupts_real_spill_emission_between_chunks() {
+    fn cancellation_interrupts_streaming_prefix_between_chunks() {
         struct Sink<'a> {
             flag: &'a AtomicBool,
             bytes: usize,
@@ -2139,17 +2425,18 @@ mod tests {
             }
         }
         let flag = AtomicBool::new(false);
-        let mut output = OutputBuffer::default()
-            .with_memory_limit(GROUP_BYTES)
-            .with_buffered_spill();
-        output
-            .write_all(&vec![b'x'; GROUP_BYTES + 3 * CHUNK])
-            .unwrap();
         let mut sink = Sink {
             flag: &flag,
             bytes: 0,
         };
-        let error = emit(&mut output, &mut sink, &|| flag.load(Ordering::Acquire)).unwrap_err();
+        let stopped = || flag.load(Ordering::Acquire);
+        let mut destination = Cancellable {
+            inner: &mut sink,
+            stopped: &stopped,
+        };
+        let mut output = OutputCapture::new(&mut destination);
+        output.write_all(&vec![b'x'; GROUP_BYTES]).unwrap();
+        let error = output.write_all(b"x").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(sink.bytes, CHUNK);
     }
@@ -2421,7 +2708,7 @@ mod tests {
                     false,
                     &cache,
                     true,
-                    &|| false,
+                    (&|| false, &mut io::sink()),
                 )
                 .unwrap()
             else {
@@ -2442,5 +2729,99 @@ mod tests {
         }
         assert_eq!(streams.get(), 1);
         assert_eq!(stats.get(), 1);
+    }
+
+    // A checked reader can panic after streaming has acquired the publisher.
+    // Its sender must drop so the writer leaves its receive loop before join.
+    #[test]
+    fn panicking_stream_worker_releases_the_publisher() {
+        let plan = plan(&["red"]);
+        let mut bytes = b"red ".to_vec();
+        bytes.resize(GROUP_BYTES + CHUNK, b'x');
+        bytes.push(b'\n');
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                panic!("injected panic after streaming")
+            }))
+        };
+        let mut host = host(&plan, Vec::new());
+        let mut jobs = [Job::Checked("panic-file".into(), NameId(0), 0)].into_iter();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(
+                &mut host,
+                |_| jobs.next().map(|job| (bytes.len() as u64, job)),
+                &fork,
+                None,
+                2,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        }));
+        assert!(result.is_err());
+        assert!(host.errors);
+        assert!(host.writer.starts_with(b"panic-file:red "));
+    }
+
+    // A small cached record set can render past 4 MiB when an alias's byte
+    // path needs JSON escaping. Re-rendering must use the streaming transition.
+    #[test]
+    fn cached_records_stream_when_an_escaped_alias_amplifies_output() {
+        use std::os::unix::ffi::OsStringExt;
+        let streams = Cell::new(0);
+        let stats = Cell::new(0);
+        let bytes = b"red\n".repeat(500);
+        let read = |_: NameId, request: ReadRequest<'_>| {
+            match request {
+                ReadRequest::Stat => stats.set(stats.get() + 1),
+                ReadRequest::Stream(each, _) => {
+                    streams.set(streams.get() + 1);
+                    each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                }
+                _ => panic!("stream expected"),
+            }
+            ReadOutcome::Stable(ReadVersion::Catalogued)
+        };
+        let mut worker = Worker {
+            plan: plan(&["--json", "red"]),
+            buffer: Vec::new(),
+            read: Some(Box::new(read)),
+        };
+        let cache = Mutex::new(Cache::default());
+        let first = worker
+            .prepare(
+                &Job::Checked("short".into(), NameId(0), 0),
+                true,
+                &cache,
+                true,
+                (&|| false, &mut io::sink()),
+            )
+            .unwrap();
+        assert!(matches!(first, Observed::Ready(_)));
+        let path = PathBuf::from(OsString::from_vec(vec![1; 4000]));
+        let mut output = Vec::new();
+        let second = worker
+            .prepare(
+                &Job::Checked(path, NameId(1), 0),
+                true,
+                &cache,
+                true,
+                (&|| false, &mut output),
+            )
+            .unwrap();
+        assert!(matches!(second, Observed::Streamed(_, None)));
+        assert!(output.len() > GROUP_BYTES);
+        assert_eq!(streams.get(), 1);
+        assert_eq!(stats.get(), 1);
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("\\u0001")
+                .count(),
+            4000 * 500
+        );
     }
 }
