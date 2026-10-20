@@ -5889,7 +5889,7 @@ streaming latency on slow filesystems mattering more than CPU; then C.
 
 ## D108 — What a refused search thread does to the result
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-21.**
 
 Question: when the system refuses a search thread (for example
 `RLIMIT_NPROC`, or a thread limit under load), should grep still finish the
@@ -5928,9 +5928,11 @@ status should not change, but the cause of a slow run should be visible. Would
 change it: wanting the invariant "exit 0 means empty stderr" (then C), or
 treating thread limits as never worth a message (then A).
 
+> Dave: I agree with the recommendations on D108 and D109.
+
 ## D109 — Waiting behind a streaming file
 
-**Status: open, 2026-10-20.**
+**Status: answered, 2026-10-21.**
 
 Question: while one file streams its output through the publisher (D103 A),
 what should another worker do when its own capture passes 4 MiB?
@@ -5960,3 +5962,5 @@ gives 0.42 / 0.29 s, with 513 MB RSS.
 Recommendation: B. It keeps D93 exactly, needs no disk, and fixes the common
 case of a source tree with a few big generated or log files. Would change it:
 heavy output from multi-GiB single files mattering; only C fixes that.
+
+> Dave: I agree with the recommendations on D108 and D109.
