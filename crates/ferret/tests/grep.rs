@@ -5495,3 +5495,102 @@ fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
     }
     assert_eq!(checked, 18);
 }
+
+/// `-g` globs match the path rg would print, with cwd stripped where the
+/// path lies below it, whatever the cwd and operand spelling. Crosses
+/// absolute, relative, parent and file operands with a cwd at the root,
+/// below it, above it and beside it, for the index, `--live` and `--files`.
+/// rg 15.2.0 is the reference throughout; ferret has no `--iglob`, `-t` or
+/// `-T`, so only `-g` is crossed.
+#[test]
+fn globs_match_the_same_paths_as_rg_whatever_the_cwd() {
+    let fixture = Fixture::new("glob-cwd");
+    for dir in ["r/src/test", "r/test", "r/x/src", "sib"] {
+        fs::create_dir_all(fixture.tree().join(dir)).unwrap();
+    }
+    for file in [
+        "r/src/a.rs",
+        "r/src/b.md",
+        "r/src/test/c.rs",
+        "r/test/d.rs",
+        "r/x/src/e.rs",
+        "r/top.rs",
+        "r/readme.md",
+    ] {
+        fixture.write(file, b"red\n");
+    }
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let tree = fixture.tree();
+    let root = tree.join("r").into_os_string().into_string().unwrap();
+    let below = format!("{root}/src");
+    // Each cwd, with operands spelled from it: the root, a directory below
+    // it, and a file.
+    let places = [
+        ("r", [".", "src", "src/a.rs"]),
+        ("r/src", ["..", ".", "a.rs"]),
+        (".", ["r", "r/src", "r/src/a.rs"]),
+        ("sib", ["../r", "../r/src", "../r/src/a.rs"]),
+    ];
+    let globs: [&[&str]; 13] = [
+        &["/src/*.rs"],
+        &["*.rs"],
+        &["src/**"],
+        &["**/test/*"],
+        &["!*.md"],
+        &["/test/*"],
+        &["/a.rs"],
+        &["!src"],
+        &["!/src"],
+        &["/r/src/*.rs"],
+        &["../r/src/*.rs"],
+        &["/../src/*.rs"],
+        &["*.rs", "!test/**"],
+    ];
+    let modes: [&[&str]; 3] = [&["--files"], &["-l", "red"], &["--live", "-l", "red"]];
+    let mut checked = 0;
+    let mut diverged = Vec::new();
+    for (cwd, relative) in places {
+        let operands = relative.iter().copied().chain([root.as_str(), &below]);
+        for operand in operands {
+            for glob in globs {
+                for mode in modes {
+                    let mut args = mode.to_vec();
+                    for glob in glob {
+                        args.extend(["-g", glob]);
+                    }
+                    args.push(operand);
+                    let listed = |binary: &OsStr, grep: bool| {
+                        let mut command = fixture.command(binary);
+                        command.current_dir(tree.join(cwd));
+                        if grep {
+                            command
+                                .arg("--index")
+                                .arg(fixture.base.join("index"))
+                                .arg("grep");
+                        }
+                        // rg has no --live: it always reads the live tree.
+                        command.args(args.iter().filter(|&&arg| grep || arg != "--live"));
+                        let output = run(command, None);
+                        let mut lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
+                        lines.sort();
+                        (output.status.code(), lines.join(&b'\n'))
+                    };
+                    let ferret = listed(OsStr::new(env!("CARGO_BIN_EXE_ferret")), true);
+                    let rg = listed(&std::env::var_os("FERRET_RG").unwrap(), false);
+                    if ferret != rg {
+                        diverged.push(format!(
+                            "cwd {cwd:?} {args:?}: {:?} {:?} vs rg {:?} {:?}",
+                            ferret.0,
+                            String::from_utf8_lossy(&ferret.1),
+                            rg.0,
+                            String::from_utf8_lossy(&rg.1)
+                        ));
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(diverged.is_empty(), "{}", diverged.join("\n"));
+    assert_eq!(checked, 4 * 5 * 13 * 3);
+}
