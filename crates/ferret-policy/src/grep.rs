@@ -137,6 +137,23 @@ impl GrepSelection {
                 || !components.last().is_some_and(|p| p.starts_with(b".")))
     }
 
+    /// Whether a walked name is held hidden although the cwd-relative
+    /// spelling no longer shows it. `walked` is the entry's path, `relative`
+    /// that path with cwd stripped, `depth` its walk depth. When cwd lies
+    /// below the operand, stripping it removes names the walk passed through,
+    /// and [`Self::allows`] and [`Self::descend`] never see them; hiddenness
+    /// depends on the names below the operand, never on where cwd is.
+    pub fn hides_stripped(&self, walked: &[u8], relative: &[u8], depth: usize) -> bool {
+        if self.hidden || walked.len() == relative.len() {
+            return false;
+        }
+        let kept = components_from_end(relative).take(depth).count();
+        components_from_end(walked)
+            .skip(kept)
+            .take(depth - kept)
+            .any(|name| name.starts_with(b"."))
+    }
+
     fn decision(&self, components: &[&[u8]], directory: bool) -> Option<bool> {
         self.rules.iter().rev().find_map(|(include, alternatives)| {
             alternatives

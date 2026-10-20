@@ -194,7 +194,12 @@ fn execute(
                                 .traversal
                                 .max_depth
                                 .is_none_or(|limit| entry.depth() < limit)
-                                && selection.descend(relative, entry.depth());
+                                && selection.descend(relative, entry.depth())
+                                && !selection.hides_stripped(
+                                    entry.path().as_os_str().as_bytes(),
+                                    relative,
+                                    entry.depth(),
+                                );
                             if descend && let Some(policy) = &mut policy {
                                 match policy.accepts(entry, false, &stopped) {
                                     Ok(allowed) => descend = allowed,
@@ -209,7 +214,14 @@ fn execute(
                                 }
                             }
                         }
-                        Ok(FileKind::File) if selection.allows(relative, entry.depth()) => {
+                        Ok(FileKind::File)
+                            if selection.allows(relative, entry.depth())
+                                && !selection.hides_stripped(
+                                    entry.path().as_os_str().as_bytes(),
+                                    relative,
+                                    entry.depth(),
+                                ) =>
+                        {
                             if let Some(policy) = &mut policy {
                                 match policy.accepts(entry, false, &stopped) {
                                     Ok(true) => {}

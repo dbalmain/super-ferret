@@ -1317,7 +1317,12 @@ impl Filter<'_> {
                 .is_none_or(|limit| entry.depth() < limit)
                 && self
                     .selection
-                    .descend(relative.as_os_str().as_bytes(), entry.depth());
+                    .descend(relative.as_os_str().as_bytes(), entry.depth())
+                && !self.selection.hides_stripped(
+                    entry.path().as_os_str().as_bytes(),
+                    relative.as_os_str().as_bytes(),
+                    entry.depth(),
+                );
             if *descend && let Some(policy) = policy {
                 let accepted = policy.accepts(entry, true, stopped);
                 let warnings = policy.take_warnings();
@@ -1342,6 +1347,11 @@ impl Filter<'_> {
             || !self
                 .selection
                 .allows(relative.as_os_str().as_bytes(), entry.depth())
+            || self.selection.hides_stripped(
+                entry.path().as_os_str().as_bytes(),
+                relative.as_os_str().as_bytes(),
+                entry.depth(),
+            )
         {
             return None;
         }

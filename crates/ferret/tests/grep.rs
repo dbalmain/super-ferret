@@ -5433,3 +5433,65 @@ fn streaming_late_binary_sentinel_keeps_prefix_and_original_warning_label() {
         );
     }
 }
+
+/// Hiddenness depends on the names below the operand, never on cwd. With
+/// cwd inside a hidden directory below an absolute operand, stripping cwd
+/// once erased that directory's name, so its files were listed; rg lists
+/// none. A cwd inside a visible directory is the control.
+#[test]
+fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
+    let fixture = Fixture::new("hidden-cwd");
+    fs::create_dir_all(fixture.tree().join("a/.g/k")).unwrap();
+    fs::create_dir_all(fixture.tree().join("a/b")).unwrap();
+    fixture.write("a/.g/h.rs", b"red\n");
+    fixture.write("a/.g/k/i.rs", b"red\n");
+    fixture.write("a/.g/.j.rs", b"red\n");
+    fixture.write("a/b/f.rs", b"red\n");
+    fixture.write("a/b/.e.rs", b"red\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let tree = fixture.tree();
+    let operand = tree.join("a").into_os_string().into_string().unwrap();
+    let mut checked = 0;
+    for cwd in ["a/.g", "a/.g/k", "a/b"] {
+        for mode in [&["-l", "red"][..], &["--live", "-l", "red"], &["--files"]] {
+            for hidden in [false, true] {
+                let mut args = mode.to_vec();
+                if hidden {
+                    args.push("--hidden");
+                }
+                args.push(&operand);
+                let listed = |binary: &OsStr, grep: bool| {
+                    let mut command = fixture.command(binary);
+                    command.current_dir(tree.join(cwd));
+                    if grep {
+                        command
+                            .arg("--index")
+                            .arg(fixture.base.join("index"))
+                            .arg("grep");
+                    }
+                    // rg has no --live: it always reads the live tree.
+                    command.args(args.iter().filter(|&&arg| grep || arg != "--live"));
+                    let output = run(command, None);
+                    let mut lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
+                    lines.sort();
+                    (
+                        output.status.code(),
+                        lines.join(&b'\n'),
+                        output.stderr.is_empty(),
+                    )
+                };
+                let ferret = listed(OsStr::new(env!("CARGO_BIN_EXE_ferret")), true);
+                let rg = listed(&std::env::var_os("FERRET_RG").unwrap(), false);
+                assert_eq!(
+                    ferret,
+                    rg,
+                    "cwd {cwd:?} {args:?}: {:?} vs {:?}",
+                    String::from_utf8_lossy(&ferret.1),
+                    String::from_utf8_lossy(&rg.1)
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 18);
+}
