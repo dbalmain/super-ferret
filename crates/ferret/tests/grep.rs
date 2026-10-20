@@ -206,7 +206,7 @@ fn names_output_is_flushed_before_a_later_read_diagnostic() {
     fixture.write("z-unreadable", b"needle\n");
     fs::set_permissions(
         fixture.tree().join("z-unreadable"),
-        fs::Permissions::from_mode(0),
+        fs::Permissions::from_mode(0o0),
     )
     .unwrap();
 
