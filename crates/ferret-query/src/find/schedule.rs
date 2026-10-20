@@ -4,21 +4,38 @@
 //! completes that level; suspended, it returns to the queue rather than
 //! occupying a worker. Find evaluates its expression per entry; grep searches
 //! each file.
+//!
+//! A task offers a loan every [`STEPS_PER_LOAN`] steps, and after any step
+//! while a worker is idle. One grep step can search a 1 GiB file, so a cadence
+//! counted in steps alone leaves idle workers waiting for seconds; a visitor
+//! whose next step is such a search says so ([`Visitor::holding`]), and the
+//! task then lends before it rather than after.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// A walk that can lend part of its remaining work to another worker.
 pub trait Split: Send + Sized {
-    /// Splits off work: a start operand if `starts` allows, else half of the
-    /// shallowest level's unvisited siblings. The counter, when given, is the
-    /// lender's count of outstanding loans for that level; it falls by one
-    /// when the borrowed walk completes.
-    fn split(&mut self, starts: bool) -> Option<(Self, Option<Arc<AtomicUsize>>)>;
+    /// Splits off work: a start operand if `starts` allows, else the
+    /// `share` of the shallowest level's unvisited siblings. The counter,
+    /// when given, is the lender's count of outstanding loans for that level;
+    /// it falls by one when the borrowed walk completes.
+    fn split(&mut self, starts: bool, share: Share) -> Option<(Self, Option<Arc<AtomicUsize>>)>;
     /// Waiting for its loans to complete; not runnable yet.
     fn waiting(&self) -> bool;
     /// Stopped only to wait for its loans.
     fn suspended(&self) -> bool;
+}
+
+/// How much of a level a split lends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Share {
+    /// Half its unvisited siblings, if it has two or more.
+    Half,
+    /// The lender's next step is long ([`Visitor::holding`]) and this many
+    /// workers are idle: every unvisited sibling if there are no more than
+    /// that, else half; a single sibling is lent too.
+    Idle(usize),
 }
 
 /// What one step of a task did.
@@ -38,6 +55,11 @@ pub trait Visitor<S, T> {
     /// State for work lent from `parent`, after publishing whatever must
     /// precede the borrower's entries.
     fn lend(&mut self, parent: &mut T) -> T;
+    /// The task's next step works on an entry it has already taken from the
+    /// walk, and may be long: lend before it while workers are idle.
+    fn holding(&self, _task: &T) -> bool {
+        false
+    }
     /// The task is about to run on this worker.
     fn resume(&mut self, _task: &mut T) {}
     /// The task suspends, to be queued again.
@@ -91,9 +113,15 @@ pub fn run<S: Split, T: Send, V: Visitor<S, T> + Send>(
                 break;
             }
         }
+        // Before the pool starts, every other worker is idle.
+        let share = if caller.holding(&task) {
+            Share::Idle(schedule.workers - 1)
+        } else {
+            Share::Half
+        };
         if schedule.workers > 1
             && first(&walk)
-            && let Some((lent, completion)) = walk.split(schedule.starts)
+            && let Some((lent, completion)) = walk.split(schedule.starts, share)
         {
             let borrowed = caller.lend(&mut task);
             let pool = Pool {
@@ -113,6 +141,7 @@ pub fn run<S: Split, T: Send, V: Visitor<S, T> + Send>(
                     active: 0,
                 }),
                 changed: Condvar::new(),
+                active: AtomicUsize::new(0),
                 schedule,
             };
             return pool.run(caller, visitor);
@@ -146,6 +175,9 @@ struct Queue<S, T> {
 struct Pool<'s, 'q, S, T> {
     queue: Mutex<Queue<S, T>>,
     changed: Condvar,
+    /// `Queue::active`, readable without the lock: a step offers a loan
+    /// when some worker has no task.
+    active: AtomicUsize,
     schedule: &'s Schedule<'q>,
 }
 
@@ -228,6 +260,7 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                 }
                 if let Some(index) = queue.tasks.iter().rposition(|lent| !lent.walk.waiting()) {
                     queue.active += 1;
+                    self.active.store(queue.active, Ordering::Relaxed);
                     break queue.tasks.swap_remove(index);
                 }
                 if queue.active == 0 {
@@ -250,10 +283,29 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                         break;
                     }
                 }
-                if steps.is_multiple_of(STEPS_PER_LOAN) {
+                let cadence = steps.is_multiple_of(STEPS_PER_LOAN);
+                let workers = self.schedule.workers;
+                if cadence || self.active.load(Ordering::Relaxed) < workers {
                     let mut queue = self.lock();
-                    if queue.tasks.len() + queue.active < self.schedule.workers * QUEUED_PER_WORKER
-                        && let Some((walk, completion)) = lent.walk.split(self.schedule.starts)
+                    // Workers with no task, less those a runnable queued task
+                    // will occupy.
+                    let idle = workers.saturating_sub(
+                        queue.active
+                            + queue
+                                .tasks
+                                .iter()
+                                .filter(|queued| !queued.walk.waiting())
+                                .count(),
+                    );
+                    let share = if idle > 0 && visitor.holding(&lent.task) {
+                        Share::Idle(idle)
+                    } else {
+                        Share::Half
+                    };
+                    let room = queue.tasks.len() + queue.active < workers * QUEUED_PER_WORKER;
+                    if (idle > 0 || (cadence && room))
+                        && let Some((walk, completion)) =
+                            lent.walk.split(self.schedule.starts, share)
                     {
                         // Under the queue lock, as the borrower must not run
                         // before the lender has published.
@@ -281,6 +333,7 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
             };
             let mut queue = self.lock();
             queue.active -= 1;
+            self.active.store(queue.active, Ordering::Relaxed);
             if let Some(lent) = suspended {
                 queue.tasks.push(lent);
             }
@@ -309,6 +362,7 @@ pub(crate) fn queued<S: Split, T: Send, V: Visitor<S, T>>(
             active: 0,
         }),
         changed: Condvar::new(),
+        active: AtomicUsize::new(0),
         schedule,
     };
     pool.worker(visitor)

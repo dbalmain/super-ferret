@@ -288,7 +288,7 @@ fn start_donation_uses_existing_effectful_plan_for_every_action_variant() {
         assert!(super::super::EntrySource::next(&mut walk, true).is_some());
         // Starts can be lent before descending into any sibling range.
         assert_eq!(
-            super::Split::split(&mut walk, !effectful)
+            super::Split::split(&mut walk, !effectful, super::schedule::Share::Half)
                 .is_some_and(|(_, completion)| completion.is_none()),
             !effectful,
             "{expression:?}"

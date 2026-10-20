@@ -1106,6 +1106,7 @@ pub(super) fn walk<W: Write>(
                                     Walked {
                                         descend: true,
                                         policy: policy.map(live::Policy::deferring),
+                                        selected: None,
                                     },
                                     &mut first,
                                     |_| true,
@@ -1155,11 +1156,14 @@ pub(super) fn unstarted(error: &io::Error) -> Option<&Unstarted> {
 }
 
 /// A walk task's own state: whether to enter the directory it last
-/// yielded, and its copy of the live policy stack (D13), cloned when the
-/// task lends part of its walk.
+/// yielded, its copy of the live policy stack (D13), cloned when the task
+/// lends part of its walk, and the file its last step selected. That file is
+/// searched by the next step, so the scheduler can lend the task's remaining
+/// siblings before a search that may take seconds.
 struct Walked {
     descend: bool,
     policy: Option<live::Policy>,
+    selected: Option<(u64, Job)>,
 }
 
 /// One worker of [`walk`]: filters each entry its task reaches and searches
@@ -1220,6 +1224,13 @@ impl Visitor<LiveWalk, Walked> for Walker<'_, '_> {
         if stopped() {
             return Step::Quit;
         }
+        if let Some((size, job)) = task.selected.take() {
+            return if self.search(size, job) {
+                Step::Next
+            } else {
+                Step::Quit
+            };
+        }
         let Some(entry) = walk.next_with_cancel(task.descend, &mut || Ok(()), &mut || stopped())
         else {
             return if stopped() { Step::Quit } else { Step::Done };
@@ -1243,16 +1254,12 @@ impl Visitor<LiveWalk, Walked> for Walker<'_, '_> {
             }
             Err(error) => Some((0, Job::Failed(error.path, error.error.to_string()))),
         };
-        match job {
-            Some((size, job)) => {
-                if self.search(size, job) {
-                    Step::Next
-                } else {
-                    Step::Quit
-                }
-            }
-            None => Step::Next,
-        }
+        task.selected = job;
+        Step::Next
+    }
+
+    fn holding(&self, task: &Walked) -> bool {
+        task.selected.is_some()
     }
 
     // The lent levels are below a directory on the lender's stack, which the
@@ -1261,6 +1268,7 @@ impl Visitor<LiveWalk, Walked> for Walker<'_, '_> {
         Walked {
             descend: true,
             policy: parent.policy.clone(),
+            selected: None,
         }
     }
 

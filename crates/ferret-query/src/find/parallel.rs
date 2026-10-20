@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::schedule::{self, Schedule, Split, Step, Visitor};
+use super::schedule::{self, Schedule, Share, Split, Step, Visitor};
 
 use super::{
     Control, Effects, EntrySource, EvaluationError, Expression, LiveWalk, Outcome, Plan,
@@ -202,11 +202,12 @@ impl Split for LiveWalk {
     fn split(
         &mut self,
         starts: bool,
+        share: Share,
     ) -> Option<(Self, Option<Arc<std::sync::atomic::AtomicUsize>>)> {
         if starts && let Some(walk) = self.split_start() {
             return Some((walk, None));
         }
-        let (walk, completion) = LiveWalk::split(self)?;
+        let (walk, completion) = LiveWalk::split(self, share)?;
         Some((walk, Some(completion)))
     }
     fn waiting(&self) -> bool {

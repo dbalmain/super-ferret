@@ -26,6 +26,7 @@ use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
 
 use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
 
+use super::schedule::Share;
 use super::{Follow, Options};
 
 /// Find's file kinds on Linux.
@@ -717,7 +718,13 @@ impl LiveWalk {
     // Donate siblings already observed by readdir. Ancestor levels remain in
     // the donated walk solely for loop detection and start/device identity.
     // Its boundary excludes their evaluation; the donor owns their completion.
-    pub(super) fn split(&mut self) -> Option<(Self, Arc<AtomicUsize>)> {
+    // A loan copies the children up to the level's end, so a whole level is
+    // lent only under `Share::Idle`, when each lent sibling has an idle worker.
+    pub(super) fn split(&mut self, share: Share) -> Option<(Self, Arc<AtomicUsize>)> {
+        let fewest = match share {
+            Share::Half => 2,
+            Share::Idle(_) => 1,
+        };
         // At depth two, catalog donation costs 7.4 ms versus 6.6 ms on the
         // caller. Live fallback levels still donate, even in this mode.
         let index = self
@@ -726,7 +733,7 @@ impl LiveWalk {
             .enumerate()
             .skip(self.boundary.saturating_sub(1))
             .find_map(|(index, level)| {
-                (level.end - level.next >= 2
+                (level.end - level.next >= fewest
                     && !(level.catalogued && self.options.max_depth.is_some_and(|max| max <= 2)))
                 .then_some(index)
             })?;
@@ -735,7 +742,11 @@ impl LiveWalk {
             .get_or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
         let level = &self.levels[index];
-        let middle = level.next + (level.end - level.next) / 2;
+        let unvisited = level.end - level.next;
+        let middle = match share {
+            Share::Idle(idle) if unvisited <= idle => level.next,
+            Share::Half | Share::Idle(_) => level.next + unvisited / 2,
+        };
         let mut levels: Vec<_> = self.levels[..=index].to_vec();
         let donated = &mut levels[index];
         donated.next = middle;

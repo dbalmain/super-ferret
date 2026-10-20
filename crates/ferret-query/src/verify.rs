@@ -3472,7 +3472,11 @@ mod group_tests {
     }
 
     impl crate::find::schedule::Split for Jobs {
-        fn split(&mut self, _: bool) -> Option<(Self, Option<std::sync::Arc<AtomicUsize>>)> {
+        fn split(
+            &mut self,
+            _: bool,
+            _: crate::find::schedule::Share,
+        ) -> Option<(Self, Option<std::sync::Arc<AtomicUsize>>)> {
             (self.0.len() > 1).then(|| (Jobs(self.0.split_off(1)), None))
         }
         fn waiting(&self) -> bool {
