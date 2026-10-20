@@ -5886,3 +5886,44 @@ streaming latency on slow filesystems mattering more than CPU; then C.
 > Dave: Agree with all of your recommendations from D100 up.
 
 **Answer: B.**
+
+## D108 — What a refused search thread does to the result
+
+**Status: open, 2026-10-20.**
+
+Question: when the system refuses a search thread (for example
+`RLIMIT_NPROC`, or a thread limit under load), should grep still finish the
+search on fewer threads, and does the refusal change the exit status?
+
+Astra's review of the grep stack found the answer depends on which spawn is
+refused. With `pthread_create` failing on demand at four threads:
+
+- feed workers refused, two file operands: both matches, exit 0, no message;
+- the live walk's outer thread refused (`-uu`): exit 2, "starting a search
+  thread", nothing searched;
+- the outer thread started, nested walk workers refused: all 130 matches, exit
+  0, no message.
+
+So the output is complete wherever a fallback exists, and the one place without
+a fallback reports an error. Before Sol's round-2 fix that place exited 1 with
+no output at all.
+
+- **A — degrade silently.** Every refused spawn falls back to fewer threads,
+  including the live walk's outer thread, which then searches on the calling
+  thread. The exit status describes the search only. Cost: about 30 lines to
+  restructure the outer spawn so a refusal doesn't consume the operands; a
+  resource limit that makes grep slow is invisible.
+- **B — degrade and warn.** As A, plus one stderr line per run, "ferret: searching
+  with N of M threads: <cause>". Exit status unchanged. Cost: A's 30 lines plus
+  a latch; stderr is no longer empty on every exit-0 run, which GNU and rg
+  conventions don't promise but our tests often assert.
+- **C — error everywhere.** Fall back where possible so the output is complete,
+  but latch the refusal and exit 2 with the message. Consistent with "anything
+  on stderr means exit 2". Cost: a script sees failure for a search that
+  returned every match; under load, `grep -q` can no longer be trusted to mean
+  "not found" on exit 1, though it never did on exit 2 either.
+
+Recommendation: B. A refused thread costs speed, not correctness, so the exit
+status should not change, but the cause of a slow run should be visible. Would
+change it: wanting the invariant "exit 0 means empty stderr" (then C), or
+treating thread limits as never worth a message (then A).
