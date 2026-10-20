@@ -5269,9 +5269,7 @@ fn streaming_replacement_with_a_surviving_hard_link_is_rejected() {
 fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
     let fixture = Fixture::new("walked-symlink-swap");
     fs::create_dir(fixture.tree().join("d")).unwrap();
-    fixture.write("d/a", b"hit\n");
-    fixture.write("d/b", b"hit\n");
-    let failed = swap_after_listing(&fixture, None);
+    let failed = swap_after_listing(&fixture, "d", None);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
@@ -5283,30 +5281,50 @@ fn walked_name_swapped_past_the_parent_budget_is_not_followed() {
     let fixture = Fixture::new("walked-symlink-swap-deep");
     let deep = format!("d{}", "/s".repeat(40));
     fs::create_dir_all(fixture.tree().join(&deep)).unwrap();
-    fixture.write(&format!("{deep}/a"), b"hit\n");
-    fixture.write(&format!("{deep}/b"), b"hit\n");
-    let failed = swap_after_listing(&fixture, Some(64));
+    let failed = swap_after_listing(&fixture, &deep, Some(64));
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// Searches `d`, whose only files are two in one directory, in each content
-/// walk mode, swapping the second-listed for a symlink to a file outside
-/// the walk once the first has started printing, optionally under an
+/// Searches `d`, whose only files are sixteen in its directory `dir`, in
+/// each content walk mode, swapping the last-listed for a symlink to a file
+/// outside the walk once the output has started, optionally under an
 /// open-file `limit`; returns the cases that read through the link or did
 /// not report the change.
-fn swap_after_listing(fixture: &Fixture, limit: Option<u32>) -> Vec<String> {
+///
+/// The swap must land after the listing and before the open. Each earlier
+/// file is one match line past a group's 4 MiB, so a worker searching one
+/// blocks: on the full pipe, or waiting to publish. A lent range is the
+/// rest of a level from some sibling to its end, so the victim, listed
+/// last, ends every range. Idle workers are lent a whole level only when
+/// it has no more unvisited siblings than they number (Share::Idle), else
+/// half: with four threads the ranges start at 0, 8, 12 and 14, and once
+/// all four workers hold a file, none is idle to be lent the victim. It is
+/// opened only after the test drains the pipe, which follows the swap. Six
+/// files were too few: the victim was lent alone and read at once.
+fn swap_after_listing(fixture: &Fixture, dir: &str, limit: Option<u32>) -> Vec<String> {
     use std::io::Read;
+    for name in 0..16 {
+        fixture.write(&format!("{dir}/{name}"), b"hit\n");
+    }
     fixture.write(".ferretignore", b"/d/\n");
     fixture.write("outside", b"hit OUTSIDE\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     // Walk order is directory order, so ask a walk for it.
     let listed = fixture.ferret(&["grep", "--files", "-uu", "d"], None);
     let order = String::from_utf8(listed.stdout).unwrap();
-    let [first, victim] = order.lines().collect::<Vec<_>>()[..] else {
+    let names: Vec<_> = order.lines().collect();
+    let Some((victim, before)) = names.split_last() else {
         panic!("listed {order:?}");
     };
+    let victim = *victim;
+    assert_eq!(before.len(), 15, "listed {order:?}");
+    let mut bytes = b"hit ".to_vec();
+    bytes.resize((4 << 20) + (64 << 10), b'x');
+    bytes.push(b'\n');
+    for first in before {
+        fixture.write(first, &bytes);
+    }
     let target = format!("{}outside", "../".repeat(victim.matches('/').count()));
-    let bytes = b"hit first\n".repeat(500_000);
     let mut checked = 0;
     let mut failed = Vec::new();
     let cases: [(&[&str], &str); 5] = [
@@ -5317,7 +5335,6 @@ fn swap_after_listing(fixture: &Fixture, limit: Option<u32>) -> Vec<String> {
         (&["--live"], "4"),
     ];
     for (mode, threads) in cases {
-        fixture.write(first, &bytes);
         let link = fixture.tree().join(victim);
         fs::remove_file(&link).unwrap();
         fixture.write(victim, b"hit victim\n");
@@ -5346,14 +5363,20 @@ fn swap_after_listing(fixture: &Fixture, limit: Option<u32>) -> Vec<String> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let changed = format!("{victim}: changed during both read attempts");
-        if stdout.contains("OUTSIDE")
+        // Read before the swap, the victim's line is printed, perhaps
+        // first: then the setup, not the code, failed.
+        let early =
+            String::from_utf8_lossy(&start).contains("hit victim") || stdout.contains("hit victim");
+        if early
+            || stdout.contains("OUTSIDE")
             || output.status.code() != Some(2)
             || !stderr.contains(&changed)
         {
             failed.push(format!(
-                "{mode:?} on {threads} threads: {:?}, through the link: {}, {stderr}",
+                "{mode:?} on {threads} threads: {:?}, through the link: {}, \
+                 read before the swap: {early}, {stderr}",
                 output.status.code(),
-                stdout.contains("OUTSIDE")
+                stdout.contains("OUTSIDE"),
             ));
         }
         checked += 1;
