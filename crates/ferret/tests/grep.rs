@@ -681,12 +681,73 @@ fn no_path_and_nothing_searched_exits_two() {
     assert_eq!(stderr.matches(NOTHING).count(), 1, "{stderr}");
 }
 
+/// The one line D108 B prints when the system refuses search threads.
+fn refused_line(running: usize, asked: usize) -> String {
+    format!(
+        "ferret: grep: searching with {running} of {asked} threads: Resource temporarily \
+         unavailable (os error 11)\n"
+    )
+}
+
 #[test]
-fn a_refused_search_thread_is_an_error_not_an_empty_search() {
+fn a_refused_search_thread_degrades_and_warns_once() {
+    // D108 B: a refused thread costs speed, not output. The debug-build hook
+    // refuses spawns of one thread kind past a count, through the same spawn
+    // call a real refusal fails in. Output is compared, as sorted lines, with
+    // a single-thread run, since completion order varies.
+    let fixture = Fixture::new("refused-threads");
+    fs::create_dir_all(fixture.tree().join("sub/many")).unwrap();
+    for i in 0..24 {
+        fixture.write(&format!("sub/many/{i}.rs"), format!("red {i}\n").as_bytes());
+    }
+    let grep = |args: &[&str], threads: &str, refuse: Option<&str>| {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .env("FERRET_SEARCH_THREADS", threads)
+            .arg("grep")
+            .args(args);
+        if let Some(refuse) = refuse {
+            command.env("FERRET_TEST_REFUSE_THREADS", refuse);
+        }
+        run(command, None)
+    };
+    let sorted = |bytes: &[u8]| {
+        let mut lines: Vec<_> = bytes.split_inclusive(|&b| b == b'\n').collect();
+        lines.sort_unstable();
+        lines.concat()
+    };
+    let files = ["red", "one.rs", "sub/three.rs", "last", "crlf"];
+    for (case, args, refuse, running) in [
+        ("feed workers", &files[..], "ferret-verify=2", 2),
+        ("feed producer", &files, "ferret-producer=0", 1),
+        ("walk thread", &["-uu", "red", "."], "ferret-walk=0", 1),
+        ("nested walkers", &["-uu", "red", "."], "ferret-walk=2", 2),
+        ("one line per run", &["-uu", "red", ".", "sub"], "ferret-walk=1", 1),
+    ] {
+        let expected = grep(args, "1", None);
+        assert_eq!(expected.status.code(), Some(0), "{case}: {expected:?}");
+        assert!(expected.stderr.is_empty(), "{case}: {expected:?}");
+        let actual = grep(args, "4", Some(refuse));
+        assert_eq!(actual.status.code(), Some(0), "{case}: {actual:?}");
+        assert_eq!(
+            sorted(&actual.stdout),
+            sorted(&expected.stdout),
+            "{case}: {actual:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&actual.stderr),
+            refused_line(running, 4),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn a_thread_limit_degrades_the_walk_to_the_calling_thread() {
     // The parallel live walk starts its own thread. With RLIMIT_NPROC at 1
-    // the system refuses it; grep once exited 1 with no output, as though
-    // nothing matched. bash's `ulimit` sets the limit without unsafe code.
-    // Root ignores the limit, so a full search is also accepted.
+    // the system refuses it and every other; grep once exited 1 with no
+    // output, then 2 having searched nothing. bash's `ulimit` sets the limit
+    // without unsafe code. Root ignores the limit, and searches in parallel.
     let fixture = Fixture::new("refused-thread");
     let mut command = fixture.command(OsStr::new("bash"));
     command
@@ -697,14 +758,9 @@ fn a_refused_search_thread_is_an_error_not_an_empty_search() {
         .args(["grep", "-uu", "red delta", "sub"]);
     let output = run(command, None);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    match output.status.code() {
-        Some(2) => {
-            assert!(output.stdout.is_empty(), "{output:?}");
-            assert!(stderr.contains("starting a search thread"), "{stderr}");
-        }
-        Some(0) => assert_eq!(output.stdout, b"sub/three.rs:red delta\n", "{output:?}"),
-        _ => panic!("refused thread was not reported: {output:?}"),
-    }
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"sub/three.rs:red delta\n", "{output:?}");
+    assert!(stderr.is_empty() || stderr == refused_line(1, 2), "{stderr}");
 }
 
 #[test]
