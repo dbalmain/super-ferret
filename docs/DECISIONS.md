@@ -6056,3 +6056,218 @@ What would change it: if refreshes taken after the exit decision often run
 for seconds (a large tree with heavy churn), B's wait would become visible. Then
 add A as well, and have the writer refuse new bursts once `stop` is set, so the
 join is always short.
+
+## D111 — Indexed grep pays for the whole index on every call
+
+**Status: open, 2026-10-21.**
+
+Question: should a directory `ferret grep` stop paying, on every call, a
+start-up cost that grows with every name in the index rather than with the
+tree it searches?
+
+Evidence. **Measured** in the impact investigation (8f72c86, warm, the same
+62-file tree searched through indexes that differ only in how many other
+names they hold): 2.4 ms with its own 102-name index, 11.0 ms at 64k names,
+22.7 ms at 250k, 80.1 ms at 1M; rg 4.1–4.5 ms throughout. About 75 µs per
+1,000 names, independent of thread count. Linear extrapolation to D40's 10M
+target: **~0.75 s per call** (the report's "~210 ms" at 10M is that figure
+weighted by the 28% of invocations that search a directory, not a per-call
+cost). **Measured** here, same tree and 64k index, 15 runs each: content grep
+11.0 ms; `grep --files` 2.9 ms; `-u` 2.6 ms; `--live` 5.0 ms. `--files` walks
+the same catalog subtree, so the catalog walk itself is not the cost.
+Earlier measurements: SCAN.md § Remaining gap puts "catalog residency, in
+`Engine::open`" at 9 ms and "document names, live set and pin" at 4 ms on a
+112k-name catalog; D78 measured the resident-name build alone at 300 ms on a
+synthetic 10M catalog, with an 841 MB peak.
+
+**Read from the code at cba36ae** (the impact report's claims hold, with one
+correction):
+
+- `grep.rs:392` `open_index` calls `Engine::open` (`engine.rs:72`) and then
+  `open_content`; `ferret grep` has no daemon route at all, so
+  `FERRET_NO_DAEMON` changes nothing for it. (The report places `open_content`
+  inside `Engine::open`; it is called by grep after it.)
+- `Engine::open` runs `Catalog::into_resident()` — loads and checks all 26
+  sections and builds `ResidentNames` (D54 B's interned table) — and then
+  `NameIndex::new` over the whole catalog.
+- Grep never reads the `NameIndex`. Its uses of the pin are `catalog()` (the
+  `CatalogSource` subtree walk), `grep_candidates` (live `DocSet` plus content
+  postings), `doc_names_until` and `search_threads`. The only consumer of
+  `DocNames` is `groups.rs:959`, which asks whether a document has more than
+  one name (hard links); building it is one pass over every name
+  (`plan.rs:211`, "2 ms at 112k names" in its comment).
+- `grep --files` already opens differently (`grep/names.rs:23`): `Catalog::open`
+  plus `load(CatalogSource::sections())` — Names, Links, Roots, Entries — with
+  no resident build and no name index. That is the 2.9 ms row above.
+- The daemon protocol (`protocol.rs` `Op`) has search, find, status, reload,
+  index and roots-remove. Find already streams its output through the daemon
+  as `stdout`/`stderr` frames (`find_json.rs` `FrameOutput`, rendered in
+  `daemon/client.rs:442`), so a grep route has a precedent to copy.
+- A section is read whole and checked whole (`read.rs:789` `load_one`,
+  `format::check`). There is no row-range read.
+
+Options:
+
+- **A — serve directory grep through the daemon.** Add `Op::Grep`; the client
+  resolves tty, colour and heading locally and sends them as explicit flags,
+  with its cwd; the daemon runs the existing grep host against a frame sink;
+  the client renders frames and maps the `end` exit. Stdin and explicit file
+  operands stay in-process. About 500–700 lines with tests, all in the
+  `ferret` crate: `grep.rs` split so the host takes a writer, cwd and pin as
+  parameters rather than reaching for `io::stdout()` and `current_dir()`;
+  a `batch::grep_request`; the client arm. No new crate edge, no dependency.
+  What it buys: the open drops to a connect and hello while a daemon is up,
+  at any index size; candidates come from a followed, fresher generation. What
+  it costs: every output byte is JSON-framed in the daemon and decoded in the
+  client — negligible at the median 11 output lines, unmeasured on dense
+  output, where ferret is now only 0.91× rg (C3). The first call with no daemon
+  still pays the full in-process open and spawns ferretd (as `search` does,
+  D78). It gives nothing where no daemon can run: `FERRET_NO_DAEMON=1`, or an
+  agent sandbox that cannot reach the runtime socket — and agents are most of
+  the callers. Forecloses nothing.
+- **B — open only what grep reads.** A grep constructor that does what
+  `grep --files` does: `Catalog::open` without `into_resident`, no
+  `NameIndex::new`, sections loaded by the calls that need them; and the
+  hard-link check at `groups.rs:959` reads the inode's `st_nlink` (already a
+  section) instead of a whole `DocNames`. About 100–150 lines in `engine.rs`,
+  `grep.rs` and `grep/groups.rs`, plus a test that grep never builds resident
+  names (`grep/names.rs` has the `OPENED` hook to copy). No format change,
+  no crate edge, no dependency. What it buys (estimated, not measured): most
+  of the 8 ms at 64k — the residual is the content open, the live `DocSet` and
+  whole-section reads, so roughly 4–5 ms, against rg's 4.1; at 10M it removes
+  the 300 ms name build and the DocNames pass, leaving whole-section reads of a
+  ~420 MB snapshot (this index is 42 B per name) at perhaps 100–250 ms. It
+  stays O(index), with a smaller constant; it works with or without a daemon.
+  It reopens D78 for grep only: D78 A kept the build on every open because
+  `search` reaches a daemon, and grep does not; D78's own "would change it"
+  was this case. Forecloses nothing; A can come later on top.
+- **C — proportional to the tree: read only the operand's subtree.** Row-range
+  section reads with per-row checks, overlay records applied to a partial
+  view, and a walk that reads children by range. A storage-reader change in
+  `ferret-catalog` plus `ferret-query`'s walk: weeks, not days, and a second
+  validation model beside whole-section checks. Buys rg-like scaling with no
+  daemon. Nothing needs it if A and B both land.
+- **D — leave it.** No code. Measured +6–8 ms at 64k names, about 2 ms per
+  average invocation once weighted by usage, and Dave has no default-location
+  index yet. Crosses 50 ms around 600k names; ~0.75 s at 10M.
+
+Recommendation: B now, A when indexes grow past about 1M names. **Fastest and
+simplest disagree here:** A is fastest (near zero open while a daemon runs, at
+any size) but is the larger change and does nothing for sandboxed or
+no-daemon agents; B is the simplest (a grep-only open path that copies
+`--files`) and helps every call, but stays linear in the index. B's
+estimates need one measurement after it lands; if the residual at 1M names is
+still over 50 ms, A becomes the real fix rather than a later one.
+
+What would change it: evidence that agent sandboxes reach the daemon socket
+and that real indexes will approach 10M soon; then do A first, and B only for
+the no-daemon path.
+
+## D112 — Grep on a directory no index covers
+
+**Status: open, 2026-10-21.**
+
+Question: when `ferret grep PATTERN DIR` names a directory that no index
+covers, should it fail as it does today, or search the directory, and with
+which ignore rules?
+
+Evidence. **Measured** with the 8f72c86 binary and isolated config:
+
+- No index at the default location (Dave's state: `~/.local/share/ferret`
+  does not exist): `ferret grep -n parse_date src` exits 2 with "no index in
+  …/ferret; run ferret index DIR; live modes arrive in M6". The last clause is
+  stale; M6 merged.
+- An index exists but the operand is outside its roots (`grep -n fn /tmp`):
+  exit 2, "start is outside the catalog or the index is stale; run ferret
+  index DIR or use -I; index this directory or use --live / --no-ignore". Two
+  hints are wrong: `-I` in grep means no filename (D74), and `--live` fails
+  outside roots too ("directory is outside configured roots; index it or use
+  --no-ignore").
+- On a real Rust repo with a 13 GB `target/` (`~/w/tally`), anchored at its
+  top: `ferret grep --live --files .` and `rg --files` list the same 75 files;
+  `-u --files` lists 38,225.
+- On a toy git repo (`.gitignore`: `*.log`, `gen/`; `src/.gitignore`:
+  `secret.txt`; plus `src/node_modules/` and an unignored `target/`),
+  `-l needle`:
+
+  | run                                    | files reported                                                   |
+  | -------------------------------------- | ---------------------------------------------------------------- |
+  | `rg src`                               | `src/a.rs`, `src/node_modules/m/i.js`                            |
+  | `--live`, root at the repo top, op src | `src/a.rs`                                                       |
+  | `--live`, root at `src` itself         | `src/a.rs`, `src/gen/b.rs`, `src/secret.txt`, `src/x.log`        |
+  | `-u src`                               | all five under `src`, `node_modules` included                    |
+
+  A root at a subdirectory of a work tree reads no `.gitignore` at all, not
+  even its own: D22 A treats it as outside any work tree.
+- Speed on the 62-file `tally/src`: `--live` 5.0 ms, `-u` 2.6 ms, rg 4.1 ms
+  (impact report; U2, 9 MB tree: `--live` 7.0 ms, rg 5.3).
+
+**Read from the code:** `--live` (`grep/live.rs`) uses the catalog only for
+its list of root paths (`Anchors { roots, faults, global, index }`); `start`
+walks from the covering root down to the operand, applying D13 rules at each
+step. With no global ignore file it falls back to `DEFAULT_IGNORE`
+(`.git/ node_modules/ vendor/ .venv/ target/ dist/ build/ .next/ result
+.cache/ __pycache__/ .direnv/`), so it needs no setup. A synthetic root is
+therefore just a path in that list. In `grep.rs` today the engine opens
+before operands are checked, so a fallback must check coverage first (the
+Roots section only), or every uncovered call would pay D111's open and then
+walk anyway.
+
+Options:
+
+- **A — keep exiting 2; fix the messages.** About 20 lines across `grep.rs`,
+  `grep/live.rs` and `grep/names.rs`: drop the M6 clause and the `-I` hint,
+  stop suggesting `--live` where it cannot work, and name both working
+  commands (`ferret index DIR`; `-u`, which searches ignored files). What it
+  buys: no change to D73's model. What it costs: the first directory search
+  in any uncovered tree fails; an agent then retries, usually with `-u`
+  (the only flag that works without an index), and gets the `-u` output below.
+  Every directory call fails until someone indexes, and the investigation
+  found the owner has no index. Forecloses nothing.
+- **B — fall back to `--live` anchored at the enclosing work tree.** If no
+  index covers an operand, search it live with D13 policy, anchored at the
+  nearest ancestor holding `.git`, or at the operand when there is none. About
+  100–150 lines in the `ferret` crate: an `Anchors` constructor from synthetic
+  roots, an upward `.git` probe (a few `stat` calls), coverage checked before
+  the engine opens, per-operand routing, and tests; no crate edge, no
+  dependency. What it buys: rg's file set on a plain repo — identical on
+  `tally` — at 5 ms against rg's 4 on a small tree. Remaining differences
+  against rg: `DEFAULT_IGNORE` directories are skipped even when git tracks
+  them (a committed Go `vendor/`, a source directory named `build/` or
+  `dist/`, `node_modules/` above); files over 8 MiB are not searched;
+  `.ignore` and `.rgignore` are not read (D74). Anchoring at the operand
+  instead would be about 30 lines less and would search everything the repo's
+  `.gitignore` excludes, as in the table. The upward probe does not
+  contradict D22 A, which governs configured roots; it does reintroduce a
+  small `.git` search that D22's revision removed from the walker, here used
+  only to choose the anchor. Forecloses: a missing index becomes silent, so
+  nothing tells the user that indexing would make the call faster; covered
+  directories answer from a snapshot (D73 A) while uncovered ones answer
+  live, which is a visible difference in freshness between two directories.
+- **C — fall back to the unrestricted walk (`-u`).** About 10 lines. No ignore
+  rules at all: on `tally` it lists 38,225 files including 13 GB of `target/`
+  where rg lists 75, so a pattern that appears in build output prints
+  thousands of lines rg never shows, and the walk reads gigabytes the first
+  time (U3: 65 ms per warm GB). Matches neither rg nor D74 A's intent that
+  `-u` is an explicit request. Simple but wrong output.
+- **D — index on first use.** Run `ferret index DIR` from inside grep. Cost:
+  the first call pays a crawl and content index (0.13 s for `tally`'s 80
+  files; seconds to minutes for a large tree), and a read command adds roots
+  and daemon watches as a side effect, so an agent grepping `/tmp/x` or a
+  throwaway worktree registers it permanently. Buys indexed speed on every
+  later call. Forecloses grep being read-only; better offered as a hint in
+  B or A than done implicitly.
+
+Recommendation: B, anchored at the enclosing work tree. **Fastest and
+simplest disagree here:** A is the simplest (20 lines) and B the fastest in
+the sense that matters, one call instead of a failure, a retry and possibly
+`-u`'s 38,000-file output. B also needs D111's ordering fix (check coverage
+before opening the engine) or its fallback calls pay the open for nothing.
+Fix A's messages in either case, since the outside-roots hint names a flag
+that means something else.
+
+What would change it: Dave preferring that ferret never silently differ from
+an indexed answer (then A, with the corrected messages), or agents mostly
+calling grep in trees whose committed sources sit under `vendor/`, `build/` or
+`dist/`, where B's default ignores would hide real matches (then B with
+`DEFAULT_IGNORE` limited to what git ignores when a work tree is found).
