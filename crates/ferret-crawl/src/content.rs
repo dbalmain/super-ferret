@@ -84,16 +84,22 @@ fn stream_file_until_with_growth(
             cap,
         });
     }
-    checked_file(file, current, accept_growth, &mut |file, size| {
-        let extent = if size == 0 { u64::MAX } else { size };
-        each(&mut Read::take(file, extent), extent).map_err(|error| {
-            if cancelled() {
-                ContentFault::Cancelled
-            } else {
-                ContentFault::Read(error)
-            }
-        })
-    })
+    checked_file(
+        file,
+        current,
+        accept_growth,
+        &mut |first| check_read_name(rustix::fs::CWD, path.as_os_str(), AtFlags::empty(), first),
+        &mut |file, size| {
+            let extent = if size == 0 { u64::MAX } else { size };
+            each(&mut Read::take(file, extent), extent).map_err(|error| {
+                if cancelled() {
+                    ContentFault::Cancelled
+                } else {
+                    ContentFault::Read(error)
+                }
+            })
+        },
+    )
 }
 
 /// Validate the open descriptor, rather than path metadata that may already
@@ -110,14 +116,37 @@ fn checked_file(
     mut file: File,
     current: ferret_catalog::Stat,
     accept_growth: bool,
+    check_name: &mut dyn FnMut(&ferret_catalog::Stat) -> Result<(), ContentFault>,
     pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
 ) -> Result<ferret_catalog::Stat, ContentFault> {
     pass(&mut file, current.size)?;
     if accept_growth {
-        bracket_search(&file, &current)
+        let after = bracket_search(&file, &current)?;
+        check_name(&current)?;
+        Ok(after)
     } else {
         bracket(&file, &current, ferret_catalog::Content::Binary)?;
         Ok(current)
+    }
+}
+
+/// A descriptor's nonzero link count can belong to an alias after this name
+/// was replaced. Search accepts ctime changes, so it needs this identity check
+/// in addition to the descriptor bracket; strict reads reject those changes.
+fn check_read_name(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    flags: AtFlags,
+    first: &ferret_catalog::Stat,
+) -> Result<(), ContentFault> {
+    let named = statat(parent, name, flags).map_err(|error| match error {
+        rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR => ContentFault::Changed,
+        _ => ContentFault::Stat(error.into()),
+    })?;
+    if (named.st_dev, named.st_ino) == (first.dev, first.ino) {
+        Ok(())
+    } else {
+        Err(ContentFault::Changed)
     }
 }
 
@@ -495,7 +524,7 @@ impl Documents {
     /// sees a byte, and the second the same version as the first.
     ///
     /// The calls, for a file in a held directory: `openat`, `fstat`, the
-    /// reads, `fstat`, `close`.
+    /// reads, `fstat`, and (for search) one no-follow `fstatat`, then `close`.
     fn current_until(
         &mut self,
         catalog: &Catalog,
@@ -508,17 +537,33 @@ impl Documents {
             return Err(ContentFault::Cancelled);
         }
         let (parent, bytes) = catalog.name_reader().edge(name);
-        let fd = self.in_directory(catalog, parent, cancelled, |dir| {
-            openat(
+        let current = self.in_directory(catalog, parent, cancelled, |dir| {
+            let fd = openat(
                 dir,
                 std::ffi::OsStr::from_bytes(bytes),
                 OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(|e| ContentFault::Open(e.into()))
+            .map_err(|e| ContentFault::Open(e.into()))?;
+            let (file, current) = regular_file(fd)?;
+            // Keep the checked parent alive through the read without a dup.
+            // Its held-descriptor lock also keeps pressure relief from closing
+            // it.
+            checked_file(
+                file,
+                current,
+                accept_growth,
+                &mut |first| {
+                    check_read_name(
+                        dir,
+                        std::ffi::OsStr::from_bytes(bytes),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                        first,
+                    )
+                },
+                pass,
+            )
         })?;
-        let (file, current) = regular_file(fd)?;
-        let current = checked_file(file, current, accept_growth, pass)?;
         self.files_read += 1;
         Ok(current)
     }
@@ -527,7 +572,8 @@ impl Documents {
     /// root for each path. A retained descriptor alone cannot establish that
     /// its original path still names it after a rename: a reader [holding
     /// directories](Documents::holding_directories) checks each path again
-    /// before reusing one.
+    /// before reusing one. The callback may read through the directory;
+    /// pressure relief waits for that read as it does for an open.
     ///
     /// An open that finds the process out of descriptors (`EMFILE`,
     /// `ENFILE`) is tried again once every held descriptor in the process

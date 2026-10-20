@@ -296,7 +296,11 @@ freshness-dependent visibility change.
 **Read-transaction clarification (2026-10-16, review R1):** regular explicit
 files and opaque/ignored-directory fallback files use the same open-descriptor
 version bracket and one changed-read retry as indexed candidates. A successful
-attempt adds one closing fstat and publishes only that attempt’s buffered output;
+attempt adds one closing fstat; search also checks the name’s `(dev, ino)`
+with one stat (a no-follow fstatat in the checked parent for indexed names).
+A surviving hard link cannot hide replacement of the searched name. Strict
+crawl reads already reject unlink/replacement through their ctime bracket.
+The attempt publishes only that attempt’s buffered output;
 it does not reread an unchanged file. This is per-file consistency, not an atomic
 tree snapshot. Stdin and other non-regular streams cannot be version-checked:
 their output describes the bytes received. Explicit special-file operands still

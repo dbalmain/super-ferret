@@ -5191,6 +5191,56 @@ fn streaming_changed_file_reports_partial_output_without_retry() {
     }
 }
 
+// Astra finding 1: a surviving hard link must not hide replacement of the
+// searched name after output has begun. An explicit file operand is read
+// directly; a directory under an index reads its catalogued names through the
+// held parent directory.
+#[test]
+fn streaming_replacement_with_a_surviving_hard_link_is_rejected() {
+    use std::io::Read;
+    let fixture = Fixture::new("streaming-replaced-hardlink");
+    let bytes = b"hit original\n".repeat(500_000);
+    fs::create_dir(fixture.tree().join("d")).unwrap();
+    for indexed in [false, true] {
+        fixture.write("d/victim", &bytes);
+        fs::hard_link(
+            fixture.tree().join("d/victim"),
+            fixture.tree().join("alias"),
+        )
+        .unwrap();
+        let operand = if indexed {
+            assert!(fixture.ferret(&["index", "."], None).status.success());
+            "d"
+        } else {
+            "d/victim"
+        };
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command.arg("--index").arg(fixture.base.join("index"));
+        command.args(["grep", "-I", "hit", operand]);
+        let mut child = command.spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let mut first = [0; 1024];
+        pipe.read_exact(&mut first).unwrap();
+        fixture.write("fresh", b"no match replacement\n");
+        fs::rename(
+            fixture.tree().join("fresh"),
+            fixture.tree().join("d/victim"),
+        )
+        .unwrap();
+        child.stdout = Some(pipe);
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "indexed={indexed}: {stderr}");
+        assert!(
+            stderr.contains("changed during read after output began"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("not retried"), "{stderr}");
+        assert_eq!([first.as_slice(), &output.stdout].concat(), bytes);
+        fs::remove_file(fixture.tree().join("alias")).unwrap();
+    }
+}
+
 // D102 + D103: the first spool can fail after the matching prefix streamed.
 // Keep that prefix, finish JSON if begun, and publish both neighboring files.
 #[test]
