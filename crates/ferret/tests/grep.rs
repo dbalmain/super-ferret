@@ -833,10 +833,14 @@ fn large_rendered_groups_need_no_temporary_directory() {
     fixture.write("ordered/small.txt", b"red small\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let mut outcomes = Vec::new();
-    for args in [
-        vec!["grep", "red", "ordered/big.txt", "ordered/small.txt"],
-        vec!["grep", "red", "ordered"],
-        vec!["grep", "red", "-", "ordered/small.txt"],
+    let mut expected = Vec::new();
+    for (args, big) in [
+        (
+            vec!["grep", "red", "ordered/big.txt", "ordered/small.txt"],
+            "ordered/big.txt",
+        ),
+        (vec!["grep", "red", "ordered"], "ordered/big.txt"),
+        (vec!["grep", "red", "-", "ordered/small.txt"], "<stdin>"),
     ] {
         let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
         if args.contains(&"-") {
@@ -852,17 +856,27 @@ fn large_rendered_groups_need_no_temporary_directory() {
             .env("FERRET_SEARCH_THREADS", "1")
             .env("TMPDIR", fixture.base.join("unavailable-spill-directory"));
         let output = run(command, None);
+        // The large group whole, then the small one: its length, ends and
+        // bytes, so a group dropped or cut short is seen without printing
+        // 24 MB.
+        let mut whole = format!("{big}:red\n").repeat(1_200_000).into_bytes();
+        whole.extend_from_slice(b"ordered/small.txt:red small\n");
+        let summary = |bytes: &[u8]| {
+            (
+                bytes.len(),
+                String::from_utf8_lossy(&bytes[..bytes.len().min(64)]).into_owned(),
+                String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(64)..]).into_owned(),
+                bytes == whole,
+            )
+        };
         outcomes.push((
             output.status.code(),
-            output.stderr.is_empty(),
-            output.stdout.ends_with(b"ordered/small.txt:red small\n"),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            summary(&output.stdout),
         ));
+        expected.push((Some(0), String::new(), summary(&whole)));
     }
-    assert_eq!(
-        outcomes,
-        [(Some(0), true, true); 3],
-        "rendered output must not spill"
-    );
+    assert_eq!(outcomes, expected, "rendered output must not spill");
 }
 
 // A spill fault is a temporary-file fault: the message names the spill
