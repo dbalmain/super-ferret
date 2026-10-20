@@ -2918,42 +2918,132 @@ mod group_tests {
         assert_eq!(emitted, 1);
     }
 
-    // A panicking worker can leave the entire input budget reserved. Its
-    // peers must wake before scope joins; isolate a regression's deadlock.
+    /// Runs `body`, catching its panic, and returns the message of every panic
+    /// on any thread, in order. The hook is process-wide: call this only in a
+    /// [`completion_child`], which runs one test per process.
+    fn panics(body: impl FnOnce()) -> Vec<String> {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new({
+            let seen = seen.clone();
+            move |info| {
+                let payload = info.payload();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                lock(&seen).push(message);
+            }
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::panic::set_hook(previous);
+        std::mem::take(&mut *lock(&seen))
+    }
+
+    /// Asserts the only panic was `intended`, re-raised by the scopes it
+    /// unwound through.
+    fn assert_only_panic(seen: &[String], intended: &str) {
+        assert!(
+            seen.first().is_some_and(|first| first == intended)
+                && seen[1..]
+                    .iter()
+                    .all(|rest| rest == "a scoped thread panicked"),
+            "expected only {intended:?}, saw {seen:?}"
+        );
+    }
+
+    // A panicking worker must stop the run before the scope joins: a sibling
+    // waiting for bytes that the panic's own release cannot satisfy, and a
+    // reader polling the stop, would otherwise sleep forever. The poller
+    // keeps all but one buffer of the budget, so only the stop wakes the
+    // waiter.
     #[test]
     fn completion_worker_panic_wakes_input_budget_waiters() {
         if completion_child("completion_worker_panic_wakes_input_budget_waiters") {
             return;
         }
-        let reached = AtomicBool::new(false);
-        let result = std::panic::catch_unwind(|| {
-            let mut task = 0;
-            completion_groups(
-                GroupSchedule::Streaming(2),
+        #[derive(Clone, Copy, Debug)]
+        enum Task {
+            Poll,
+            Panic,
+            Wait,
+        }
+        const INJECTED: &str = "injected worker panic with a sibling waiting";
+        let buffer = crate::scan::BUFFER as u64;
+        let waiting = std::sync::Arc::new(AtomicBool::new(false));
+        let _seams = seam::Seams {
+            on_budget_wait: Some({
+                let waiting = waiting.clone();
+                std::sync::Arc::new(move || waiting.store(true, Ordering::SeqCst))
+            }),
+            ..Default::default()
+        }
+        .set();
+        let polling = AtomicBool::new(false);
+        let serial = AtomicBool::new(false);
+        let mut tasks = [
+            (IN_FLIGHT_BYTES - buffer, Task::Poll),
+            (buffer, Task::Panic),
+            (2 * buffer, Task::Wait),
+        ]
+        .into_iter();
+        let until = |flag: &AtomicBool, stopped: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !flag.load(Ordering::SeqCst) && !stopped() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            flag.load(Ordering::SeqCst)
+        };
+        let seen = panics(|| {
+            completion_groups_with_handoff(
+                GroupSchedule::Streaming(3),
                 &AtomicBool::new(false),
-                |_| {
-                    let current = task;
-                    task += 1;
-                    if current == 1 {
-                        reached.store(true, Ordering::Release);
+                |stopped| {
+                    // The poller reserves first, so the panicking reader's
+                    // buffer fits beside it and the waiter's two do not.
+                    let next = tasks.next()?;
+                    if !matches!(next.1, Task::Poll) {
+                        until(&polling, stopped);
                     }
-                    (current < 2).then_some((IN_FLIGHT_BYTES, current))
+                    Some(next)
                 },
                 || (),
-                |_, task, _| {
-                    assert_eq!(task, 0, "second task cannot reserve the occupied budget");
-                    let deadline = Instant::now() + Duration::from_secs(3);
-                    while !reached.load(Ordering::Acquire) && Instant::now() < deadline {
-                        std::thread::yield_now();
+                |_, task, stopped, _, concurrent| {
+                    if !concurrent {
+                        serial.store(true, Ordering::SeqCst);
+                        polling.store(true, Ordering::SeqCst);
+                        return;
                     }
-                    assert!(reached.load(Ordering::Acquire));
-                    panic!("injected worker panic with a live reservation");
+                    match task {
+                        Task::Poll => {
+                            polling.store(true, Ordering::SeqCst);
+                            while !stopped() {
+                                std::thread::yield_now();
+                            }
+                        }
+                        Task::Panic if until(&waiting, &|| false) => panic!("{INJECTED}"),
+                        Task::Panic => panic!("setup: no sibling waited for bytes"),
+                        Task::Wait => {}
+                    }
                 },
                 |_| 0,
-                |_: ()| ControlFlow::Continue(()),
+                |()| ControlFlow::Continue(()),
             );
         });
-        assert!(result.is_err());
+        assert!(
+            !serial.load(Ordering::SeqCst),
+            "no worker threads: {seen:?}"
+        );
+        assert!(
+            polling.load(Ordering::SeqCst),
+            "the poller never ran: {seen:?}"
+        );
+        assert!(
+            waiting.load(Ordering::SeqCst),
+            "no sibling waited: {seen:?}"
+        );
+        assert_only_panic(&seen, INJECTED);
     }
 
     // The first task is a quiet hit and the producer then blocks until that
@@ -3321,11 +3411,17 @@ mod group_tests {
             &AtomicBool::new(false),
             |lanes, stopped| {
                 let lane = &lanes[0];
+                let held = lane.reserve(u64::MAX, stopped);
+                assert!(held.is_some(), "the reader never held the budget");
                 let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _held = lane.reserve(u64::MAX, stopped);
+                    let _held = held;
                     panic!("reader fails mid-read");
                 }));
-                assert!(unwound.is_err());
+                let payload = unwound.expect_err("the reader did not panic");
+                assert_eq!(
+                    payload.downcast_ref::<&str>(),
+                    Some(&"reader fails mid-read")
+                );
                 assert!(lane.reserve(u64::MAX, stopped).is_some());
             },
             |(): ()| ControlFlow::Continue(()),
@@ -3346,7 +3442,7 @@ mod group_tests {
         Hog,
         /// Waits for the hog's reservation, then reserves.
         Wait,
-        /// Panics.
+        /// Panics once a sibling polls.
         Panic,
         /// Holds a reservation until the run stops, as a slow read does.
         Poll,
@@ -3372,6 +3468,7 @@ mod group_tests {
         met: &'l Barrier,
         hogged: &'l AtomicBool,
         waiting: &'l AtomicBool,
+        polling: &'l AtomicBool,
     }
 
     impl crate::find::schedule::Visitor<Jobs, ()> for Jobber<'_, '_> {
@@ -3401,9 +3498,13 @@ mod group_tests {
                     until(self.hogged);
                     let _held = self.lane.reserve(1, self.stopped);
                 }
-                Job::Panic => panic!("walker fails"),
+                Job::Panic => {
+                    until(self.polling);
+                    panic!("walker fails")
+                }
                 Job::Poll => {
                     let _held = self.lane.reserve(1, self.stopped);
+                    self.polling.store(true, Ordering::SeqCst);
                     while !(self.stopped)() {
                         std::thread::sleep(Duration::from_millis(1));
                     }
@@ -3418,8 +3519,8 @@ mod group_tests {
     }
 
     /// Walks `jobs` with two scheduler workers inside [`lane_groups`], as
-    /// grep's live walk does, and says whether the run ended by panicking.
-    fn walk_jobs(jobs: Vec<Job>) -> bool {
+    /// grep's live walk does, and returns its [`panics`].
+    fn walk_jobs(jobs: Vec<Job>) -> Vec<String> {
         let waiting = std::sync::Arc::new(AtomicBool::new(false));
         let _seams = seam::Seams {
             on_budget_wait: Some({
@@ -3431,8 +3532,9 @@ mod group_tests {
         .set();
         let met = Barrier::new(2);
         let hogged = AtomicBool::new(false);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            lane_groups(
+        let polling = AtomicBool::new(false);
+        panics(|| {
+            let _ = lane_groups(
                 2,
                 &AtomicBool::new(false),
                 |lanes, stopped| {
@@ -3450,6 +3552,7 @@ mod group_tests {
                         met: &met,
                         hogged: &hogged,
                         waiting: &waiting,
+                        polling: &polling,
                     };
                     crate::find::schedule::run(
                         &schedule,
@@ -3461,9 +3564,8 @@ mod group_tests {
                     );
                 },
                 |(): ()| ControlFlow::Continue(()),
-            )
-        }))
-        .is_err()
+            );
+        })
     }
 
     // P2 of the D105 review: a walker panicking inside the scheduler stops
@@ -3474,8 +3576,11 @@ mod group_tests {
         if completion_child("a_walker_panic_stops_sibling_walkers") {
             return;
         }
-        assert!(walk_jobs(vec![Job::Lend, Job::Hog, Job::Wait]));
-        assert!(walk_jobs(vec![Job::Lend, Job::Panic, Job::Poll]));
+        // Each panic happens only after its sibling is waiting or polling.
+        let seen = walk_jobs(vec![Job::Lend, Job::Hog, Job::Wait]);
+        assert_only_panic(&seen, "hog fails holding the budget");
+        let seen = walk_jobs(vec![Job::Lend, Job::Panic, Job::Poll]);
+        assert_only_panic(&seen, "walker fails");
     }
 
     // Streaming keeps the input reservation while the publisher consumes an
@@ -3502,7 +3607,7 @@ mod group_tests {
             .set();
             let mut held = false;
             let mut received = 0;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let seen = panics(|| {
                 lane_groups(
                     2,
                     &AtomicBool::new(false),
@@ -3546,8 +3651,12 @@ mod group_tests {
                     },
                 )
                 .unwrap();
-            }));
-            assert_eq!(result.is_err(), mode == 2);
+            });
+            if mode == 2 {
+                assert_only_panic(&seen, "stream owner panics after its first chunk");
+            } else {
+                assert_eq!(seen, Vec::<String>::new());
+            }
             assert_eq!(received, if mode == 0 { 32 } else { 1 });
         }
     }
