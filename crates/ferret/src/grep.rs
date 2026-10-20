@@ -491,8 +491,8 @@ impl<W: Write> Host<'_, W> {
         let plan = self.plan;
         // A walked file is opened beneath the directory it was listed in.
         let directory = recursive.then(|| {
-            crate::engine::reader::Parent::Open(std::sync::Arc::new(
-                fs::File::open(path.parent().unwrap()).unwrap(),
+            crate::engine::reader::Parent::Open(ferret_query::find::DirectoryHandle::from_file(
+                std::sync::Arc::new(fs::File::open(path.parent().unwrap()).unwrap()),
             ))
         });
         self.transaction(path, &mut |each| {

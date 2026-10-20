@@ -3,6 +3,7 @@
 
 use ferret_catalog::Catalog;
 use ferret_crawl::{ContentFault, Documents};
+use ferret_query::find::DirectoryHandle;
 use ferret_query::{
     CheckedReader, ReadFault, ReadOperation, ReadOutcome, ReadRequest, ReadVersion,
 };
@@ -66,7 +67,7 @@ pub(crate) fn direct(
 #[derive(Debug)]
 pub(crate) enum Parent {
     /// Still open, as the walk retained it.
-    Open(std::sync::Arc<std::fs::File>),
+    Open(DirectoryHandle),
     /// Closed by a walk past its descriptor budget: its `(dev, ino)`, which
     /// the directory reopened by path must still have.
     Closed(u64, u64),
@@ -101,7 +102,7 @@ pub(crate) fn listed(
                 .read(true)
                 .custom_flags(DIRECTORY | NONBLOCK)
                 .open(spelled.unwrap_or(".".as_ref()))
-            .and_then(|directory| Ok((directory.metadata()?, directory)));
+                .and_then(|directory| Ok((directory.metadata()?, directory)));
             reopened = match opened {
                 Ok((stat, directory)) if (stat.dev(), stat.ino()) == (dev, ino) => directory,
                 Ok(_) => return ReadOutcome::RetryChanged,

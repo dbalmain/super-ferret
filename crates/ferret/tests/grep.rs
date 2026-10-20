@@ -5332,8 +5332,18 @@ fn walked_parent_swapped_for_a_fifo_after_output_is_changed_not_a_hang() {
     let mut stdout = first.to_vec();
     stdout.extend(rest);
     let mut stderr = Vec::new();
-    child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
-    assert_eq!(status.code(), Some(2), "{}", String::from_utf8_lossy(&stderr));
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
     assert!(
         String::from_utf8_lossy(&stderr).contains("changed during both read attempts"),
         "{}",
@@ -5512,6 +5522,67 @@ fn deep_walk_under_a_low_open_file_limit_searches_every_level() {
         }
     }
     assert_eq!(checked, 6);
+}
+
+// Queued indexed jobs retain their listed directory descriptors. Their budget
+// charge must live with the shared descriptor owner, not only with the DFS
+// level that produced each job (EMFILE used to drop matches under RLIMIT 64).
+#[test]
+fn indexed_queued_directory_handles_remain_charged_until_the_last_job_drops() {
+    let fixture = Fixture::new("indexed-queued-directory-handles");
+    fs::create_dir(fixture.tree().join("d")).unwrap();
+    let mut line = b"hit ".to_vec();
+    line.resize((4 << 20) + 128, b'x');
+    line.push(b'\n');
+    for sibling in 0..96 {
+        let directory = format!("d/{sibling:03}");
+        fs::create_dir(fixture.tree().join(&directory)).unwrap();
+        fixture.write(&format!("{directory}/file"), &line);
+    }
+    fixture.write(".ferretignore", b"/d/\n");
+    let indexed = fixture.ferret(&["index", "."], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+
+    let run = |limit: Option<u32>| {
+        let mut command = if let Some(limit) = limit {
+            let mut command = fixture.command(OsStr::new("sh"));
+            command
+                .arg("-c")
+                .arg("ulimit -n \"$1\" && shift && exec \"$@\"")
+                .arg("sh")
+                .arg(limit.to_string())
+                .arg(env!("CARGO_BIN_EXE_ferret"));
+            command
+        } else {
+            fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")))
+        };
+        command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .args(["grep", "-c", "hit", "d"])
+            .env("FERRET_SEARCH_THREADS", "4");
+        command.output().unwrap()
+    };
+
+    let unlimited = run(None);
+    assert_eq!(unlimited.status.code(), Some(0));
+    let limited = run(Some(64));
+    let stderr = String::from_utf8_lossy(&limited.stderr);
+    assert_eq!(limited.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("Too many open files"), "{stderr}");
+    fn sorted_lines(output: &[u8]) -> Vec<Vec<u8>> {
+        let mut lines: Vec<_> = output
+            .split(|&byte| byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+    assert_eq!(
+        sorted_lines(&limited.stdout),
+        sorted_lines(&unlimited.stdout)
+    );
+    assert_eq!(sorted_lines(&limited.stdout).len(), 97);
 }
 
 // D102 + D103: the first spool can fail after the matching prefix streamed.

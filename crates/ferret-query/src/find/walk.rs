@@ -15,7 +15,8 @@ use std::ffi::OsStr;
 use std::fs::{self, File, FileType, Metadata};
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use std::ops::Deref;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,49 @@ pub enum FileKind {
     Block,
     /// Character device.
     Character,
+}
+
+/// A retained directory descriptor. Clones share both the descriptor and its
+/// budget charge, so queued work keeps the descriptor charged until last use.
+#[derive(Clone, Debug)]
+pub struct DirectoryHandle {
+    file: Arc<File>,
+    _charge: Option<Arc<Charge>>,
+}
+
+impl DirectoryHandle {
+    /// Wraps an existing directory descriptor without a walk budget charge.
+    pub fn from_file(file: Arc<File>) -> Self {
+        Self::uncharged(file)
+    }
+
+    fn uncharged(file: Arc<File>) -> Self {
+        Self {
+            file,
+            _charge: None,
+        }
+    }
+
+    fn charged(file: Arc<File>, charge: Charge) -> Self {
+        Self {
+            file,
+            _charge: Some(Arc::new(charge)),
+        }
+    }
+}
+
+impl Deref for DirectoryHandle {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl AsFd for DirectoryHandle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
 }
 
 pub(super) fn kind(value: FileType) -> FileKind {
@@ -283,11 +327,11 @@ impl Entry {
         }
     }
 
-    pub(super) fn command_cwd(&self) -> Option<Arc<File>> {
+    pub(super) fn command_cwd(&self) -> Option<DirectoryHandle> {
         if self.inherit_cwd {
             None
         } else {
-            self.cwd_handle.clone()
+            self.cwd_handle.clone().map(DirectoryHandle::uncharged)
         }
     }
 
@@ -295,7 +339,7 @@ impl Entry {
     /// retains parents ([`LiveWalk::retaining_parents`]); `None` for a
     /// catalogued listing, which opens no directory. A start operand's is the
     /// directory named by its spelling's parent.
-    pub fn directory_handle(&self) -> Option<Arc<File>> {
+    pub fn directory_handle(&self) -> Option<DirectoryHandle> {
         self.state.directory.clone()
     }
 
@@ -557,7 +601,7 @@ pub(super) const CANCELLATION_INTERVAL: usize = 256;
 struct Saved {
     follow: bool,
     followed_symlink: bool,
-    directory: Option<Arc<File>>,
+    directory: Option<DirectoryHandle>,
     depth: usize,
     kind: Option<FileKind>,
     metadata: OnceCell<Result<Metadata, Arc<io::Error>>>,
@@ -597,10 +641,7 @@ struct Child {
 struct Level {
     catalogued: bool,
     pending: Option<Arc<AtomicUsize>>,
-    handle: Option<Arc<File>>,
-    /// `handle`'s share of the parent budget, returned when the last clone
-    /// of this level goes.
-    _charge: Option<Arc<Charge>>,
+    handle: Option<DirectoryHandle>,
     /// The directory's `(dev, ino)` when `handle` was closed for want of
     /// budget.
     identity: Option<(u64, u64)>,
@@ -970,11 +1011,10 @@ impl LiveWalk {
                 catalogued: true,
                 pending: None,
                 handle: if self.options.retain_parent {
-                    handle
+                    handle.map(DirectoryHandle::uncharged)
                 } else {
                     None
                 },
-                _charge: None,
                 identity: None,
                 path_len,
                 separator,
@@ -1085,16 +1125,16 @@ impl LiveWalk {
         // whole subtree the way an effectful walk must, bounds live fd use
         // by width instead of depth (#10): a 100-level chain under a tight
         // RLIMIT_NOFILE no longer exhausts descriptors one per ancestor.
-        let (handle, charge, identity) = if !self.options.retain_parent {
+        let (handle, identity) = if !self.options.retain_parent {
             drop(handle);
-            (None, None, None)
+            (None, None)
         } else if !self.options.bounded_parents {
-            (Some(handle), None, None)
+            (Some(DirectoryHandle::uncharged(handle)), None)
         } else if let Some(charge) = Charge::take() {
-            (Some(handle), Some(Arc::new(charge)), None)
+            (Some(DirectoryHandle::charged(handle, charge)), None)
         } else {
             match handle.metadata() {
-                Ok(stat) => (None, None, Some((stat.dev(), stat.ino()))),
+                Ok(stat) => (None, Some((stat.dev(), stat.ino()))),
                 Err(error) => {
                     self.children.truncate(start);
                     self.names.truncate(names_start);
@@ -1107,7 +1147,6 @@ impl LiveWalk {
             catalogued: false,
             pending: None,
             handle,
-            _charge: charge,
             identity,
             path_len,
             separator,
@@ -1160,7 +1199,9 @@ impl LiveWalk {
                     && (self.catalog.is_none() || self.options.live_checks)
                 {
                     match parent_handle(&self.entry) {
-                        Ok(handle) => self.entry.state.directory = Some(handle),
+                        Ok(handle) => {
+                            self.entry.state.directory = Some(DirectoryHandle::uncharged(handle))
+                        }
                         Err(error) => return Some(Err(self.entry.error(error))),
                     }
                 }
@@ -1213,7 +1254,9 @@ impl LiveWalk {
                 }
                 if self.options.retain_parent && self.entry.state.directory.is_none() {
                     match parent_handle(&self.entry) {
-                        Ok(handle) => self.entry.state.directory = Some(handle),
+                        Ok(handle) => {
+                            self.entry.state.directory = Some(DirectoryHandle::uncharged(handle))
+                        }
                         Err(error) => return Some(Err(self.entry.error(error))),
                     }
                 }
