@@ -5964,3 +5964,95 @@ case of a source tree with a few big generated or log files. Would change it:
 heavy output from multi-GiB single files mattering; only C fixes that.
 
 > Dave: I agree with the recommendations on D108 and D109.
+
+## D110 — A client that connects while ferretd is exiting
+
+**Status: open, 2026-10-21.**
+
+Question: when a client connects to a ferretd that has already decided to exit,
+should the daemon stop that from happening, or should the client wait and
+retry?
+
+Found while fixing the watch idle-exit flake (7b5f8e3); the evidence is from
+reading the code at 7b5f8e3. Once the idle loop in `daemon.rs` breaks, ferretd
+sets `stop`, joins the writer, calls `close_writer`, removes its socket and
+only then drops the endpoint lock. Until the socket is removed, `connect`
+succeeds: the listener thread keeps accepting, but nobody reads the channel,
+and the streams are closed when `run` returns. The client sees EOF before any
+hello. The same thing happens in two other places. During an explicit drain
+(the build-mismatch replacement), the main loop drops `Accepted` streams and
+`connection()` returns before writing a hello. A 33rd client (`CLIENTS = 32`)
+is also dropped without a hello.
+
+What the client does with that EOF (`client.rs`, `connect_owner`): the error
+is `Owner`, not `NoOwner`, because it did connect. Queries then fall back to
+the in-process engine, which is correct, just not served by the daemon. Writer
+commands (`index`, `roots remove`) fail with exit 3 and "writer command:
+daemon closed the connection". The window is usually milliseconds: the
+writer is idle, so `join` returns as soon as `Intake` wakes it. But if the
+writer had already taken a debounced burst when the exit was decided, the
+window is the whole of that refresh, which takes seconds on a large tree. With
+the production idle of 15 minutes this is rare. Drain makes it more likely,
+since that is when clients are actively arriving.
+
+Two locks rule out a second writer whatever we choose, and they were checked
+for each option:
+
+- the endpoint lock (`ferret/lock` in the runtime dir) is held from startup
+  until after the socket is removed. A starter that cannot take it, and whose
+  socket does not answer, retries every 20 ms until `FERRET_DAEMON_STARTUP_MS`
+  (10 s) runs out, then exits with "singleton winner did not bind";
+- the catalog writer flock (`<index>/lock`, taken by `WriterSession::open`) is
+  held until `close_writer`. An in-process `ferret index` that finds it held
+  fails with `BeginError::Locked`.
+
+So no option can let two writers touch the index at once. They differ in what
+the client sees.
+
+- **A — remove the socket as soon as the exit is decided, before joining the
+  writer.** About 10 lines in `run`: move the identity-checked
+  `remove_socket` above `writer.join()`, keeping the lock until the end.
+  What it buys: new connections get `ENOENT` straight away, and queries take
+  the no-owner path: spawn a starter, answer in-process. The starter waits on
+  the endpoint lock, polling every 20 ms, and then wins. If the join outlasts
+  10 s, it gives up and the next client spawns another. What it costs: a
+  writer command now reaches `NoOwner` and runs in-process, but the exiting
+  writer still holds the catalog flock. So it fails with "another `ferret
+  index` holds the catalog lock", which replaces one error with another.
+  Streams already in the channel or the kernel backlog when the socket is
+  removed still see EOF. It does nothing for drain or the 33rd client. What it
+  forecloses: nothing, and it combines with B.
+- **B — the client treats EOF before hello as an owner leaving, and waits for
+  it to go.** About 15 lines in `connect_owner`. On EOF before hello, record
+  the socket's dev/ino in `draining_socket` (the existing build-mismatch wait)
+  and `continue`. Once the socket is gone or replaced, behave as if no owner
+  had been seen. A writer command then finds no owner and runs in-process,
+  because `close_writer` runs before the socket is removed, so the flock is
+  already free. A query spawns a daemon and answers in-process as today. What
+  it buys: one fix for idle exit, drain and the client cap, and no
+  daemon-side change. What it costs in latency: the time until the old
+  daemon removes its socket, plus up to one 20 ms poll. That is milliseconds
+  when the writer is idle. In the bad case it is the rest of an in-flight
+  refresh, capped at the 10 s startup deadline, after which today's
+  `OwnerTimeout` message stands. Queries should keep falling back at once
+  instead of waiting, so the wait applies to writers only. For the client cap
+  the socket never goes away, so a writer would wait out the whole 10 s and
+  then report `OwnerTimeout`. What it forecloses: a daemon can no longer
+  refuse a writer "now, try later" with a silent close; it would have to say
+  so in a hello.
+- **C — accept it and document it.** No code. Writer commands that race an
+  exit or a drain fail with exit 3, and a retry by the user succeeds. What it
+  costs: a scripted `ferret index` in a cron job or a git hook fails at
+  random, at a rate set by how often it lands on the idle boundary.
+
+Recommendation: B, for writer commands only. It is the one option that turns
+every no-hello close into the right outcome. It relies on an ordering the
+daemon already guarantees (writer lock released, then socket removed, then
+endpoint lock released), and it covers drain, which is the more likely of the
+three windows. A is cheap, but it moves the writer failure from EOF to the
+catalog-lock error, so on its own it does not help.
+
+What would change it: if refreshes taken after the exit decision often run
+for seconds (a large tree with heavy churn), B's wait would become visible. Then
+add A as well, and have the writer refuse new bursts once `stop` is set, so the
+join is always short.
