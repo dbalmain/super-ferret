@@ -463,3 +463,93 @@ fn a_refused_worker_spawn_leaves_the_walk_to_the_rest() {
         assert_eq!(records, expected, "fail at {fail}");
     }
 }
+
+#[test]
+fn long_steps_in_one_directory_run_at_once() {
+    // A grep step can search a 1 GiB file. Loans were offered only every 64
+    // steps and only of two or more siblings, so four huge files in one
+    // directory were searched one or two at a time while other workers sat
+    // idle. Each step here holds its file, then waits until all four are
+    // being "searched" together.
+    use super::super::{EntrySource, FileKind, LiveWalk};
+    use super::schedule::{Step, Visitor};
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    const FILES: usize = 4;
+    #[derive(Default)]
+    struct Rendezvous {
+        arrived: Mutex<usize>,
+        all: Condvar,
+        missed: AtomicUsize,
+    }
+    struct Searcher<'r>(&'r Rendezvous);
+    impl Visitor<LiveWalk, Option<PathBuf>> for Searcher<'_> {
+        fn step(&mut self, walk: &mut LiveWalk, held: &mut Option<PathBuf>) -> Step {
+            if held.take().is_some() {
+                let mut arrived = self.0.arrived.lock().unwrap();
+                *arrived += 1;
+                self.0.all.notify_all();
+                let (arrived, timeout) = self
+                    .0
+                    .all
+                    .wait_timeout_while(arrived, Duration::from_secs(5), |arrived| *arrived < FILES)
+                    .unwrap();
+                drop(arrived);
+                if timeout.timed_out() {
+                    self.0.missed.fetch_add(1, Ordering::SeqCst);
+                }
+                return Step::Next;
+            }
+            match walk.next_with_cancel(true, &mut || Ok(()), &mut || false) {
+                None => Step::Done,
+                Some(Ok(entry)) => {
+                    if entry.kind().is_ok_and(|kind| kind == FileKind::File) {
+                        *held = Some(entry.path().to_path_buf());
+                    }
+                    Step::Next
+                }
+                Some(Err(error)) => panic!("{error:?}"),
+            }
+        }
+        fn lend(&mut self, _parent: &mut Option<PathBuf>) -> Option<PathBuf> {
+            None
+        }
+        fn holding(&self, held: &Option<PathBuf>) -> bool {
+            held.is_some()
+        }
+        fn end(&mut self, _held: &mut Option<PathBuf>) -> u64 {
+            0
+        }
+    }
+
+    let tree = Tree::new();
+    let directory = tree.0.join("long");
+    fs::create_dir(&directory).unwrap();
+    for file in 0..FILES {
+        fs::write(directory.join(format!("f{file}")), b"x").unwrap();
+    }
+    let plan = Plan::parse(&[OsString::from("-I"), directory.into_os_string()]).unwrap();
+    let rendezvous = Rendezvous::default();
+    let quit = super::AtomicBool::new(false);
+    let schedule = super::Schedule {
+        workers: FILES,
+        starts: true,
+        quit: &quit,
+        on_panic: None,
+    };
+    super::schedule::run(
+        &schedule,
+        plan.live_source(),
+        None,
+        &mut Searcher(&rendezvous),
+        |_| true,
+        |_| Searcher(&rendezvous),
+    );
+    assert_eq!(*rendezvous.arrived.lock().unwrap(), FILES);
+    assert_eq!(
+        rendezvous.missed.load(Ordering::SeqCst),
+        0,
+        "searches that never overlapped all four"
+    );
+}
