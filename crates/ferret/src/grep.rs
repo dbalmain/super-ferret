@@ -540,6 +540,7 @@ impl<W: Write> Host<'_, W> {
         let flag = self.cancelled;
         let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
         let render = groups::Render {
+            capture: None,
             plan: self.plan,
             prefix: (self.filename || self.plan.json)
                 .then_some(label(path, self.plan.paths.is_empty())),

@@ -2,6 +2,8 @@
 //! The parent host supplies operands/policy; query's existing scheduler owns
 //! parallelism. A bounded completion queue feeds the calling publisher.
 
+mod capture;
+
 use super::*;
 use ferret_query::find::LiveWalk;
 use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
@@ -23,6 +25,7 @@ pub(super) struct Render<'a> {
     pub plan: &'a Plan,
     pub prefix: Option<&'a [u8]>,
     pub stopped: &'a dyn Fn() -> bool,
+    pub capture: Option<&'a Arc<capture::Budget>>,
 }
 
 #[derive(Clone)]
@@ -79,6 +82,7 @@ impl Capture {
 pub(super) struct Group {
     pub result: InputResult,
     pub output: OutputBuffer,
+    _capture: Option<capture::Held>,
     version: ReadVersion,
     records: Option<Vec<Record>>,
 }
@@ -101,35 +105,62 @@ pub(super) enum Observed {
     Streamed(InputResult, Option<String>),
 }
 
-/// Rendered captures never spill in production: crossing the threshold hands
-/// the captured prefix to the single publisher, then keeps writing there.
+/// Rendered captures never spill. Above the threshold they claim the single
+/// streaming slot or keep capturing within the shared allocation budget.
 struct OutputCapture<'a> {
     buffer: OutputBuffer,
+    held: Option<capture::Held>,
     target: &'a mut dyn Write,
+    stopped: &'a dyn Fn() -> bool,
     streamed: bool,
 }
 impl<'a> OutputCapture<'a> {
     fn new(target: &'a mut dyn Write) -> Self {
         Self {
             buffer: OutputBuffer::default().with_memory_limit(GROUP_BYTES),
+            held: None,
             target,
+            stopped: &|| false,
             streamed: false,
+        }
+    }
+    fn pooled(mut self, render: &Render<'a>) -> Self {
+        self.held = render.capture.map(|budget| budget.hold());
+        self.stopped = render.stopped;
+        self
+    }
+
+    fn reset(&mut self) {
+        self.buffer = OutputBuffer::default().with_memory_limit(GROUP_BYTES);
+        if let Some(held) = &mut self.held {
+            held.clear();
         }
     }
 }
 impl Write for OutputCapture<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if !self.streamed && self.buffer.len() + bytes.len() as u64 > GROUP_BYTES as u64 {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let count = bytes.len().min(CHUNK);
+        if !self.streamed {
+            let needed = self.buffer.len() as usize + count;
+            let capacity = if let Some(held) = &mut self.held {
+                held.grow(needed, self.stopped)?
+            } else {
+                (needed <= GROUP_BYTES).then_some(GROUP_BYTES)
+            };
+            if let Some(capacity) = capacity {
+                self.buffer = std::mem::take(&mut self.buffer).with_memory_limit(capacity);
+                return self.buffer.write(&bytes[..count]);
+            }
             self.streamed = true;
             self.buffer.write_to(self.target)?;
-            self.buffer = OutputBuffer::default();
+            self.reset();
         }
-        if self.streamed {
-            self.target.write(bytes)
-        } else {
-            self.buffer.write(bytes)
-        }
+        self.target.write(&bytes[..count])
     }
+
     fn flush(&mut self) -> io::Result<()> {
         if self.streamed {
             self.target.flush()
@@ -284,14 +315,14 @@ pub(super) fn observe_streaming(
     cache: bool,
     target: &mut dyn Write,
 ) -> io::Result<Observed> {
-    let mut output = OutputCapture::new(target);
+    let mut output = OutputCapture::new(target).pooled(render);
     let mut result = InputResult::default();
     let mut capture = Capture::new(cache);
     let mut output_failure = None;
     let mut changed_after_publication = false;
     let outcome = ferret_query::retry_read(
         || {
-            output.buffer = OutputBuffer::default().with_memory_limit(GROUP_BYTES);
+            output.reset();
             result = InputResult::default();
             capture = Capture::new(cache);
             let mut each = |input: &mut dyn Read, size| match render.scan(
@@ -360,6 +391,7 @@ pub(super) fn observe_streaming(
         ReadOutcome::Stable(version) => Observed::Ready(Group {
             result,
             output: output.buffer,
+            _capture: output.held,
             version,
             records: capture.records,
         }),
@@ -592,7 +624,11 @@ impl Worker<'_> {
         filename: bool,
         cache: &Mutex<Cache>,
         eligible: bool,
-        destination: (&dyn Fn() -> bool, &mut dyn Write),
+        destination: (
+            &dyn Fn() -> bool,
+            &mut dyn Write,
+            Option<&Arc<capture::Budget>>,
+        ),
     ) -> io::Result<Observed> {
         prepare(
             &self.plan,
@@ -617,13 +653,18 @@ fn prepare(
     filename: bool,
     cache: &Mutex<Cache>,
     eligible: bool,
-    destination: (&dyn Fn() -> bool, &mut dyn Write),
+    destination: (
+        &dyn Fn() -> bool,
+        &mut dyn Write,
+        Option<&Arc<capture::Budget>>,
+    ),
 ) -> io::Result<Observed> {
-    let (stopped, target) = destination;
+    let (stopped, target, capture) = destination;
     let render = Render {
         plan,
         prefix: (filename || plan.json).then(|| label(job.path(), plan.paths.is_empty())),
         stopped,
+        capture,
     };
     let observed = match job {
         Job::Checked(_, name, doc) => {
@@ -634,7 +675,7 @@ fn prepare(
             if let Some(cached) = cached {
                 match read(*name, ReadRequest::Stat) {
                     ReadOutcome::Stable(ReadVersion::Catalogued) => {
-                        let mut output = OutputCapture::new(target);
+                        let mut output = OutputCapture::new(target).pooled(&render);
                         let mut cursor = Cursor::default();
                         for record in &cached.records {
                             render.line(
@@ -659,6 +700,7 @@ fn prepare(
                         return Ok(Observed::Ready(Group {
                             result: cached.result,
                             output: output.buffer,
+                            _capture: output.held,
                             version: ReadVersion::Catalogued,
                             records: None,
                         }));
@@ -715,6 +757,7 @@ fn prepare(
         Job::Absent(_) => Observed::Ready(Group {
             result: InputResult::empty(plan),
             output: OutputBuffer::default().with_memory_limit(GROUP_BYTES),
+            _capture: None,
             version: ReadVersion::Catalogued,
             records: None,
         }),
@@ -917,7 +960,7 @@ pub(super) fn run<'a, W: Write>(
                     search.filename,
                     &search.cache,
                     eligible,
-                    (stopped, target),
+                    (stopped, target, Some(&search.capture)),
                 )
             });
             if worker.buffer.capacity() > ferret_query::KEPT_BUFFER {
@@ -967,6 +1010,7 @@ struct Search<'s> {
     fatal: Mutex<Option<io::Error>>,
     publication: Mutex<()>,
     descriptors: line_grep::IoBudget,
+    capture: Arc<capture::Budget>,
 }
 
 impl<'s> Search<'s> {
@@ -981,6 +1025,7 @@ impl<'s> Search<'s> {
             fatal: Mutex::new(None),
             publication: Mutex::new(()),
             descriptors: line_grep::IoBudget::new(threads),
+            capture: capture::Budget::new(threads),
         }
     }
 
@@ -1264,7 +1309,7 @@ impl Walker<'_, '_> {
                     self.search.filename,
                     &self.search.cache,
                     false,
-                    (self.stopped, target),
+                    (self.stopped, target, Some(&self.search.capture)),
                 )
             });
         if self.buffer.capacity() > ferret_query::KEPT_BUFFER {
@@ -2065,6 +2110,7 @@ mod tests {
             plan: &plan,
             prefix: None,
             stopped: &|| false,
+            capture: None,
         };
         let mut bytes = vec![b'x'; GROUP_BYTES];
         bytes.extend_from_slice(b"\nred\n");
@@ -2239,7 +2285,7 @@ mod tests {
                     true,
                     &cache,
                     true,
-                    (&|| false, &mut io::sink()),
+                    (&|| false, &mut io::sink(), None),
                 )
                 .unwrap();
             let Observed::Ready(mut group) = observed else {
@@ -2292,7 +2338,7 @@ mod tests {
                     true,
                     &cache,
                     true,
-                    (&|| false, &mut io::sink()),
+                    (&|| false, &mut io::sink(), None),
                 )
                 .unwrap()
             else {
@@ -2338,7 +2384,7 @@ mod tests {
                     false,
                     &cache,
                     true,
-                    (&|| false, &mut io::sink()),
+                    (&|| false, &mut io::sink(), None),
                 )
                 .unwrap()
             else {
@@ -2390,7 +2436,7 @@ mod tests {
                     false,
                     &cache,
                     true,
-                    (&|| false, &mut io::sink()),
+                    (&|| false, &mut io::sink(), None),
                 )
                 .unwrap()
             else {
@@ -2489,6 +2535,7 @@ mod tests {
             plan: &plan,
             prefix: None,
             stopped: &stopped,
+            capture: None,
         };
         let bytes = [b"red".to_vec(), vec![b'x'; 200_000]].concat();
         let mut input = &bytes[..];
@@ -2531,6 +2578,7 @@ mod tests {
         let mut destination = Cancellable {
             inner: &mut sink,
             stopped: &stopped,
+            capture: None,
         };
         let mut output = OutputCapture::new(&mut destination);
         output.write_all(&vec![b'x'; GROUP_BYTES]).unwrap();
@@ -2806,7 +2854,7 @@ mod tests {
                     false,
                     &cache,
                     true,
-                    (&|| false, &mut io::sink()),
+                    (&|| false, &mut io::sink(), None),
                 )
                 .unwrap()
             else {
@@ -2942,7 +2990,7 @@ mod tests {
                 true,
                 &cache,
                 true,
-                (&|| false, &mut io::sink()),
+                (&|| false, &mut io::sink(), None),
             )
             .unwrap();
         assert!(matches!(first, Observed::Ready(_)));
@@ -2954,7 +3002,7 @@ mod tests {
                 true,
                 &cache,
                 true,
-                (&|| false, &mut output),
+                (&|| false, &mut output, None),
             )
             .unwrap();
         assert!(matches!(second, Observed::Streamed(_, None)));
