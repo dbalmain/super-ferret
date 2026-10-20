@@ -712,7 +712,7 @@ fn run_property(patterns: u32, seed: u64) -> Tally {
                 tally.refused += 1;
                 continue;
             }
-            Err(e @ GrepError::Derivation(_)) => panic!("{pattern:?}: {e}"),
+            Err(e) => panic!("{pattern:?}: {e}"),
         };
         let search = grep.search();
         tally.filtered += u32::from(search.filters());
@@ -786,7 +786,7 @@ fn join(rng: &mut Rng, docs: &[Vec<u8>]) -> Vec<u8> {
 
 /// [`super::Search::find`] against the pattern over the whole text: the
 /// same first match.
-fn check_search(grep: &super::Grep, search: &super::Search, text: &[u8], tally: &mut Tally) {
+fn check_search(grep: &super::Grep, search: &super::Search<'_>, text: &[u8], tally: &mut Tally) {
     let expected = grep.regex().find(text).map(|m| m.start);
     assert_eq!(
         search.find(text),
@@ -794,6 +794,15 @@ fn check_search(grep: &super::Grep, search: &super::Search, text: &[u8], tally: 
         "{:?} over {text:?}",
         grep.pattern()
     );
+    if grep.is_line_local() {
+        let line = |at: usize| memchr::memchr_iter(b'\n', &text[..at]).count();
+        assert_eq!(
+            search.matching_line(text).map(line),
+            expected.map(line),
+            "line selection {:?} over {text:?}",
+            grep.pattern()
+        );
+    }
     if search.filters() {
         tally.filtered_matched += u32::from(expected.is_some());
         tally.filtered_windowed += u32::from(expected.is_none() && search.run_occurs(text));
@@ -1100,4 +1109,337 @@ fn the_search_finds_the_patterns_first_match_in_random_text() {
             same_first(grep, &text);
         }
     }
+}
+
+// Borrowed caches survive separate inputs without retaining their bytes or
+// changing assertion/span context, including invalid UTF-8 and terminal
+// empties.
+#[test]
+fn borrowed_and_owned_searches_agree_across_reused_inputs() {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    for pattern in [
+        r"\w+ing\b",
+        r"[a-z]+ing",
+        r"^red$",
+        r"\A|\z",
+        "",
+        r"\s",
+        r"(?-u:\xFF)",
+    ] {
+        let grep = flags.compile_lines(pattern).unwrap();
+        let owned = grep.search();
+        let borrowed = grep.borrowed_search();
+        for _ in 0..3 {
+            for bytes in [
+                b"singing red\n".as_slice(),
+                "é singing\n".as_bytes(),
+                b"\xffred\n",
+                b"red",
+                b"\n",
+                b"",
+            ] {
+                assert_eq!(
+                    borrowed.find(bytes),
+                    owned.find(bytes),
+                    "{pattern}: {bytes:?}"
+                );
+                assert_eq!(
+                    borrowed.spans(bytes).collect::<Vec<_>>(),
+                    owned.spans(bytes).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn filtered_spans_keep_matches_and_scan_one_window_once() {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    let count = 128;
+    let mut bytes = b"ing".repeat(count);
+    bytes.push(b'\n');
+    let grep = flags.compile_lines(r"[a-z]*?ing").unwrap();
+    let spans = grep.search().spans(&bytes).collect::<Vec<_>>();
+    assert_eq!(spans, grep.regex().spans(&bytes).collect::<Vec<_>>());
+    super::reset_window_scanned();
+    grep.search().spans(&bytes).for_each(drop);
+    assert!(
+        super::window_scanned() <= bytes.len() * 2,
+        "window boundary scans examined {} bytes for {} input bytes",
+        super::window_scanned(),
+        bytes.len()
+    );
+}
+
+// Selection needs the first matching source line even when an earliest end
+// belongs to a different alternative than the full leftmost-first span.
+#[test]
+fn earliest_end_and_full_span_select_the_same_source_line() {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    for pattern in [
+        r"a.*z|b",
+        r"red.*red|gap",
+        r"^|$",
+        r"\b",
+        r"\B",
+        r"\w+ing\b",
+        r"[a-z]+ing",
+        r"a*(?-u:\x90\x80\x81)$",
+        r"(?-u:[\x00-\x09\x0B-\xEF]*\x90\x80\x81)$",
+        r"[a-z]+ing\b",
+        "",
+        r"a*?",
+        r"(?-u:\xFF)",
+    ] {
+        let grep = flags.compile_lines(pattern).unwrap();
+        let search = grep.borrowed_search();
+        for text in [
+            b"a b z\nb\n".as_slice(),
+            b"gap\nred red\n",
+            "é walking\nmissing\n".as_bytes(),
+            b"\xff\nred\r\n\n",
+            b"",
+            b"\n",
+            b"red",
+            b"\x90\x80\x81\xf0\x90\x80\x81X",
+            "singing界no\nwalking\n".as_bytes(),
+            "x singing𐀀 end\n".as_bytes(),
+            "singing🙂\nred\n".as_bytes(),
+        ] {
+            let line = |at: usize| memchr::memchr_iter(b'\n', &text[..at]).count();
+            assert_eq!(
+                search.matching_line(text).map(line),
+                search.find(text).map(line),
+                "{pattern}: {text:?}"
+            );
+        }
+    }
+}
+
+// A filtered search finds each span in its required-run window. Every line
+// built from these pieces must give the spans the unfiltered regex gives:
+// runs at window edges, back to back, in non-word bytes' right context, next
+// to non-ASCII word characters and invalid UTF-8.
+#[test]
+fn windowed_spans_equal_the_regex_spans_over_every_line() {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    let pieces: [&[u8]; 10] = [
+        b"ing",
+        b"sing",
+        b" ",
+        b",",
+        "é".as_bytes(),
+        b"\xff",
+        b"_",
+        b"xab",
+        b"ab",
+        "ж".as_bytes(),
+    ];
+    for pattern in [
+        r"\w+ing\b",
+        r"\w*ing\b",
+        r"\w*ab\w*ing\b",
+        r"[a-z]+xab\b",
+        r"(?i)[A-Z_]+ing",
+    ] {
+        let grep = flags.compile_lines(pattern).unwrap();
+        let search = grep.borrowed_search();
+        assert!(search.filters(), "{pattern} must take the windowed path");
+        // Every sequence of up to five pieces, by counting in base ten.
+        for n in 0..100_000_u32 {
+            let mut line = Vec::new();
+            let mut rest = n;
+            for _ in 0..5 {
+                line.extend_from_slice(pieces[(rest % 10) as usize]);
+                rest /= 10;
+            }
+            assert_eq!(
+                search.spans(&line).collect::<Vec<_>>(),
+                grep.regex().spans(&line).collect::<Vec<_>>(),
+                "{pattern}: {line:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn windowed_spans_match_unwindowed_search_on_seeded_cases() {
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn pick(&mut self, len: usize) -> usize {
+            (self.next() as usize) % len
+        }
+    }
+
+    const SEED: u64 = 0x05ee_dcaf_ed15_ca11;
+    let mut rng = Rng(SEED);
+    let prefixes = [
+        "", r"\w*", r"\w*?", r".{0,5}", r".{0,5}?", r"[^x]+", r"[^x]+?",
+    ];
+    let suffixes = [
+        "", r"\w*", r"\w*?", r".{0,5}", r".{0,5}?", r"[^x]+", r"[^x]+?",
+    ];
+    let before = ["", r"\b", r"\B", "^"];
+    let after = ["", r"\b", r"\B", "$"];
+    let literals = ["abc", "long", "sss", "KKK", "xyz", "ßß", "aaa"];
+    let atoms: [&[u8]; 19] = [
+        b"a",
+        b"x",
+        b"_",
+        b" ",
+        b"!",
+        b"\n",
+        b"abc",
+        b"long",
+        b"sss",
+        b"SSS",
+        b"KKK",
+        b"kkk",
+        "ſ".as_bytes(),
+        "ſſſ".as_bytes(),
+        "K".as_bytes(),
+        "ß".as_bytes(),
+        "ßß".as_bytes(),
+        "界".as_bytes(),
+        b"\xff",
+    ];
+
+    let mut patterns = Vec::new();
+    let mut windowed = 0;
+    for _ in 0..128 {
+        let literal = literals[rng.pick(literals.len())];
+        let core = if rng.pick(12) == 0 {
+            // One branch has no required literal; it also supplies empty spans.
+            format!(
+                "(?:{}{}{}|)",
+                prefixes[rng.pick(prefixes.len())],
+                literal,
+                suffixes[rng.pick(suffixes.len())]
+            )
+        } else if rng.pick(12) == 0 {
+            format!(
+                "(?:{}{}{}|.{{0,4}}other)",
+                prefixes[rng.pick(prefixes.len())],
+                literal,
+                suffixes[rng.pick(suffixes.len())]
+            )
+        } else {
+            format!(
+                "{}{}{}",
+                prefixes[rng.pick(prefixes.len())],
+                literal,
+                suffixes[rng.pick(suffixes.len())]
+            )
+        };
+        let pattern = format!(
+            "{}{}{}{}",
+            if rng.pick(3) == 0 { "(?i)" } else { "" },
+            before[rng.pick(before.len())],
+            core,
+            after[rng.pick(after.len())]
+        );
+        let flags = GrepFlags {
+            case_insensitive: rng.pick(2) == 0,
+        };
+        let Ok(grep) = flags.compile(&pattern) else {
+            continue;
+        };
+        let search = grep.search();
+        windowed += usize::from(search.filters());
+        patterns.push((pattern, literal, search));
+    }
+
+    let mut compared = 0;
+    let mut empty_matches = 0;
+    for case in 0..3_500 {
+        let (pattern, literal, search) = &patterns[rng.pick(patterns.len())];
+        let reference = search.without_windowing();
+        let mut text = Vec::new();
+        // Long documents force many distinct windows and repeated/overlapping
+        // occurrences. The generated bytes also include invalid UTF-8.
+        let count = 48 + rng.pick(48);
+        for _ in 0..count {
+            text.extend_from_slice(atoms[rng.pick(atoms.len())]);
+        }
+        for _ in 0..(1 + rng.pick(4)) {
+            let at = rng.pick(text.len() + 1);
+            let insertion = match *literal {
+                "sss" if rng.pick(3) == 0 => "ſſſ".as_bytes(),
+                "KKK" if rng.pick(3) == 0 => "Kkk".as_bytes(),
+                "abc" if rng.pick(2) == 0 => b"ababc".as_slice(),
+                _ => literal.as_bytes(),
+            };
+            text.splice(at..at, insertion.iter().copied());
+        }
+        // Adjacent occurrences exercise the boundary between windows; `aaa`
+        // also overlaps within the repeated run.
+        text.extend_from_slice(literal.as_bytes());
+        text.extend_from_slice(literal.as_bytes());
+
+        let expected = reference.spans(&text).collect::<Vec<_>>();
+        let actual = search.spans(&text).collect::<Vec<_>>();
+        if actual != expected {
+            let mut minimal = text;
+            let mut chunk = minimal.len() / 2;
+            while chunk > 0 {
+                let mut reduced = false;
+                let mut start = 0;
+                while start + chunk <= minimal.len() {
+                    let mut candidate = minimal.clone();
+                    candidate.drain(start..start + chunk);
+                    if search.spans(&candidate).collect::<Vec<_>>()
+                        != reference.spans(&candidate).collect::<Vec<_>>()
+                    {
+                        minimal = candidate;
+                        reduced = true;
+                        break;
+                    }
+                    start += chunk;
+                }
+                if !reduced {
+                    chunk /= 2;
+                }
+            }
+            panic!(
+                "seed={SEED:#x} case={case} pattern={pattern:?} minimal_input={minimal:?} windowed={:?} unwindowed={:?}",
+                search.spans(&minimal).collect::<Vec<_>>(),
+                reference.spans(&minimal).collect::<Vec<_>>(),
+            );
+        }
+        empty_matches += expected.iter().filter(|span| span.is_empty()).count();
+        compared += 1;
+    }
+    assert!(
+        compared >= 3_000,
+        "seed={SEED:#x}: compiled {compared} cases"
+    );
+    assert!(
+        patterns.len() >= 120,
+        "seed={SEED:#x}: compiled {} patterns",
+        patterns.len()
+    );
+    assert!(
+        windowed > 20,
+        "seed={SEED:#x}: only {windowed} patterns used windows"
+    );
+    assert!(
+        empty_matches > 0,
+        "seed={SEED:#x}: no empty matches compared"
+    );
 }

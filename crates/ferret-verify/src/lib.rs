@@ -30,7 +30,7 @@ pub mod trigram;
 mod tests;
 
 pub use dialect::{Dialect, FindRegex, MatchLimit};
-pub use matcher::{Matcher, Regex, RegexError};
+pub use matcher::{Captures, Matcher, Regex, RegexError, Replacement};
 pub use scan::{Arm, Finder};
 pub use text::{MatchStats, Text, TextMatcher, forces_whole};
-pub use trigram::{Grep, GrepError, GrepFlags, Search, Trigrams};
+pub use trigram::{Grep, GrepError, GrepFlags, LineFlags, Search, Spans, Trigrams};

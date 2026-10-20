@@ -105,12 +105,15 @@ mod content;
 mod expr;
 pub mod find;
 mod grep;
+pub mod line_grep;
 
 pub mod name_index;
 mod pattern;
 mod plan;
 mod query;
+mod read;
 mod run;
+mod scan;
 mod verify;
 
 #[cfg(test)]
@@ -124,5 +127,12 @@ pub use plan::{
     ReadRequest, ReadVersion, Reader, Side, UNCOVERED_BOUND,
 };
 pub use query::{GREP_PREFIX, ParseError, Query, Strategy};
+pub use read::{CheckedReader, ReadFault, ReadOperation, ReadOutcome, read_bytes, retry_read};
 pub use run::{Row, RunError, Stats};
 pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers};
+
+/// Shared bounded scheduling for completed grep file groups.
+pub use verify::{
+    GroupSchedule, Lane, Reservation, Shortfall, completion_groups, completion_groups_with_handoff,
+    lane_groups,
+};

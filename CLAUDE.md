@@ -16,6 +16,8 @@ nix develop --command cargo test --workspace
 
 The dev shell supplies the pinned GNU findutils 4.11.0 differential oracle via
 `FERRET_GNU_FIND`. Missing or different oracle versions fail the tests.
+Python (`FERRET_PYTHON`) drives grep's real-pty differential tests using its
+standard-library `os.openpty`; it is test tooling only.
 
 Formatting needs nightly rustfmt because `rustfmt.toml` wraps comments; the
 flake pins it, and the build stays on stable. Plain `cargo fmt` with stable

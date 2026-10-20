@@ -15,17 +15,19 @@ use std::ffi::OsStr;
 use std::fs::{self, File, FileType, Metadata};
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use std::ops::Deref;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
 
-use ferret_catalog::{Catalog, Contents, InoId, Kind, Target};
+use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
 
+use super::schedule::Share;
 use super::{Follow, Options};
 
 /// Find's file kinds on Linux.
@@ -45,6 +47,49 @@ pub enum FileKind {
     Block,
     /// Character device.
     Character,
+}
+
+/// A retained directory descriptor. Clones share both the descriptor and its
+/// budget charge, so queued work keeps the descriptor charged until last use.
+#[derive(Clone, Debug)]
+pub struct DirectoryHandle {
+    file: Arc<File>,
+    _charge: Option<Arc<Charge>>,
+}
+
+impl DirectoryHandle {
+    /// Wraps an existing directory descriptor without a walk budget charge.
+    pub fn from_file(file: Arc<File>) -> Self {
+        Self::uncharged(file)
+    }
+
+    fn uncharged(file: Arc<File>) -> Self {
+        Self {
+            file,
+            _charge: None,
+        }
+    }
+
+    fn charged(file: Arc<File>, charge: Charge) -> Self {
+        Self {
+            file,
+            _charge: Some(Arc::new(charge)),
+        }
+    }
+}
+
+impl Deref for DirectoryHandle {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl AsFd for DirectoryHandle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
 }
 
 pub(super) fn kind(value: FileType) -> FileKind {
@@ -122,7 +167,9 @@ impl Entry {
                 metadata: OnceCell::new(),
                 target: None,
                 parent: None,
+                id: None,
                 catalog: None,
+                listed: None,
             },
         }
     }
@@ -133,6 +180,19 @@ impl Entry {
     }
     pub(super) fn root(&self) -> &Path {
         Path::new(OsStr::from_bytes(&self.path[..self.root_len]))
+    }
+
+    /// Catalog name identity when this entry came from stored children.
+    pub fn catalog_name(&self) -> Option<ferret_catalog::NameId> {
+        let catalog = self.state.catalog.as_ref()?;
+        let parent = self.state.parent?;
+        // A catalog listing already knows the id; looking it up again was most
+        // of the serial producer's time in a flat directory (grep-why P1).
+        if let Some(id) = self.state.id {
+            debug_assert_eq!(Some(id), catalog.lookup(parent, self.name()));
+            return Some(id);
+        }
+        catalog.lookup(parent, self.name())
     }
 
     /// Depth relative to the current start path, which has depth zero.
@@ -267,16 +327,28 @@ impl Entry {
         }
     }
 
-    pub(super) fn command_cwd(&self) -> Option<Arc<File>> {
+    pub(super) fn command_cwd(&self) -> Option<DirectoryHandle> {
         if self.inherit_cwd {
             None
         } else {
-            self.cwd_handle.clone()
+            self.cwd_handle.clone().map(DirectoryHandle::uncharged)
         }
     }
 
-    pub(super) fn directory_handle(&self) -> Option<Arc<File>> {
+    /// The directory this entry was listed in, still open, when its walk
+    /// retains parents ([`LiveWalk::retaining_parents`]); `None` for a
+    /// catalogued listing, which opens no directory. A start operand's is the
+    /// directory named by its spelling's parent.
+    pub fn directory_handle(&self) -> Option<DirectoryHandle> {
         self.state.directory.clone()
+    }
+
+    /// The `(dev, ino)` of the directory this entry was listed in, when a
+    /// walk [retaining parents](LiveWalk::retaining_parents) was past its
+    /// descriptor budget and closed it after listing: a host that reopens
+    /// the directory by path checks it against this.
+    pub fn directory_identity(&self) -> Option<(u64, u64)> {
+        self.state.listed
     }
 
     fn follow_catalog(&mut self) -> io::Result<()> {
@@ -481,6 +553,17 @@ pub trait EntrySource {
     ) -> Option<Result<&Entry, WalkError>> {
         self.next(descend)
     }
+    /// Fetches the next entry while allowing long source operations to poll
+    /// for cancellation. Sources that cannot poll internally retain their
+    /// existing fetch behavior.
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        _cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.next_with(descend, before_directory)
+    }
 }
 
 impl<S: EntrySource + ?Sized> EntrySource for &mut S {
@@ -497,24 +580,38 @@ impl<S: EntrySource + ?Sized> EntrySource for &mut S {
     ) -> Option<Result<&Entry, WalkError>> {
         (**self).next_with(descend, before_directory)
     }
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        (**self).next_with_cancel(descend, before_directory, cancelled)
+    }
 }
 
 /// getdents64 buffer. One call reads a typical directory whole; 8 KiB took
 /// three calls per directory on the timing tree.
 const LISTING_BUFFER: usize = 64 * 1024;
+/// Bounds cancellation work without polling the host once per name.
+pub(super) const CANCELLATION_INTERVAL: usize = 256;
 
 /// A directory entry's own fields while its children use the lent entry.
 #[derive(Clone, Default)]
 struct Saved {
     follow: bool,
     followed_symlink: bool,
-    directory: Option<Arc<File>>,
+    directory: Option<DirectoryHandle>,
     depth: usize,
     kind: Option<FileKind>,
     metadata: OnceCell<Result<Metadata, Arc<io::Error>>>,
     target: Option<Target>,
     parent: Option<InoId>,
+    id: Option<NameId>,
     catalog: Option<Arc<Catalog>>,
+    /// The listing directory's `(dev, ino)`, where a walk bounded by
+    /// [`Charge`] closed it instead of retaining it.
+    listed: Option<(u64, u64)>,
 }
 
 impl Saved {
@@ -535,6 +632,7 @@ struct Child {
     kind: Option<FileKind>,
     target: Option<Target>,
     parent: Option<InoId>,
+    id: Option<NameId>,
 }
 
 /// An open directory. Its children occupy `start..end` of the walk's child
@@ -543,7 +641,10 @@ struct Child {
 struct Level {
     catalogued: bool,
     pending: Option<Arc<AtomicUsize>>,
-    handle: Option<Arc<File>>,
+    handle: Option<DirectoryHandle>,
+    /// The directory's `(dev, ino)` when `handle` was closed for want of
+    /// budget.
+    identity: Option<(u64, u64)>,
     /// The directory's own path is `entry.path[..path_len]`.
     path_len: usize,
     separator: bool,
@@ -577,7 +678,8 @@ enum Loaded {
 
 /// Sequential DFS. The unrestricted source uses readdir without ignore rules;
 /// the catalog source shares the stack and substitutes catalog child listings.
-/// It holds one directory handle per ancestor and never sorts child names.
+/// It holds one directory handle per ancestor only when it retains parents,
+/// and never sorts child names.
 /// A descriptor exhaustion error is reported just like a listing failure.
 pub struct LiveWalk {
     catalog: Option<Arc<Catalog>>,
@@ -595,11 +697,37 @@ pub struct LiveWalk {
     children: Vec<Child>,
     names: Vec<u8>,
     buffer: Vec<MaybeUninit<u8>>,
+    cancelled: bool,
     #[cfg(test)]
     pub(super) force_unknown: bool,
+    #[cfg(test)]
+    pub(super) on_listed: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl LiveWalk {
+    /// An unrestricted physical walk, retaining each operand's spelling.
+    pub fn paths(paths: Vec<PathBuf>, cwd: PathBuf) -> Self {
+        Self::new(paths, Options::at(cwd))
+    }
+
+    /// Keeps each listed directory open while its entries are visited, so
+    /// that a host can open a listed name beneath the directory it was listed
+    /// in ([`Entry::directory_handle`]) instead of resolving its path again,
+    /// which a name swapped for a symlink would redirect (D21). Costs one
+    /// descriptor per directory on the walk's stack, plus one per start for
+    /// the start's parent; the syscalls are the same.
+    ///
+    /// Those descriptors are charged to a process-wide budget ([`Charge`]).
+    /// Past it a listed directory is closed as an unretaining walk closes
+    /// it, keeping only its `(dev, ino)` from one `fstat`
+    /// ([`Entry::directory_identity`]), so a deep tree under a low open-file
+    /// limit walks as it would without retaining.
+    pub fn retaining_parents(mut self) -> Self {
+        self.options.retain_parent = true;
+        self.options.bounded_parents = true;
+        self
+    }
+
     pub(super) fn new(paths: Vec<PathBuf>, options: Options) -> Self {
         Self {
             catalog: None,
@@ -616,8 +744,11 @@ impl LiveWalk {
             children: Vec::new(),
             names: Vec::new(),
             buffer: Vec::new(),
+            cancelled: false,
             #[cfg(test)]
             force_unknown: false,
+            #[cfg(test)]
+            on_listed: None,
         }
     }
 
@@ -669,7 +800,13 @@ impl LiveWalk {
     // Donate siblings already observed by readdir. Ancestor levels remain in
     // the donated walk solely for loop detection and start/device identity.
     // Its boundary excludes their evaluation; the donor owns their completion.
-    pub(super) fn split(&mut self) -> Option<(Self, Arc<AtomicUsize>)> {
+    // A loan copies the children up to the level's end, so a whole level is
+    // lent only under `Share::Idle`, when each lent sibling has an idle worker.
+    pub(super) fn split(&mut self, share: Share) -> Option<(Self, Arc<AtomicUsize>)> {
+        let fewest = match share {
+            Share::Half => 2,
+            Share::Idle(_) => 1,
+        };
         // At depth two, catalog donation costs 7.4 ms versus 6.6 ms on the
         // caller. Live fallback levels still donate, even in this mode.
         let index = self
@@ -678,7 +815,7 @@ impl LiveWalk {
             .enumerate()
             .skip(self.boundary.saturating_sub(1))
             .find_map(|(index, level)| {
-                (level.end - level.next >= 2
+                (level.end - level.next >= fewest
                     && !(level.catalogued && self.options.max_depth.is_some_and(|max| max <= 2)))
                 .then_some(index)
             })?;
@@ -687,7 +824,11 @@ impl LiveWalk {
             .get_or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
         let level = &self.levels[index];
-        let middle = level.next + (level.end - level.next) / 2;
+        let unvisited = level.end - level.next;
+        let middle = match share {
+            Share::Idle(idle) if unvisited <= idle => level.next,
+            Share::Half | Share::Idle(_) => level.next + unvisited / 2,
+        };
         let mut levels: Vec<_> = self.levels[..=index].to_vec();
         let donated = &mut levels[index];
         donated.next = middle;
@@ -703,9 +844,11 @@ impl LiveWalk {
         walk.boundary = index + 1;
         walk.children = self.children[..level.end].to_vec();
         walk.names = self.names.clone();
+        walk.cancelled = self.cancelled;
         #[cfg(test)]
         {
             walk.force_unknown = self.force_unknown;
+            walk.on_listed = self.on_listed.clone();
         }
         self.levels[index].end = middle;
         pending.fetch_add(1, Ordering::Relaxed);
@@ -716,6 +859,7 @@ impl LiveWalk {
     fn descend(
         &mut self,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<(), WalkError> {
         let entry = &mut self.entry;
         if self
@@ -752,7 +896,19 @@ impl LiveWalk {
             };
             let start = self.children.len();
             let names_start = self.names.len();
+            let mut seen = 0usize;
             for child in catalog.entries(dir) {
+                seen += 1;
+                #[cfg(test)]
+                if let Some(listed) = &self.on_listed {
+                    listed();
+                }
+                if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
+                    self.children.truncate(start);
+                    self.names.truncate(names_start);
+                    self.cancelled = true;
+                    return Ok(());
+                }
                 if matches!(child.target, Target::Ignored(_)) {
                     continue;
                 }
@@ -800,6 +956,7 @@ impl LiveWalk {
                     kind: Some(catalog_kind(child.kind)),
                     target: Some(child.target),
                     parent: Some(dir),
+                    id: Some(child.name),
                 });
             }
             // Nested roots have no name row in the outer crawl (D34).
@@ -811,6 +968,17 @@ impl LiveWalk {
                 .take_while(|(parent, _, _)| *parent == dir);
             let mut added = false;
             for (_, id, name) in roots {
+                seen += 1;
+                #[cfg(test)]
+                if let Some(listed) = &self.on_listed {
+                    listed();
+                }
+                if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
+                    self.children.truncate(start);
+                    self.names.truncate(names_start);
+                    self.cancelled = true;
+                    return Ok(());
+                }
                 added = true;
                 let name_start = self.names.len();
                 self.names.extend_from_slice(name);
@@ -819,7 +987,14 @@ impl LiveWalk {
                     kind: Some(FileKind::Directory),
                     target: Some(Target::Inode(*id)),
                     parent: Some(dir),
+                    id: None,
                 });
+            }
+            if cancelled() {
+                self.children.truncate(start);
+                self.names.truncate(names_start);
+                self.cancelled = true;
+                return Ok(());
             }
             if added {
                 self.children[start..].sort_unstable_by(|a, b| {
@@ -836,10 +1011,11 @@ impl LiveWalk {
                 catalogued: true,
                 pending: None,
                 handle: if self.options.retain_parent {
-                    handle
+                    handle.map(DirectoryHandle::uncharged)
                 } else {
                     None
                 },
+                identity: None,
                 path_len,
                 separator,
                 start,
@@ -870,6 +1046,7 @@ impl LiveWalk {
             self.buffer.resize(LISTING_BUFFER, MaybeUninit::uninit());
         }
         let mut reader = RawDir::new(&*handle, &mut self.buffer);
+        let mut seen = 0usize;
         while let Some(item) = reader.next() {
             let item = match item {
                 Ok(item) => item,
@@ -882,6 +1059,17 @@ impl LiveWalk {
                     });
                 }
             };
+            seen += 1;
+            #[cfg(test)]
+            if let Some(listed) = &self.on_listed {
+                listed();
+            }
+            if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
+                self.children.truncate(start);
+                self.names.truncate(names_start);
+                self.cancelled = true;
+                return Ok(());
+            }
             let name = item.file_name().to_bytes();
             if name == b"." || name == b".." {
                 continue;
@@ -911,7 +1099,14 @@ impl LiveWalk {
                 kind,
                 target,
                 parent: None,
+                id: None,
             });
+        }
+        if cancelled() {
+            self.children.truncate(start);
+            self.names.truncate(names_start);
+            self.cancelled = true;
+            return Ok(());
         }
         if self.children.len() > start
             && let Err(error) = before_directory()
@@ -930,16 +1125,29 @@ impl LiveWalk {
         // whole subtree the way an effectful walk must, bounds live fd use
         // by width instead of depth (#10): a 100-level chain under a tight
         // RLIMIT_NOFILE no longer exhausts descriptors one per ancestor.
-        let handle = if self.options.retain_parent {
-            Some(handle)
-        } else {
+        let (handle, identity) = if !self.options.retain_parent {
             drop(handle);
-            None
+            (None, None)
+        } else if !self.options.bounded_parents {
+            (Some(DirectoryHandle::uncharged(handle)), None)
+        } else if let Some(charge) = Charge::take() {
+            (Some(DirectoryHandle::charged(handle, charge)), None)
+        } else {
+            match handle.metadata() {
+                Ok(stat) => (None, Some((stat.dev(), stat.ino()))),
+                Err(error) => {
+                    self.children.truncate(start);
+                    self.names.truncate(names_start);
+                    own.restore(entry);
+                    return Err(entry.error(error));
+                }
+            }
         };
         self.levels.push(Level {
             catalogued: false,
             pending: None,
             handle,
+            identity,
             path_len,
             separator,
             start,
@@ -991,12 +1199,15 @@ impl LiveWalk {
                     && (self.catalog.is_none() || self.options.live_checks)
                 {
                     match parent_handle(&self.entry) {
-                        Ok(handle) => self.entry.state.directory = Some(handle),
+                        Ok(handle) => {
+                            self.entry.state.directory = Some(DirectoryHandle::uncharged(handle))
+                        }
                         Err(error) => return Some(Err(self.entry.error(error))),
                     }
                 }
                 if let Some(catalog) = &self.catalog {
                     if self.options.delete {
+                        self.entry.state.id = None;
                         self.entry.state.parent =
                             std::path::absolute(self.entry.lookup_path().as_ref())
                                 .ok()
@@ -1043,7 +1254,9 @@ impl LiveWalk {
                 }
                 if self.options.retain_parent && self.entry.state.directory.is_none() {
                     match parent_handle(&self.entry) {
-                        Ok(handle) => self.entry.state.directory = Some(handle),
+                        Ok(handle) => {
+                            self.entry.state.directory = Some(DirectoryHandle::uncharged(handle))
+                        }
                         Err(error) => return Some(Err(self.entry.error(error))),
                     }
                 }
@@ -1072,12 +1285,14 @@ impl LiveWalk {
             entry.state.follow = self.options.follow == Follow::All;
             entry.state.followed_symlink = false;
             entry.state.directory = level.handle.clone();
+            entry.state.listed = level.identity;
             entry.state.depth = level.own.depth + 1;
             entry.state.kind = child.kind;
             entry.check_directory = false;
             entry.state.metadata = OnceCell::new();
             entry.state.target = child.target;
             entry.state.parent = child.parent;
+            entry.state.id = child.id;
             // Deletion accounting is walk-wide and stays in the reusable entry;
             // re-cloning its shared counter here contends across workers.
             if child.target.is_some() {
@@ -1109,6 +1324,7 @@ impl LiveWalk {
     fn visit(
         &mut self,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<bool, WalkError> {
         let entry = &mut self.entry;
         if entry.check_directory {
@@ -1200,7 +1416,7 @@ impl LiveWalk {
         if self.options.xdev && entry.stat().is_ok_and(|stat| stat.dev() != self.root_dev) {
             return Ok(true);
         }
-        self.descend(before_directory)?;
+        self.descend(before_directory, cancelled)?;
         Ok(false)
     }
 
@@ -1208,12 +1424,19 @@ impl LiveWalk {
         &mut self,
         descend: bool,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Option<Result<&Entry, WalkError>> {
+        if self.cancelled {
+            return None;
+        }
         self.suspended = false;
         let mut loaded = match std::mem::replace(&mut self.slot, Slot::Empty) {
             Slot::Pending if descend => {
-                if let Err(error) = self.descend(before_directory) {
+                if let Err(error) = self.descend(before_directory, cancelled) {
                     return Some(Err(error));
+                }
+                if self.cancelled {
+                    return None;
                 }
                 None
             }
@@ -1222,6 +1445,9 @@ impl LiveWalk {
             Slot::Empty | Slot::Pending => None,
         };
         loop {
+            if self.cancelled {
+                return None;
+            }
             let current = match loaded.take() {
                 Some(current) => current,
                 None => match self.advance()? {
@@ -1231,7 +1457,7 @@ impl LiveWalk {
             };
             match current {
                 Loaded::Directory => return Some(Ok(&self.entry)),
-                Loaded::Entry => match self.visit(before_directory) {
+                Loaded::Entry => match self.visit(before_directory, cancelled) {
                     Ok(true) => return Some(Ok(&self.entry)),
                     Ok(false) => {}
                     Err(error) => return Some(Err(error)),
@@ -1246,14 +1472,22 @@ impl EntrySource for LiveWalk {
         self.catalog.as_deref()
     }
     fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>> {
-        self.next_entry(descend, &mut || Ok(()))
+        self.next_entry(descend, &mut || Ok(()), &mut || false)
     }
     fn next_with(
         &mut self,
         descend: bool,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
     ) -> Option<Result<&Entry, WalkError>> {
-        self.next_entry(descend, before_directory)
+        self.next_entry(descend, before_directory, &mut || false)
+    }
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.next_entry(descend, before_directory, cancelled)
     }
 }
 
@@ -1277,6 +1511,32 @@ pub struct CatalogSource {
 }
 
 impl CatalogSource {
+    /// Namespace sections needed by physical traversal, including their
+    /// validated dependencies. No document/content sections are required.
+    pub fn sections() -> &'static [ferret_catalog::Section] {
+        use ferret_catalog::Section;
+        &[
+            Section::Names,
+            Section::Links,
+            Section::Roots,
+            Section::Entries,
+        ]
+    }
+
+    /// Catalog visibility with find's ordinary physical traversal and live
+    /// fallback for explicit ignored/opaque starts. No expression is parsed.
+    pub fn paths(catalog: Catalog, paths: Vec<PathBuf>, cwd: PathBuf) -> Self {
+        Self::new(catalog, paths, Options::at(cwd))
+    }
+
+    /// [`LiveWalk::retaining_parents`] for the live listings of opaque and
+    /// ignored directories. Catalogued listings open no directory to retain.
+    pub fn retaining_parents(mut self) -> Self {
+        self.walk.options.retain_parent = true;
+        self.walk.options.bounded_parents = true;
+        self
+    }
+
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
         let mut walk = LiveWalk::new(paths, options);
         walk.removed_children = walk
@@ -1321,6 +1581,15 @@ impl EntrySource for CatalogSource {
     ) -> Option<Result<&Entry, WalkError>> {
         self.walk.next_with(descend, before_directory)
     }
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.walk
+            .next_with_cancel(descend, before_directory, cancelled)
+    }
 }
 
 fn catalog_kind(kind: Kind) -> FileKind {
@@ -1332,6 +1601,40 @@ fn catalog_kind(kind: Kind) -> FileKind {
         Kind::Socket => FileKind::Socket,
         Kind::Block => FileKind::Block,
         Kind::Character => FileKind::Character,
+    }
+}
+
+/// One retained parent descriptor's share of the budget that
+/// [`LiveWalk::retaining_parents`] walks share: a quarter of the process's
+/// open-file limit, at most 1,024, as for the crawl's held directories
+/// (D21). Returned when dropped.
+#[derive(Debug)]
+struct Charge;
+
+static PARENTS: OnceLock<AtomicUsize> = OnceLock::new();
+
+impl Charge {
+    fn budget() -> &'static AtomicUsize {
+        PARENTS.get_or_init(|| {
+            let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+            AtomicUsize::new(limit.map_or(1024, |limit| (limit / 4).min(1024)) as usize)
+        })
+    }
+
+    /// A share, if any is left.
+    fn take() -> Option<Self> {
+        Self::budget()
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .ok()
+            .map(|_| Charge)
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        Self::budget().fetch_add(1, Ordering::AcqRel);
     }
 }
 

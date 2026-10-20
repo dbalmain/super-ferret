@@ -16,6 +16,7 @@
 //! uses [`GrepFlags::required_literals`] to measure longer grams through
 //! the same fold, while shipped trigrams retain their original limits.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -23,6 +24,9 @@ use ferret_text::trigram_key;
 use regex_syntax::hir::{Class, Hir, HirKind};
 
 use crate::matcher::{Regex, RegexError};
+
+mod profile;
+pub use profile::LineFlags;
 
 #[cfg(test)]
 mod tests;
@@ -145,8 +149,55 @@ impl GrepFlags {
             trigrams,
             planning,
             line_local,
+            lf_excluded: lf_excluded(&hir),
             filter,
         })
+    }
+
+    /// Compiles grep's line profile. Literal LF nodes are errors (classes
+    /// containing LF are harmless because execution excludes terminators).
+    /// The necessary query still describes the original indexed bytes when
+    /// the executor strips an initial UTF-8 BOM.
+    pub fn compile_lines(&self, pattern: &str) -> Result<Grep, GrepError> {
+        let grep = self.compile(pattern)?;
+        let hir = self
+            .parser()
+            .build()
+            .parse(pattern)
+            .map_err(|e| GrepError::Derivation(e.to_string()))?;
+        fn literal_lf(hir: &Hir) -> bool {
+            match hir.kind() {
+                HirKind::Literal(literal) => literal.0.contains(&b'\n'),
+                HirKind::Capture(capture) => literal_lf(&capture.sub),
+                HirKind::Repetition(repetition) => literal_lf(&repetition.sub),
+                HirKind::Concat(parts) | HirKind::Alternation(parts) => {
+                    parts.iter().any(literal_lf)
+                }
+                _ => false,
+            }
+        }
+        if pattern.contains('\n') || literal_lf(&hir) {
+            return Err(GrepError::LineFeed);
+        }
+        Ok(grep)
+    }
+
+    /// Compile a line profile's OR patterns after resolving fixed-string mode.
+    /// Pattern arguments remain intact; only the eventual pattern-file caller
+    /// splits its input into lines. Scoped alternatives keep inline flags
+    /// local.
+    pub fn compile_line_patterns(
+        &self,
+        patterns: &[String],
+        fixed: bool,
+    ) -> Result<Grep, GrepError> {
+        self.compile_line_profile(
+            patterns,
+            LineFlags {
+                fixed,
+                ..LineFlags::default()
+            },
+        )
     }
 
     /// Experimental required literals, using the same Cox fold and flags as
@@ -193,6 +244,7 @@ pub struct Grep {
     /// Every match lies within one line, and finding it needs nothing
     /// beyond that line ([`Grep::is_line_local`]).
     line_local: bool,
+    lf_excluded: bool,
     /// A required run of the pattern, searched first to find where a match
     /// can be ([`Search`]); only for line-local patterns whose matches the
     /// engine cannot find by a literal prefix.
@@ -227,12 +279,31 @@ impl Grep {
         self.line_local
     }
 
+    /// Conservative LF exclusion from the resolved HIR. Line/absolute
+    /// assertions give no exclusion proof; word assertions do. Impossible
+    /// alternatives are not discarded.
+    /// This is a counting/execution profile, not language reachability.
+    pub fn excludes_lf(&self) -> bool {
+        self.lf_excluded
+    }
+
     /// A copy of what finds the first match, for one thread's own use
     /// (its engine caches are then its own).
-    pub fn search(&self) -> Search {
+    pub fn search(&self) -> Search<'static> {
         Search {
-            regex: self.regex.clone(),
-            filter: self.filter.clone(),
+            regex: Cow::Owned(self.regex.clone()),
+            filter: self.filter.clone().map(Cow::Owned),
+        }
+    }
+
+    /// Reuse this grep's cache pool across inputs instead of creating cold
+    /// caches for each file. The regex pool supplies independent concurrent
+    /// searches with their own caches; owned searches remain available for
+    /// long-lived worker-local use.
+    pub fn borrowed_search(&self) -> Search<'_> {
+        Search {
+            regex: Cow::Borrowed(&self.regex),
+            filter: self.filter.as_ref().map(Cow::Borrowed),
         }
     }
 
@@ -292,22 +363,81 @@ impl Grep {
 /// ([`Grep::is_line_local`]). The run is cut from the parsed pattern itself,
 /// after case folding, so it accepts every case variant the pattern does
 /// (`k` and the Kelvin sign, `s` and the long s).
+///
+/// Line selection additionally uses consuming-byte windows with original left
+/// context and four right-context bytes. Its end-position bound prevents added
+/// context, including an artificial EOF, from supplying a selected match.
 #[derive(Clone, Debug)]
-pub struct Search {
-    regex: Regex,
-    filter: Option<Filter>,
+pub struct Search<'a> {
+    regex: Cow<'a, Regex>,
+    filter: Option<Cow<'a, Filter>>,
 }
 
 /// [`Search`]'s required run and window.
 #[derive(Clone, Debug)]
 struct Filter {
     run: Regex,
-    /// The bytes a match can be made of, by byte value; `None` for a
-    /// pattern with assertions, whose window is the line.
-    within: Option<Box<[bool; 256]>>,
+    /// Every byte a consuming node can admit. Full-span searches keep a
+    /// whole line when assertions are present; line selection adds context
+    /// around this narrower window instead.
+    within: Box<Window>,
 }
 
-impl Search {
+#[derive(Clone, Debug)]
+struct Window {
+    bytes: [bool; 256],
+    assertions: bool,
+}
+
+impl Filter {
+    fn start(&self, text: &[u8], at: usize, hit_start: usize) -> usize {
+        text[at..hit_start]
+            .iter()
+            .rposition(|&b| !self.within.bytes[usize::from(b)])
+            .map_or(at, |i| at + i + 1)
+    }
+
+    fn window(&self, text: &[u8], at: usize, hit: std::ops::Range<usize>) -> (usize, usize) {
+        #[cfg(test)]
+        WINDOW_SCANNED.with(|scanned| scanned.set(scanned.get() + text.len() - hit.end));
+        (
+            text[at..hit.start]
+                .iter()
+                .rposition(|&b| !self.within.bytes[usize::from(b)])
+                .map_or(at, |i| at + i + 1),
+            text[hit.end..]
+                .iter()
+                .position(|&b| !self.within.bytes[usize::from(b)])
+                .map_or(text.len(), |i| hit.end + i),
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WINDOW_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_window_scanned() {
+    WINDOW_SCANNED.with(|scanned| scanned.set(0));
+}
+
+#[cfg(test)]
+fn window_scanned() -> usize {
+    WINDOW_SCANNED.with(std::cell::Cell::get)
+}
+
+impl Search<'_> {
+    /// Uses the same regex and span iterator without the required-run windows.
+    #[cfg(test)]
+    fn without_windowing(&self) -> Search<'_> {
+        Search {
+            regex: Cow::Borrowed(&self.regex),
+            filter: None,
+        }
+    }
+
     /// Offset of the first match's start in `text`.
     pub fn find(&self, text: &[u8]) -> Option<usize> {
         let Some(filter) = &self.filter else {
@@ -316,22 +446,14 @@ impl Search {
         let mut at = 0;
         while at <= text.len() {
             let hit = filter.run.find(&text[at..])?;
-            let (hit, hit_end) = (at + hit.start, at + hit.end);
-            let (start, end) = match &filter.within {
-                None => (
-                    memchr::memrchr(b'\n', &text[at..hit]).map_or(at, |i| at + i + 1),
-                    memchr::memchr(b'\n', &text[hit_end..]).map_or(text.len(), |i| hit_end + i),
-                ),
-                Some(within) => (
-                    text[at..hit]
-                        .iter()
-                        .rposition(|&b| !within[usize::from(b)])
-                        .map_or(at, |i| at + i + 1),
-                    text[hit_end..]
-                        .iter()
-                        .position(|&b| !within[usize::from(b)])
-                        .map_or(text.len(), |i| hit_end + i),
-                ),
+            let hit = at + hit.start..at + hit.end;
+            let (start, end) = if filter.within.assertions {
+                (
+                    memchr::memrchr(b'\n', &text[at..hit.start]).map_or(at, |i| at + i + 1),
+                    memchr::memchr(b'\n', &text[hit.end..]).map_or(text.len(), |i| hit.end + i),
+                )
+            } else {
+                filter.window(text, at, hit)
             };
             if let Some(span) = self.regex.find(&text[start..end]) {
                 return Some(start + span.start);
@@ -340,6 +462,58 @@ impl Search {
             at = end + 1;
         }
         None
+    }
+
+    /// A position on the first matching line, possibly at its LF or end.
+    /// Requires [`Grep::is_line_local`]. Consuming-byte windows keep original
+    /// left context and four right-context bytes for LF/Unicode word
+    /// assertions. An occurrence ending in that added context cannot select
+    /// the window. Rendering and counts still search the complete original
+    /// line.
+    pub fn matching_line(&self, text: &[u8]) -> Option<usize> {
+        let Some(filter) = &self.filter else {
+            return self.regex.shortest_match(text);
+        };
+        let mut at = 0;
+        while at <= text.len() {
+            let hit = filter.run.find(&text[at..])?;
+            let (start, end) = filter.window(text, at, at + hit.start..at + hit.end);
+            // The supported assertions inspect at most one UTF-8 scalar on
+            // either side. Keep the left haystack intact and include enough
+            // right context even when a scalar is invalid or four bytes wide.
+            let context = end.saturating_add(4).min(text.len());
+            if self
+                .regex
+                .shortest_match_at(&text[..context], start)
+                .is_some_and(|found| found <= end)
+            {
+                return Some(start);
+            }
+            at = end + 1;
+        }
+        None
+    }
+
+    /// Every match's byte span, for line rendering and match counts: the
+    /// spans [`Regex::spans`] gives over `text`.
+    ///
+    /// With a filter, each match is searched for only in the window around
+    /// the next occurrence of the required run, with the left haystack intact
+    /// and four bytes of right context, as [`Search::matching_line`] does.
+    /// Searching from each match to the end of `text` instead is quadratic in
+    /// a long line's matches, and with Unicode word boundaries over non-ASCII
+    /// text the engine's slow fallback runs over all of that.
+    pub fn spans<'r, 't>(&'r self, text: &'t [u8]) -> Spans<'r, 't> {
+        match &self.filter {
+            None => Spans(Windows::Whole(self.regex.spans(text))),
+            Some(filter) => Spans(Windows::Filtered {
+                regex: &self.regex,
+                filter,
+                text,
+                at: 0,
+                window_end: 0,
+            }),
+        }
     }
 
     /// Whether the search looks for a required run before the pattern.
@@ -353,6 +527,70 @@ impl Search {
         self.filter
             .as_ref()
             .is_some_and(|filter| filter.run.find(text).is_some())
+    }
+}
+
+/// [`Search::spans`]'s iterator.
+#[derive(Debug)]
+pub struct Spans<'r, 't>(Windows<'r, 't>);
+
+#[derive(Debug)]
+enum Windows<'r, 't> {
+    /// No filter: the engine searches the rest of the text for each match.
+    Whole(crate::matcher::Spans<'r, 't>),
+    /// The windows around the required run, in order, from `at`.
+    Filtered {
+        regex: &'r Regex,
+        filter: &'r Filter,
+        text: &'t [u8],
+        at: usize,
+        window_end: usize,
+    },
+}
+
+impl Iterator for Spans<'_, '_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (regex, filter, text, at, window_end) = match &mut self.0 {
+            Windows::Whole(spans) => return spans.next(),
+            Windows::Filtered {
+                regex,
+                filter,
+                text,
+                at,
+                window_end,
+            } => (*regex, *filter, *text, at, window_end),
+        };
+        // Every match contains an occurrence of the run and lies within one
+        // window, whose end byte no match contains; a match is never empty,
+        // as the run is at least three long. So the next match is the first
+        // one found in a window, searched in order.
+        while *at <= text.len() {
+            let Some(hit) = filter.run.find(&text[*at..]) else {
+                *at = text.len() + 1;
+                return None;
+            };
+            let hit = *at + hit.start..*at + hit.end;
+            let (start, end) = if hit.end <= *window_end {
+                (filter.start(text, *at, hit.start), *window_end)
+            } else {
+                let window = filter.window(text, *at, hit.clone());
+                *window_end = window.1;
+                window
+            };
+            let context = end.saturating_add(4).min(text.len());
+            match regex.find_at(&text[..context], start) {
+                // A span reaching into the added context may owe its match to
+                // the artificial end of text.
+                Some(span) if span.end <= end => {
+                    *at = span.end;
+                    return Some(span);
+                }
+                _ => *at = end + 1,
+            }
+        }
+        None
     }
 }
 
@@ -372,11 +610,12 @@ fn filter(hir: &Hir) -> Option<Filter> {
     // Printing a HIR gives a pattern that parses back to it; it is already
     // case folded, so it compiles with the builder's defaults.
     let run = Regex::build(&regex::bytes::RegexBuilder::new(&run.to_string())).ok()?;
-    let mut within = Box::new([false; 256]);
-    let within = match_bytes(hir, &mut within).then(|| {
-        within[usize::from(b'\n')] = false;
-        within
+    let mut within = Box::new(Window {
+        bytes: [false; 256],
+        assertions: false,
     });
+    within.assertions = !match_bytes(hir, &mut within.bytes);
+    within.bytes[usize::from(b'\n')] = false;
     Some(Filter { run, within })
 }
 
@@ -419,7 +658,15 @@ fn match_bytes(hir: &Hir, within: &mut [bool; 256]) -> bool {
         HirKind::Repetition(repetition) => match_bytes(&repetition.sub, within),
         HirKind::Capture(capture) => match_bytes(&capture.sub, within),
         HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
-            hirs.iter().all(|hir| match_bytes(hir, within))
+            // Assertions require context, but every consuming node still
+            // contributes to the selection window's byte set.
+            let mut plain = true;
+            for hir in hirs {
+                if !match_bytes(hir, within) {
+                    plain = false;
+                }
+            }
+            plain
         }
     }
 }
@@ -483,6 +730,22 @@ fn literal_length(hir: &Hir) -> Option<usize> {
     }
 }
 
+// Line/absolute anchors supply no proof excluding LF. Word assertions do;
+// every consuming node and every alternative must conservatively exclude LF.
+fn lf_excluded(hir: &Hir) -> bool {
+    use regex_syntax::hir::Look;
+    match hir.kind() {
+        HirKind::Look(look) => !matches!(
+            look,
+            Look::Start | Look::End | Look::StartLF | Look::EndLF | Look::StartCRLF | Look::EndCRLF
+        ),
+        HirKind::Capture(capture) => lf_excluded(&capture.sub),
+        HirKind::Repetition(repetition) => lf_excluded(&repetition.sub),
+        HirKind::Concat(parts) | HirKind::Alternation(parts) => parts.iter().all(lf_excluded),
+        _ => line_local(hir),
+    }
+}
+
 /// [`Grep::is_line_local`] of a parsed pattern.
 fn line_local(hir: &Hir) -> bool {
     use regex_syntax::hir::Look;
@@ -533,6 +796,8 @@ pub(crate) fn all_of(parts: impl IntoIterator<Item = Trigrams>) -> Trigrams {
 /// Why [`GrepFlags::compile`] failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GrepError {
+    /// Line mode cannot execute a literal LF.
+    LineFeed,
     /// The verifier refused the pattern: the user's answer.
     Pattern(RegexError),
     /// The verifier compiled the pattern and the derivation's parse refused
@@ -543,6 +808,7 @@ pub enum GrepError {
 impl fmt::Display for GrepError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            GrepError::LineFeed => f.write_str("literal newline requires multiline mode (M7)"),
             GrepError::Pattern(e) => e.fmt(f),
             GrepError::Derivation(e) => write!(
                 f,

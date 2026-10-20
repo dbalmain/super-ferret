@@ -917,3 +917,40 @@ fn log_session(
     });
     Ok(session)
 }
+
+// A size check alone is insufficient: drive the shared production loader
+// while its already-opened policy file grows past the limit after fstat.
+#[test]
+fn shared_policy_loader_rejects_growth_during_read() {
+    let dir = Scratch::new("policy-growth");
+    let path = dir.join(".ferretignore");
+    write(&path, "!blocked\n");
+    crate::walk::AFTER_IGNORE_STAT.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move || {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len((1 << 20) + 1).unwrap();
+        }));
+    });
+    let mut faults = Vec::new();
+    let rules = crate::load_policy(
+        &dir.path,
+        None,
+        Some("blocked\n"),
+        Config::default(),
+        |event| {
+            if let Event::Io { path, error, .. } = event {
+                faults.push((path.to_owned(), error.kind()));
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        faults,
+        vec![(PathBuf::from(".ferretignore"), io::ErrorKind::FileTooLarge)]
+    );
+    assert_eq!(
+        rules.decide(Path::new("blocked"), ferret_policy::Entry::File { size: 4 }),
+        Decision::Skip
+    );
+    assert!(crate::walk::AFTER_IGNORE_STAT.with_borrow(|hook| hook.is_none()));
+}

@@ -284,13 +284,12 @@ fn start_donation_uses_existing_effectful_plan_for_every_action_variant() {
             effectful,
             "{expression:?}"
         );
-        let quit = Arc::new(super::AtomicBool::new(false));
-        let mut task = super::Task::new(plan.live_source(), None, &quit);
-        assert!(super::super::EntrySource::next(&mut task.walk, true).is_some());
-        // Starts can be donated before descending into any sibling range.
+        let mut walk = plan.live_source();
+        assert!(super::super::EntrySource::next(&mut walk, true).is_some());
+        // Starts can be lent before descending into any sibling range.
         assert_eq!(
-            task.donate(&quit, effectful)
-                .is_some_and(|donated| donated.completion.is_none()),
+            super::Split::split(&mut walk, !effectful, super::schedule::Share::Half)
+                .is_some_and(|(_, completion)| completion.is_none()),
             !effectful,
             "{expression:?}"
         );
@@ -349,25 +348,29 @@ fn a_batch_boundary_output_failure_cancels_queued_workers() {
         flushes: Arc::default(),
     };
     let quit = Arc::new(super::AtomicBool::new(false));
-    let mut failing = super::Task::new(plan.live_source(), None, &quit);
+    let mut walk = plan.live_source();
+    let mut failing = super::Task::new(&quit);
     assert!(failing.step(
+        &mut walk,
         &plan,
         &plan.expression,
         &mut output,
         crate::find::output::policy(&plan.expression)
     ));
     let later = tree.plan(&["-maxdepth", "0", "-print"]);
-    let queued = super::Task::new(later.live_source(), None, &quit);
-    let pool = super::Pool {
-        queue: Mutex::new(super::Queue {
-            tasks: vec![queued, failing],
-            active: 0,
-        }),
-        changed: super::Condvar::new(),
-        quit: quit.clone(),
+    let queued = super::Task::new(&quit);
+    let schedule = super::Schedule {
         workers: 2,
+        starts: false,
+        quit: &quit,
+        on_panic: None,
+        on_refused: None,
     };
-    let errors = pool.worker(&plan, &plan.expression, output.clone());
+    let errors = super::schedule::queued(
+        &schedule,
+        vec![(later.live_source(), queued), (walk, failing)],
+        &mut super::Worker::new(&plan, &plan.expression, output.clone(), &quit),
+    );
     assert_eq!(errors, expected.errors);
     assert!(
         quit.load(Ordering::Acquire),
@@ -438,4 +441,117 @@ fn execdir_cwd_failure_stops_before_the_next_start_like_gnu() {
             "workers={workers}"
         );
     }
+}
+
+#[test]
+fn a_refused_worker_spawn_leaves_the_walk_to_the_rest() {
+    // The OS may refuse a thread (RLIMIT_NPROC). The walk must still visit
+    // every entry, on the workers that did start, rather than panic.
+    let tree = Tree::new();
+    let (_, expected) = tree.run(&["-print"], 1);
+    let mut expected = expected.records.lock().unwrap().clone();
+    expected.sort();
+    for fail in [1, 3] {
+        let _seams = crate::verify::seam::Seams {
+            fail_spawn_at: Some(fail),
+            ..Default::default()
+        }
+        .set();
+        let (outcome, output) = tree.run(&["-print"], 4);
+        assert_eq!(outcome.errors, 0, "{:?}", output.errors);
+        let mut records = output.records.lock().unwrap().clone();
+        records.sort();
+        assert_eq!(records, expected, "fail at {fail}");
+    }
+}
+
+#[test]
+fn long_steps_in_one_directory_run_at_once() {
+    // A grep step can search a 1 GiB file. Loans were offered only every 64
+    // steps and only of two or more siblings, so four huge files in one
+    // directory were searched one or two at a time while other workers sat
+    // idle. Each step here holds its file, then waits until all four are
+    // being "searched" together.
+    use super::super::{EntrySource, FileKind, LiveWalk};
+    use super::schedule::{Step, Visitor};
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    const FILES: usize = 4;
+    #[derive(Default)]
+    struct Rendezvous {
+        arrived: Mutex<usize>,
+        all: Condvar,
+        missed: AtomicUsize,
+    }
+    struct Searcher<'r>(&'r Rendezvous);
+    impl Visitor<LiveWalk, Option<PathBuf>> for Searcher<'_> {
+        fn step(&mut self, walk: &mut LiveWalk, held: &mut Option<PathBuf>) -> Step {
+            if held.take().is_some() {
+                let mut arrived = self.0.arrived.lock().unwrap();
+                *arrived += 1;
+                self.0.all.notify_all();
+                let (arrived, timeout) = self
+                    .0
+                    .all
+                    .wait_timeout_while(arrived, Duration::from_secs(5), |arrived| *arrived < FILES)
+                    .unwrap();
+                drop(arrived);
+                if timeout.timed_out() {
+                    self.0.missed.fetch_add(1, Ordering::SeqCst);
+                }
+                return Step::Next;
+            }
+            match walk.next_with_cancel(true, &mut || Ok(()), &mut || false) {
+                None => Step::Done,
+                Some(Ok(entry)) => {
+                    if entry.kind().is_ok_and(|kind| kind == FileKind::File) {
+                        *held = Some(entry.path().to_path_buf());
+                    }
+                    Step::Next
+                }
+                Some(Err(error)) => panic!("{error:?}"),
+            }
+        }
+        fn lend(&mut self, _parent: &mut Option<PathBuf>) -> Option<PathBuf> {
+            None
+        }
+        fn holding(&self, held: &Option<PathBuf>) -> bool {
+            held.is_some()
+        }
+        fn end(&mut self, _held: &mut Option<PathBuf>) -> u64 {
+            0
+        }
+    }
+
+    let tree = Tree::new();
+    let directory = tree.0.join("long");
+    fs::create_dir(&directory).unwrap();
+    for file in 0..FILES {
+        fs::write(directory.join(format!("f{file}")), b"x").unwrap();
+    }
+    let plan = Plan::parse(&[OsString::from("-I"), directory.into_os_string()]).unwrap();
+    let rendezvous = Rendezvous::default();
+    let quit = super::AtomicBool::new(false);
+    let schedule = super::Schedule {
+        workers: FILES,
+        starts: true,
+        quit: &quit,
+        on_panic: None,
+        on_refused: None,
+    };
+    super::schedule::run(
+        &schedule,
+        plan.live_source(),
+        None,
+        &mut Searcher(&rendezvous),
+        |_| true,
+        |_| Searcher(&rendezvous),
+    );
+    assert_eq!(*rendezvous.arrived.lock().unwrap(), FILES);
+    assert_eq!(
+        rendezvous.missed.load(Ordering::SeqCst),
+        0,
+        "searches that never overlapped all four"
+    );
 }

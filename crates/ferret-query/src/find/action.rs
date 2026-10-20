@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use super::output::OutputBuffer;
 use super::printf::Format;
-use super::{Effects, Entry, EvaluationError, FileKind, WalkError};
+use super::{DirectoryHandle, Effects, Entry, EvaluationError, FileKind, WalkError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -90,7 +90,7 @@ pub(super) struct Exec {
 pub(super) struct Batch {
     exec: Exec,
     directory: Option<PathBuf>,
-    handle: Option<Arc<File>>,
+    handle: Option<DirectoryHandle>,
     paths: Vec<OsString>,
     bytes: usize,
 }
@@ -198,7 +198,7 @@ pub(super) fn flush_shared(
 }
 
 impl Batch {
-    fn new(exec: &Exec, directory: Option<PathBuf>, handle: Option<Arc<File>>) -> Self {
+    fn new(exec: &Exec, directory: Option<PathBuf>, handle: Option<DirectoryHandle>) -> Self {
         Self {
             exec: exec.clone(),
             directory,

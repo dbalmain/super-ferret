@@ -64,12 +64,12 @@
 //! read. The ring holds finished rows, not documents: a path and a few
 //! words per position.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread::Scope;
+use std::thread::{Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
@@ -338,7 +338,7 @@ impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
         let mut ledger = Ledger::new(self, read, 1, emit);
         let mut names = NameTester::new(self.query, self.catalog, self.cancelled);
         let stopped = || self.stopped();
-        let mut batch = Batch::default();
+        let mut batch = Batch::<Item>::default();
         for at in 0..self.ids.len() {
             if stopped() {
                 return Ok(ledger.halted(at));
@@ -603,6 +603,18 @@ enum Item {
     Row(Pending),
 }
 
+trait Placed {
+    fn place(&mut self, path: Range<usize>);
+}
+
+impl Placed for Item {
+    fn place(&mut self, path: Range<usize>) {
+        if let Self::Row(pending) = self {
+            pending.path = path;
+        }
+    }
+}
+
 /// A row S1 passed whose index truth is Yes or Maybe.
 struct Pending {
     /// Its path, in its batch's `paths`.
@@ -646,40 +658,56 @@ enum How {
 }
 
 /// Consecutive positions, finished.
-#[derive(Default)]
-struct Batch {
+struct Batch<T = Item> {
     /// The first position.
     start: usize,
-    items: Vec<Item>,
+    items: Vec<T>,
     /// The rows' paths.
     paths: Vec<u8>,
 }
 
-impl Batch {
+impl<T> Default for Batch<T> {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            items: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
+}
+
+impl<T: Placed> Batch<T> {
     fn clear(&mut self) {
         self.items.clear();
         self.paths.clear();
     }
 
     /// Appends `item`, whose path is all of `paths`.
-    fn push(&mut self, mut item: Item, paths: &[u8]) {
-        if let Item::Row(pending) = &mut item {
-            let start = self.paths.len();
-            pending.path = start..start + paths.len();
-        }
+    fn push(&mut self, mut item: T, paths: &[u8]) {
+        let start = self.paths.len();
+        item.place(start..start + paths.len());
         self.paths.extend_from_slice(paths);
         self.items.push(item);
     }
 }
 
 /// A slot of the ring: one batch's finished positions not yet taken.
-#[derive(Default)]
-struct Slot {
+struct Slot<T = Item> {
     /// The batch, plus one (0: none).
     index: usize,
-    part: Batch,
+    part: Batch<T>,
     /// Every position of the batch has been posted.
     complete: bool,
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            part: Batch::default(),
+            complete: false,
+        }
+    }
 }
 
 // ── the calling thread's side ──
@@ -890,7 +918,7 @@ struct Hand<'r, 'a> {
     /// This thread's own copy of each grep atom's search, by atom: a regex
     /// shared between threads hands each a match cache from a pool, which
     /// many threads at once contend on.
-    regexes: Vec<Option<Search>>,
+    regexes: Vec<Option<Search<'static>>>,
 }
 
 impl<'r, 'a> Hand<'r, 'a> {
@@ -1029,7 +1057,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
 /// unless `stopped` says to stop first; the reader is given `stopped` too.
 fn verify(
     atoms: &[ContentAtom],
-    regexes: &[Option<Search>],
+    regexes: &[Option<Search<'_>>],
     read: &mut Reader<'_>,
     matcher: &mut TextMatcher,
     bytes: &mut Vec<u8>,
@@ -1096,10 +1124,6 @@ fn unread(start: Instant, stopped: &dyn Fn() -> bool) -> Outcome {
     }
 }
 
-/// The read buffer for streamed documents: one per thread, reused, small
-/// enough to stay in cache while the regex runs over what was just read.
-const LINES: usize = 64 << 10;
-
 /// Whether every atom is a pattern [`stream`] can search a run of lines at
 /// a time: then documents are streamed, not read whole.
 fn streams(atoms: &[ContentAtom]) -> bool {
@@ -1114,7 +1138,7 @@ fn streams(atoms: &[ContentAtom]) -> bool {
 /// its last `\n`, not including it, with the partial line after it carried
 /// to the next. A line longer than the buffer grows it, by doubling, up to
 /// the rest of the document's declared length: a document's buffer is never
-/// larger than [`LINES`] or its length. The run stops early once every atom
+/// larger than 64 KiB or its length. The run stops early once every atom
 /// has matched.
 ///
 /// The answers are the whole-document search's. The first match of a
@@ -1129,7 +1153,7 @@ fn streams(atoms: &[ContentAtom]) -> bool {
 /// returned, counts the atoms that had finished: those that matched, and
 /// those the last run was searched for without a match.
 fn stream(
-    regexes: &[Option<Search>],
+    regexes: &[Option<Search<'_>>],
     read: &mut Reader<'_>,
     buffer: &mut Vec<u8>,
     name: NameId,
@@ -1138,9 +1162,6 @@ fn stream(
     let start = Instant::now();
     if stopped() {
         return Outcome::Stopped(Matched::default());
-    }
-    if buffer.len() < LINES {
-        buffer.resize(LINES, 0);
     }
     // Sized before the read, in case the host never calls `each`.
     let mut answers = vec![None; regexes.len()];
@@ -1162,71 +1183,39 @@ fn stream(
             halted = true;
             Err(io::Error::other("stopped"))
         };
-        // `buffer[..filled]` is the document from offset `base`, starting
-        // at a line.
-        let (mut filled, mut base) = (0, 0);
-        loop {
-            if stopped() {
-                return halt();
-            }
-            // The source holds at most `len` bytes: once they are all in,
-            // that is the end, and the buffer never grows past them.
-            let left = len.saturating_sub(base as u64 + filled as u64);
-            let n = match left {
-                0 => 0,
-                _ => {
-                    if filled == buffer.len() {
-                        let grown = (buffer.len() * 2).min(filled + left as usize);
-                        buffer
-                            .try_reserve_exact(grown - buffer.len())
-                            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-                        buffer.resize(grown, 0);
+        crate::scan::runs(
+            source,
+            len,
+            buffer,
+            stopped,
+            None,
+            |run, base, terminated| {
+                let engine = Instant::now();
+                for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
+                    let (false, Some(search)) = (*done, search) else {
+                        continue;
+                    };
+                    if stopped() {
+                        regex += engine.elapsed();
+                        return halt();
                     }
-                    match source.read(&mut buffer[filled..]) {
-                        Ok(n) => n,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
+                    if let Some(found) = search.find(run) {
+                        *answer = Some(base + found);
+                        open -= 1;
                     }
+                    *done = answer.is_some() || !terminated;
                 }
-            };
-            // `buffer[..filled]` held no `\n` before this read.
-            let fresh = filled;
-            filled += n;
-            let end = match n {
-                0 => filled,
-                _ => match memchr::memrchr(b'\n', &buffer[fresh..filled]) {
-                    Some(end) => fresh + end,
-                    None => continue,
-                },
-            };
-            let run = &buffer[..end];
-            let engine = Instant::now();
-            for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
-                let (false, Some(search)) = (*done, search) else {
-                    continue;
-                };
-                if stopped() {
-                    regex += engine.elapsed();
+                regex += engine.elapsed();
+                if (open == 0 || !terminated) && stopped() {
                     return halt();
                 }
-                if let Some(found) = search.find(run) {
-                    *answer = Some(base + found);
-                    open -= 1;
-                }
-                // The last run settles a miss too.
-                *done = answer.is_some() || n == 0;
-            }
-            regex += engine.elapsed();
-            if open == 0 || n == 0 {
-                if stopped() {
-                    return halt();
-                }
-                return Ok(());
-            }
-            buffer.copy_within(end + 1..filled, 0);
-            filled -= end + 1;
-            base += end + 1;
-        }
+                Ok(if open == 0 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            },
+        )
     };
     let version = read(name, ReadRequest::Stream(&mut each, stopped));
     // The atoms that finished, matched or not: every one after a full read.
@@ -1279,7 +1268,7 @@ fn add(sum: &mut MatchStats, more: &MatchStats) {
 /// signals: so either the waiter sees the condition before it sleeps, or
 /// the notifier sees the waiter and wakes it. Nobody signals a thread that
 /// is not waiting, which keeps wakes, and their syscalls, per batch.
-struct Pool {
+struct Pool<T: Placed = Item> {
     /// Positions in the run.
     positions: usize,
     /// Positions per batch, and the batch count.
@@ -1291,7 +1280,7 @@ struct Pool {
     head: AtomicUsize,
     /// Each batch's finished positions not yet taken, at
     /// `index % ring.len()`.
-    ring: Vec<Mutex<Slot>>,
+    ring: Vec<Mutex<Slot<T>>>,
     /// Positions posted to each slot, ever: the calling thread sleeps until
     /// its slot's count moves.
     posted: Vec<AtomicUsize>,
@@ -1324,8 +1313,8 @@ struct Budget {
     freed: Condvar,
 }
 
-impl Pool {
-    fn new(positions: usize, threads: usize) -> Self {
+impl<T: Placed> Pool<T> {
+    fn schedule(positions: usize, threads: usize) -> Self {
         let batch = (positions / (threads * BATCHES_PER_THREAD)).clamp(1, MAX_BATCH);
         let slots = threads * RING_PER_THREAD;
         Self {
@@ -1370,33 +1359,6 @@ impl Pool {
         self.stop.load(Ordering::SeqCst)
     }
 
-    /// One worker: claim batches in order and post each position as it
-    /// finishes, until none is left or the pool stops.
-    fn work(&self, scan: &Scan<'_, '_, '_>, fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
-        let _lost = LostOnPanic(self);
-        let mut read = fork();
-        let mut hand = Hand::new(&mut *read, &scan.query.atoms);
-        let mut names = NameTester::new(scan.query, scan.catalog, scan.cancelled);
-        let halt = || self.halted() || stopped();
-        let mut paths = Vec::new();
-        loop {
-            if self.halted() {
-                return;
-            }
-            let index = self.next.fetch_add(1, Ordering::Relaxed);
-            if index >= self.batches || !self.room_for(index) {
-                return;
-            }
-            let start = index * self.batch;
-            let end = (start + self.batch).min(self.positions);
-            for at in start..end {
-                paths.clear();
-                let item = scan.item(at, &mut names, &mut hand, Some(self), &halt, &mut paths);
-                self.post(index, at, item, &paths, at + 1 == end);
-            }
-        }
-    }
-
     /// Waits until batch `index` has a slot in the ring: the calling thread
     /// has taken the batch that held it. False once the pool stops.
     fn room_for(&self, index: usize) -> bool {
@@ -1419,7 +1381,7 @@ impl Pool {
 
     /// Posts position `at` of batch `index`, whose row's path is `paths`;
     /// `last` if it is the batch's last.
-    fn post(&self, index: usize, at: usize, item: Item, paths: &[u8], last: bool) {
+    fn post(&self, index: usize, at: usize, item: T, paths: &[u8], last: bool) {
         let slot = index % self.ring.len();
         {
             let mut held = lock(&self.ring[slot]);
@@ -1447,7 +1409,7 @@ impl Pool {
     /// Batch `index`'s next finished positions, into `out` (empty): waits
     /// until there is at least one, or the batch is complete. True once the
     /// batch is complete, which frees its slot; `None` if a worker was lost.
-    fn take(&self, index: usize, out: &mut Batch) -> Option<bool> {
+    fn take(&self, index: usize, out: &mut Batch<T>) -> Option<bool> {
         let slot = index % self.ring.len();
         let posted = &self.posted[slot];
         loop {
@@ -1486,33 +1448,6 @@ impl Pool {
             if !moved() {
                 return None;
             }
-        }
-    }
-
-    /// Reads and matches one document on a worker, within the byte budget.
-    fn read(
-        &self,
-        query: &Query,
-        hand: &mut Hand<'_, '_>,
-        name: NameId,
-        size: u64,
-        halt: &dyn Fn() -> bool,
-    ) -> Outcome {
-        match self.reserve(size, halt) {
-            Some(size) => {
-                let outcome = hand.verify(&query.atoms, name, halt);
-                if hand.bytes.capacity() > KEPT_BUFFER {
-                    hand.bytes = Vec::new();
-                }
-                if hand.lines.capacity() > KEPT_BUFFER {
-                    hand.lines = Vec::new();
-                }
-                // Freed only after an oversized buffer is: a reader that the
-                // release wakes cannot allocate against bytes still held.
-                self.release(size);
-                outcome
-            }
-            None => Outcome::Stopped(Matched::default()),
         }
     }
 
@@ -1567,6 +1502,66 @@ impl Pool {
     }
 }
 
+impl Pool {
+    fn new(positions: usize, threads: usize) -> Self {
+        Self::schedule(positions, threads)
+    }
+
+    /// One worker: claim batches in order and post each position as it
+    /// finishes, until none is left or the pool stops.
+    fn work(&self, scan: &Scan<'_, '_, '_>, fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
+        let _lost = LostOnPanic(self);
+        let mut read = fork();
+        let mut hand = Hand::new(&mut *read, &scan.query.atoms);
+        let mut names = NameTester::new(scan.query, scan.catalog, scan.cancelled);
+        let halt = || self.halted() || stopped();
+        let mut paths = Vec::new();
+        loop {
+            if self.halted() {
+                return;
+            }
+            let index = self.next.fetch_add(1, Ordering::Relaxed);
+            if index >= self.batches || !self.room_for(index) {
+                return;
+            }
+            let start = index * self.batch;
+            let end = (start + self.batch).min(self.positions);
+            for at in start..end {
+                paths.clear();
+                let item = scan.item(at, &mut names, &mut hand, Some(self), &halt, &mut paths);
+                self.post(index, at, item, &paths, at + 1 == end);
+            }
+        }
+    }
+
+    /// Reads and matches one document on a worker, within the byte budget.
+    fn read(
+        &self,
+        query: &Query,
+        hand: &mut Hand<'_, '_>,
+        name: NameId,
+        size: u64,
+        halt: &dyn Fn() -> bool,
+    ) -> Outcome {
+        match self.reserve(size, halt) {
+            Some(size) => {
+                let outcome = hand.verify(&query.atoms, name, halt);
+                if hand.bytes.capacity() > KEPT_BUFFER {
+                    hand.bytes = Vec::new();
+                }
+                if hand.lines.capacity() > KEPT_BUFFER {
+                    hand.lines = Vec::new();
+                }
+                // Freed only after an oversized buffer is: a reader that the
+                // release wakes cannot allocate against bytes still held.
+                self.release(size);
+                outcome
+            }
+            None => Outcome::Stopped(Matched::default()),
+        }
+    }
+}
+
 /// A pool lock; a panicking worker holds none across user code, so what it
 /// guards is consistent.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1579,31 +1574,97 @@ fn spawn<'scope>(
     i: usize,
     work: impl FnOnce() + Send + 'scope,
 ) -> std::io::Result<()> {
+    spawn_named(scope, i, "ferret-verify", work).map(drop)
+}
+
+/// Starts thread `i` on the scope, named so profiles can tell it apart. The
+/// process's first spawn reserves the descriptor table its workers share.
+pub(crate) fn spawn_named<'scope, R: Send + 'scope>(
+    scope: &'scope Scope<'scope, '_>,
+    i: usize,
+    name: &str,
+    work: impl FnOnce() -> R + Send + 'scope,
+) -> std::io::Result<ScopedJoinHandle<'scope, R>> {
     #[cfg(test)]
     if seam::Seams::current().fail_spawn_at == Some(i) {
         return Err(std::io::Error::other("injected spawn failure"));
     }
     #[cfg(not(test))]
     let _ = i;
+    #[cfg(debug_assertions)]
+    if refused_for_tests(name) {
+        return Err(rustix::io::Errno::AGAIN.into());
+    }
+    static RESERVED: std::sync::Once = std::sync::Once::new();
+    RESERVED.call_once(reserve_descriptor_table);
     std::thread::Builder::new()
-        .name("ferret-verify".into())
+        .name(name.into())
         .spawn_scoped(scope, work)
-        .map(drop)
+}
+
+/// Whether `FERRET_TEST_REFUSE_THREADS=NAME=K` refuses this spawn, as
+/// `pthread_create` does under `RLIMIT_NPROC`: the first `K` threads named
+/// `NAME` start, and later ones are refused. Debug builds only, so the CLI's
+/// tests can refuse one kind of thread at a time.
+#[cfg(debug_assertions)]
+fn refused_for_tests(name: &str) -> bool {
+    static LIMIT: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+    let limit = LIMIT.get_or_init(|| {
+        let value = std::env::var("FERRET_TEST_REFUSE_THREADS").ok()?;
+        let (name, count) = value.rsplit_once('=')?;
+        Some((name.to_owned(), count.parse().ok()?))
+    });
+    limit.as_ref().is_some_and(|(refused, count)| {
+        refused == name && STARTED.fetch_add(1, Ordering::Relaxed) >= *count
+    })
+}
+
+/// Search threads the system refused to start: the run went on with
+/// `running` of the `asked` threads.
+#[derive(Debug)]
+pub struct Shortfall {
+    /// Threads searching, the calling thread included when it searches.
+    pub running: usize,
+    /// Threads the run asked for.
+    pub asked: usize,
+    /// The first refusal.
+    pub cause: std::io::Error,
+}
+
+/// Grows the process's descriptor table to 1024 slots before the first worker
+/// shares it. Growing a table that several threads share waits out an RCU grace
+/// period while every other opener waits on the resize, and a deep tree's held
+/// directory chains (D21) reach a few hundred descriptors, so the table used to
+/// grow several times mid-search: 46–49 ms of a 520 ms index grep at 32
+/// threads on a 300k-file tree (kdiag, 2026-10-20). Best effort: under a low
+/// open-file limit, or with no descriptor 2 to duplicate, the table grows as
+/// it did before.
+fn reserve_descriptor_table() {
+    use std::os::fd::AsFd;
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .unwrap_or(u64::MAX);
+    let Ok(top) = i32::try_from(limit.saturating_sub(1).min(1023)) else {
+        return;
+    };
+    // Dropped at once: the table keeps its size after the slot is freed.
+    let _ = rustix::io::fcntl_dupfd_cloexec(std::io::stderr().as_fd(), top);
 }
 
 /// Stops the pool when the calling thread leaves the scope, by any path.
-struct StopOnDrop<'p>(&'p Pool);
+struct StopOnDrop<'p, T: Placed = Item>(&'p Pool<T>);
 
-impl Drop for StopOnDrop<'_> {
+impl<T: Placed> Drop for StopOnDrop<'_, T> {
     fn drop(&mut self) {
         self.0.halt();
     }
 }
 
 /// Tells the calling thread a worker panicked, so it stops waiting.
-struct LostOnPanic<'p>(&'p Pool);
+struct LostOnPanic<'p, T: Placed = Item>(&'p Pool<T>);
 
-impl Drop for LostOnPanic<'_> {
+impl<T: Placed> Drop for LostOnPanic<'_, T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.0.lost.store(true, Ordering::SeqCst);
@@ -1611,6 +1672,659 @@ impl Drop for LostOnPanic<'_> {
             self.0.ready_signal.notify_all();
         }
     }
+}
+
+// A panicking file worker may still own a byte reservation. Stop and wake
+// its peers before the scope joins, rather than waiting on those leaked bytes.
+struct StopOnPanic<'p>(&'p Pool<()>);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.halt();
+        }
+    }
+}
+
+/// Tasks the [`completion_groups`] producer may run ahead of the workers, per
+/// worker. A few per worker keep the queue from emptying between the
+/// producer's wakes; the backlog is paths, not captures (D93 bounds those).
+const FEED_PER_THREAD: usize = 4;
+
+/// At most this many consecutive indexed paths, and this many input bytes,
+/// belong to a worker's run. A larger file travels alone.
+const RUN_TASKS: usize = 16;
+const RUN_BYTES: u64 = 64 << 10;
+
+/// Tasks produced on a separate thread. Indexed paths are taken in runs for
+/// checked-directory reuse; their pending tails remain accessible even while
+/// the owner is blocked in a read. Streaming producers keep immediate wakes:
+/// they may block after producing a single task whose execution releases them.
+struct Feed<Task> {
+    state: Mutex<FeedState<Task>>,
+    runs: Vec<Mutex<VecDeque<(u64, Task)>>>,
+    ready: Condvar,
+    room: Condvar,
+    capacity: usize,
+    indexed: bool,
+}
+
+struct FeedState<Task> {
+    tasks: VecDeque<(u64, Task)>,
+    /// No more tasks will arrive; pending runs can still be stolen.
+    closed: bool,
+    sleeping: usize,
+    /// The producer is asleep on `room` and has not been woken.
+    full: bool,
+}
+
+impl<Task> Feed<Task> {
+    fn new(threads: usize, indexed: bool) -> Self {
+        // D107's wake threshold must fit even with only two workers.
+        let capacity = (threads * FEED_PER_THREAD).max(if indexed { RUN_TASKS } else { 1 });
+        Self {
+            state: Mutex::new(FeedState {
+                tasks: VecDeque::with_capacity(capacity),
+                closed: false,
+                sleeping: 0,
+                full: false,
+            }),
+            runs: (0..threads).map(|_| Mutex::default()).collect(),
+            ready: Condvar::new(),
+            room: Condvar::new(),
+            capacity,
+            indexed,
+        }
+    }
+
+    /// Runs `next` without holding a feed or run lock.
+    fn produce(
+        &self,
+        next: &mut impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
+        stopped: &dyn Fn() -> bool,
+    ) {
+        loop {
+            {
+                let mut state = lock(&self.state);
+                while state.tasks.len() >= self.capacity && !state.closed {
+                    state.full = true;
+                    state = wait(&self.room, state);
+                }
+                state.full = false;
+                if state.closed {
+                    return;
+                }
+            }
+            if stopped() {
+                return;
+            }
+            let Some(task) = next(stopped) else { return };
+            let mut state = lock(&self.state);
+            if state.closed {
+                return;
+            }
+            state.tasks.push_back(task);
+            let wake = if self.indexed {
+                state.sleeping > 0 && state.tasks.len().is_multiple_of(RUN_TASKS)
+            } else {
+                state.sleeping >= state.tasks.len()
+            };
+            drop(state);
+            if wake {
+                self.ready.notify_one();
+            }
+        }
+    }
+
+    /// Takes the near end of this worker's run, a new run, or the far end of
+    /// another worker's run (half its pending tail). The feed lock orders
+    /// assignment and stealing against going to sleep, closing the
+    /// lost-wakeup window. Owners take only their run lock, and release it
+    /// before any read or publication.
+    fn take(&self, worker: usize) -> Option<(u64, Task)> {
+        if self.indexed
+            && let Some(task) = lock(&self.runs[worker]).pop_front()
+        {
+            return Some(task);
+        }
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(task) = state.tasks.pop_front() {
+                let lend = self.indexed
+                    && self.fill_run(worker, &mut state.tasks, task.0)
+                    && state.sleeping > 0;
+                let wake = state.full && state.tasks.len() <= self.capacity / 2;
+                if wake {
+                    state.full = false;
+                }
+                drop(state);
+                if wake {
+                    self.room.notify_one();
+                }
+                if lend {
+                    self.ready.notify_one();
+                }
+                return Some(task);
+            }
+            if self.indexed {
+                for offset in 1..self.runs.len() {
+                    let mut run = lock(&self.runs[(worker + offset) % self.runs.len()]);
+                    if !run.is_empty() {
+                        // Keep locality in the stolen tail too; repeated
+                        // single-file steals scatter the same directory
+                        // across every idle worker.
+                        let half = run.len() / 2;
+                        let mut own = lock(&self.runs[worker]);
+                        own.extend(run.drain(half..));
+                        let task = own.pop_front();
+                        let lend = (!run.is_empty() || !own.is_empty()) && state.sleeping > 0;
+                        drop(own);
+                        drop(run);
+                        drop(state);
+                        if lend {
+                            self.ready.notify_one();
+                        }
+                        return task;
+                    }
+                }
+            }
+            if state.closed {
+                return None;
+            }
+            state.sleeping += 1;
+            state = wait(&self.ready, state);
+            state.sleeping -= 1;
+        }
+    }
+
+    /// Leaves the current file on the caller and its consecutive tail in
+    /// the shared run. The caller holds the feed lock; the run is empty.
+    fn fill_run(&self, worker: usize, tasks: &mut VecDeque<(u64, Task)>, mut bytes: u64) -> bool {
+        let mut run = lock(&self.runs[worker]);
+        while bytes <= RUN_BYTES && run.len() + 1 < RUN_TASKS {
+            let Some((size, _)) = tasks.front() else {
+                break;
+            };
+            if *size > RUN_BYTES - bytes {
+                break;
+            }
+            bytes += *size;
+            if let Some(next) = tasks.pop_front() {
+                run.push_back(next);
+            }
+        }
+        !run.is_empty()
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.ready.notify_all();
+        self.room.notify_all();
+    }
+}
+
+fn wait<'a, T>(signal: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    signal.wait(guard).unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Closes the feed when its holder leaves, by any path: the producer's end
+/// wakes the sleeping workers, and a worker's exit stops the producer.
+struct CloseOnDrop<'f, Task>(&'f Feed<Task>);
+
+impl<Task> Drop for CloseOnDrop<'_, Task> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// A group whose capture holds this many bytes or more is handed to the caller
+/// alone; smaller groups travel together up to this many bytes in all. Keeps
+/// D93's capture bound to within one batch per worker.
+const HANDOFF_BYTES: u64 = 64 << 10;
+/// At most this many groups travel in one handoff.
+const HANDOFF_GROUPS: usize = 16;
+
+/// A worker's completed groups not yet handed to the caller: at most
+/// [`HANDOFF_BYTES`] and [`HANDOFF_GROUPS`] of them.
+struct Held<G> {
+    groups: Vec<G>,
+    bytes: u64,
+}
+
+impl<G> Default for Held<G> {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<G> Held<G> {
+    /// Holds a completed group of `weight` bytes and returns the batches to
+    /// hand off now, in completion order: first the held batch, when this
+    /// group would push it past [`HANDOFF_BYTES`] or reaches that size alone;
+    /// then the large group alone, or the batch this group filled to
+    /// [`HANDOFF_GROUPS`].
+    fn add(&mut self, group: G, weight: u64) -> [Option<Vec<G>>; 2] {
+        if weight >= HANDOFF_BYTES {
+            return [self.take(), Some(vec![group])];
+        }
+        let crossed = if self.bytes + weight > HANDOFF_BYTES {
+            self.take()
+        } else {
+            None
+        };
+        self.bytes += weight;
+        self.groups.push(group);
+        let full = if self.groups.len() >= HANDOFF_GROUPS {
+            self.take()
+        } else {
+            None
+        };
+        [crossed, full]
+    }
+
+    /// The held batch, if any, leaving the slot empty.
+    fn take(&mut self) -> Option<Vec<G>> {
+        self.bytes = 0;
+        (!self.groups.is_empty()).then(|| std::mem::take(&mut self.groups))
+    }
+}
+
+/// Input scheduling for completed file groups, with the worker count.
+pub enum GroupSchedule {
+    /// A producer that may block: wake a worker for each available task.
+    Streaming(usize),
+    /// Catalog enumeration: take bounded runs with stealing and wake at 16
+    /// queued tasks, or when enumeration ends.
+    Indexed(usize),
+}
+
+/// Prepares checked file groups on workers and emits them on the caller in
+/// completion order. One thread keeps source order. The producer runs on its
+/// own thread, a few tasks per worker ahead of them, and no worker ever calls
+/// it; if that thread cannot start, the caller works alone. Returns the
+/// [`Shortfall`] if the system refused a worker or the producer.
+///
+/// Workers hand groups over in batches through a bounded queue of `threads`
+/// handoffs: a group whose `weight` (its capture's allocation) reaches
+/// [`HANDOFF_BYTES`] goes alone, smaller ones together up to that many bytes.
+/// So the queue holds at most `threads` large groups; each worker owns one in
+/// progress and a held batch of at most [`HANDOFF_BYTES`]; the caller owns one
+/// handoff.
+///
+/// Workers hold groups only while the caller is busy. Before it sleeps, the
+/// caller takes every held batch; a worker that then completes a group finds
+/// it idle and hands off at once. So a held group waits only while the caller
+/// has other groups to publish, never on its worker's next file, nor on a
+/// worker asleep waiting for the producer.
+///
+/// Each task carries the same input-byte reservation as document
+/// verification; callers discard oversized input buffers before returning
+/// bounded or spilled groups. A stop wakes the feed and the budget and reaches
+/// active reads. The producer receives the same stop predicate and must poll
+/// it during filtering or traversal before returning its next task.
+pub fn completion_groups<Task: Send, State, Group: Send>(
+    schedule: GroupSchedule,
+    cancelled: &AtomicBool,
+    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
+    make: impl Fn() -> State + Sync,
+    work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
+    weight: impl Fn(&Group) -> u64 + Sync,
+    emit: impl FnMut(Group) -> ControlFlow<()>,
+) -> Option<Shortfall> {
+    completion_groups_with_handoff(
+        schedule,
+        cancelled,
+        next,
+        make,
+        |state, task, stopped, _, _| work(state, task, stopped),
+        weight,
+        emit,
+    )
+}
+
+/// Like [`completion_groups`], with handoffs during an active task. A handoff
+/// flushes that worker's held batch first and uses the same bounded queue.
+/// The final boolean tells `work` whether publication runs concurrently. On
+/// the single-thread and spawn-fallback paths handoffs publish synchronously;
+/// callers must not wait for that same task to supply more data in that case.
+/// A failed handoff means the publisher stopped and the task must unwind.
+pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
+    schedule: GroupSchedule,
+    cancelled: &AtomicBool,
+    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
+    make: impl Fn() -> State + Sync,
+    work: impl Fn(&mut State, Task, &dyn Fn() -> bool, &dyn Fn(Group) -> bool, bool) -> Group + Sync,
+    weight: impl Fn(&Group) -> u64 + Sync,
+    mut emit: impl FnMut(Group) -> ControlFlow<()>,
+) -> Option<Shortfall> {
+    let (threads, indexed) = match schedule {
+        GroupSchedule::Streaming(threads) => (threads, false),
+        GroupSchedule::Indexed(threads) => (threads, true),
+    };
+    if threads <= 1 {
+        groups_alone_with_handoff(next, cancelled, &make, &work, &mut emit);
+        return None;
+    }
+    let pool = Pool::<()>::schedule(0, threads);
+    let source = Mutex::new(next);
+    let feed = Feed::new(threads, indexed);
+    let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
+    // Set by the caller before its last look at the slots ahead of sleeping;
+    // cleared by the first worker to hand it work, or by the caller on waking.
+    let idle = AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Group>>(threads);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&pool);
+        let _close = CloseOnDrop(&feed);
+        let make = &make;
+        let work = &work;
+        let feed = &feed;
+        let pool = &pool;
+        let stopped = move || pool.halted() || cancelled.load(Ordering::Acquire);
+        let weight = &weight;
+        let held = &held;
+        let idle = &idle;
+        let mut refused = None;
+        let started = (0..threads)
+            .take_while(|&i| {
+                let sender = sender.clone();
+                let started = spawn(scope, i, move || {
+                    let _panic = StopOnPanic(pool);
+                    let _close = CloseOnDrop(feed);
+                    let mut state = make();
+                    let lane = Lane {
+                        slot: &held[i],
+                        idle,
+                        sender,
+                        pool,
+                    };
+                    while !stopped() {
+                        let Some((size, task)) = feed.take(i) else {
+                            break;
+                        };
+                        let Some(reservation) = lane.reserve(size, &stopped) else {
+                            break;
+                        };
+                        let handoff = |group| lane.handoff(group, &stopped);
+                        let group = work(&mut state, task, &stopped, &handoff, true);
+                        drop(reservation);
+                        if stopped() {
+                            break;
+                        }
+                        let bytes = weight(&group);
+                        if lane.hand(group, bytes).is_break() {
+                            break;
+                        }
+                    }
+                    lane.flush(stopped());
+                });
+                started.map_err(|error| refused = Some(error)).is_ok()
+            })
+            .count();
+        drop(sender);
+        let source = &source;
+        let fed = started > 0
+            && spawn_named(scope, threads, "ferret-producer", move || {
+                let _panic = StopOnPanic(pool);
+                let _close = CloseOnDrop(feed);
+                feed.produce(&mut *lock(source), &stopped);
+            })
+            .map_err(|error| refused.get_or_insert(error))
+            .is_ok();
+        let shortfall = refused.map(|cause| Shortfall {
+            running: if fed { started } else { 1 },
+            asked: threads,
+            cause,
+        });
+        if !fed {
+            // Any started workers find the feed closed and empty, and leave.
+            feed.close();
+            groups_alone_with_handoff(&mut *lock(source), cancelled, make, work, &mut emit);
+            return shortfall;
+        }
+        collect(&receiver, held, idle, &stopped, &mut emit);
+        // Dropping the receiver unblocks senders before scope join. The stop
+        // guard also wakes input-budget waiters.
+        drop(receiver);
+        shortfall
+    })
+}
+
+/// A worker's way to the caller: its slot of held groups, and the bounded
+/// queue of handoffs. Shared by [`completion_groups`] and [`lane_groups`].
+pub struct Lane<'g, Group> {
+    slot: &'g Mutex<Held<Group>>,
+    idle: &'g AtomicBool,
+    sender: std::sync::mpsc::SyncSender<Vec<Group>>,
+    pool: &'g Pool<()>,
+}
+
+impl<'g, Group> Lane<'g, Group> {
+    /// Reserves the input bytes for a task of `size` (at least one read
+    /// buffer) until the reservation drops; `None` once the run stops.
+    pub fn reserve(&self, size: u64, stopped: &dyn Fn() -> bool) -> Option<Reservation<'g>> {
+        let size = self
+            .pool
+            .reserve(size.max(crate::scan::BUFFER as u64), stopped)?;
+        Some(Reservation {
+            pool: self.pool,
+            size,
+        })
+    }
+
+    /// Stops the run and wakes every lane waiting for bytes. For a walker
+    /// that panics: its siblings poll the stop, not the walker.
+    pub fn stop(&self) {
+        self.pool.halt();
+    }
+
+    /// Hands over an active task's group after flushing its held batch.
+    /// Sends outside the slot lock: the publisher may consume this task until
+    /// it finishes, so it must never wait on a lock held by the sender.
+    /// False means the publisher stopped and the task must unwind.
+    pub fn handoff(&self, group: Group, stopped: &dyn Fn() -> bool) -> bool {
+        let batch = lock(self.slot).take();
+        if let Some(batch) = batch
+            && self.sender.send(batch).is_err()
+        {
+            return false;
+        }
+        self.idle.store(false, Ordering::SeqCst);
+        !stopped() && self.sender.send(vec![group]).is_ok()
+    }
+
+    /// Holds a completed group of `bytes`, or hands batches over now (see
+    /// [`completion_groups`]). Breaks once the caller has gone.
+    pub fn hand(&self, group: Group, bytes: u64) -> ControlFlow<()> {
+        let handoffs = {
+            let mut slot = lock(self.slot);
+            let mut handoffs = slot.add(group, bytes);
+            // Read under the slot lock, which orders it after the caller's
+            // last look at this slot. Any send wakes the caller, who looks at
+            // every slot again before sleeping, so only one worker need flush.
+            if handoffs.iter().all(Option::is_none)
+                && self.idle.load(Ordering::SeqCst)
+                && self.idle.swap(false, Ordering::SeqCst)
+            {
+                handoffs[1] = slot.take();
+            }
+            handoffs
+        };
+        // Send outside the slot lock: the caller takes that lock to collect,
+        // and a full queue waits on the caller.
+        for batch in handoffs.into_iter().flatten() {
+            if self.sender.send(batch).is_err() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Out of work, hands over what is held. A stopped run drops it, as the
+    /// caller drops queued groups.
+    pub fn flush(&self, stopped: bool) {
+        // Take first: a guard in the condition would live through a send
+        // that may wait on the collecting caller.
+        let batch = lock(self.slot).take();
+        if !stopped && let Some(batch) = batch {
+            let _ = self.sender.send(batch);
+        }
+    }
+}
+
+/// Input bytes held by a [`Lane`]'s task, released when dropped, unwinding
+/// included, so a panicking reader cannot strand its siblings.
+pub struct Reservation<'g> {
+    pool: &'g Pool<()>,
+    size: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.pool.release(self.size);
+    }
+}
+
+/// Collects handoffs on the caller until every lane has gone, the run stops
+/// or `emit` breaks. Before sleeping, takes every held batch.
+fn collect<Group>(
+    receiver: &std::sync::mpsc::Receiver<Vec<Group>>,
+    held: &[Mutex<Held<Group>>],
+    idle: &AtomicBool,
+    stopped: &dyn Fn() -> bool,
+    emit: &mut impl FnMut(Group) -> ControlFlow<()>,
+) {
+    // Slots seen empty in a row since `idle` was last set, and the next
+    // slot to look at. Sleeping needs a full clean pass after setting it.
+    let mut clean = 0;
+    let mut at = 0;
+    loop {
+        let batch = match receiver.try_recv() {
+            Ok(batch) => Some(batch),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) if clean < held.len() => {
+                if clean == 0 {
+                    idle.store(true, Ordering::SeqCst);
+                }
+                let batch = lock(&held[at]).take();
+                at = (at + 1) % held.len();
+                clean += 1;
+                batch
+            }
+            // Every slot was empty after `idle` was set: a group completed
+            // from here on is sent, which wakes this receive.
+            Err(std::sync::mpsc::TryRecvError::Empty) => match receiver.recv() {
+                Ok(batch) => Some(batch),
+                Err(_) => break,
+            },
+        };
+        if let Some(batch) = batch {
+            idle.store(false, Ordering::SeqCst);
+            clean = 0;
+            if publish(batch, stopped, emit).is_break() {
+                break;
+            }
+        }
+    }
+}
+
+/// Like [`completion_groups`], for workers that find their own tasks: `run`
+/// gets one [`Lane`] per worker and the stop predicate, starts its workers,
+/// and returns once they have all finished. The caller emits groups in
+/// completion order meanwhile, under the same handoff and input bounds.
+///
+/// `run` gets its own thread, as the caller is busy emitting; if that thread
+/// cannot start, nothing runs and the spawn's error is returned. A worker
+/// whose walk panics should [`Lane::stop`] the run before unwinding further.
+pub fn lane_groups<'g, Group: Send + 'g>(
+    threads: usize,
+    cancelled: &AtomicBool,
+    run: impl FnOnce(Vec<Lane<'_, Group>>, &(dyn Fn() -> bool + Sync)) + Send,
+    mut emit: impl FnMut(Group) -> ControlFlow<()>,
+) -> io::Result<()> {
+    let threads = threads.max(1);
+    let pool = Pool::<()>::schedule(0, threads);
+    let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
+    let idle = AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Group>>(threads);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&pool);
+        let pool = &pool;
+        let held = &held;
+        let idle = &idle;
+        let stopped = move || pool.halted() || cancelled.load(Ordering::Acquire);
+        let lanes = (0..threads)
+            .map(|i| Lane {
+                slot: &held[i],
+                idle,
+                sender: sender.clone(),
+                pool,
+            })
+            .collect();
+        drop(sender);
+        let started = spawn_named(scope, threads, "ferret-walk", move || {
+            let _panic = StopOnPanic(pool);
+            run(lanes, &stopped);
+        })
+        .map(drop);
+        if started.is_ok() {
+            collect(&receiver, held, idle, &stopped, &mut emit);
+        }
+        drop(receiver);
+        started
+    })
+}
+
+/// Emits a handoff's groups in order until the run stops or `emit` breaks.
+fn publish<Group>(
+    batch: Vec<Group>,
+    halted: &dyn Fn() -> bool,
+    emit: &mut impl FnMut(Group) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    for group in batch {
+        if halted() {
+            return ControlFlow::Break(());
+        }
+        emit(group)?;
+    }
+    ControlFlow::Continue(())
+}
+
+fn groups_alone_with_handoff<Task, State, Group>(
+    mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
+    cancelled: &AtomicBool,
+    make: &impl Fn() -> State,
+    work: &impl Fn(&mut State, Task, &dyn Fn() -> bool, &dyn Fn(Group) -> bool, bool) -> Group,
+    emit: &mut impl FnMut(Group) -> ControlFlow<()>,
+) {
+    let stopped = || cancelled.load(Ordering::Acquire);
+    let emit = std::cell::RefCell::new(emit);
+    let handoff = |group| {
+        if stopped() || emit.borrow_mut()(group).is_break() {
+            cancelled.store(true, Ordering::Release);
+            false
+        } else {
+            true
+        }
+    };
+    let mut state = make();
+    while !stopped() {
+        let Some((_, task)) = next(&stopped) else {
+            break;
+        };
+        let item = work(&mut state, task, &stopped, &handoff, false);
+        if stopped() || emit.borrow_mut()(item).is_break() {
+            break;
+        }
+    }
+}
+
+// File groups use the pool only for its input budget and stop flag.
+impl Placed for () {
+    fn place(&mut self, _: Range<usize>) {}
 }
 
 /// Test-only hooks into the pool, set per test thread: a spawn that fails,
@@ -1625,7 +2339,8 @@ pub(crate) mod seam {
 
     #[derive(Clone, Default)]
     pub(crate) struct Seams {
-        /// The worker whose spawn fails.
+        /// The thread whose spawn fails: worker `i`, or `threads` for the
+        /// completion producer.
         pub fail_spawn_at: Option<usize>,
         /// Called, under the budget lock, when a worker sleeps for bytes.
         pub on_budget_wait: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -2116,7 +2831,7 @@ mod streamed {
     /// and at 8 MiB, the size cap, and the answers stay the whole search's.
     #[test]
     fn a_long_line_grows_the_buffer_to_the_documents_length_at_most() {
-        use super::LINES;
+        use crate::scan::BUFFER as LINES;
         let query = Query::parse("grep:a$ grep:ab", UNIX_EPOCH + Duration::from_secs(1)).unwrap();
         let never = || false;
         let regexes = Hand::new(&mut |_, _| None, &query.atoms).regexes;
@@ -2160,6 +2875,897 @@ mod streamed {
             let text = format!("grep:{pattern}");
             let query = Query::parse(&text, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
             assert!(!streams(&query.atoms), "{pattern} is not line-local");
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    fn completion_child(name: &str) -> bool {
+        const MARKER: &str = "FERRET_TEST_COMPLETION_CHILD";
+        if std::env::var_os(MARKER).is_some() {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("verify::group_tests::{name}")])
+            .env(MARKER, name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("completion worker left a waiter asleep");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // D106 B: the owner cannot step or lend while task zero is blocked.
+    // Every other task in its run must still reach the real publisher.
+    #[test]
+    fn indexed_run_is_stolen_while_its_head_is_blocked() {
+        let published = AtomicUsize::new(0);
+        let mut tasks = (0..RUN_TASKS).map(|task| (1, task));
+        completion_groups(
+            GroupSchedule::Indexed(2),
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                if task == 0 {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while published.load(Ordering::Acquire) < RUN_TASKS - 1 {
+                        assert!(Instant::now() < deadline, "run stranded behind its head");
+                        std::thread::yield_now();
+                    }
+                }
+                task
+            },
+            |_| 0,
+            |task| {
+                if task != 0 {
+                    published.fetch_add(1, Ordering::Release);
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(published.load(Ordering::Acquire), RUN_TASKS - 1);
+    }
+
+    // A full queue must bound captures, and dropping its receiver on Break
+    // must unblock senders before scope join. Isolate a regression's deadlock.
+    // Groups exactly at the handoff threshold go alone, so the bound stays
+    // one group per queue slot, per worker and on the caller.
+    #[test]
+    fn completion_queue_bounds_captures_and_releases_blocked_senders() {
+        if completion_child("completion_queue_bounds_captures_and_releases_blocked_senders") {
+            return;
+        }
+        let threads = 4;
+        let prepared = AtomicUsize::new(0);
+        let mut tasks = (0..256).map(|task| (1, task));
+        let mut emitted = 0;
+        completion_groups(
+            GroupSchedule::Streaming(threads),
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                prepared.fetch_add(1, Ordering::Release);
+                task
+            },
+            |_| HANDOFF_BYTES,
+            |_| {
+                emitted += 1;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while prepared.load(Ordering::Acquire) < 2 * threads + 1
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                // Once saturated, another prepare cannot finish until the
+                // caller consumes a group, which it deliberately does not.
+                std::thread::sleep(Duration::from_millis(10));
+                assert_eq!(prepared.load(Ordering::Acquire), 2 * threads + 1);
+                ControlFlow::Break(())
+            },
+        );
+        assert_eq!(emitted, 1);
+    }
+
+    /// Runs `body`, catching its panic, and returns the message of every panic
+    /// on any thread, in order. The hook is process-wide: call this only in a
+    /// [`completion_child`], which runs one test per process.
+    fn panics(body: impl FnOnce()) -> Vec<String> {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new({
+            let seen = seen.clone();
+            move |info| {
+                let payload = info.payload();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                lock(&seen).push(message);
+            }
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::panic::set_hook(previous);
+        std::mem::take(&mut *lock(&seen))
+    }
+
+    /// Asserts the only panic was `intended`, re-raised by the scopes it
+    /// unwound through.
+    fn assert_only_panic(seen: &[String], intended: &str) {
+        assert!(
+            seen.first().is_some_and(|first| first == intended)
+                && seen[1..]
+                    .iter()
+                    .all(|rest| rest == "a scoped thread panicked"),
+            "expected only {intended:?}, saw {seen:?}"
+        );
+    }
+
+    // A panicking worker must stop the run before the scope joins: a sibling
+    // waiting for bytes that the panic's own release cannot satisfy, and a
+    // reader polling the stop, would otherwise sleep forever. The poller
+    // keeps all but one buffer of the budget, so only the stop wakes the
+    // waiter.
+    #[test]
+    fn completion_worker_panic_wakes_input_budget_waiters() {
+        if completion_child("completion_worker_panic_wakes_input_budget_waiters") {
+            return;
+        }
+        #[derive(Clone, Copy, Debug)]
+        enum Task {
+            Poll,
+            Panic,
+            Wait,
+        }
+        const INJECTED: &str = "injected worker panic with a sibling waiting";
+        let buffer = crate::scan::BUFFER as u64;
+        let waiting = std::sync::Arc::new(AtomicBool::new(false));
+        let _seams = seam::Seams {
+            on_budget_wait: Some({
+                let waiting = waiting.clone();
+                std::sync::Arc::new(move || waiting.store(true, Ordering::SeqCst))
+            }),
+            ..Default::default()
+        }
+        .set();
+        let polling = AtomicBool::new(false);
+        let serial = AtomicBool::new(false);
+        let mut tasks = [
+            (IN_FLIGHT_BYTES - buffer, Task::Poll),
+            (buffer, Task::Panic),
+            (2 * buffer, Task::Wait),
+        ]
+        .into_iter();
+        let until = |flag: &AtomicBool, stopped: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !flag.load(Ordering::SeqCst) && !stopped() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            flag.load(Ordering::SeqCst)
+        };
+        let seen = panics(|| {
+            completion_groups_with_handoff(
+                GroupSchedule::Streaming(3),
+                &AtomicBool::new(false),
+                |stopped| {
+                    // The poller reserves first, so the panicking reader's
+                    // buffer fits beside it and the waiter's two do not.
+                    let next = tasks.next()?;
+                    if !matches!(next.1, Task::Poll) {
+                        until(&polling, stopped);
+                    }
+                    Some(next)
+                },
+                || (),
+                |_, task, stopped, _, concurrent| {
+                    if !concurrent {
+                        serial.store(true, Ordering::SeqCst);
+                        polling.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    match task {
+                        Task::Poll => {
+                            polling.store(true, Ordering::SeqCst);
+                            while !stopped() {
+                                std::thread::yield_now();
+                            }
+                        }
+                        Task::Panic if until(&waiting, &|| false) => panic!("{INJECTED}"),
+                        Task::Panic => panic!("setup: no sibling waited for bytes"),
+                        Task::Wait => {}
+                    }
+                },
+                |_| 0,
+                |()| ControlFlow::Continue(()),
+            );
+        });
+        assert!(
+            !serial.load(Ordering::SeqCst),
+            "no worker threads: {seen:?}"
+        );
+        assert!(
+            polling.load(Ordering::SeqCst),
+            "the poller never ran: {seen:?}"
+        );
+        assert!(
+            waiting.load(Ordering::SeqCst),
+            "no sibling waited: {seen:?}"
+        );
+        assert_only_panic(&seen, INJECTED);
+    }
+
+    // The first task is a quiet hit and the producer then blocks until that
+    // hit cancels the run, as grep's filtering producer can. A worker that
+    // fetched the hit and called the producer again before working it would
+    // wait forever (grep-why P2); isolate a regression's deadlock.
+    #[test]
+    fn a_first_task_hit_reaches_a_worker_while_the_producer_blocks() {
+        if completion_child("a_first_task_hit_reaches_a_worker_while_the_producer_blocks") {
+            return;
+        }
+        let cancelled = AtomicBool::new(false);
+        let mut calls = 0;
+        completion_groups(
+            GroupSchedule::Streaming(2),
+            &cancelled,
+            |stopped| {
+                calls += 1;
+                if calls == 1 {
+                    return Some((1, ()));
+                }
+                while !stopped() {
+                    std::thread::yield_now();
+                }
+                None
+            },
+            || (),
+            |_, (), _| cancelled.store(true, Ordering::Release),
+            |_| 0,
+            |()| ControlFlow::Continue(()),
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    // Small groups travel in batches, so more are prepared before the queue
+    // stalls than one per slot, but never more than the batch rules allow:
+    // with quarter-threshold groups, four per batch, each worker may hold a
+    // full batch it is sending plus one group, the queue a full batch per
+    // slot and the caller one batch.
+    #[test]
+    fn completion_queue_bounds_small_groups_by_batch() {
+        if completion_child("completion_queue_bounds_small_groups_by_batch") {
+            return;
+        }
+        let threads = 4;
+        let prepared = AtomicUsize::new(0);
+        let mut tasks = (0..1024).map(|task| (1, task));
+        completion_groups(
+            GroupSchedule::Streaming(threads),
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                prepared.fetch_add(1, Ordering::Release);
+                task
+            },
+            |_| HANDOFF_BYTES / 4,
+            |_| {
+                // Wait for preparation to stall, then never consume more.
+                let mut seen = prepared.load(Ordering::Acquire);
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let now = prepared.load(Ordering::Acquire);
+                    if now == seen {
+                        break;
+                    }
+                    seen = now;
+                }
+                assert!(seen > 2 * threads + 1, "groups were not batched: {seen}");
+                assert!(
+                    seen <= 9 * threads + 4,
+                    "batches exceeded the bound: {seen}"
+                );
+                ControlFlow::Break(())
+            },
+        );
+    }
+
+    // A worker that completes a group while the caller is idle must hand it
+    // off before taking its next task, which here is slow.
+    #[test]
+    fn group_completed_while_the_caller_is_idle_publishes_before_a_slow_task() {
+        let published = AtomicBool::new(false);
+        let waited_out = AtomicBool::new(false);
+        let mut tasks = (0..3).map(|task| (1, task));
+        let mut emitted = Vec::new();
+        completion_groups(
+            GroupSchedule::Streaming(2),
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                // Tasks 0 and 2 finish only once something is published;
+                // task 1 is the fast one its worker holds.
+                if task != 1 {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !published.load(Ordering::Acquire) {
+                        if Instant::now() >= deadline {
+                            waited_out.store(true, Ordering::Release);
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+                task
+            },
+            |_| 0,
+            |task| {
+                emitted.push(task);
+                published.store(true, Ordering::Release);
+                ControlFlow::Continue(())
+            },
+        );
+        assert!(!waited_out.load(Ordering::Acquire));
+        assert_eq!(emitted[0], 1);
+        emitted.sort_unstable();
+        assert_eq!(emitted, [0, 1, 2]);
+    }
+
+    // A worker that completes a group while the caller is busy holds it, then
+    // blocks on a slow task. When the caller runs out of queued groups it
+    // must collect the held one rather than sleep: both other tasks finish
+    // only once that group is published.
+    #[test]
+    fn group_held_while_the_caller_is_busy_publishes_before_a_slow_task() {
+        let emitting = AtomicBool::new(false);
+        let held_done = AtomicBool::new(false);
+        let published = AtomicBool::new(false);
+        let waited_out = AtomicBool::new(false);
+        let wait_for = |flag: &AtomicBool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !flag.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    waited_out.store(true, Ordering::Release);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        };
+        let mut tasks = (0..4).map(|task| (1, task));
+        let mut emitted = Vec::new();
+        completion_groups(
+            GroupSchedule::Streaming(2),
+            &AtomicBool::new(false),
+            |_| tasks.next(),
+            || (),
+            |_, task, _| {
+                match task {
+                    // Task 0 keeps the caller busy, below.
+                    0 => {}
+                    // Task 1 completes while the caller publishes task 0.
+                    1 => {
+                        wait_for(&emitting);
+                        held_done.store(true, Ordering::Release);
+                    }
+                    // Whichever worker takes 2 and 3 is stuck until task 1
+                    // is published, so neither can hand it off.
+                    _ => wait_for(&published),
+                }
+                task
+            },
+            |_| 0,
+            |task| {
+                if task == 0 {
+                    emitting.store(true, Ordering::Release);
+                    wait_for(&held_done);
+                    // Let task 1's worker hold it and start its next task.
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if task == 1 {
+                    published.store(true, Ordering::Release);
+                }
+                emitted.push(task);
+                ControlFlow::Continue(())
+            },
+        );
+        assert!(!waited_out.load(Ordering::Acquire));
+        assert_eq!(emitted[..2], [0, 1]);
+        emitted.sort_unstable();
+        assert_eq!(emitted, [0, 1, 2, 3]);
+    }
+
+    // The batch rules, as the workers apply them: the threshold is inclusive,
+    // a group that would cross it flushes the held batch first, a large group
+    // follows the batch it overtakes, and a batch is capped in count.
+    #[test]
+    fn held_batches_follow_the_handoff_rules() {
+        let mut held = Held::<u32>::default();
+        // Just under the threshold is held; exactly at it goes alone.
+        assert_eq!(held.add(0, HANDOFF_BYTES - 1), [None, None]);
+        assert_eq!(held.add(1, HANDOFF_BYTES), [Some(vec![0]), Some(vec![1])]);
+        assert_eq!(held.take(), None);
+        // Just over goes alone too, with nothing held before it.
+        assert_eq!(held.add(2, HANDOFF_BYTES + 1), [None, Some(vec![2])]);
+        // Filling the batch to exactly the threshold holds it; one more byte
+        // flushes it and starts the next batch.
+        assert_eq!(held.add(3, HANDOFF_BYTES / 2), [None, None]);
+        assert_eq!(held.add(4, HANDOFF_BYTES / 2), [None, None]);
+        assert_eq!(held.add(5, 1), [Some(vec![3, 4]), None]);
+        assert_eq!(held.bytes, 1);
+        // A batch that would cross by its last group flushes before it.
+        assert_eq!(held.add(6, HANDOFF_BYTES - 2), [None, None]);
+        assert_eq!(held.add(7, 2), [Some(vec![5, 6]), None]);
+        assert_eq!(held.take(), Some(vec![7]));
+        // Count cap: the sixteenth small group hands the batch off.
+        for group in 0..HANDOFF_GROUPS as u32 - 1 {
+            assert_eq!(held.add(group, 0), [None, None]);
+        }
+        let full = held.add(99, 0);
+        assert_eq!(full[0], None);
+        assert_eq!(full[1].as_ref().map(Vec::len), Some(HANDOFF_GROUPS));
+        assert_eq!(held.take(), None);
+    }
+
+    // Four workers each hold their first task at a barrier, so the groups
+    // are prepared in parallel; each payload arrives whole, once, and small
+    // ones travel through the held batches.
+    #[test]
+    fn groups_use_parallel_workers_and_preserve_each_payload() {
+        if completion_child("groups_use_parallel_workers_and_preserve_each_payload") {
+            return;
+        }
+        let barrier = Barrier::new(4);
+        let mut emitted = Vec::new();
+        let mut tasks = (0..80).map(|at| (1, at));
+        completion_groups(
+            GroupSchedule::Streaming(4),
+            &AtomicBool::new(false),
+            move |_| tasks.next(),
+            || false,
+            |started, at, _| {
+                if !*started {
+                    *started = true;
+                    barrier.wait();
+                }
+                (at, vec![at as u8; 1000])
+            },
+            |(_, payload)| payload.len() as u64,
+            |item| {
+                emitted.push(item);
+                ControlFlow::Continue(())
+            },
+        );
+        emitted.sort();
+        assert_eq!(
+            emitted,
+            (0..80)
+                .map(|at| (at, vec![at as u8; 1000]))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Every task but the first waits for the stop. The caller's Break must
+    // reach those workers and the producer, blocked on a full feed, before
+    // the scope joins; isolate a regression's deadlock.
+    #[test]
+    fn a_group_emission_break_cancels_in_progress_work() {
+        if completion_child("a_group_emission_break_cancels_in_progress_work") {
+            return;
+        }
+        let mut emitted = Vec::new();
+        let mut tasks = (0..80).map(|at| (1, at));
+        completion_groups(
+            GroupSchedule::Streaming(4),
+            &AtomicBool::new(false),
+            move |_| tasks.next(),
+            || (),
+            |_, at, stopped| {
+                if at != 0 {
+                    while !stopped() {
+                        std::thread::yield_now();
+                    }
+                }
+                at
+            },
+            |_| 0,
+            |at| {
+                emitted.push(at);
+                ControlFlow::Break(())
+            },
+        );
+        assert_eq!(emitted, [0]);
+    }
+
+    // A refused spawn still emits every group: with no worker or no producer
+    // the caller works alone, in source order; with some workers started,
+    // they share the work in completion order.
+    #[test]
+    fn spawn_failure_still_emits_every_group() {
+        if completion_child("spawn_failure_still_emits_every_group") {
+            return;
+        }
+        let threads = 4;
+        // (thread whose spawn fails, whether the caller works alone)
+        for (fail, alone) in [(0, true), (1, false), (3, false), (threads, true)] {
+            let _seams = seam::Seams {
+                fail_spawn_at: Some(fail),
+                ..Default::default()
+            }
+            .set();
+            let caller = std::thread::current().id();
+            let mut tasks = (0..32).map(|task| (1, task));
+            let mut emitted = Vec::new();
+            let on_caller = AtomicUsize::new(0);
+            completion_groups(
+                GroupSchedule::Streaming(threads),
+                &AtomicBool::new(false),
+                |_| tasks.next(),
+                || (),
+                |_, task, _| {
+                    if std::thread::current().id() == caller {
+                        on_caller.fetch_add(1, Ordering::Relaxed);
+                    }
+                    task
+                },
+                |_| 0,
+                |task| {
+                    emitted.push(task);
+                    ControlFlow::Continue(())
+                },
+            );
+            let on_caller = on_caller.into_inner();
+            if alone {
+                assert_eq!(emitted, (0..32).collect::<Vec<_>>(), "fail at {fail}");
+                assert_eq!(on_caller, 32, "fail at {fail}");
+            } else {
+                emitted.sort_unstable();
+                assert_eq!(emitted, (0..32).collect::<Vec<_>>(), "fail at {fail}");
+                assert_eq!(on_caller, 0, "fail at {fail}");
+            }
+        }
+    }
+
+    // A refused walk-thread spawn must not pass for an empty search: the
+    // caller either runs the search or hears why it could not.
+    #[test]
+    fn a_refused_walk_spawn_is_reported() {
+        let threads = 2;
+        let _seams = seam::Seams {
+            fail_spawn_at: Some(threads),
+            ..Default::default()
+        }
+        .set();
+        let ran = AtomicBool::new(false);
+        let result = lane_groups(
+            threads,
+            &AtomicBool::new(false),
+            |_, _| ran.store(true, Ordering::Relaxed),
+            |(): ()| ControlFlow::Continue(()),
+        );
+        assert!(!ran.load(Ordering::Relaxed));
+        let error = result.expect_err("the search never ran, silently");
+        assert_eq!(error.to_string(), "injected spawn failure");
+    }
+
+    // A reservation taken by a task that panics is released as it unwinds,
+    // so a later reader is not left waiting on leaked bytes.
+    #[test]
+    fn a_panicking_reader_releases_its_reservation() {
+        if completion_child("a_panicking_reader_releases_its_reservation") {
+            return;
+        }
+        lane_groups(
+            1,
+            &AtomicBool::new(false),
+            |lanes, stopped| {
+                let lane = &lanes[0];
+                let held = lane.reserve(u64::MAX, stopped);
+                assert!(held.is_some(), "the reader never held the budget");
+                let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _held = held;
+                    panic!("reader fails mid-read");
+                }));
+                let payload = unwound.expect_err("the reader did not panic");
+                assert_eq!(
+                    payload.downcast_ref::<&str>(),
+                    Some(&"reader fails mid-read")
+                );
+                assert!(lane.reserve(u64::MAX, stopped).is_some());
+            },
+            |(): ()| ControlFlow::Continue(()),
+        )
+        .unwrap();
+    }
+
+    /// A walk of [`Job`]s for the find scheduler. Its first step lends every
+    /// job but the next, so each job after it runs as its own task.
+    struct Jobs(Vec<Job>);
+
+    #[derive(Clone, Copy)]
+    enum Job {
+        /// Does nothing, so the walk splits.
+        Lend,
+        /// Reserves the whole input budget and panics once a sibling waits
+        /// for bytes.
+        Hog,
+        /// Waits for the hog's reservation, then reserves.
+        Wait,
+        /// Panics once a sibling polls.
+        Panic,
+        /// Holds a reservation until the run stops, as a slow read does.
+        Poll,
+    }
+
+    impl crate::find::schedule::Split for Jobs {
+        fn split(
+            &mut self,
+            _: bool,
+            _: crate::find::schedule::Share,
+        ) -> Option<(Self, Option<std::sync::Arc<AtomicUsize>>)> {
+            (self.0.len() > 1).then(|| (Jobs(self.0.split_off(1)), None))
+        }
+        fn waiting(&self) -> bool {
+            false
+        }
+        fn suspended(&self) -> bool {
+            false
+        }
+    }
+
+    /// Runs [`Job`]s against its lane, as grep's walk workers search files.
+    struct Jobber<'l, 'g> {
+        lane: &'l Lane<'g, ()>,
+        stopped: &'l (dyn Fn() -> bool + Sync),
+        /// Both jobs of a run are on their own workers before either acts.
+        met: &'l Barrier,
+        hogged: &'l AtomicBool,
+        waiting: &'l AtomicBool,
+        polling: &'l AtomicBool,
+    }
+
+    impl crate::find::schedule::Visitor<Jobs, ()> for Jobber<'_, '_> {
+        fn step(&mut self, walk: &mut Jobs, (): &mut ()) -> crate::find::schedule::Step {
+            use crate::find::schedule::Step;
+            if walk.0.is_empty() {
+                return Step::Done;
+            }
+            let job = walk.0.remove(0);
+            if !matches!(job, Job::Lend) {
+                self.met.wait();
+            }
+            let until = |flag: &AtomicBool| {
+                while !flag.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            match job {
+                Job::Lend => {}
+                Job::Hog => {
+                    let _held = self.lane.reserve(u64::MAX, self.stopped);
+                    self.hogged.store(true, Ordering::SeqCst);
+                    until(self.waiting);
+                    panic!("hog fails holding the budget");
+                }
+                Job::Wait => {
+                    until(self.hogged);
+                    let _held = self.lane.reserve(1, self.stopped);
+                }
+                Job::Panic => {
+                    until(self.polling);
+                    panic!("walker fails")
+                }
+                Job::Poll => {
+                    let _held = self.lane.reserve(1, self.stopped);
+                    self.polling.store(true, Ordering::SeqCst);
+                    while !(self.stopped)() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            Step::Next
+        }
+        fn lend(&mut self, (): &mut ()) {}
+        fn end(&mut self, (): &mut ()) -> u64 {
+            0
+        }
+    }
+
+    /// Walks `jobs` with two scheduler workers inside [`lane_groups`], as
+    /// grep's live walk does, and returns its [`panics`].
+    fn walk_jobs(jobs: Vec<Job>) -> Vec<String> {
+        let waiting = std::sync::Arc::new(AtomicBool::new(false));
+        let _seams = seam::Seams {
+            on_budget_wait: Some({
+                let waiting = waiting.clone();
+                std::sync::Arc::new(move || waiting.store(true, Ordering::SeqCst))
+            }),
+            ..Default::default()
+        }
+        .set();
+        let met = Barrier::new(2);
+        let hogged = AtomicBool::new(false);
+        let polling = AtomicBool::new(false);
+        panics(|| {
+            let _ = lane_groups(
+                2,
+                &AtomicBool::new(false),
+                |lanes, stopped| {
+                    let quit = AtomicBool::new(false);
+                    let stop = || lanes[0].stop();
+                    let schedule = crate::find::schedule::Schedule {
+                        workers: 2,
+                        starts: false,
+                        quit: &quit,
+                        on_panic: Some(&stop),
+                        on_refused: None,
+                    };
+                    let jobber = |i: usize| Jobber {
+                        lane: &lanes[i],
+                        stopped,
+                        met: &met,
+                        hogged: &hogged,
+                        waiting: &waiting,
+                        polling: &polling,
+                    };
+                    crate::find::schedule::run(
+                        &schedule,
+                        Jobs(jobs),
+                        (),
+                        &mut jobber(0),
+                        |_| true,
+                        jobber,
+                    );
+                },
+                |(): ()| ControlFlow::Continue(()),
+            );
+        })
+    }
+
+    // P2 of the D105 review: a walker panicking inside the scheduler stops
+    // the lane pool, so a sibling waiting for bytes, or reading until the
+    // run stops, wakes and the panic reaches the caller.
+    #[test]
+    fn a_walker_panic_stops_sibling_walkers() {
+        if completion_child("a_walker_panic_stops_sibling_walkers") {
+            return;
+        }
+        // Each panic happens only after its sibling is waiting or polling.
+        let seen = walk_jobs(vec![Job::Lend, Job::Hog, Job::Wait]);
+        assert_only_panic(&seen, "hog fails holding the budget");
+        let seen = walk_jobs(vec![Job::Lend, Job::Panic, Job::Poll]);
+        assert_only_panic(&seen, "walker fails");
+    }
+
+    // Streaming keeps the input reservation while the publisher consumes an
+    // active task. A sibling waiting for that budget must not strand either
+    // thread, including when publication stops or the stream owner panics.
+    #[test]
+    fn active_lane_streams_release_budget_waiters_and_channel_senders() {
+        if completion_child("active_lane_streams_release_budget_waiters_and_channel_senders") {
+            return;
+        }
+        enum Handoff {
+            Held,
+            Stream(std::sync::mpsc::Receiver<usize>),
+        }
+        for mode in 0..3 {
+            let waiting = std::sync::Arc::new(AtomicBool::new(false));
+            let _seams = seam::Seams {
+                on_budget_wait: Some({
+                    let waiting = waiting.clone();
+                    std::sync::Arc::new(move || waiting.store(true, Ordering::SeqCst))
+                }),
+                ..Default::default()
+            }
+            .set();
+            let mut held = false;
+            let mut received = 0;
+            let seen = panics(|| {
+                lane_groups(
+                    2,
+                    &AtomicBool::new(false),
+                    |lanes, stopped| {
+                        std::thread::scope(|scope| {
+                            let _reservation = lanes[0].reserve(u64::MAX, stopped).unwrap();
+                            let sibling = &lanes[1];
+                            scope.spawn(move || {
+                                let _reservation = sibling.reserve(1, stopped);
+                            });
+                            while !waiting.load(Ordering::SeqCst) {
+                                std::thread::yield_now();
+                            }
+                            assert!(lanes[0].hand(Handoff::Held, 0).is_continue());
+                            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                            assert!(lanes[0].handoff(Handoff::Stream(receiver), stopped));
+                            for chunk in 0..32 {
+                                if sender.send(chunk).is_err() {
+                                    break;
+                                }
+                                assert!(mode != 2, "stream owner panics after its first chunk");
+                            }
+                        });
+                    },
+                    |handoff| match handoff {
+                        Handoff::Held => {
+                            held = true;
+                            ControlFlow::Continue(())
+                        }
+                        Handoff::Stream(receiver) => {
+                            assert!(held, "active handoff did not flush the held batch");
+                            for chunk in receiver {
+                                assert_eq!(chunk, received);
+                                received += 1;
+                                if mode == 1 {
+                                    return ControlFlow::Break(());
+                                }
+                            }
+                            ControlFlow::Continue(())
+                        }
+                    },
+                )
+                .unwrap();
+            });
+            if mode == 2 {
+                assert_only_panic(&seen, "stream owner panics after its first chunk");
+            } else {
+                assert_eq!(seen, Vec::<String>::new());
+            }
+            assert_eq!(received, if mode == 0 { 32 } else { 1 });
+        }
+    }
+
+    // An active task cannot wait for its own synchronous publisher. Both
+    // worker-start and producer-start fallback must expose that same mode.
+    #[test]
+    fn active_handoffs_publish_synchronously_on_serial_and_spawn_fallback_paths() {
+        if completion_child(
+            "active_handoffs_publish_synchronously_on_serial_and_spawn_fallback_paths",
+        ) {
+            return;
+        }
+        for (threads, fail_spawn_at) in [(1, None), (2, Some(0)), (2, Some(2))] {
+            let _seams = seam::Seams {
+                fail_spawn_at,
+                ..Default::default()
+            }
+            .set();
+            let mut tasks = (0..4).map(|task| (1, task));
+            let mut emitted = Vec::new();
+            completion_groups_with_handoff(
+                GroupSchedule::Streaming(threads),
+                &AtomicBool::new(false),
+                |_| tasks.next(),
+                || (),
+                |_, task, _, handoff, concurrent| {
+                    assert!(!concurrent);
+                    assert!(handoff(task * 2));
+                    task * 2 + 1
+                },
+                |_| 0,
+                |item| {
+                    emitted.push(item);
+                    ControlFlow::Continue(())
+                },
+            );
+            assert_eq!(emitted, (0..8).collect::<Vec<_>>());
         }
     }
 }

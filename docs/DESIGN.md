@@ -52,6 +52,127 @@ ferret-bench   → anything; nothing depends on it
 | `ferret-query`   | query syntax, planning, execution, result rows                                                                                 | any structure's on-disk format |
 | `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                              | —                              |
 
+Grep M1 (2026-10-16) adds no dependency edge: query’s `line_grep` owns
+rg argv parsing, candidate selection and line records; verify owns its resolved
+line profile and matcher; policy owns override globs/hidden selection; the
+`ferret::grep` host owns operand resolution and grouped plain output. Search and
+grep share the candidate seam, crawl reader adaptation and query’s streaming
+core. Find exposes source constructors without requiring a parsed expression.
+
+Grep M2 (2026-10-17) keeps that graph: the existing query verification scheduler
+also carries bounded line-group payloads. Its producer runs on its own thread;
+workers never call it. Streaming feeds queue at most four paths per worker.
+Indexed feeds queue at most max(4T, 16) paths and wake a worker at each 16 queued
+paths, then everyone when enumeration ends (D107 B). Workers take consecutive
+runs of at most 16 files or 64 KiB of summed catalog sizes, with larger files
+alone (D106 B). Each run's pending tail remains shared: idle workers steal its
+far end even while the owner is blocked in a file read, so a slow file holds no
+other file's path. At most 15 pending paths per worker join the producer
+backlog; these hold no input-byte reservation or rendered capture. That is the
+indexed producer path. The D105 parallel live walk (`-uu`, `--live`) has no
+producer: workers lend each other subtrees of a directory operand, so there a
+slow file holds only its own worker. Two bends keep operand order. A segment's
+file operands are searched in order by one worker, so a slow one delays the
+files after it. Each directory operand is its own scheduler run, a barrier: it
+starts after the operands before it finish and ends before the next starts.
+A refused thread runs the search on fewer and warns once (D108 B).
+Workers own checked reads and line rendering. Grep workers send completed
+groups through a bounded completion queue (D92 B); the
+calling host publishes each whole group. One thread keeps walk order. A
+publication mutex excludes live policy warnings from groups; per-file
+diagnostics share the host. Workers batch groups only while the host is busy:
+a group whose capture holds 64 KiB or more goes alone, smaller ones travel
+together up to 64 KiB, and the host takes every held batch before it sleeps,
+so a held group waits only on other output, never on its worker's next file
+or on a worker asleep waiting for the producer. For configured concurrency T,
+the queue holds at most T handoffs, each worker one group in progress and a
+batch of at most 64 KiB, and the host one handoff. Captures share one allocation
+budget of (2T + 1) × 4 MiB across workers, queued groups and the publisher
+(D109 B); a single waiting file may use most of it. Charges cover buffer
+capacity, remain with completed groups through publication/discard, and return
+only after the corresponding allocation is freed. Live capture allocations
+plus handoff buffers remain bounded by (2T + 1) × 4 MiB + (4T + 1) × 64 KiB,
+under 269 MiB at 32 threads (D93). The 64 KiB terms cover held batches,
+stream buffering, one queued and one sending chunk per worker, and the
+publisher's current chunk. This is not a peak-RSS bound. RSS adds the base heap
+(77 MiB on the 112k-file flat index at one thread), per-worker read and matcher state, and freed captures
+that glibc keeps: once a large block is freed its dynamic mmap threshold rises,
+so later captures come from per-thread arenas that each keep their own high
+water. Before streaming, flat `--json -F the` at 32 threads measured 436 MiB
+(226 MiB with `MALLOC_MMAP_THRESHOLD_=131072`), against rg's 591 MiB. D93
+permits peak RSS up to rg's at the same thread count; these historical figures
+are not a new streaming measurement. The producer's queue holds paths, not
+captures.
+
+Above 4 MiB, a growing capture takes the exclusive streaming slot when free
+and hands an active stream through the same completion queue, flushing that
+worker's held batch first. The publisher writes the prefix and consumes a
+one-slot channel of 64 KiB chunks until the file's closing check finishes
+(D103 A). Other workers keep capturing past 4 MiB within the shared budget,
+waiting only when it is full (D109 B). A still-growing file takes the slot on
+its next write after the previous stream ends; budget waiters wake for slot
+release as well as freed bytes. A file that finishes capturing first publishes
+a complete checked group. Streaming ownership is granted before checking space
+and held through the publisher's finish message. The owner replays its prefix
+and finishes without ever waiting for capture bytes, even with a full budget.
+Feed and D105 walk workers use the same lane handoff. No worker holds a
+queue-slot, feed/run or publication lock while sending. The stream owner keeps
+its input reservation until it finishes, but the publisher never reserves input
+bytes or waits for other workers; it drains only that owner's chunk channel.
+Each read also holds its full descriptor admission through the closing version
+check, including capture waits. Neither streaming owner nor publisher needs a
+blocked reader's admission; no input or context spool releases and reacquires
+one. Thus neither byte nor descriptor waits can block the stream's progress.
+Indexed pending tails remain stealable while their owner streams. Live policy
+warnings acquire the publication lock outside reads and handoffs, so a streaming
+owner never needs a lock held by its publisher. Reservations release on unwind;
+the walk scheduler's panic hook stops the lane pool and wakes budget waiters.
+Sender/receiver drop releases channel waiters on cancellation or panic. Capture
+budget waits poll the combined stop predicate at most every 20 ms, covering
+external cancellation, quiet hits, publication faults and scheduler panic.
+Single-thread and spawn-fallback feed handoffs publish synchronously; stdin uses
+a direct writer. Find retains its ordered publication path.
+
+Rendered grep captures never spill, whether scanning, queued, or re-rendered
+from cached records. Only the separate rolling before-context spool spills,
+past 64 KiB, with its existing disk bound. Its faults fail the input file and
+continue with exit 2 (D102 A). Before publication the capture is discarded;
+after publication the prefix remains and the diagnostic names the input and
+temporary-file fault. Streamed files never retry. Up to 4 MiB, publication
+retains one checked version per file; larger captures waiting for the streaming
+slot retain that transaction too. Once streaming starts it promises **one
+version, or a diagnostic**. A changed closing version or later file error
+retains printed output, diagnoses the file, and sets exit 2. JSON closes its
+begun group with observed partial statistics. A broken stdout pipe remains silent exit 0 (D94).
+The queue lets workers prepare ahead while the host waits on stdout; direct worker publication
+regressed pipe throughput in the D92 measurements, despite reducing caller CPU
+work. Bounded catalog-version line records are reused only after each alias's
+own stat; current-byte answers stay local.
+
+Grep M6 (2026-10-17) keeps the graph. Host namespace adapters choose find's
+catalog or physical live constructors; policy-preserving live search loads
+validated root anchors and reconstructs D13 with the existing pure DirRules.
+Scoped ignore-file I/O uses crawl’s shared single-directory loader (review
+correction, 2026-10-17); it lives neither in policy nor in the query walker.
+Unrestricted live search needs no catalog. All content reads still use the
+same bracket/retry and bounded worker/group engine.
+
+Grep M7 (2026-10-17) keeps the graph. Verify resolves multiline/dotall and
+conservative LF exclusion alongside the shared HIR/necessary query. Query's
+multiline scanner buffers one checked attempt with fallible allocation, then
+takes one pass of whole matches over it (D98): the `-m` limit, counts, rendering,
+replacement captures and JSON submatches all read those spans, and lines after
+the limit are context that is never searched. Host records retain cross-line
+highlight spans through bounded duplicate caching; rendering does not re-run a
+cross-line pattern on detached line contents.
+
+Grep M8 (2026-10-17) extends GrepFlags' shared profile compilation with
+replacement reference resolution. Verify owns capture spans and byte expansion;
+query projects expanded records one displayed line at a time, preserving the
+original source boundaries independently of display numbers. Host caches those
+records and highlights through the existing checked capture/stream transaction.
+No input write path or dependency edge is added.
+
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
 - **`ferret-index` knows doc ids and byte strings, not files.** It is the part

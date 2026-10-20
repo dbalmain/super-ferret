@@ -279,7 +279,7 @@ fn a_stream_reads_the_current_version_once() {
 /// old inode's under the new file's path.
 #[test]
 fn a_stream_rejects_a_file_unlinked_or_replaced_during_its_read() {
-    for replace in [false, true] {
+    for (replace, alias) in [(false, false), (true, false), (false, true), (true, true)] {
         let tmp = Tmp::new(if replace {
             "stream-replaced"
         } else {
@@ -288,6 +288,11 @@ fn a_stream_rejects_a_file_unlinked_or_replaced_during_its_read() {
         let (catalog, _) = indexed(&tmp, &FILES);
         let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
         let path = tmp.at("a/b/one.txt");
+        // Strict reads already reject the ctime change even if an alias
+        // survives.
+        if alias {
+            fs::hard_link(&path, tmp.at("alias")).unwrap();
+        }
         let during = || match replace {
             false => fs::remove_file(&path).unwrap(),
             true => {

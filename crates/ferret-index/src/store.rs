@@ -369,12 +369,25 @@ impl View {
     /// unlinks a retired one only after publishing the manifest that drops
     /// it, so a segment missing here means a newer manifest exists: the
     /// open is retried, a few times, from the manifest.
+    ///
+    /// Segments open on up to one thread per available core; a host with a
+    /// configured thread count uses [`View::open_with_threads`].
     pub fn open(dir: &Path, catalog: &CatalogView) -> Result<Option<Self>, Error> {
+        Self::open_with_threads(dir, catalog, available_threads())
+    }
+
+    /// [`View::open`] with segments opened on at most `threads` threads,
+    /// capped by the segment count; one opens them on the calling thread.
+    pub fn open_with_threads(
+        dir: &Path,
+        catalog: &CatalogView,
+        threads: usize,
+    ) -> Result<Option<Self>, Error> {
         for _ in 0..3 {
             let Some(manifest) = Manifest::read(dir)?.filter(|m| fits(m, catalog)) else {
                 return Ok(None);
             };
-            match open_pairs(dir, &manifest) {
+            match open_pairs(dir, &manifest, threads) {
                 Ok((segments, trigrams)) => {
                     return Ok(Some(Self {
                         manifest,
@@ -453,18 +466,39 @@ impl IndexWriter {
     /// version, one whose high water exceeds the catalog's `next_doc`, or one
     /// whose manifest or segments do not read back. Files no manifest names
     /// are removed.
+    ///
+    /// Segments open as [`View::open`] opens them.
     pub fn open(dir: &Path, catalog: &CatalogView) -> Result<Self, Error> {
         Self::open_with_codec(dir, catalog, crate::segment::DICTIONARY_CODEC)
+    }
+
+    /// [`IndexWriter::open`] with segments opened as
+    /// [`View::open_with_threads`] opens them.
+    pub fn open_with_threads(
+        dir: &Path,
+        catalog: &CatalogView,
+        threads: usize,
+    ) -> Result<Self, Error> {
+        Self::open_with(dir, catalog, crate::segment::DICTIONARY_CODEC, threads)
     }
 
     /// Opens an index with the requested term dictionary codec. Existing
     /// segments of another codec are rebuilt through coverage.
     pub fn open_with_codec(dir: &Path, catalog: &CatalogView, codec: u32) -> Result<Self, Error> {
+        Self::open_with(dir, catalog, codec, available_threads())
+    }
+
+    fn open_with(
+        dir: &Path,
+        catalog: &CatalogView,
+        codec: u32,
+        threads: usize,
+    ) -> Result<Self, Error> {
         Writer::with_codec(0, 0, codec)?;
         fs::create_dir_all(dir)?;
         let usable = Manifest::read(dir)?.filter(|m| fits(m, catalog));
         let opened = match usable {
-            Some(manifest) => match open_pairs(dir, &manifest) {
+            Some(manifest) => match open_pairs(dir, &manifest, threads) {
                 Ok((segments, trigrams)) if segments.iter().all(|s| s.codec() == codec) => {
                     Some(View {
                         manifest,
@@ -1045,44 +1079,97 @@ type OpenPair = (Arc<Segment<File>>, Arc<Segment<File>>);
 type WrittenPair = (SegmentEntry, Arc<Segment<File>>, Arc<Segment<File>>);
 type PairedSegments = (Vec<Arc<Segment<File>>>, Vec<Arc<Segment<File>>>);
 
-fn open_pairs(dir: &Path, manifest: &Manifest) -> Result<PairedSegments, Error> {
-    manifest
-        .segments
-        .iter()
-        .map(|entry| -> Result<OpenPair, Error> {
-            let open = |tri: bool| -> Result<_, Error> {
-                let name = if tri {
-                    entry.trigram_file_name()
-                } else {
-                    entry.file_name()
-                };
-                let file = File::open(dir.join(name))?;
-                let bytes = file.metadata()?.len();
-                let segment = Segment::open(file)?;
-                let matches = if tri {
-                    entry.matches_trigrams(
-                        &segment.info(),
-                        &segment.digest(),
-                        bytes,
-                        manifest.trigram_version,
-                    ) && segment.codec() == crate::segment::DICTIONARY_CODEC
-                } else {
-                    entry.matches(
-                        &segment.info(),
-                        &segment.digest(),
-                        bytes,
-                        manifest.tokenizer_version,
-                    )
-                };
-                if !matches {
-                    return Err(ReadError::Head.into());
-                }
-                Ok(Arc::new(segment))
+/// Opens every segment pair in manifest order, on at most `threads` threads.
+/// The error is the first in manifest order, as a serial open returns it: a
+/// NotFound there makes [`View::open`] retry from a newer manifest.
+fn open_pairs(dir: &Path, manifest: &Manifest, threads: usize) -> Result<PairedSegments, Error> {
+    let one = |entry: &SegmentEntry| -> Result<OpenPair, Error> {
+        let open = |tri: bool| -> Result<_, Error> {
+            let name = if tri {
+                entry.trigram_file_name()
+            } else {
+                entry.file_name()
             };
-            Ok((open(false)?, open(true)?))
+            let file = File::open(dir.join(name))?;
+            let bytes = file.metadata()?.len();
+            let segment = Segment::open(file)?;
+            let matches = if tri {
+                entry.matches_trigrams(
+                    &segment.info(),
+                    &segment.digest(),
+                    bytes,
+                    manifest.trigram_version,
+                ) && segment.codec() == crate::segment::DICTIONARY_CODEC
+            } else {
+                entry.matches(
+                    &segment.info(),
+                    &segment.digest(),
+                    bytes,
+                    manifest.tokenizer_version,
+                )
+            };
+            if !matches {
+                return Err(ReadError::Head.into());
+            }
+            Ok(Arc::new(segment))
+        };
+        Ok((open(false)?, open(true)?))
+    };
+    // Parsing each segment's block index is most of opening a view, so
+    // segments open in parallel (grep-why P7), on the host's thread count
+    // (D77 C). The calling thread opens whatever a refused spawn leaves.
+    let segments = &manifest.segments;
+    let threads = threads.clamp(1, segments.len().max(1));
+    let pairs: Result<Vec<_>, Error> = if threads == 1 {
+        segments.iter().map(one).collect()
+    } else {
+        let chunk = segments.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut rest: &[SegmentEntry] = &[];
+            for (i, entries) in segments.chunks(chunk).enumerate() {
+                let work = move || entries.iter().map(one).collect::<Vec<_>>();
+                match spawn_open(scope, i, work) {
+                    Ok(handle) => handles.push(handle),
+                    Err(_) => {
+                        rest = &segments[i * chunk..];
+                        break;
+                    }
+                }
+            }
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .chain(rest.iter().map(one))
+                .collect()
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|pairs| pairs.into_iter().unzip())
+    };
+    pairs.map(|pairs| pairs.into_iter().unzip())
+}
+
+/// Starts segment-open thread `i` on the scope; `Err` when the OS refuses.
+fn spawn_open<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    i: usize,
+    work: impl FnOnce() -> T + Send + 'scope,
+) -> io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    #[cfg(test)]
+    {
+        if FAIL_OPEN_SPAWN_AT.get() == Some(i) {
+            return Err(io::Error::other("injected spawn failure"));
+        }
+        OPEN_SPAWNS.set(OPEN_SPAWNS.get() + 1);
+    }
+    #[cfg(not(test))]
+    let _ = i;
+    std::thread::Builder::new()
+        .name("ferret-open".into())
+        .spawn_scoped(scope, work)
+}
+
+/// One thread per available core, for opens without a configured count.
+fn available_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// Unlinks merged-away segments. Open views keep their descriptors (D32);
@@ -1185,6 +1272,10 @@ thread_local! {
     static CANCEL_AT: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
     static CANCELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static STOP: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
+    /// The segment-open thread whose spawn fails.
+    static FAIL_OPEN_SPAWN_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Segment-open threads started on this thread.
+    static OPEN_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

@@ -17,6 +17,8 @@ use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Me
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
 use ferret_query::{Content, DocNames, NameIndex, Query, Row, RunError, Stats, UNCOVERED_BOUND};
 
+pub(crate) mod reader;
+
 static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// A checked, fully loaded query engine. A query-only engine takes no writer
@@ -244,12 +246,18 @@ impl Engine {
     /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] under the
     /// writer lock this engine holds. An index that does not fit the current
     /// catalog view is discarded, to be rebuilt by [`Engine::follow_content`].
+    /// Segments open on the search thread count.
     pub fn attach_content(&self, catalog_dir: &Path) -> Result<(), Error> {
+        let threads = self.pin().search_threads();
         let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let live = live_documents(&view);
-        let opened = IndexWriter::open(&catalog_dir.join(CONTENT_DIR), &catalog_view(&view, &live))
-            .map_err(Error::Content)?;
+        let opened = IndexWriter::open_with_threads(
+            &catalog_dir.join(CONTENT_DIR),
+            &catalog_view(&view, &live),
+            threads,
+        )
+        .map_err(Error::Content)?;
         let published = opened.view();
         *self.content.lock().map_err(|_| Error::WriterPanicked)? = Some(opened);
         self.select_content(published);
@@ -260,12 +268,13 @@ impl Engine {
     /// reading, for a query-only engine: no writer lock, nothing repaired
     /// or removed. An index that is absent or does not fit the catalog view
     /// leaves the engine without one, which content queries treat as
-    /// nothing covered.
+    /// nothing covered. Segments open on the search thread count.
     pub fn open_content(&self, catalog_dir: &Path) -> Result<(), Error> {
         let pin = self.pin();
-        let view = ferret_index::View::open(
+        let view = ferret_index::View::open_with_threads(
             &catalog_dir.join(CONTENT_DIR),
             &catalog_view(pin.catalog(), pin.live()),
+            pin.search_threads(),
         )
         .map_err(Error::Content)?;
         let mut current = self
@@ -540,28 +549,10 @@ impl QuerySession {
         };
         let documents = ferret_crawl::Documents::by_name(catalog)?;
         let fork = || -> Box<ferret_query::Reader<'_>> {
-            // One reader per thread for this query: the directories it
-            // walks are held for the query's later paths.
-            let mut reader = documents.fork().holding_directories();
-            Box::new(move |name, request: ferret_query::ReadRequest<'_>| {
-                let observed = match request {
-                    ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
-                    // `stop` is the query's cancellation, and on a
-                    // worker also the pool's stop at a limit.
-                    ferret_query::ReadRequest::Bytes(out, stop) => {
-                        reader.read_current_name_until(catalog, name, out, stop)
-                    }
-                    ferret_query::ReadRequest::Stream(each, stop) => {
-                        reader.stream_current_name_until(catalog, name, each, stop)
-                    }
-                }
-                .ok()?;
-                let recorded = catalog.inode(catalog.name(name).child).stat;
-                Some(if recorded.same_version(&observed) {
-                    ferret_query::ReadVersion::Catalogued
-                } else {
-                    ferret_query::ReadVersion::Current
-                })
+            let mut checked = reader::checked(catalog, &documents);
+            Box::new(move |name, request| match checked(name, request) {
+                ferret_query::ReadOutcome::Stable(version) => Some(version),
+                _ => None,
             })
         };
         query.run_content_parallel(
@@ -575,6 +566,21 @@ impl QuerySession {
             cancelled,
             emit,
         )
+    }
+
+    /// Grep's necessary candidates, including uncovered documents. Missing
+    /// trigram sources automatically enumerate; there is no scan refusal.
+    pub(crate) fn grep_candidates(
+        &self,
+        grep: &ferret_verify::Grep,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<DocSet, ferret_index::ReadError> {
+        let live = self
+            .live_until(stopped)
+            .ok_or(ferret_index::ReadError::Cancelled)?;
+        let pinned = Pinned::new_until(self.content.as_deref(), live, stopped)
+            .ok_or(ferret_index::ReadError::Cancelled)?;
+        ferret_query::line_grep::candidates(grep, &pinned, stopped)
     }
 
     /// The catalog view's live documents, built once per view.
@@ -664,7 +670,7 @@ impl QuerySession {
     /// As `doc_names`, publishing only a completed build: `Ok(None)` once
     /// `cancelled` answers true, leaving the next caller to build it. Two
     /// concurrent builders may both build; the first to finish wins.
-    fn doc_names_until(
+    pub(crate) fn doc_names_until(
         &self,
         cancelled: impl Fn() -> bool,
     ) -> Result<Option<&DocNames>, OpenError> {
@@ -701,6 +707,11 @@ pub fn env_threads(value: Option<&str>) -> Option<usize> {
     value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&threads| threads > 0)
+}
+
+/// Resolve index settings without opening the resident content engine.
+pub(crate) fn search_threads_for(index: &Path) -> usize {
+    Threads::new(index).get()
 }
 
 impl Threads {

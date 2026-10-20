@@ -31,7 +31,183 @@ use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 
 use crate::ContentFault;
-use crate::observe::{BulkRead, Opened, Reader, bracket, catalog_stat};
+use crate::observe::{BulkRead, Opened, Reader, bracket, bracket_search, catalog_stat};
+
+/// Streams an explicit regular file or live-fallback file, using the same
+/// current-version bracket as catalogued candidates. `None` imposes no policy
+/// size cap. Zero reported size selects an EOF read so virtual-file content
+/// is visible; nonzero sizes bound reads. Both retain the closing fstat against
+/// the opening version, even after an early stop. The caller owns retry and
+/// publication of buffered output.
+pub fn stream_file_until(
+    path: &std::path::Path,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    stream_file_until_with_growth(
+        Named::follow(rustix::fs::CWD, path.as_os_str()),
+        cap,
+        each,
+        cancelled,
+        false,
+    )
+}
+
+/// Search-only form of [`stream_file_until`]. The caller publishes the
+/// opening-size prefix only after this function accepts its closing stat.
+pub fn stream_search_file_until(
+    path: &std::path::Path,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    stream_file_until_with_growth(
+        Named::follow(rustix::fs::CWD, path.as_os_str()),
+        cap,
+        each,
+        cancelled,
+        true,
+    )
+}
+
+/// [`stream_search_file_until`] for a name a walk listed in `directory`,
+/// opened beneath that descriptor without following a symlink, and checked
+/// by that same name, no-follow, at the close. A name swapped for a symlink
+/// after the listing reads as changed rather than through the link (D21).
+pub fn stream_search_listed_until(
+    directory: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    let named = Named {
+        directory,
+        name,
+        open: OFlags::NOFOLLOW,
+        check: AtFlags::SYMLINK_NOFOLLOW,
+    };
+    stream_file_until_with_growth(named, cap, each, cancelled, true)
+}
+
+/// A file to open by `name` beneath `directory`, with the symlink policy
+/// for its open and for its closing name check, which must agree.
+struct Named<'a> {
+    directory: BorrowedFd<'a>,
+    name: &'a std::ffi::OsStr,
+    open: OFlags,
+    check: AtFlags,
+}
+
+impl<'a> Named<'a> {
+    /// An explicit operand's path, following symlinks throughout.
+    fn follow(directory: BorrowedFd<'a>, name: &'a std::ffi::OsStr) -> Self {
+        Self {
+            directory,
+            name,
+            open: OFlags::empty(),
+            check: AtFlags::empty(),
+        }
+    }
+}
+
+fn stream_file_until_with_growth(
+    named: Named<'_>,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+    accept_growth: bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    if cancelled() {
+        return Err(ContentFault::Cancelled);
+    }
+    let fd = openat(
+        named.directory,
+        named.name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | named.open,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        // A single no-follow name that is now a symlink: not the regular
+        // file its directory listed, so changed, like any other type.
+        rustix::io::Errno::LOOP if named.open.contains(OFlags::NOFOLLOW) => ContentFault::Changed,
+        _ => ContentFault::Open(error.into()),
+    })?;
+    let (file, current) = regular_file(fd)?;
+    if let Some(cap) = cap
+        && current.size > cap
+    {
+        return Err(ContentFault::TooLarge {
+            size: current.size,
+            cap,
+        });
+    }
+    checked_file(
+        file,
+        current,
+        accept_growth,
+        &mut |first| check_read_name(named.directory, named.name, named.check, first),
+        &mut |file, size| {
+            let extent = if size == 0 { u64::MAX } else { size };
+            each(&mut Read::take(file, extent), extent).map_err(|error| {
+                if cancelled() {
+                    ContentFault::Cancelled
+                } else {
+                    ContentFault::Read(error)
+                }
+            })
+        },
+    )
+}
+
+/// Validate the open descriptor, rather than path metadata that may already
+/// name another inode. Shared by sized transactions and direct virtual streams.
+fn regular_file(fd: OwnedFd) -> Result<(File, ferret_catalog::Stat), ContentFault> {
+    let stat = fstat(&fd).map_err(|error| ContentFault::Stat(error.into()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(ContentFault::Changed);
+    }
+    Ok((File::from(fd), catalog_stat(&stat)))
+}
+
+fn checked_file(
+    mut file: File,
+    current: ferret_catalog::Stat,
+    accept_growth: bool,
+    check_name: &mut dyn FnMut(&ferret_catalog::Stat) -> Result<(), ContentFault>,
+    pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    pass(&mut file, current.size)?;
+    if accept_growth {
+        let after = bracket_search(&file, &current)?;
+        check_name(&current)?;
+        Ok(after)
+    } else {
+        bracket(&file, &current, ferret_catalog::Content::Binary)?;
+        Ok(current)
+    }
+}
+
+/// A descriptor's nonzero link count can belong to an alias after this name
+/// was replaced. Search accepts ctime changes, so it needs this identity check
+/// in addition to the descriptor bracket; strict reads reject those changes.
+fn check_read_name(
+    parent: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    flags: AtFlags,
+    first: &ferret_catalog::Stat,
+) -> Result<(), ContentFault> {
+    let named = statat(parent, name, flags).map_err(|error| match error {
+        rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR => ContentFault::Changed,
+        _ => ContentFault::Stat(error.into()),
+    })?;
+    if (named.st_dev, named.st_ino) == (first.dev, first.ino) {
+        Ok(())
+    } else {
+        Err(ContentFault::Changed)
+    }
+}
 
 /// One catalog view's documents, each with one of its names.
 pub struct Documents {
@@ -295,12 +471,40 @@ impl Documents {
         out: &mut Vec<u8>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.read_current_name_with_growth(catalog, name, out, cancelled, false)
+    }
+
+    /// Search-only version of [`Documents::read_current_name_until`].
+    pub fn read_search_name_until(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        out: &mut Vec<u8>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.read_current_name_with_growth(catalog, name, out, cancelled, true)
+    }
+
+    fn read_current_name_with_growth(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        out: &mut Vec<u8>,
+        cancelled: &dyn Fn() -> bool,
+        accept_growth: bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
         out.clear();
         let (cap, limiter) = (self.config.size_cap, self.limiter.clone());
-        let current = self.current_until(catalog, name, cancelled, &mut |file, size| {
-            out.clear();
-            read_all(file, size, cap, limiter.as_deref(), out, cancelled)
-        });
+        let current = self.current_until(
+            catalog,
+            name,
+            cancelled,
+            accept_growth,
+            &mut |file, size| {
+                out.clear();
+                read_all(file, size, cap, limiter.as_deref(), out, cancelled)
+            },
+        );
         if current.is_ok() {
             self.bytes_read += out.len() as u64;
         }
@@ -319,30 +523,58 @@ impl Documents {
         each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.stream_current_name_with_growth(catalog, name, each, cancelled, false)
+    }
+
+    /// Search-only version of [`Documents::stream_current_name_until`].
+    pub fn stream_search_name_until(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.stream_current_name_with_growth(catalog, name, each, cancelled, true)
+    }
+
+    fn stream_current_name_with_growth(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+        cancelled: &dyn Fn() -> bool,
+        accept_growth: bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
         let (cap, limiter) = (self.config.size_cap, self.limiter.clone());
-        self.current_until(catalog, name, cancelled, &mut |file, size| {
-            if cancelled() {
-                return Err(ContentFault::Cancelled);
-            }
-            if size > cap {
-                return Err(ContentFault::TooLarge { size, cap });
-            }
-            let done = match limiter.as_deref() {
-                Some(limiter) => each(
-                    &mut BulkRead {
-                        file,
-                        limiter: Some(limiter),
-                        remaining: size,
-                    },
-                    size,
-                ),
-                None => each(&mut Read::take(file, size), size),
-            };
-            done.map_err(|e| match cancelled() {
-                true => ContentFault::Cancelled,
-                false => ContentFault::Read(e),
-            })
-        })
+        self.current_until(
+            catalog,
+            name,
+            cancelled,
+            accept_growth,
+            &mut |file, size| {
+                if cancelled() {
+                    return Err(ContentFault::Cancelled);
+                }
+                if size > cap {
+                    return Err(ContentFault::TooLarge { size, cap });
+                }
+                let done = match limiter.as_deref() {
+                    Some(limiter) => each(
+                        &mut BulkRead {
+                            file,
+                            limiter: Some(limiter),
+                            remaining: size,
+                        },
+                        size,
+                    ),
+                    None => each(&mut Read::take(file, size), size),
+                };
+                done.map_err(|e| match cancelled() {
+                    true => ContentFault::Cancelled,
+                    false => ContentFault::Read(e),
+                })
+            },
+        )
     }
 
     /// The current version of the file `name` names, read by `pass` (given
@@ -351,35 +583,46 @@ impl Documents {
     /// sees a byte, and the second the same version as the first.
     ///
     /// The calls, for a file in a held directory: `openat`, `fstat`, the
-    /// reads, `fstat`, `close`.
+    /// reads, `fstat`, and (for search) one no-follow `fstatat`, then `close`.
     fn current_until(
         &mut self,
         catalog: &Catalog,
         name: NameId,
         cancelled: &dyn Fn() -> bool,
+        accept_growth: bool,
         pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
         if cancelled() {
             return Err(ContentFault::Cancelled);
         }
         let (parent, bytes) = catalog.name_reader().edge(name);
-        let fd = self.in_directory(catalog, parent, cancelled, |dir| {
-            openat(
+        let current = self.in_directory(catalog, parent, cancelled, |dir| {
+            let fd = openat(
                 dir,
                 std::ffi::OsStr::from_bytes(bytes),
                 OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(|e| ContentFault::Open(e.into()))
+            .map_err(|e| ContentFault::Open(e.into()))?;
+            let (file, current) = regular_file(fd)?;
+            // Keep the checked parent alive through the read without a dup.
+            // Its held-descriptor lock also keeps pressure relief from closing
+            // it.
+            checked_file(
+                file,
+                current,
+                accept_growth,
+                &mut |first| {
+                    check_read_name(
+                        dir,
+                        std::ffi::OsStr::from_bytes(bytes),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                        first,
+                    )
+                },
+                pass,
+            )
         })?;
-        let stat = fstat(&fd).map_err(|e| ContentFault::Stat(e.into()))?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Err(ContentFault::Changed);
-        }
-        let current = catalog_stat(&stat);
-        let mut file = File::from(fd);
-        pass(&mut file, current.size)?;
-        bracket(&file, &current, ferret_catalog::Content::Binary)?;
         self.files_read += 1;
         Ok(current)
     }
@@ -388,7 +631,8 @@ impl Documents {
     /// root for each path. A retained descriptor alone cannot establish that
     /// its original path still names it after a rename: a reader [holding
     /// directories](Documents::holding_directories) checks each path again
-    /// before reusing one.
+    /// before reusing one. The callback may read through the directory;
+    /// pressure relief waits for that read as it does for an open.
     ///
     /// An open that finds the process out of descriptors (`EMFILE`,
     /// `ENFILE`) is tried again once every held descriptor in the process

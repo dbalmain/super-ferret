@@ -8,6 +8,7 @@ mod output;
 mod parallel;
 mod parse;
 mod printf;
+pub mod schedule;
 mod test;
 mod walk;
 
@@ -15,9 +16,9 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
-pub use output::OutputBuffer;
+pub use output::{OutputBuffer, spill_path};
 pub use parse::{ParseError, Plan};
-pub use walk::{CatalogSource, Entry, EntrySource, FileKind, LiveWalk, WalkError};
+pub use walk::{CatalogSource, DirectoryHandle, Entry, EntrySource, FileKind, LiveWalk, WalkError};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Expression {
@@ -77,11 +78,20 @@ pub(crate) struct Options {
     pub follow: Follow,
     pub live_checks: bool,
     pub retain_parent: bool,
+    /// Retained parents are charged to a budget, closed past it.
+    pub bounded_parents: bool,
     pub delete: bool,
     guard: Option<CandidateGuard>,
 }
 
 impl Options {
+    fn at(cwd: std::path::PathBuf) -> Self {
+        Self {
+            cwd: Some(std::sync::Arc::new(cwd)),
+            ..Self::default()
+        }
+    }
+
     fn logical_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
         match &self.cwd {
             Some(cwd) => std::borrow::Cow::Owned(cwd.join(path)),
@@ -428,12 +438,7 @@ impl Plan {
     /// Sections needed for traversal and the stored fields this plan reads.
     pub fn catalog_sections(&self) -> Vec<ferret_catalog::Section> {
         use ferret_catalog::Section;
-        let mut sections = vec![
-            Section::Names,
-            Section::Links,
-            Section::Roots,
-            Section::Entries,
-        ];
+        let mut sections = CatalogSource::sections().to_vec();
         if self.options.xdev || self.options.follow != Follow::Physical {
             sections.extend([Section::Dev, Section::Ino]);
         }
