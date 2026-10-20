@@ -7,6 +7,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod groups;
@@ -489,7 +490,7 @@ fn block_stdout(plan: &Plan) -> bool {
 /// Redirected path/count records may share the block buffer until an operand
 /// or diagnostic boundary. Ttys, NUL names and live policy keep line output.
 fn buffered_path_output(plan: &Plan) -> bool {
-    !io::stdout().is_terminal()
+    !stdout_is_terminal()
         && !plan.traversal.live
         && !nul_names(plan)
         && !plan.json
@@ -746,6 +747,11 @@ impl<W: Write> Host<'_, W> {
         }
         Ok(())
     }
+}
+
+fn stdout_is_terminal() -> bool {
+    static IS_TERMINAL: OnceLock<bool> = OnceLock::new();
+    *IS_TERMINAL.get_or_init(|| io::stdout().is_terminal())
 }
 
 /// Stdin and checked single-thread test hosts need no channel handoff.
