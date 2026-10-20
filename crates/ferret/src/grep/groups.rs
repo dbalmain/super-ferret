@@ -102,7 +102,7 @@ pub(super) enum Observed {
     Skipped,
     Failed(ReadFault),
     Spool(io::Error),
-    Streamed(InputResult, Option<String>),
+    Streamed(InputResult, Option<String>, Option<capture::Held>),
 }
 
 /// Rendered captures never spill. Above the threshold they claim the single
@@ -146,6 +146,9 @@ impl Write for OutputCapture<'_> {
         if !self.streamed {
             let needed = self.buffer.len() as usize + count;
             let capacity = if let Some(held) = &mut self.held {
+                if held.capacity(needed).is_some() {
+                    return self.buffer.write(&bytes[..count]);
+                }
                 held.grow(needed, self.stopped)?
             } else {
                 (needed <= GROUP_BYTES).then_some(GROUP_BYTES)
@@ -382,7 +385,7 @@ pub(super) fn observe_streaming(
                 _ => None,
             }
         };
-        return Ok(Observed::Streamed(result, error));
+        return Ok(Observed::Streamed(result, error, output.held));
     }
     if let Some(error) = spool_failure {
         return Ok(Observed::Spool(error));
@@ -695,7 +698,7 @@ fn prepare(
                         }
                         output.flush()?;
                         if output.streamed {
-                            return Ok(Observed::Streamed(cached.result, None));
+                            return Ok(Observed::Streamed(cached.result, None, output.held));
                         }
                         return Ok(Observed::Ready(Group {
                             result: cached.result,
@@ -775,7 +778,7 @@ type Fork<'a> = dyn Fn() -> Option<Box<CheckedReader<'a>>> + Sync + 'a;
 enum Message {
     Begin,
     Chunk(Vec<u8>),
-    Finish(InputResult, Option<String>),
+    Finish(InputResult, Option<String>, Option<capture::Held>),
 }
 
 enum Handoff {
@@ -876,7 +879,7 @@ fn publish_handoff<W: Write>(
                     host.error(job.path(), &error);
                     Ok(())
                 }
-                Observed::Streamed(_, _) => unreachable!("streamed results finish their handoff"),
+                Observed::Streamed(..) => unreachable!("streamed results finish their handoff"),
             }
         }
         Handoff::Stream(path, receiver) => {
@@ -887,7 +890,7 @@ fn publish_handoff<W: Write>(
                         host.writer.write_all(&bytes)?;
                         printed += bytes.len() as u64;
                     }
-                    Message::Finish(result, error) => {
+                    Message::Finish(result, error, _capture) => {
                         return host.finish_stream(&path, result, printed, error);
                     }
                     Message::Begin => unreachable!("channel streams begin at handoff"),
@@ -911,7 +914,7 @@ fn publish_handoff<W: Write>(
                         *printed += bytes.len() as u64;
                     }
                 }
-                Message::Finish(result, error) => {
+                Message::Finish(result, error, _capture) => {
                     let printed = current.take().unwrap_or(0);
                     host.finish_stream(&path, result, printed, error)?;
                 }
@@ -1063,8 +1066,8 @@ impl<'s> Search<'s> {
         // Never retry pending writes implicitly after a destination fault.
         let (mut relay, _) = stream.into_parts();
         let result = match result {
-            Ok(Observed::Streamed(result, error)) => relay
-                .send(Message::Finish(result, error))
+            Ok(Observed::Streamed(result, error, capture)) => relay
+                .send(Message::Finish(result, error, capture))
                 .map(|()| Observed::Skipped),
             other => other,
         };
@@ -1693,6 +1696,7 @@ impl<'a> Source<'a> {
 
 #[cfg(test)]
 mod tests {
+    mod capture;
     use super::*;
     use std::cell::Cell;
 
@@ -1711,7 +1715,8 @@ mod tests {
     }
 
     // Drive the real handoff with groups just over the capture threshold.
-    // All groups must stream, stay whole, and bypass completed-group replay.
+    // Groups may finish capturing behind a stream (D109); all must stay
+    // whole and none may spill.
     #[test]
     fn parallel_publication_keeps_large_groups_whole() {
         use std::cell::RefCell;
@@ -1776,8 +1781,8 @@ mod tests {
         result.unwrap();
         assert!(host.writer.carry.is_empty());
         assert!(
-            spilled.borrow().is_empty(),
-            "large groups streamed instead of committing a capture"
+            spilled.borrow().iter().all(|spilled| !spilled),
+            "waiting captures must remain in memory"
         );
         let mut runs = std::mem::take(&mut host.writer.runs);
         runs.sort();
@@ -2578,7 +2583,6 @@ mod tests {
         let mut destination = Cancellable {
             inner: &mut sink,
             stopped: &stopped,
-            capture: None,
         };
         let mut output = OutputCapture::new(&mut destination);
         output.write_all(&vec![b'x'; GROUP_BYTES]).unwrap();
@@ -3005,7 +3009,7 @@ mod tests {
                 (&|| false, &mut output, None),
             )
             .unwrap();
-        assert!(matches!(second, Observed::Streamed(_, None)));
+        assert!(matches!(second, Observed::Streamed(_, None, _)));
         assert!(output.len() > GROUP_BYTES);
         assert_eq!(streams.get(), 1);
         assert_eq!(stats.get(), 1);

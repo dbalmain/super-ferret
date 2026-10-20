@@ -179,14 +179,20 @@ the next required-run occurrence, not from the previous match to the line end,
 which was quadratic on long lines and ran the engine's slow Unicode-`\b`
 fallback over non-ASCII text. Captures and replacement still use the whole
 source line. Uncoloured, unnumbered plain records combine path,
-separator, data and LF through the capture's vectored writer. Grep holds up to
-4 MiB of rendered output per file (D93). On crossing that threshold, it waits
-for the single publisher, sends the captured prefix, and streams the rest of
-that file in 64 KiB chunks (D103 A). The group holds the publisher until its
-closing version check finishes. Other workers fill the bounded completion
-queue and then stall; groups never interleave. T=1 preserves walk order and
-streams on the calling thread. Stdin and cached-record rendering use the same
-threshold. Counts, names and quiet modes create no large capture.
+separator, data and LF through the capture's vectored writer. Grep shares one
+capture allocation budget of (2T+1) × 4 MiB for configured concurrency T (D93,
+D109 B), covering workers, queued groups and the publisher's current capture.
+Above 4 MiB, a file takes the streaming slot when available, sends its captured
+prefix, and streams the rest in 64 KiB chunks (D103 A). While another file
+streams, it keeps capturing while the shared budget has room; one file may use
+most of that budget. It waits only when the budget is full and takes a free
+streaming slot on its next write, including when woken from a budget wait. A
+file that finishes capturing first publishes as a complete checked group. The
+stream owner keeps the publisher until its closing version check finishes;
+groups never interleave. Active streams never wait for capture space. T=1
+preserves walk order and streams on the calling thread. Stdin and cached-record
+rendering use the same threshold. Counts, names and quiet modes create no large
+capture. Multi-GiB output from a single file still streams serially.
 
 Rendered output never spills, including captures queued behind a streaming
 file. The separate before-context spool still spills past 64 KiB. A spool
@@ -220,8 +226,9 @@ Read candidates through S2's bracketed reader. Changed bytes yield path-local
 answers; unchanged copies share content facts after independent full-key stats.
 Drop vanished candidates even under inversion. Other read failures report an
 error, never a negative match. Up to 4 MiB of rendered output is transactional:
-retry instability once, then continue with exit 2. Above 4 MiB, the guarantee is
-**one version, or a diagnostic**: a changed closing version or a file error
+retry instability once, then continue with exit 2. A larger capture waiting for
+the streaming slot also remains transactional until publication starts. Once a
+file starts streaming, the guarantee is **one version, or a diagnostic**: a changed closing version or a file error
 keeps the already printed prefix, names the file, exits 2 and does not retry.
 No atomic tree snapshot is promised; default `--files` keeps stale listings.
 **D73 A+D (confirmed 2026-10-16):** `--live` (M6) enumerates current names and reads current
@@ -349,9 +356,13 @@ limit is tight, without changing the thread count or warning. At limit 1,024
 with sixteen workers, every worker and the producer fit and admission takes no
 mutex. Each read reserves its whole allowance through the closing check, so a
 stream holding the publisher never needs a descriptor permit held by another
-reader. Future capture-byte waits must preserve this order: descriptor admission
+reader. Capture-byte waits preserve this order: descriptor admission
 before reading or capturing, and no further admission until that read closes;
-the active streamer must continue without waiting for capture bytes.
+the active streamer must continue without waiting for capture bytes. The shared
+capture budget grants streaming ownership before checking available space, so
+even a full budget cannot prevent that owner from replaying its prefix and
+finishing. Capture-space waiters poll cancellation at most every 20 ms, as
+descriptor waiters do; dropping captures or finishing a stream also wakes them.
 
 Indexed recursive content excludes policy's non-content files (binary-sniffed
 and over the default 8 MiB cap); name listing includes them. Changed candidates
@@ -930,10 +941,13 @@ use D105's scheduler instead.
 at most 64 KiB while it is busy, and the host collects every held batch before
 it sleeps. One-file tasks and bounded handoffs bound queued
 groups; no array of every path or second concurrent pool is introduced. The
-calling thread publishes whole groups. A worker crossing 4 MiB hands over an
-active stream through the same queue, after flushing its held batch. The
-publisher consumes that stream's bounded chunk channel through completion;
-other handoffs remain bounded in the queue. T=1 and spawn fallback handoffs
+calling thread publishes whole groups. A worker past 4 MiB hands over an
+active stream through the same queue when it acquires the streaming slot,
+after flushing its held batch. Until then it captures within the pool-wide
+(2T+1) × 4 MiB allocation budget (D109 B), shared with completed groups until
+publication or discard. The publisher consumes the active stream's bounded
+chunk channel through completion; its owner never waits for capture space.
+Other handoffs remain bounded in the queue. T=1 and spawn fallback handoffs
 publish synchronously without waiting for their own task to send more data.
 Stdin is a direct operand barrier;
 workers never wait for its producer. The D105 parallel live walk (`-uu`,

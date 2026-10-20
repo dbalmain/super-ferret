@@ -566,7 +566,7 @@ impl<W: Write> Host<'_, W> {
                 Ok(())
             }
             groups::Observed::Skipped => Ok(()),
-            groups::Observed::Streamed(result, error) => {
+            groups::Observed::Streamed(result, error, _capture) => {
                 self.finish_stream(path, result, printed.unwrap_or(0), error)
             }
         }

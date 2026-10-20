@@ -86,8 +86,12 @@ together up to 64 KiB, and the host takes every held batch before it sleeps,
 so a held group waits only on other output, never on its worker's next file
 or on a worker asleep waiting for the producer. For configured concurrency T,
 the queue holds at most T handoffs, each worker one group in progress and a
-batch of at most 64 KiB, and the host one handoff: live rendered capture bytes
-plus handoff buffers are bounded by (2T + 1) × 4 MiB + (4T + 1) × 64 KiB,
+batch of at most 64 KiB, and the host one handoff. Captures share one allocation
+budget of (2T + 1) × 4 MiB across workers, queued groups and the publisher
+(D109 B); a single waiting file may use most of it. Charges cover buffer
+capacity, remain with completed groups through publication/discard, and return
+only after the corresponding allocation is freed. Live capture allocations
+plus handoff buffers remain bounded by (2T + 1) × 4 MiB + (4T + 1) × 64 KiB,
 under 269 MiB at 32 threads (D93). The 64 KiB terms cover held batches,
 stream buffering, one queued and one sending chunk per worker, and the
 publisher's current chunk. This is not a peak-RSS bound. RSS adds the base heap
@@ -100,19 +104,32 @@ permits peak RSS up to rg's at the same thread count; these historical figures
 are not a new streaming measurement. The producer's queue holds paths, not
 captures.
 
-Above 4 MiB, a growing capture hands an active stream through the same completion
-queue, flushing that worker's held batch first. The publisher writes the prefix
-and consumes a one-slot channel of 64 KiB chunks until the file's closing check
-finishes (D103 A). Other groups queue within the same bound, then workers stall.
+Above 4 MiB, a growing capture takes the exclusive streaming slot when free
+and hands an active stream through the same completion queue, flushing that
+worker's held batch first. The publisher writes the prefix and consumes a
+one-slot channel of 64 KiB chunks until the file's closing check finishes
+(D103 A). Other workers keep capturing past 4 MiB within the shared budget,
+waiting only when it is full (D109 B). A still-growing file takes the slot on
+its next write after the previous stream ends; budget waiters wake for slot
+release as well as freed bytes. A file that finishes capturing first publishes
+a complete checked group. Streaming ownership is granted before checking space
+and held through the publisher's finish message. The owner replays its prefix
+and finishes without ever waiting for capture bytes, even with a full budget.
 Feed and D105 walk workers use the same lane handoff. No worker holds a
 queue-slot, feed/run or publication lock while sending. The stream owner keeps
 its input reservation until it finishes, but the publisher never reserves input
 bytes or waits for other workers; it drains only that owner's chunk channel.
+Each read also holds its full descriptor admission through the closing version
+check, including capture waits. Neither streaming owner nor publisher needs a
+blocked reader's admission; no input or context spool releases and reacquires
+one. Thus neither byte nor descriptor waits can block the stream's progress.
 Indexed pending tails remain stealable while their owner streams. Live policy
 warnings acquire the publication lock outside reads and handoffs, so a streaming
 owner never needs a lock held by its publisher. Reservations release on unwind;
 the walk scheduler's panic hook stops the lane pool and wakes budget waiters.
-Sender/receiver drop releases channel waiters on cancellation or panic.
+Sender/receiver drop releases channel waiters on cancellation or panic. Capture
+budget waits poll the combined stop predicate at most every 20 ms, covering
+external cancellation, quiet hits, publication faults and scheduler panic.
 Single-thread and spawn-fallback feed handoffs publish synchronously; stdin uses
 a direct writer. Find retains its ordered publication path.
 
@@ -122,10 +139,11 @@ past 64 KiB, with its existing disk bound. Its faults fail the input file and
 continue with exit 2 (D102 A). Before publication the capture is discarded;
 after publication the prefix remains and the diagnostic names the input and
 temporary-file fault. Streamed files never retry. Up to 4 MiB, publication
-retains one checked version per file; above 4 MiB it promises **one version, or
-a diagnostic**. A changed closing version or later file error retains printed
-output, diagnoses the file, and sets exit 2. JSON closes its begun group with
-observed partial statistics. A broken stdout pipe remains silent exit 0 (D94).
+retains one checked version per file; larger captures waiting for the streaming
+slot retain that transaction too. Once streaming starts it promises **one
+version, or a diagnostic**. A changed closing version or later file error
+retains printed output, diagnoses the file, and sets exit 2. JSON closes its
+begun group with observed partial statistics. A broken stdout pipe remains silent exit 0 (D94).
 The queue lets workers prepare ahead while the host waits on stdout; direct worker publication
 regressed pipe throughput in the D92 measurements, despite reducing caller CPU
 work. Bounded catalog-version line records are reused only after each alias's
