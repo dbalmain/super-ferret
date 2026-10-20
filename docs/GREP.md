@@ -329,6 +329,11 @@ operand without opening it; walked specials and symlinks are skipped. Explicit
 directory symlinks follow their start only, using find's trailing-slash source
 resolution. Skip recursive symlinks;
 `-L` is deferred.
+A walked file is opened beneath the parent descriptor the walk listed it from,
+without following a final symlink, and its closing name check uses the same
+name, also no-follow; a name swapped for a symlink after listing reads as
+changed (one retry, then exit 2). Content walks therefore hold one directory
+descriptor per depth level per worker (review R2-1, 2026-10-20).
 
 Indexed recursive content excludes policy's non-content files (binary-sniffed
 and over the default 8 MiB cap); name listing includes them. Changed candidates

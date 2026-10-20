@@ -56,6 +56,34 @@ pub(crate) fn direct(
     }
 }
 
+/// A walked file, by its name beneath the `directory` it was listed in,
+/// never through a symlink; otherwise as [`direct`].
+pub(crate) fn listed(
+    directory: &std::fs::File,
+    path: &std::path::Path,
+    cap: Option<u64>,
+    each: ferret_query::Consumer<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> ReadOutcome {
+    use std::os::fd::AsFd;
+    let Some(name) = path.file_name() else {
+        return ReadOutcome::Failed(ReadFault::Io(
+            ReadOperation::Open,
+            std::io::Error::other("a walked file has no name"),
+        ));
+    };
+    match ferret_crawl::content::stream_search_listed_until(
+        directory.as_fd(),
+        name,
+        cap,
+        each,
+        cancelled,
+    ) {
+        Ok(_) => ReadOutcome::Stable(ReadVersion::Current),
+        Err(error) => fault(error, false),
+    }
+}
+
 fn fault(error: ContentFault, vanished: bool) -> ReadOutcome {
     let (operation, error) = match error {
         ContentFault::Changed | ContentFault::Alias => return ReadOutcome::RetryChanged,

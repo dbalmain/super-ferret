@@ -45,7 +45,13 @@ pub fn stream_file_until(
     each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<ferret_catalog::Stat, ContentFault> {
-    stream_file_until_with_growth(path, cap, each, cancelled, false)
+    stream_file_until_with_growth(
+        Named::follow(rustix::fs::CWD, path.as_os_str()),
+        cap,
+        each,
+        cancelled,
+        false,
+    )
 }
 
 /// Search-only form of [`stream_file_until`]. The caller publishes the
@@ -56,11 +62,58 @@ pub fn stream_search_file_until(
     each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<ferret_catalog::Stat, ContentFault> {
-    stream_file_until_with_growth(path, cap, each, cancelled, true)
+    stream_file_until_with_growth(
+        Named::follow(rustix::fs::CWD, path.as_os_str()),
+        cap,
+        each,
+        cancelled,
+        true,
+    )
+}
+
+/// [`stream_search_file_until`] for a name a walk listed in `directory`,
+/// opened beneath that descriptor without following a symlink, and checked
+/// by that same name, no-follow, at the close. A name swapped for a symlink
+/// after the listing reads as changed rather than through the link (D21).
+pub fn stream_search_listed_until(
+    directory: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    let named = Named {
+        directory,
+        name,
+        open: OFlags::NOFOLLOW,
+        check: AtFlags::SYMLINK_NOFOLLOW,
+    };
+    stream_file_until_with_growth(named, cap, each, cancelled, true)
+}
+
+/// A file to open by `name` beneath `directory`, with the symlink policy
+/// for its open and for its closing name check, which must agree.
+struct Named<'a> {
+    directory: BorrowedFd<'a>,
+    name: &'a std::ffi::OsStr,
+    open: OFlags,
+    check: AtFlags,
+}
+
+impl<'a> Named<'a> {
+    /// An explicit operand's path, following symlinks throughout.
+    fn follow(directory: BorrowedFd<'a>, name: &'a std::ffi::OsStr) -> Self {
+        Self {
+            directory,
+            name,
+            open: OFlags::empty(),
+            check: AtFlags::empty(),
+        }
+    }
 }
 
 fn stream_file_until_with_growth(
-    path: &std::path::Path,
+    named: Named<'_>,
     cap: Option<u64>,
     each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
     cancelled: &dyn Fn() -> bool,
@@ -69,12 +122,18 @@ fn stream_file_until_with_growth(
     if cancelled() {
         return Err(ContentFault::Cancelled);
     }
-    let fd = open(
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+    let fd = openat(
+        named.directory,
+        named.name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | named.open,
         Mode::empty(),
     )
-    .map_err(|error| ContentFault::Open(error.into()))?;
+    .map_err(|error| match error {
+        // A single no-follow name that is now a symlink: not the regular
+        // file its directory listed, so changed, like any other type.
+        rustix::io::Errno::LOOP if named.open.contains(OFlags::NOFOLLOW) => ContentFault::Changed,
+        _ => ContentFault::Open(error.into()),
+    })?;
     let (file, current) = regular_file(fd)?;
     if let Some(cap) = cap
         && current.size > cap
@@ -88,7 +147,7 @@ fn stream_file_until_with_growth(
         file,
         current,
         accept_growth,
-        &mut |first| check_read_name(rustix::fs::CWD, path.as_os_str(), AtFlags::empty(), first),
+        &mut |first| check_read_name(named.directory, named.name, named.check, first),
         &mut |file, size| {
             let extent = if size == 0 { u64::MAX } else { size };
             each(&mut Read::take(file, extent), extent).map_err(|error| {

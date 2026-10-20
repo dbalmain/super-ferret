@@ -489,8 +489,10 @@ impl<W: Write> Host<'_, W> {
         let flag = self.cancelled;
         let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
         let plan = self.plan;
+        // A walked file is opened beneath the directory it was listed in.
+        let directory = recursive.then(|| fs::File::open(path.parent().unwrap()).unwrap());
         self.transaction(path, &mut |each| {
-            groups::read_file(path, recursive, plan, each, &stopped)
+            groups::read_file(path, directory.as_ref(), plan, each, &stopped)
         })
     }
 

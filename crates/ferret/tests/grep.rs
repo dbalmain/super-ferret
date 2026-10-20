@@ -5241,6 +5241,82 @@ fn streaming_replacement_with_a_surviving_hard_link_is_rejected() {
     }
 }
 
+// Review R2-1: a walked file is opened beneath the directory it was listed
+// in, never through a symlink (GREP.md: recursive symlinks are skipped). A
+// listed regular file swapped for a symlink before its open was once read
+// through the link, printing the target's bytes under the walked name. It
+// now reads as changed: exit 2, nothing from the target. The first walked
+// file streams over 4 MiB into a paused stdout, so the swap lands between
+// the listing and the open. Covers the index's opaque fallback, `-uu` and
+// `--live` on one thread, and the parallel walk `-uu` and `--live` take on
+// four. The index's other workers read ahead of a paused stdout, so it has
+// no deterministic swap there; its jobs are the one-thread ones.
+#[test]
+fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
+    use std::io::Read;
+    let fixture = Fixture::new("walked-symlink-swap");
+    fs::create_dir(fixture.tree().join("d")).unwrap();
+    fixture.write(".ferretignore", b"/d/\n");
+    fixture.write("outside", b"hit OUTSIDE\n");
+    fixture.write("d/a", b"hit\n");
+    fixture.write("d/b", b"hit\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    // Walk order is directory order, so ask a walk for it.
+    let listed = fixture.ferret(&["grep", "--files", "-uu", "d"], None);
+    let order = String::from_utf8(listed.stdout).unwrap();
+    let [first, victim] = order.lines().collect::<Vec<_>>()[..] else {
+        panic!("listed {order:?}");
+    };
+    let bytes = b"hit first\n".repeat(500_000);
+    let mut checked = 0;
+    let mut failed = Vec::new();
+    let cases: [(&[&str], &str); 5] = [
+        (&[], "1"),
+        (&["-uu"], "1"),
+        (&["-uu"], "4"),
+        (&["--live"], "1"),
+        (&["--live"], "4"),
+    ];
+    for (mode, threads) in cases {
+        fixture.write(first, &bytes);
+        let link = fixture.tree().join(victim);
+        fs::remove_file(&link).unwrap();
+        fixture.write(victim, b"hit victim\n");
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(mode)
+            .args(["hit", "d"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let mut child = command.spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let mut start = [0; 1024];
+        pipe.read_exact(&mut start).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("../outside", &link).unwrap();
+        child.stdout = Some(pipe);
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let changed = format!("{victim}: changed during both read attempts");
+        if stdout.contains("OUTSIDE")
+            || output.status.code() != Some(2)
+            || !stderr.contains(&changed)
+        {
+            failed.push(format!(
+                "{mode:?} on {threads} threads: {:?}, through the link: {}, {stderr}",
+                output.status.code(),
+                stdout.contains("OUTSIDE")
+            ));
+        }
+        checked += 1;
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    assert_eq!(checked, 5);
+}
+
 // D102 + D103: the first spool can fail after the matching prefix streamed.
 // Keep that prefix, finish JSON if begun, and publish both neighboring files.
 #[test]

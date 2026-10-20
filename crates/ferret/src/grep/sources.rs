@@ -29,6 +29,16 @@ impl Directory {
             ))
         })
     }
+
+    /// Keeps each listed directory open for the files listed in it, which
+    /// content searches open beneath it (D21). Names-only listings open no
+    /// file and leave it.
+    pub fn retaining_parents(self) -> Self {
+        match self {
+            Self::Catalog(source) => Self::Catalog(source.retaining_parents()),
+            Self::Live(source) => Self::Live(source.retaining_parents()),
+        }
+    }
 }
 
 /// A walk of the live tree below directory operand `path`.

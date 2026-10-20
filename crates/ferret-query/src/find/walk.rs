@@ -289,7 +289,11 @@ impl Entry {
         }
     }
 
-    pub(super) fn directory_handle(&self) -> Option<Arc<File>> {
+    /// The directory this entry was listed in, still open, when its walk
+    /// retains parents ([`LiveWalk::retaining_parents`]); `None` for a
+    /// catalogued listing, which opens no directory. A start operand's is the
+    /// directory named by its spelling's parent.
+    pub fn directory_handle(&self) -> Option<Arc<File>> {
         self.state.directory.clone()
     }
 
@@ -614,7 +618,8 @@ enum Loaded {
 
 /// Sequential DFS. The unrestricted source uses readdir without ignore rules;
 /// the catalog source shares the stack and substitutes catalog child listings.
-/// It holds one directory handle per ancestor and never sorts child names.
+/// It holds one directory handle per ancestor only when it retains parents,
+/// and never sorts child names.
 /// A descriptor exhaustion error is reported just like a listing failure.
 pub struct LiveWalk {
     catalog: Option<Arc<Catalog>>,
@@ -643,6 +648,17 @@ impl LiveWalk {
     /// An unrestricted physical walk, retaining each operand's spelling.
     pub fn paths(paths: Vec<PathBuf>, cwd: PathBuf) -> Self {
         Self::new(paths, Options::at(cwd))
+    }
+
+    /// Keeps each listed directory open while its entries are visited, so
+    /// that a host can open a listed name beneath the directory it was listed
+    /// in ([`Entry::directory_handle`]) instead of resolving its path again,
+    /// which a name swapped for a symlink would redirect (D21). Costs one
+    /// descriptor per directory on the walk's stack, plus one per start for
+    /// the start's parent; the syscalls are the same.
+    pub fn retaining_parents(mut self) -> Self {
+        self.options.retain_parent = true;
+        self
     }
 
     pub(super) fn new(paths: Vec<PathBuf>, options: Options) -> Self {
@@ -1415,6 +1431,13 @@ impl CatalogSource {
     /// fallback for explicit ignored/opaque starts. No expression is parsed.
     pub fn paths(catalog: Catalog, paths: Vec<PathBuf>, cwd: PathBuf) -> Self {
         Self::new(catalog, paths, Options::at(cwd))
+    }
+
+    /// [`LiveWalk::retaining_parents`] for the live listings of opaque and
+    /// ignored directories. Catalogued listings open no directory to retain.
+    pub fn retaining_parents(mut self) -> Self {
+        self.walk.options.retain_parent = true;
+        self
     }
 
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
