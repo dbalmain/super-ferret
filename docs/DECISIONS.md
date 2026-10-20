@@ -5927,3 +5927,36 @@ Recommendation: B. A refused thread costs speed, not correctness, so the exit
 status should not change, but the cause of a slow run should be visible. Would
 change it: wanting the invariant "exit 0 means empty stderr" (then C), or
 treating thread limits as never worth a message (then A).
+
+## D109 — Waiting behind a streaming file
+
+**Status: open, 2026-10-20.**
+
+Question: while one file streams its output through the publisher (D103 A),
+what should another worker do when its own capture passes 4 MiB?
+
+Today it blocks until that stream ends, so files with heavy output publish one
+at a time and the pool idles. Measured on src-uu (a source tree with 32 files
+whose `-v` output totals 197 MiB) at T=32, locked, after the walk-lending fix
+(dbc2cbb): `-v` 0.84 s and `--json` 0.43 s, against 0.49 / 0.29 s at 3348266
+(before streaming) and rg's 0.20 / 0.11 s. A control with streaming disabled
+gives 0.42 / 0.29 s, with 513 MB RSS.
+
+- **A — keep blocking at 4 MiB.** No new code. Resident capture stays at
+  (2T+1)×4 MiB + (4T+1)×64 KiB. About 1.7× slower than 3348266 on `-v` and
+  1.5× on `--json` for trees with several big-output files.
+- **B — one shared capture budget of D93's total.** A waiting owner keeps
+  capturing past 4 MiB while the pool's (2T+1)×4 MiB total has room, and
+  streams from the 4 MiB point once the publisher is free, so `| head` still
+  sees output early. D93's bound is unchanged; one file may use most of it.
+  Estimated 0.42–0.77 s on `-v` (unmeasured). 60–100 lines: a shared counter
+  and a wait in the capture path. Multi-GiB single files stay serial: huge-uu
+  `--json` stays at 11.7 s, against 3.5 s at 3348266.
+- **C — spill a waiting owner's capture to a temp file.** Recovers the
+  multi-GiB case too (3348266, which spilled, ran huge `--json` in 3.45 s).
+  Restores the spill code removed in 938054a and its fault paths (D102: a
+  full or unwritable temp directory), and writes the output's size to disk.
+
+Recommendation: B. It keeps D93 exactly, needs no disk, and fixes the common
+case of a source tree with a few big generated or log files. Would change it:
+heavy output from multi-GiB single files mattering; only C fixes that.
