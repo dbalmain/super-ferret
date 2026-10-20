@@ -214,7 +214,7 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     fs::write(path, bytes).unwrap();
 }
 
-fn mkfifo(path: &Path) {
+pub(crate) fn mkfifo(path: &Path) {
     let status = Command::new("mkfifo").arg(path).status().unwrap();
     assert!(status.success(), "mkfifo {}: {status}", path.display());
 }

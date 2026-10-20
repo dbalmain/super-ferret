@@ -320,6 +320,46 @@ fn an_external_policy_parent_attributes_event_refreshes_its_root() {
 }
 
 #[test]
+fn a_fifo_policy_parent_neither_blocks_nor_loses_coverage() {
+    let tree = Tree::new("policy-fifo-parent", 100, 1 << 20);
+    let root = tree.path.join("root");
+    let outside = tree.path.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let fifo = outside.join("fifo");
+    crate::tests::mkfifo(&fifo);
+    let (done, finished) = std::sync::mpsc::channel();
+    let watch = tree.watch.clone();
+    let (r, rules) = (root.clone(), fifo.join("rules"));
+    std::thread::spawn(move || {
+        watch.policy_path(&r, &rules);
+        let _ = done.send(());
+    });
+    if finished.recv_timeout(Duration::from_secs(5)).is_err() {
+        // Release the blocked reader so the thread does not outlive the test.
+        let _ = rustix::fs::open(
+            &fifo,
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        );
+        panic!("policy_path blocked opening a FIFO as a parent");
+    }
+    assert_eq!(
+        tree.watch.status().failed,
+        0,
+        "a FIFO parent is not a failure"
+    );
+    tree.watch.drain().unwrap();
+    assert_eq!(tree.watch.status().pending, 0);
+    fs::remove_file(&fifo).unwrap();
+    fs::create_dir(&fifo).unwrap();
+    tree.watch.drain().unwrap();
+    assert!(
+        tree.watch.status().pending > 0,
+        "the directory replacing the FIFO must be noticed"
+    );
+}
+
+#[test]
 fn unreliable_filesystem_magic_keeps_successfully_watched_roots_in_the_poll_set() {
     let tree = Tree::new("network-poll", 100, 1 << 20);
     for magic in [

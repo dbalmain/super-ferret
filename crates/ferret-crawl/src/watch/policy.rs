@@ -12,6 +12,16 @@ pub(super) fn unreliable(magic: u64) -> bool {
         0x6969 | 0xff534d42 | 0x517b | 0xfe534d42 | 0x01021997 | 0x65735546
     )
 }
+/// Opens a parent as a directory, never blocking: a FIFO at the pathname
+/// fails `ENOTDIR` instead of waiting for a writer. Symlinks are followed,
+/// since policy paths may legitimately pass through them.
+fn open_parent(parent: &Path) -> Result<OwnedFd, Errno> {
+    rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
 fn failure(s: &mut State, root: &Path, path: PathBuf) {
     let epoch = s.policy_epochs.get(root).copied().unwrap_or(0);
     s.gaps.insert(root.to_owned());
@@ -47,7 +57,7 @@ impl Watch {
                 self.gap(root);
                 return;
             };
-            match std::fs::File::open(parent) {
+            match open_parent(parent) {
                 Ok(fd) => {
                     if let Some(name) = candidate.file_name() {
                         self.policy_input(root, fd.as_fd(), name);
@@ -55,7 +65,10 @@ impl Watch {
                     }
                     return;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A parent that is not a directory (a FIFO, a file) cannot
+                // hold the input either; watching where it would appear
+                // notices when a directory replaces it.
+                Err(Errno::NOENT | Errno::NOTDIR) => {
                     candidate = parent.to_owned();
                 }
                 Err(_) => {
@@ -87,7 +100,7 @@ impl Watch {
                 continue;
             }
             if let Some(parent) = prefix.parent() {
-                match std::fs::File::open(parent) {
+                match open_parent(parent) {
                     Ok(fd) => {
                         self.policy_input(root, fd.as_fd(), prefix.file_name().unwrap_or_default())
                     }
