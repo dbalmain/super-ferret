@@ -943,6 +943,17 @@ ends before the next operand starts (DESIGN.md, Grep M2). Explicit operands
 resolve before searching, including failed-path diagnostics even when a quiet
 match is found elsewhere.
 
+**D108 B (2026-10-21):** a search thread the system refuses (`RLIMIT_NPROC`,
+a thread limit under load) costs speed, not output. Feed workers search on the
+workers that started, or on the calling thread alone if none did or the
+producer was refused. Nested walk workers leave a walk to fewer. A refused
+live walk thread leaves every operand to the single-thread path. One stderr
+line per run, `ferret: grep: searching with N of M threads: <cause>`, names
+the first shortfall, N counting the threads that search; the exit status
+describes the search alone. Debug builds refuse on demand for the CLI tests:
+`FERRET_TEST_REFUSE_THREADS=ferret-walk=1` lets the first thread of that name
+start and refuses the rest.
+
 D77's index setting and environment override select workers. Explicit-only
 commands keep the no-index rule and use the override/default count, limited to
 the number of file operands. Inversion declares Searchable as its name universe

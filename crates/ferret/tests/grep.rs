@@ -722,7 +722,7 @@ fn a_refused_search_thread_degrades_and_warns_once() {
         ("feed producer", &files, "ferret-producer=0", 1),
         ("walk thread", &["-uu", "red", "."], "ferret-walk=0", 1),
         ("nested walkers", &["-uu", "red", "."], "ferret-walk=2", 2),
-        ("one line per run", &["-uu", "red", ".", "sub"], "ferret-walk=1", 1),
+        ("two walks", &["-uu", "red", ".", "sub"], "ferret-walk=1", 1),
     ] {
         let expected = grep(args, "1", None);
         assert_eq!(expected.status.code(), Some(0), "{case}: {expected:?}");
@@ -760,7 +760,10 @@ fn a_thread_limit_degrades_the_walk_to_the_calling_thread() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(output.stdout, b"sub/three.rs:red delta\n", "{output:?}");
-    assert!(stderr.is_empty() || stderr == refused_line(1, 2), "{stderr}");
+    assert!(
+        stderr.is_empty() || stderr == refused_line(1, 2),
+        "{stderr}"
+    );
 }
 
 #[test]

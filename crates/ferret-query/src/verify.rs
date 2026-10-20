@@ -1944,7 +1944,8 @@ pub enum GroupSchedule {
 /// Prepares checked file groups on workers and emits them on the caller in
 /// completion order. One thread keeps source order. The producer runs on its
 /// own thread, a few tasks per worker ahead of them, and no worker ever calls
-/// it; if that thread cannot start, the caller works alone.
+/// it; if that thread cannot start, the caller works alone. Returns the
+/// [`Shortfall`] if the system refused a worker or the producer.
 ///
 /// Workers hand groups over in batches through a bounded queue of `threads`
 /// handoffs: a group whose `weight` (its capture's allocation) reaches

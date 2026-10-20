@@ -75,6 +75,7 @@ slow file holds only its own worker. Two bends keep operand order. A segment's
 file operands are searched in order by one worker, so a slow one delays the
 files after it. Each directory operand is its own scheduler run, a barrier: it
 starts after the operands before it finish and ends before the next starts.
+A refused thread runs the search on fewer and warns once (D108 B).
 Workers own checked reads and line rendering. Grep workers send completed
 groups through a bounded completion queue (D92 B); the
 calling host publishes each whole group. One thread keeps walk order. A

@@ -133,6 +133,6 @@ pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers};
 
 /// Shared bounded scheduling for completed grep file groups.
 pub use verify::{
-    GroupSchedule, Lane, Reservation, Shortfall, completion_groups,
-    completion_groups_with_handoff, lane_groups,
+    GroupSchedule, Lane, Reservation, Shortfall, completion_groups, completion_groups_with_handoff,
+    lane_groups,
 };
