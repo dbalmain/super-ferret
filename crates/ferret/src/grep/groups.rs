@@ -2803,23 +2803,56 @@ mod tests {
 
     // A checked reader can panic after streaming has acquired the publisher.
     // Its sender must drop so the writer leaves its receive loop before join.
+    // The scope re-raises a worker's panic as its own, so the injected one is
+    // seen by a panic hook, which is process-wide: run in a child process.
     #[test]
     fn panicking_stream_worker_releases_the_publisher() {
+        const MARKER: &str = "FERRET_TEST_STREAM_PANIC";
+        const INJECTED: &str = "injected panic after streaming";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "grep::groups::tests::panicking_stream_worker_releases_the_publisher",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
         let plan = plan(&["red"]);
         let mut bytes = b"red ".to_vec();
         bytes.resize(GROUP_BYTES + CHUNK, b'x');
         bytes.push(b'\n');
+        let reached = AtomicBool::new(false);
         let fork = || -> Option<Box<CheckedReader<'_>>> {
             Some(Box::new(|_, request| {
                 let ReadRequest::Stream(each, _) = request else {
                     panic!("stream")
                 };
                 each(&mut &bytes[..], bytes.len() as u64).unwrap();
-                panic!("injected panic after streaming")
+                reached.store(true, Ordering::SeqCst);
+                panic!("{INJECTED}")
             }))
         };
         let mut host = host(&plan, Vec::new());
         let mut jobs = [Job::Checked("panic-file".into(), NameId(0), 0)].into_iter();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new({
+            let seen = seen.clone();
+            move |info| {
+                let payload = info.payload();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                lock(&seen).push(message);
+            }
+        }));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run(
                 &mut host,
@@ -2831,7 +2864,21 @@ mod tests {
             )
             .unwrap();
         }));
-        assert!(result.is_err());
+        std::panic::set_hook(previous);
+        let seen = std::mem::take(&mut *lock(&seen));
+        assert!(result.is_err(), "the run did not panic");
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "the injection was not reached: {seen:?}"
+        );
+        // The injected panic first, then only the scopes re-raising it.
+        assert!(
+            seen.first().is_some_and(|first| first == INJECTED)
+                && seen[1..]
+                    .iter()
+                    .all(|rest| rest == "a scoped thread panicked"),
+            "expected only {INJECTED:?}, saw {seen:?}"
+        );
         assert!(host.errors);
         assert!(host.writer.starts_with(b"panic-file:red "));
     }
