@@ -340,6 +340,19 @@ listing, keeping its `(dev, ino)`; its files reopen it by path and read as
 changed unless it is still that directory. A 300-deep tree under `ulimit -n 64`
 searches as without the limit.
 
+Grep also admits transient descriptor use before each listing/policy step or
+complete file read. A shared budget leaves room for both retained-directory
+caches, sixteen host descriptors and six descriptors per active operation,
+including reopened parents, input files and simultaneous context spools during
+compaction. It always permits one operation; additional workers wait when the
+limit is tight, without changing the thread count or warning. At limit 1,024
+with sixteen workers, every worker and the producer fit and admission takes no
+mutex. Each read reserves its whole allowance through the closing check, so a
+stream holding the publisher never needs a descriptor permit held by another
+reader. Future capture-byte waits must preserve this order: descriptor admission
+before reading or capturing, and no further admission until that read closes;
+the active streamer must continue without waiting for capture bytes.
+
 Indexed recursive content excludes policy's non-content files (binary-sniffed
 and over the default 8 MiB cap); name listing includes them. Changed candidates
 that exceed the cap report an error, rather than silently disappear. `-a`

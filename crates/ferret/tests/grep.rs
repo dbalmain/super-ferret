@@ -5612,7 +5612,12 @@ fn many_readers_under_a_low_descriptor_limit_match_one_worker() {
         let colon = group.iter().position(|&byte| byte == b':').unwrap();
         assert_eq!(&group[colon + 1..], line);
     }
-    for (mode, limit) in [(&["-uu"][..], 64), (&["--live"][..], 64), (&[][..], 64), (&["-uu"][..], 24)] {
+    for (mode, limit) in [
+        (&["-uu"][..], 64),
+        (&["--live"][..], 64),
+        (&[][..], 64),
+        (&["-uu"][..], 24),
+    ] {
         let parallel = run(mode, "32", limit);
         // Parallel publication may reorder complete groups; every byte of
         // each group, including its unique path, must match the serial run.
