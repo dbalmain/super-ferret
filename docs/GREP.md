@@ -360,7 +360,9 @@ but cannot resurrect excluded names. D13 reinclusion can retain ancestor directo
 prunes rejected ancestors: a file-only positive cannot revive a pruned or
 held-hidden parent. Globs are relative to the query cwd; explicit directory
 starts bypass their own filters (clarified by M1 probes, 2026-10-16). Apply rg
-glob semantics, not find's `-path` glob dialect.
+glob semantics, not find's `-path` glob dialect. A walked cwd is matched as
+the empty path, as in rg: `*`, `**`, `**/*` and `/*` whitelist a hidden cwd
+below the operand, `?*` and `*/**` do not (review R2-2, 2026-10-20).
 
 Conversely ferret can search what default rg excludes: `.ignore`/`.rgignore`
 are not ferret inputs; Git's user-global ignores differ from ferret's global

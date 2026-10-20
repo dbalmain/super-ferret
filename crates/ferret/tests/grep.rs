@@ -5438,6 +5438,12 @@ fn streaming_late_binary_sentinel_keeps_prefix_and_original_warning_label() {
 /// cwd inside a hidden directory below an absolute operand, stripping cwd
 /// once erased that directory's name, so its files were listed; rg lists
 /// none. A cwd inside a visible directory is the control.
+///
+/// Review R2-2: the fix then hid that directory even when a positive glob
+/// whitelists it. rg matches the cwd directory's own (empty) relative path
+/// against the globs, so `*`, `**`, `**/*` and `/*` reveal it while `?*`
+/// and `*/**` do not. Crosses positive and negative globs with `-u` and
+/// `--hidden`.
 #[test]
 fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
     let fixture = Fixture::new("hidden-cwd");
@@ -5451,49 +5457,68 @@ fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let tree = fixture.tree();
     let operand = tree.join("a").into_os_string().into_string().unwrap();
+    let globs: [&[&str]; 10] = [
+        &[],
+        &["**"],
+        &["*"],
+        &["**/*"],
+        &["/*"],
+        &["?*"],
+        &["*/**"],
+        &["*.rs"],
+        &["!*.rs"],
+        &["*", "!.g"],
+    ];
     let mut checked = 0;
+    let mut diverged = Vec::new();
     for cwd in ["a/.g", "a/.g/k", "a/b"] {
         for mode in [&["-l", "red"][..], &["--live", "-l", "red"], &["--files"]] {
-            for hidden in [false, true] {
-                let mut args = mode.to_vec();
-                if hidden {
-                    args.push("--hidden");
-                }
-                args.push(&operand);
-                let listed = |binary: &OsStr, grep: bool| {
-                    let mut command = fixture.command(binary);
-                    command.current_dir(tree.join(cwd));
-                    if grep {
-                        command
-                            .arg("--index")
-                            .arg(fixture.base.join("index"))
-                            .arg("grep");
+            for flag in [None, Some("-u"), Some("--hidden")] {
+                for glob in globs {
+                    let mut args = mode.to_vec();
+                    args.extend(flag);
+                    for glob in glob {
+                        args.extend(["-g", glob]);
                     }
-                    // rg has no --live: it always reads the live tree.
-                    command.args(args.iter().filter(|&&arg| grep || arg != "--live"));
-                    let output = run(command, None);
-                    let mut lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
-                    lines.sort();
-                    (
-                        output.status.code(),
-                        lines.join(&b'\n'),
-                        output.stderr.is_empty(),
-                    )
-                };
-                let ferret = listed(OsStr::new(env!("CARGO_BIN_EXE_ferret")), true);
-                let rg = listed(&std::env::var_os("FERRET_RG").unwrap(), false);
-                assert_eq!(
-                    ferret,
-                    rg,
-                    "cwd {cwd:?} {args:?}: {:?} vs {:?}",
-                    String::from_utf8_lossy(&ferret.1),
-                    String::from_utf8_lossy(&rg.1)
-                );
-                checked += 1;
+                    args.push(&operand);
+                    let listed = |binary: &OsStr, grep: bool| {
+                        let mut command = fixture.command(binary);
+                        command.current_dir(tree.join(cwd));
+                        if grep {
+                            command
+                                .arg("--index")
+                                .arg(fixture.base.join("index"))
+                                .arg("grep");
+                        }
+                        // rg has no --live: it always reads the live tree.
+                        command.args(args.iter().filter(|&&arg| grep || arg != "--live"));
+                        let output = run(command, None);
+                        let mut lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
+                        lines.sort();
+                        (
+                            output.status.code(),
+                            lines.join(&b'\n'),
+                            output.stderr.is_empty(),
+                        )
+                    };
+                    let ferret = listed(OsStr::new(env!("CARGO_BIN_EXE_ferret")), true);
+                    let rg = listed(&std::env::var_os("FERRET_RG").unwrap(), false);
+                    if ferret != rg {
+                        diverged.push(format!(
+                            "cwd {cwd:?} {args:?}: {:?} {:?} vs rg {:?} {:?}",
+                            ferret.0,
+                            String::from_utf8_lossy(&ferret.1),
+                            rg.0,
+                            String::from_utf8_lossy(&rg.1)
+                        ));
+                    }
+                    checked += 1;
+                }
             }
         }
     }
-    assert_eq!(checked, 18);
+    assert!(diverged.is_empty(), "{}", diverged.join("\n"));
+    assert_eq!(checked, 3 * 3 * 3 * 10);
 }
 
 /// `-g` globs match the path rg would print, with cwd stripped where the
