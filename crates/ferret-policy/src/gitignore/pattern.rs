@@ -112,16 +112,25 @@ impl Pattern {
     }
 
     /// Whether this override matches the empty path, as rg's globs see cwd
-    /// relative to itself. Leading globstars match nothing, then at most one
-    /// all-star glob matches the empty name; anything after it needs a
-    /// separator the empty path lacks. So `*`, `**`, `**/*`, `/*` and `/**`
-    /// match it, and `?*`, `*/*` and `*/**` do not (rg 15.2.0).
+    /// relative to itself. Leading zero-allowing globstars match nothing, then
+    /// at most one all-star glob matches the empty name; a mandatory globstar
+    /// cannot. Anything after an all-star glob needs a separator the empty
+    /// path lacks. So `*`, `**`, `**/*`, `/*` and `/**` match it, and `?*`,
+    /// `*/*`, `*/**` and `**\\/**` do not (rg 15.2.0).
     pub(crate) fn matches_empty_path(&self) -> bool {
-        let first = self
-            .components
-            .iter()
-            .position(|c| !matches!(c, Component::Globstar { .. }))
-            .unwrap_or(self.components.len());
+        let mut first = 0;
+        while matches!(
+            self.components.get(first),
+            Some(Component::Globstar { allow_zero: true })
+        ) {
+            first += 1;
+        }
+        if matches!(
+            self.components.get(first),
+            Some(Component::Globstar { allow_zero: false })
+        ) {
+            return false;
+        }
         match &self.components[first..] {
             [] => true,
             [Component::Glob(glob)] => glob.atoms.iter().all(|atom| *atom == Atom::Star),

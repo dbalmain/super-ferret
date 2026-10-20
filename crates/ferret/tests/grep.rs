@@ -5801,7 +5801,7 @@ fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let tree = fixture.tree();
     let operand = tree.join("a").into_os_string().into_string().unwrap();
-    let globs: [&[&str]; 10] = [
+    let globs: [&[&str]; 16] = [
         &[],
         &["**"],
         &["*"],
@@ -5812,6 +5812,12 @@ fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
         &["*.rs"],
         &["!*.rs"],
         &["*", "!.g"],
+        &["**\\/**"],
+        &["*", "!**\\/**"],
+        &["**/**"],
+        &["**/**\\/**"],
+        &["**\\/**/h.rs"],
+        &["**/**\\/**/h.rs"],
     ];
     let mut checked = 0;
     let mut diverged = Vec::new();
@@ -5862,7 +5868,7 @@ fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
         }
     }
     assert!(diverged.is_empty(), "{}", diverged.join("\n"));
-    assert_eq!(checked, 3 * 3 * 3 * 10);
+    assert_eq!(checked, 3 * 3 * 3 * globs.len());
 }
 
 /// `-g` globs match the path rg would print, with cwd stripped where the
