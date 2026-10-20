@@ -507,7 +507,9 @@ fn nul_names(plan: &Plan) -> bool {
 
 impl<W: Write> Host<'_, W> {
     fn error(&mut self, path: &Path, error: &dyn std::fmt::Display) -> io::Result<()> {
-        self.writer.flush()?;
+        if !nul_names(self.plan) {
+            self.writer.flush()?;
+        }
         cli::error(&format!("grep: {}: {error}", path.display()));
         self.errors = true;
         Ok(())

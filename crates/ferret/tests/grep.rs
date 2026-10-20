@@ -202,10 +202,12 @@ impl Fixture {
 #[test]
 fn names_output_is_flushed_before_a_later_read_diagnostic() {
     let fixture = Fixture::new("names-diagnostic-order");
-    fixture.write("a-match", b"needle\n");
-    fixture.write("z-unreadable", b"needle\n");
+    fs::create_dir_all(fixture.tree().join("first")).unwrap();
+    fs::create_dir_all(fixture.tree().join("second")).unwrap();
+    fixture.write("first/a-match", b"needle\n");
+    fixture.write("second/z-unreadable", b"needle\n");
     fs::set_permissions(
-        fixture.tree().join("z-unreadable"),
+        fixture.tree().join("second/z-unreadable"),
         fs::Permissions::from_mode(0o0),
     )
     .unwrap();
@@ -213,7 +215,7 @@ fn names_output_is_flushed_before_a_later_read_diagnostic() {
     // The same pipe captures stdout and stderr so this asserts their actual
     // publication order, rather than merely comparing two collected streams.
     let binary = OsStr::new(env!("CARGO_BIN_EXE_ferret"));
-    let script = "exec \"$1\" grep -l -u needle \"$2\" 2>&1";
+    let script = "exec \"$1\" grep -l -u needle \"$2\" \"$3\" 2>&1";
     let command = if Command::new("id")
         .arg("-u")
         .output()
@@ -230,7 +232,10 @@ fn names_output_is_flushed_before_a_later_read_diagnostic() {
             script,
             "sh",
         ]);
-        command.arg(binary).arg(fixture.tree());
+        command
+            .arg(binary)
+            .arg(fixture.tree().join("first"))
+            .arg(fixture.tree().join("second"));
         command
     } else {
         let mut command = fixture.command(OsStr::new("sh"));
@@ -239,16 +244,15 @@ fn names_output_is_flushed_before_a_later_read_diagnostic() {
             .arg(script)
             .arg("sh")
             .arg(binary)
-            .arg(fixture.tree());
+            .arg(fixture.tree().join("first"))
+            .arg(fixture.tree().join("second"));
         command
     };
     let output = run(command, None);
     let combined = String::from_utf8_lossy(&output.stdout);
-    let record = combined
-        .find("a-match")
-        .expect("matching name is published");
+    let record = combined.find("first").expect("matching name is published");
     let diagnostic = combined
-        .find("z-unreadable")
+        .find("second")
         .expect("unreadable input is diagnosed");
     assert!(record < diagnostic, "{combined}");
 }
