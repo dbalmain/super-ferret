@@ -20,7 +20,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
 
@@ -124,6 +124,7 @@ impl Entry {
                 parent: None,
                 id: None,
                 catalog: None,
+                listed: None,
             },
         }
     }
@@ -295,6 +296,14 @@ impl Entry {
     /// directory named by its spelling's parent.
     pub fn directory_handle(&self) -> Option<Arc<File>> {
         self.state.directory.clone()
+    }
+
+    /// The `(dev, ino)` of the directory this entry was listed in, when a
+    /// walk [retaining parents](LiveWalk::retaining_parents) was past its
+    /// descriptor budget and closed it after listing: a host that reopens
+    /// the directory by path checks it against this.
+    pub fn directory_identity(&self) -> Option<(u64, u64)> {
+        self.state.listed
     }
 
     fn follow_catalog(&mut self) -> io::Result<()> {
@@ -555,6 +564,9 @@ struct Saved {
     parent: Option<InoId>,
     id: Option<NameId>,
     catalog: Option<Arc<Catalog>>,
+    /// The listing directory's `(dev, ino)`, where a walk bounded by
+    /// [`Charge`] closed it instead of retaining it.
+    listed: Option<(u64, u64)>,
 }
 
 impl Saved {
@@ -585,6 +597,12 @@ struct Level {
     catalogued: bool,
     pending: Option<Arc<AtomicUsize>>,
     handle: Option<Arc<File>>,
+    /// `handle`'s share of the parent budget, returned when the last clone
+    /// of this level goes.
+    _charge: Option<Arc<Charge>>,
+    /// The directory's `(dev, ino)` when `handle` was closed for want of
+    /// budget.
+    identity: Option<(u64, u64)>,
     /// The directory's own path is `entry.path[..path_len]`.
     path_len: usize,
     separator: bool,
@@ -656,8 +674,15 @@ impl LiveWalk {
     /// which a name swapped for a symlink would redirect (D21). Costs one
     /// descriptor per directory on the walk's stack, plus one per start for
     /// the start's parent; the syscalls are the same.
+    ///
+    /// Those descriptors are charged to a process-wide budget ([`Charge`]).
+    /// Past it a listed directory is closed as an unretaining walk closes
+    /// it, keeping only its `(dev, ino)` from one `fstat`
+    /// ([`Entry::directory_identity`]), so a deep tree under a low open-file
+    /// limit walks as it would without retaining.
     pub fn retaining_parents(mut self) -> Self {
         self.options.retain_parent = true;
+        self.options.bounded_parents = true;
         self
     }
 
@@ -938,6 +963,8 @@ impl LiveWalk {
                 } else {
                     None
                 },
+                _charge: None,
+                identity: None,
                 path_len,
                 separator,
                 start,
@@ -1047,16 +1074,30 @@ impl LiveWalk {
         // whole subtree the way an effectful walk must, bounds live fd use
         // by width instead of depth (#10): a 100-level chain under a tight
         // RLIMIT_NOFILE no longer exhausts descriptors one per ancestor.
-        let handle = if self.options.retain_parent {
-            Some(handle)
-        } else {
+        let (handle, charge, identity) = if !self.options.retain_parent {
             drop(handle);
-            None
+            (None, None, None)
+        } else if !self.options.bounded_parents {
+            (Some(handle), None, None)
+        } else if let Some(charge) = Charge::take() {
+            (Some(handle), Some(Arc::new(charge)), None)
+        } else {
+            match handle.metadata() {
+                Ok(stat) => (None, None, Some((stat.dev(), stat.ino()))),
+                Err(error) => {
+                    self.children.truncate(start);
+                    self.names.truncate(names_start);
+                    own.restore(entry);
+                    return Err(entry.error(error));
+                }
+            }
         };
         self.levels.push(Level {
             catalogued: false,
             pending: None,
             handle,
+            _charge: charge,
+            identity,
             path_len,
             separator,
             start,
@@ -1190,6 +1231,7 @@ impl LiveWalk {
             entry.state.follow = self.options.follow == Follow::All;
             entry.state.followed_symlink = false;
             entry.state.directory = level.handle.clone();
+            entry.state.listed = level.identity;
             entry.state.depth = level.own.depth + 1;
             entry.state.kind = child.kind;
             entry.check_directory = false;
@@ -1437,6 +1479,7 @@ impl CatalogSource {
     /// ignored directories. Catalogued listings open no directory to retain.
     pub fn retaining_parents(mut self) -> Self {
         self.walk.options.retain_parent = true;
+        self.walk.options.bounded_parents = true;
         self
     }
 
@@ -1504,6 +1547,40 @@ fn catalog_kind(kind: Kind) -> FileKind {
         Kind::Socket => FileKind::Socket,
         Kind::Block => FileKind::Block,
         Kind::Character => FileKind::Character,
+    }
+}
+
+/// One retained parent descriptor's share of the budget that
+/// [`LiveWalk::retaining_parents`] walks share: a quarter of the process's
+/// open-file limit, at most 1,024, as for the crawl's held directories
+/// (D21). Returned when dropped.
+#[derive(Debug)]
+struct Charge;
+
+static PARENTS: OnceLock<AtomicUsize> = OnceLock::new();
+
+impl Charge {
+    fn budget() -> &'static AtomicUsize {
+        PARENTS.get_or_init(|| {
+            let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+            AtomicUsize::new(limit.map_or(1024, |limit| (limit / 4).min(1024)) as usize)
+        })
+    }
+
+    /// A share, if any is left.
+    fn take() -> Option<Self> {
+        Self::budget()
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .ok()
+            .map(|_| Charge)
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        Self::budget().fetch_add(1, Ordering::AcqRel);
     }
 }
 

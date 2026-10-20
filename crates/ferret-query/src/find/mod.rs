@@ -78,6 +78,8 @@ pub(crate) struct Options {
     pub follow: Follow,
     pub live_checks: bool,
     pub retain_parent: bool,
+    /// Retained parents are charged to a budget, closed past it.
+    pub bounded_parents: bool,
     pub delete: bool,
     guard: Option<CandidateGuard>,
 }

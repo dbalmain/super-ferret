@@ -374,7 +374,7 @@ pub(super) fn observe_streaming(
 /// that directory without following one (D21).
 pub(super) fn read_file(
     path: &Path,
-    listed: Option<&std::fs::File>,
+    listed: Option<&engine::reader::Parent>,
     plan: &Plan,
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
@@ -409,7 +409,7 @@ pub(super) fn read_file(
     };
     match listed {
         None => engine::reader::direct(path, cap, &mut pass, stopped),
-        Some(directory) => engine::reader::listed(directory, path, cap, &mut pass, stopped),
+        Some(parent) => engine::reader::listed(parent, path, cap, &mut pass, stopped),
     }
 }
 
@@ -508,7 +508,7 @@ pub(super) enum Job {
     Direct(PathBuf),
     /// A walked file and the directory it was listed in, which it is opened
     /// beneath, never through a symlink.
-    Listed(PathBuf, Arc<std::fs::File>),
+    Listed(PathBuf, engine::reader::Parent),
     Checked(PathBuf, NameId, u32),
     /// A catalogued name with no document, searched under `-a` because it is
     /// binary: read through the checked catalog walk, uncached.
@@ -1434,18 +1434,23 @@ impl Filter<'_> {
                 Job::Checked(entry.path().to_owned(), name, doc.0),
             ));
         }
-        // Content walks retain parents, and every name a catalogued listing,
-        // which opens no directory, yields is catalogued.
-        let Some(directory) = entry.directory_handle() else {
-            return Some((
-                0,
-                Job::Failed(
-                    entry.path().to_owned(),
-                    "walked without its directory".into(),
-                ),
-            ));
+        // Content walks retain parents or, past their budget, the parent's
+        // identity; every name a catalogued listing, which opens no
+        // directory, yields is catalogued.
+        let parent = match (entry.directory_handle(), entry.directory_identity()) {
+            (Some(directory), _) => engine::reader::Parent::Open(directory),
+            (None, Some((dev, ino))) => engine::reader::Parent::Closed(dev, ino),
+            (None, None) => {
+                return Some((
+                    0,
+                    Job::Failed(
+                        entry.path().to_owned(),
+                        "walked without its directory".into(),
+                    ),
+                ));
+            }
         };
-        Some((0, Job::Listed(entry.path().to_owned(), directory)))
+        Some((0, Job::Listed(entry.path().to_owned(), parent)))
     }
 }
 

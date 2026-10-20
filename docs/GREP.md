@@ -333,7 +333,12 @@ A walked file is opened beneath the parent descriptor the walk listed it from,
 without following a final symlink, and its closing name check uses the same
 name, also no-follow; a name swapped for a symlink after listing reads as
 changed (one retry, then exit 2). Content walks therefore hold one directory
-descriptor per depth level per worker (review R2-1, 2026-10-20).
+descriptor per depth level per worker (review R2-1, 2026-10-20), charged to a
+process-wide budget of a quarter of the open-file limit, at most 1,024, as the
+crawl's held directories are (D21). Past it a listed directory is closed after
+listing, keeping its `(dev, ino)`; its files reopen it by path and read as
+changed unless it is still that directory. A 300-deep tree under `ulimit -n 64`
+searches as without the limit.
 
 Indexed recursive content excludes policy's non-content files (binary-sniffed
 and over the default 8 MiB cap); name listing includes them. Changed candidates

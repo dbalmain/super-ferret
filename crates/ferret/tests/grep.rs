@@ -5253,13 +5253,37 @@ fn streaming_replacement_with_a_surviving_hard_link_is_rejected() {
 // no deterministic swap there; its jobs are the one-thread ones.
 #[test]
 fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
-    use std::io::Read;
     let fixture = Fixture::new("walked-symlink-swap");
     fs::create_dir(fixture.tree().join("d")).unwrap();
-    fixture.write(".ferretignore", b"/d/\n");
-    fixture.write("outside", b"hit OUTSIDE\n");
     fixture.write("d/a", b"hit\n");
     fixture.write("d/b", b"hit\n");
+    let failed = swap_after_listing(&fixture, None);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+// The same swap where the walk is past its parent descriptor budget: under
+// `ulimit -n 64` a quarter, 16, is retained, so a directory 40 deep was
+// closed after listing and is reopened by path, checked by identity.
+#[test]
+fn walked_name_swapped_past_the_parent_budget_is_not_followed() {
+    let fixture = Fixture::new("walked-symlink-swap-deep");
+    let deep = format!("d{}", "/s".repeat(40));
+    fs::create_dir_all(fixture.tree().join(&deep)).unwrap();
+    fixture.write(&format!("{deep}/a"), b"hit\n");
+    fixture.write(&format!("{deep}/b"), b"hit\n");
+    let failed = swap_after_listing(&fixture, Some(64));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Searches `d`, whose only files are two in one directory, in each content
+/// walk mode, swapping the second-listed for a symlink to a file outside
+/// the walk once the first has started printing, optionally under an
+/// open-file `limit`; returns the cases that read through the link or did
+/// not report the change.
+fn swap_after_listing(fixture: &Fixture, limit: Option<u32>) -> Vec<String> {
+    use std::io::Read;
+    fixture.write(".ferretignore", b"/d/\n");
+    fixture.write("outside", b"hit OUTSIDE\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     // Walk order is directory order, so ask a walk for it.
     let listed = fixture.ferret(&["grep", "--files", "-uu", "d"], None);
@@ -5267,6 +5291,7 @@ fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
     let [first, victim] = order.lines().collect::<Vec<_>>()[..] else {
         panic!("listed {order:?}");
     };
+    let target = format!("{}outside", "../".repeat(victim.matches('/').count()));
     let bytes = b"hit first\n".repeat(500_000);
     let mut checked = 0;
     let mut failed = Vec::new();
@@ -5282,8 +5307,14 @@ fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
         let link = fixture.tree().join(victim);
         fs::remove_file(&link).unwrap();
         fixture.write(victim, b"hit victim\n");
-        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        let mut command = fixture.command(OsStr::new("sh"));
         command
+            .arg("-c")
+            .arg(match limit {
+                Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+                None => "exec \"$0\" \"$@\"".to_owned(),
+            })
+            .arg(env!("CARGO_BIN_EXE_ferret"))
             .arg("--index")
             .arg(fixture.base.join("index"))
             .arg("grep")
@@ -5295,7 +5326,7 @@ fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
         let mut start = [0; 1024];
         pipe.read_exact(&mut start).unwrap();
         fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink("../outside", &link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
         child.stdout = Some(pipe);
         let output = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5313,8 +5344,68 @@ fn walked_name_swapped_for_a_symlink_after_listing_is_not_followed() {
         }
         checked += 1;
     }
-    assert!(failed.is_empty(), "{}", failed.join("\n"));
     assert_eq!(checked, 5);
+    failed
+}
+
+// Retained parents are budgeted: a chain 300 deep under `ulimit -n 64`
+// searches as it does with no limit, in every content walk mode. Retaining
+// one descriptor per level without a budget ran out at depth 59.
+#[test]
+fn deep_walk_under_a_low_open_file_limit_searches_every_level() {
+    let fixture = Fixture::new("deep-walk-descriptors");
+    let mut dir = "d".to_owned();
+    for level in 0..300 {
+        fs::create_dir_all(fixture.tree().join(&dir)).unwrap();
+        fixture.write(&format!("{dir}/f"), format!("hit {level}\n").as_bytes());
+        dir.push_str("/s");
+    }
+    fixture.write(".ferretignore", b"/d/\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let run = |mode: &[&str], threads: &str, limit: Option<u32>| {
+        let mut command = fixture.command(OsStr::new("sh"));
+        command
+            .arg("-c")
+            .arg(match limit {
+                Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+                None => "exec \"$0\" \"$@\"".to_owned(),
+            })
+            .arg(env!("CARGO_BIN_EXE_ferret"))
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(mode)
+            .args(["hit", "d"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let output = command.output().unwrap();
+        // Several threads print files in completion order.
+        let mut lines: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort_unstable();
+        (
+            output.status.code(),
+            lines,
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let mut checked = 0;
+    for mode in [&[][..], &["-uu"], &["--live"]] {
+        for threads in ["1", "4"] {
+            let unlimited = run(mode, threads, None);
+            assert_eq!(unlimited.0, Some(0), "{mode:?} {threads}: {}", unlimited.2);
+            assert_eq!(unlimited.1.len(), 300);
+            assert_eq!(
+                run(mode, threads, Some(64)),
+                unlimited,
+                "{mode:?} on {threads}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 6);
 }
 
 // D102 + D103: the first spool can fail after the matching prefix streamed.

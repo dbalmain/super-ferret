@@ -56,29 +56,57 @@ pub(crate) fn direct(
     }
 }
 
-/// A walked file, by its name beneath the `directory` it was listed in,
-/// never through a symlink; otherwise as [`direct`].
+/// The directory a walked file was listed in.
+#[derive(Debug)]
+pub(crate) enum Parent {
+    /// Still open, as the walk retained it.
+    Open(std::sync::Arc<std::fs::File>),
+    /// Closed by a walk past its descriptor budget: its `(dev, ino)`, which
+    /// the directory reopened by path must still have.
+    Closed(u64, u64),
+}
+
+/// A walked file, by its name beneath the directory it was listed in,
+/// never through a symlink; otherwise as [`direct`]. A closed parent
+/// reopened as another directory reads as changed.
 pub(crate) fn listed(
-    directory: &std::fs::File,
+    parent: &Parent,
     path: &std::path::Path,
     cap: Option<u64>,
     each: ferret_query::Consumer<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> ReadOutcome {
     use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
     let Some(name) = path.file_name() else {
         return ReadOutcome::Failed(ReadFault::Io(
             ReadOperation::Open,
             std::io::Error::other("a walked file has no name"),
         ));
     };
-    match ferret_crawl::content::stream_search_listed_until(
-        directory.as_fd(),
-        name,
-        cap,
-        each,
-        cancelled,
-    ) {
+    let reopened;
+    let directory = match parent {
+        Parent::Open(directory) => directory.as_fd(),
+        &Parent::Closed(dev, ino) => {
+            let spelled = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty());
+            let opened = std::fs::File::open(spelled.unwrap_or(".".as_ref()))
+                .and_then(|directory| Ok((directory.metadata()?, directory)));
+            reopened = match opened {
+                Ok((stat, directory)) if (stat.dev(), stat.ino()) == (dev, ino) => directory,
+                Ok(_) => return ReadOutcome::RetryChanged,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return ReadOutcome::RetryChanged;
+                }
+                Err(error) => {
+                    return ReadOutcome::Failed(ReadFault::Io(ReadOperation::Open, error));
+                }
+            };
+            reopened.as_fd()
+        }
+    };
+    match ferret_crawl::content::stream_search_listed_until(directory, name, cap, each, cancelled) {
         Ok(_) => ReadOutcome::Stable(ReadVersion::Current),
         Err(error) => fault(error, false),
     }
