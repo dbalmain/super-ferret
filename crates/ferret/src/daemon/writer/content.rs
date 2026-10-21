@@ -229,10 +229,15 @@ fn content_checkpoint(host: &Host, phase: &str, checks: u64, interrupted: &dyn F
     }
 }
 
-/// Follows every uncovered document for an explicit command. No byte pacing
-/// and no background test gate. Drain and shutdown stop the pass; the caller
-/// still replies with the catalog report. A merge this makes due stays on
-/// the background merge worker.
+/// Follows every uncovered document for an explicit command. No byte pacing.
+/// Drain and shutdown stop the pass. If documents remain, that is a content
+/// error: the catalog change is already published, and the reply tells the
+/// user to run `ferret index` again. A finished follow (`remaining == 0`) is
+/// success even when the same check also fired. A merge this makes due stays
+/// on the background merge worker.
+///
+/// Debug builds share [`content_checkpoint`] on the `explicit` phase, which
+/// is not the background `follow` gate.
 pub(super) fn follow_explicit(host: &Host, engine: &Engine) -> Result<(), String> {
     loop {
         let stop = || {
@@ -243,18 +248,33 @@ pub(super) fn follow_explicit(host: &Host, engine: &Engine) -> Result<(), String
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .draining
         };
+        // A fresh counter per pass. The background follow's gate is a
+        // different phase, and this command must not park in it.
+        #[cfg(debug_assertions)]
+        let checks = std::cell::Cell::new(0u64);
+        let cancelled = || {
+            #[cfg(debug_assertions)]
+            {
+                checks.set(checks.get() + 1);
+                content_checkpoint(host, "explicit", checks.get(), &stop);
+            }
+            stop()
+        };
         let pace = |_bytes: usize| Ok(());
         let budget = ferret_index::Budget {
             bytes: u64::MAX,
             buffer: ferret_index::BUFFER,
             pace: &pace,
-            cancelled: &stop,
+            cancelled: &cancelled,
         };
         let followed = engine
             .follow_content(&budget, None)
             .map_err(|error| error.to_string())?;
-        if followed.remaining == 0 || followed.stopped == ferret_index::Stopped::Asked {
+        if followed.remaining == 0 {
             return Ok(());
+        }
+        if followed.stopped == ferret_index::Stopped::Asked {
+            return Err("interrupted (daemon stopping); run ferret index again".to_owned());
         }
     }
 }

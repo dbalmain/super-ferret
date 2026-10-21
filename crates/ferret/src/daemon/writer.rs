@@ -34,7 +34,8 @@ struct CommandJob {
 }
 pub(super) struct CommandReply {
     result: Result<ferret_crawl::Report, ferret_crawl::IndexError>,
-    /// `Ok` when the catalog change failed, or after its content follow.
+    /// `Ok` when the catalog change failed or content follow covered every
+    /// document. Drain and shutdown leave `Err` while documents remain.
     content: Result<(), String>,
     /// A deferred command with no watch must arm the fallback backstop again.
     arm_fallback: bool,

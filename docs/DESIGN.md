@@ -801,9 +801,10 @@ Above 10,000 uncovered live documents, default content queries return
 permits the larger scan. Watch traffic never cancels a merge. A queued
 command, battery pause, drain and shutdown cancel background follow and an
 in-flight merge at cooperative checkpoints. An explicit command's own follow
-stops for drain and shutdown, then the command still replies with the catalog
-report. Writer teardown cancels and joins the merge before releasing the
-catalog lock, then removes the socket (D110).
+stops for drain and shutdown. If documents remain, that is a content error:
+the client exits 3 and is told to run `ferret index` again. The catalog
+change is already published. Writer teardown cancels and joins the merge
+before releasing the catalog lock, then removes the socket (D110).
 Content publications check incarnation, high water and monotonic manifest
 sequence under the publication lock, including reader opens; catalog publication
 preserves the latest matching content view under that same lock. Status reports
