@@ -945,6 +945,10 @@ fn observe(
             || {
                 let mut hasher = Hasher::with_source(source, &cache, root);
                 hasher.watch = options.watch.as_deref();
+                // An unpaced bulk control is an explicit command. Its workers
+                // keep the spawning thread's nice; background crawls still
+                // lower.
+                hasher.lower_priority = options.bulk.as_ref().is_none_or(|control| control.paced());
                 if bulk_read {
                     hasher.reader.limiter = options
                         .bulk
@@ -1310,6 +1314,9 @@ pub(crate) struct Hasher<'a> {
     selection: Option<&'a crate::refresh::Selection>,
     watch: Option<&'a crate::watch::Watch>,
     priority_error: Option<io::Error>,
+    /// Background workers lower themselves. An unpaced explicit command leaves
+    /// this false so the worker keeps the nice of the thread that spawned it.
+    lower_priority: bool,
 }
 
 /// What a worker leaves behind.
@@ -1356,6 +1363,7 @@ impl<'a> Hasher<'a> {
             selection: None,
             watch: None,
             priority_error: None,
+            lower_priority: true,
         }
     }
 
@@ -1596,7 +1604,9 @@ impl EventVisitor for Hasher<'_> {
         true
     }
     fn worker_started(&mut self) {
-        self.priority_error = crate::lower_index_priority().err();
+        if self.lower_priority {
+            self.priority_error = crate::lower_index_priority().err();
+        }
     }
     type Dir = DirToken;
 

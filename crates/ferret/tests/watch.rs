@@ -1390,29 +1390,118 @@ fn manifest_equals_clean(tree: &Tree) {
     let actual = content_answers(|q| tree.local(&["search", "--scan-uncovered", q]));
     assert_eq!(actual, expected);
 }
+/// Threads exit between `readdir` and the `stat` read. A missing row is a
+/// thread that is already gone, so the sample skips it.
+fn task_rows(pid: u32) -> Vec<(String, String, i32)> {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|entry| {
+            let tid = entry.file_name().to_string_lossy().into_owned();
+            let comm = fs::read_to_string(entry.path().join("comm")).ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let nice = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(16))
+                .and_then(|field| field.parse().ok())?;
+            Some((tid, comm.trim().to_owned(), nice))
+        })
+        .collect()
+}
+
 #[test]
 fn queued_command_interrupts_a_ten_thousand_document_follow() {
     let mut tree = Tree::new();
     unfollowed_burst(&tree);
     let gate = gate(&tree, "follow");
     let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
-    tree.spawn(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    tree.spawn(&[
+        ("FERRET_CONTENT_TEST_GATE", gate_text),
+        ("FERRET_INDEX_WORKERS", "4"),
+    ]);
     wait(|| gate.join("follow.reached").exists());
     write(tree.path("src/urgent.txt"), "urgent");
-    let started = Instant::now();
-    tree.success(tree.run(&["index", "src"]));
+    let pid = tree
+        .daemon
+        .as_ref()
+        .unwrap_or_else(|| panic!("daemon"))
+        .id();
+    let before = task_rows(pid);
+    let before_tids: std::collections::HashSet<_> =
+        before.iter().map(|(tid, _, _)| tid.clone()).collect();
+    let command_nice = before
+        .iter()
+        .find(|(_, comm, _)| comm == "ferret-command")
+        .map(|(_, _, nice)| *nice)
+        .unwrap_or_else(|| panic!("command thread missing: {before:?}"));
+    let lowered: Vec<_> = before
+        .iter()
+        .filter(|(_, _, nice)| *nice == 19)
+        .map(|(tid, _, _)| tid.clone())
+        .collect();
     assert!(
-        started.elapsed() < BOUND,
-        "writer command exceeded budget bound"
+        !lowered.is_empty(),
+        "writer was not at nice 19 before the command: {before:?}"
     );
+    let mut seen = std::collections::HashMap::<String, (String, i32)>::new();
+    let output = std::thread::scope(|scope| {
+        let index = scope.spawn(|| tree.run(&["index", "src"]));
+        while !index.is_finished() {
+            for (tid, comm, nice) in task_rows(pid) {
+                // The merge worker is spawned from the nice-19 writer once
+                // follow finishes, and it can appear before the client has
+                // observed the reply. It is background work.
+                if !before_tids.contains(&tid) && comm != "ferret-merge" {
+                    seen.entry(tid).or_insert((comm, nice));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        index
+            .join()
+            .unwrap_or_else(|_| panic!("index thread panicked"))
+    });
+    tree.success(output);
     assert!(
         gate.join("follow").exists(),
-        "command must complete while first build is held"
+        "command follow waited in the background content gate"
+    );
+    assert_eq!(
+        number(&tree.status(), "uncovered"),
+        0,
+        "index returned with content still uncovered: {}",
+        tree.status()
+    );
+    let search = tree.success(tree.run(&["search", "text:unique7777"]));
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        stdout.contains("burst-7777.txt"),
+        "indexed content missing from search: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&search.stderr);
+    assert!(
+        !stderr.contains("does not yet cover"),
+        "search scanned or refused: {stderr}"
     );
     assert!(
-        number(&tree.status(), "uncovered") > 0,
-        "whole first build completed before command"
+        !seen.is_empty(),
+        "command crawl spawned no worker; nice inheritance was not observed"
     );
+    for (tid, (comm, nice)) in &seen {
+        assert_eq!(
+            *nice, command_nice,
+            "worker {tid} ({comm}) nice {nice}, command thread {command_nice}"
+        );
+        assert_ne!(*nice, 19, "worker {tid} ({comm}) ran at background nice");
+    }
+    let after = task_rows(pid);
+    for tid in &lowered {
+        if let Some((_, comm, nice)) = after.iter().find(|(id, _, _)| id == tid) {
+            assert_eq!(*nice, 19, "background thread {tid} ({comm}) left nice 19");
+        }
+    }
     fs::remove_file(gate.join("follow")).unwrap_or_else(|e| panic!("release: {e}"));
     tree.converges();
 }

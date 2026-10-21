@@ -228,3 +228,33 @@ fn content_checkpoint(host: &Host, phase: &str, checks: u64, interrupted: &dyn F
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// Follows every uncovered document for an explicit command. No byte pacing
+/// and no background test gate. Drain and shutdown stop the pass; the caller
+/// still replies with the catalog report. A merge this makes due stays on
+/// the background merge worker.
+pub(super) fn follow_explicit(host: &Host, engine: &Engine) -> Result<(), String> {
+    loop {
+        let stop = || {
+            host.stop.load(Ordering::Acquire)
+                || host
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .draining
+        };
+        let pace = |_bytes: usize| Ok(());
+        let budget = ferret_index::Budget {
+            bytes: u64::MAX,
+            buffer: ferret_index::BUFFER,
+            pace: &pace,
+            cancelled: &stop,
+        };
+        let followed = engine
+            .follow_content(&budget, None)
+            .map_err(|error| error.to_string())?;
+        if followed.remaining == 0 || followed.stopped == ferret_index::Stopped::Asked {
+            return Ok(());
+        }
+    }
+}

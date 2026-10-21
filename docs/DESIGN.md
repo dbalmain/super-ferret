@@ -776,21 +776,34 @@ Ordinary queries connect to the daemon, spawning it on first use; unavailable
 background operation or `FERRET_NO_DAEMON` uses the same engine in process.
 D56 A keeps effectful find in the local client; live/information-only find
 and batch remain local too. M5a retains one WriterSession and its lock;
-explicit index/root commands are ordering barriers in one writer queue. Commands
-use the real session producer and return the ordinary report after publication.
+explicit index/root commands are ordering barriers in one writer queue. Each
+runs on a thread spawned before the writer lowers itself to nice 19, so the
+crawl and the unpaced content follow keep the nice the process started with.
+Workers of that crawl inherit it; background workers still lower themselves.
+The command replies only after that follow finishes. An unprivileged process
+cannot raise a thread's nice (RLIMIT_NICE is a hard ceiling), so the writer
+stays at nice 19 for its whole life. A merge already holding the content
+index stops at its next checkpoint, because a queued command is urgent, and
+the follow then takes that lock. A merge the follow makes due stays on the
+nice-19 merge worker and runs after the reply. Watch refreshes stay queued
+behind the command. A client hangup leaves the command running: the crawl
+runs to publication, and the follow finishes before the reply is sent.
 No-daemon indexing stays direct and fails promptly against a daemon-held lock.
 Queries pin the last checked view while refresh/recovery runs. Recovery retains
 the same lock and revalidates the durable prefix before rebuilding writer lookups.
 
 D114 runs content merges on a separate nice-19 thread with the content-index
 mutex and the catalog pin used for admission. Catalog refreshes continue on the
-writer. Follow uses try-lock and retries after a merge; edited documents receive
-new uncovered DocIds and queries verify their bytes directly. Above 10,000
-uncovered live documents, default content queries return `IndexIncomplete`
-until follow catches up; `--scan-uncovered` explicitly permits the larger scan.
-Watch traffic never cancels a merge. Commands, battery pause, drain and shutdown
-still cancel at cooperative checkpoints. Writer teardown cancels and joins the
-merge before releasing the catalog lock, then removes the socket (D110).
+writer. Background follow uses try-lock and retries after a merge; edited
+documents receive new uncovered DocIds and queries verify their bytes directly.
+Above 10,000 uncovered live documents, default content queries return
+`IndexIncomplete` until follow catches up; `--scan-uncovered` explicitly
+permits the larger scan. Watch traffic never cancels a merge. A queued
+command, battery pause, drain and shutdown cancel background follow and an
+in-flight merge at cooperative checkpoints. An explicit command's own follow
+stops for drain and shutdown, then the command still replies with the catalog
+report. Writer teardown cancels and joins the merge before releasing the
+catalog lock, then removes the socket (D110).
 Content publications check incarnation, high water and monotonic manifest
 sequence under the publication lock, including reader opens; catalog publication
 preserves the latest matching content view under that same lock. Status reports
@@ -836,7 +849,10 @@ source advice is enabled; no-reuse is disabled and unmeasured. S1B records
 configuration, status and the required M7 reserve/cache measurements.
 
 M6's revised priority decision uses per-thread nice 19 only, via rustix's
-`process`/`thread` features. No idle I/O class or SCHED_IDLE is applied.
+`process`/`thread` features. Background workers, the writer and merges use
+it. An explicit command runs on a thread created before that lower, and its
+crawl workers keep the process's starting nice. No idle I/O class or
+SCHED_IDLE is applied.
 Default Linux best-effort I/O priority derives level 7 from nice 19 where the
 scheduler honours it (BFQ); Dave's nine devices use `none` and ignore I/O
 priority, so bulk byte pacing supplies the I/O protection. SCHED_IDLE offers
