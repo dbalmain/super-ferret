@@ -68,8 +68,10 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -a, --text         search binary bytes as text\n\
   --max-depth N      limit directory traversal depth\n\
   --scan             accepted; broad patterns always scan\n\n\
-Directories use snapshot names/postings and current candidate bytes.\n\
-Uncovered directories search live with rg ignore rules; trigrams are optional.\n\
+Directories use snapshot names and postings. Candidates and catalogued\n\
+files over the 8 MiB index cap are read live.\n\
+Uncovered directories search live with rg ignore rules, including ancestor\n\
+.ignore and .rgignore up to /. Trigrams are optional.\n\
 Explicit files and stdin search directly. UTF-8 BOMs are stripped; UTF-16\n\
 decoding is deferred. Excluded paths are absent. Exit: 0 match, 1 none, 2 error.\n";
 

@@ -1803,9 +1803,9 @@ candidate seam and the first content index:
 - **M4** — the cursor tree, certainty algebra and `text:` compiled and planned
   (M4a); measured against the real corpus (M4b); then a needle prefilter and
   windowed verification that cut phrase cost (M4c).
-- **M5** — daemon integration: paced follow and merge under the existing writer
-  lock and 32 MiB/s limiter, content-aware `status`/`stats`, socket and batch
-  content queries.
+- **M5** — daemon integration: paced follow on the writer, content merges on
+  their own nice-19 thread beside refreshes (D114), the shared 32 MiB/s
+  limiter, content-aware `status`/`stats`, socket and batch content queries.
 
 **Measured** (2026-10-07, isolated catalog of `$HOME`, 113,010 live documents,
 4.03 GB of text, release builds, one run at a time):

@@ -6300,6 +6300,13 @@ calling grep in trees whose committed sources sit under `vendor/`, `build/` or
 `dist/`, where B's default ignores would hide real matches (then B with
 `DEFAULT_IGNORE` limited to what git ignores when a work tree is found).
 
+Note (2026-10-22): the shipped fallback also reads `.ignore` and `.rgignore`
+from every ancestor above the work tree, up to `/`, and those rules stay in
+force inside a nested work tree. Each outranks every git source, including a
+closer `.gitignore`. `.gitignore`, `.git/info/exclude` and the XDG global git
+excludes (`$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`) apply
+only inside a work tree. Ferret does not read `core.excludesFile`.
+
 ## D113 — Indexed grep and files over the size cap
 
 **Status: answered, yes, 2026-10-21.**

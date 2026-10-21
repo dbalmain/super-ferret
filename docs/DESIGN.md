@@ -751,8 +751,8 @@ already permits that coordination. There is no separate daemon crate. D57 A and 
 JSON-lines reader and event writer; no external parser dependency is needed.
 
 Both hosts open checked catalog buffers resident, validate the effective
-snapshot-plus-overlay view (D53 A), and pin generations per query. Future
-content indexes are mapped by their owning crate in S2; none exists today.
+snapshot-plus-overlay view (D53 A), and pin generations per query. The
+content index is `ferret-index`, under the catalog directory (S2).
 D54 adds resident interned names and row postings in catalog, and a name-term
 index/planner in query using text's tokenizer, retaining BFS. These catalog
 row postings do not change the content-index boundary. D55 remains open.
@@ -772,8 +772,10 @@ complete read allowances at low descriptor limits (two at NOFILE=64). A stalled
 request cannot consume another admitted request's share. Each request retains
 its own capture budget and streaming owner.
 
-Ordinary queries connect to the daemon, spawning it on first use; unavailable
-background operation or `FERRET_NO_DAEMON` uses the same engine in process.
+Search, default find and covered directory grep connect to the daemon,
+spawning it on first use. `status` and `stats --json` connect without
+spawning; text `stats` stays local. Unavailable background operation or
+`FERRET_NO_DAEMON` uses the same engine in process.
 D56 A keeps effectful find in the local client; live/information-only find
 and batch remain local too. M5a retains one WriterSession and its lock;
 explicit index/root commands are ordering barriers in one writer queue. Commands

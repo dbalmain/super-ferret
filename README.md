@@ -15,7 +15,8 @@ its code.
 
 `ferret index DIR` adds an indexed root. `ferret find [PATH...] [EXPRESSION]`
 then takes GNU find syntax and answers from the index: ignored paths do not
-exist to it, and it sees the tree as of the last `ferret index`.
+exist to it. While ferretd is running the index follows the tree; otherwise
+find sees it as of the last `ferret index`.
 `ferret find -I` (or `--no-ignore`) walks the disk live with no ignore rules,
 and `find_no_ignore = true` in `~/.config/ferret/config` makes that the default.
 Both walk in parallel: parents still come before children (after them under

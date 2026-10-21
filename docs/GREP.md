@@ -55,9 +55,12 @@ requests. Mixed covered/uncovered requests stay
 local: each covered operand uses the snapshot, each uncovered operand walks
 live, in operand order. Covered-only requests retain daemon routing.
 
-The D112 fallback reads `.gitignore` from the work-tree top down,
-`.git/info/exclude`, `$XDG_CONFIG_HOME/git/ignore` (or `~/.config/git/ignore`),
-`.ignore`, and `.rgignore`, in increasing precedence. It applies no ferret
+The D112 fallback applies, in increasing precedence, the XDG global git
+excludes (`$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`), then
+`.git/info/exclude`, then `.gitignore` from the work-tree top down, then
+`.ignore`, then `.rgignore`. `.ignore` and `.rgignore` are also read from
+every ancestor up to `/`, and each outranks every git source, including a
+closer `.gitignore`. It applies no ferret
 ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
 read `core.excludesFile`. As in rg 15.2.0, the three git sources apply only
 in directories inside a work tree: any ancestor holding a `.git` that

@@ -2,8 +2,9 @@
 //! directories, run one command, and map its outcome to an exit status.
 //!
 //! Each command lives in its own module ([`crate::find`], [`crate::search`],
-//! [`crate::index`], [`crate::stats`]) and returns an [`Exit`]; this module is
-//! the only one that reads the process environment.
+//! [`crate::index`], [`crate::stats`], [`crate::grep`]) and returns an
+//! [`Exit`]. This module reads the arguments and `FERRET_INDEX`. Other
+//! modules read the process environment too.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -140,9 +141,12 @@ query atoms:
 
 search freshness:
   Content answers are as of the index's last follow; names are as of the
-  catalog's last refresh. The daemon normally keeps both within about a
-  second of change. Exact Yes rows are not re-read. A Maybe candidate that
-  changed is checked against its current bytes; a vanished file is dropped.
+  catalog's last refresh. While ferretd is running it keeps both within
+  about a second of change. Search, default find and indexed grep start
+  it on first use. It exits after 15 minutes idle, and the call that
+  starts it answers from the last publication. Exact Yes rows are not
+  re-read. A Maybe candidate that changed is checked against its current
+  bytes; a vanished file is dropped.
   A new term absent from the snapshot can be missed until the next follow:
   after alpha becomes zeta, text:zeta may miss it while text:alpha still hits.
 

@@ -7,7 +7,8 @@
 //! are not read: like git's global ignore file, ferret's files are per user.
 //!
 //! Pure over an environment lookup, so tests never touch the process
-//! environment; [`Dirs::from_env`] is the one caller of `std::env`.
+//! environment. [`Dirs::from_env`] and [`Dirs::config_from_env`] are this
+//! module's callers of `std::env`.
 
 use std::ffi::OsString;
 use std::fmt;
