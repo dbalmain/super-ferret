@@ -1,6 +1,6 @@
 //! Checks identity before id interpretation and exercises published wire bytes.
 
-use super::{Scratch, commit, dir_stat, file_stat, hash, paths, reopen, snapshot};
+use super::{Scratch, at, commit, dir_stat, file_stat, hash, paths, reopen, snapshot};
 use crate::generation::{MANIFEST_LEN, Manifest, checksum};
 use crate::{
     Catalog, Content, DecodeError, Generation, Handle, InoId, NameId, OpenError, Section,
@@ -309,4 +309,96 @@ fn allocation_boundaries_and_exhausted_documents_drive_the_real_codec_and_writer
         Err(crate::CommitError::Build(crate::BuildError::TooLarge))
     ));
     assert_eq!(reopen(&scratch.path).generation(), original.generation);
+}
+
+fn generations_agree(dir: &std::path::Path) {
+    assert_eq!(
+        Catalog::published_generation(dir).unwrap(),
+        Catalog::open(dir)
+            .unwrap()
+            .map(|catalog| catalog.generation())
+    );
+}
+
+#[test]
+fn published_generation_matches_open_across_publications_and_a_new_incarnation() {
+    let scratch = Scratch::new("published-generation");
+    // A new incarnation is `Generation::fresh`, used when begin finds no
+    // published catalog. Nothing else in the public API mints one in place:
+    // commits, log appends and compaction keep the incarnation and renumber
+    // the checkpoint.
+    generations_agree(&scratch.path);
+    std::fs::create_dir_all(&scratch.path).unwrap();
+    generations_agree(&scratch.path);
+
+    let first = commit(&scratch.path, |txn| {
+        let mut batch = txn.batch();
+        let root = batch.root(b"/root", dir_stat(1));
+        batch.file(root, b"a", file_stat(2), Content::Hashed(hash(1)));
+        txn.add(batch);
+    });
+    let incarnation = first.generation().incarnation;
+    generations_agree(&scratch.path);
+
+    let mut next = Transaction::begin(&scratch.path, 1).unwrap();
+    next.keep(b"/root").unwrap();
+    let second = next.commit().unwrap();
+    assert_eq!(second.generation().incarnation, incarnation);
+    assert!(second.generation().checkpoint > first.generation().checkpoint);
+    generations_agree(&scratch.path);
+
+    let mut session = crate::WriterSession::open(&scratch.path).unwrap();
+    session.set_compaction_limits(crate::CompactionLimits {
+        log_bytes: u64::MAX,
+        records: u64::MAX,
+        dirty_percent: u32::MAX,
+        dead_percent: u32::MAX,
+    });
+    for step in 0..3 {
+        let view = session.view();
+        let id = at(&view, "/root/a");
+        let mut inode = view.inode(id);
+        inode.stat.ctime_nsec += step + 1;
+        let published = session
+            .commit(
+                &crate::log::ChangeSet {
+                    counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+                    counts: [
+                        view.inode_count(),
+                        view.name_count(),
+                        view.dir_count(),
+                        view.doc_count(),
+                    ],
+                    records: vec![crate::log::Record::InodePut {
+                        id: id.0,
+                        kind: crate::Kind::File,
+                        stat: inode.stat,
+                        state: inode.state,
+                        doc: inode.doc.map(|doc| doc.0),
+                    }],
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(published.generation().incarnation, incarnation);
+        assert!(published.generation().sequence > second.generation().sequence);
+        generations_agree(&scratch.path);
+    }
+    let logged = session.view().generation();
+    let compacted = session.compact().unwrap();
+    assert_eq!(compacted.generation().incarnation, incarnation);
+    assert_ne!(compacted.generation().checkpoint, logged.checkpoint);
+    assert_eq!(compacted.generation().sequence, logged.sequence);
+    drop(session);
+    generations_agree(&scratch.path);
+
+    std::fs::remove_file(scratch.path.join("current")).unwrap();
+    generations_agree(&scratch.path);
+    let rebuilt = commit(&scratch.path, |txn| {
+        let mut batch = txn.batch();
+        batch.root(b"/other", dir_stat(1));
+        txn.add(batch);
+    });
+    assert_ne!(rebuilt.generation().incarnation, incarnation);
+    generations_agree(&scratch.path);
 }

@@ -196,10 +196,13 @@ fn connect_owner(
     writer: bool,
     observed_owner: &mut bool,
 ) -> io::Result<Connected> {
-    let incarnation = ferret_catalog::Catalog::open(index)
+    // The incarnation lives in the fixed-length manifest. Opening the catalog
+    // also walks every change-log transaction, which a long-lived index
+    // accumulates without bound.
+    let incarnation = ferret_catalog::Catalog::published_generation(index)
         .ok()
         .flatten()
-        .map(|catalog| crate::find_json::hex(&catalog.generation().incarnation));
+        .map(|generation| crate::find_json::hex(&generation.incarnation));
     let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
     let context = endpoint::context()?;
     let mut draining_socket = None;

@@ -2579,3 +2579,54 @@ fn compare_over_cap_grep(name: &str, nul: Option<usize>) {
         }
     }
 }
+
+/// Resigns `current` so its incarnation no longer matches the snapshot.
+/// `Catalog::open` then fails checkpoint identity, while the manifest alone
+/// still yields the new incarnation.
+fn resign_incarnation(index: &std::path::Path) {
+    let path = index.join("current");
+    let mut bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), 128, "manifest length");
+    bytes[16] ^= 0x01;
+    assert_ne!(&bytes[16..32], &[0; 16], "incarnation must stay nonzero");
+    let digest = ferret_catalog::checkpoint_checksum(&bytes[..112]);
+    bytes[112..128].copy_from_slice(&digest);
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn client_compares_the_manifest_incarnation_without_a_full_open() {
+    let tree = Tree::new();
+    let pid = tree.start(&[]);
+    let status = tree.run(&["status", "--json"]);
+    assert!(status.status.success(), "{status:?}");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("\"host_running\":true"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    // No published manifest: the client skips the check, as it does for a
+    // missing index, and the already-loaded daemon still answers.
+    let current = tree.base.join("index/current");
+    let saved = fs::read(&current).unwrap();
+    fs::remove_file(&current).unwrap();
+    let missing = tree.run(&["status", "--json"]);
+    assert!(missing.status.success(), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("\"host_running\":true"),
+        "{}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    fs::write(&current, saved).unwrap();
+
+    resign_incarnation(&tree.base.join("index"));
+    let mismatched = tree.run(&["status", "--json"]);
+    assert_eq!(mismatched.status.code(), Some(3), "{mismatched:?}");
+    assert!(
+        String::from_utf8_lossy(&mismatched.stderr).contains("checkpoint identity"),
+        "{}",
+        String::from_utf8_lossy(&mismatched.stderr)
+    );
+    assert_eq!(number(&tree.connect().1, "pid"), Some(pid));
+}

@@ -293,11 +293,22 @@ pub(crate) fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
 }
 
 impl Catalog {
-    /// Opens the catalog in `dir`, reading and checking only the header and
-    /// section table; no section is loaded. `Ok(None)` when nothing has been
-    /// committed there yet.
+    /// Opens the catalog in `dir`. Checks the manifest, the checkpoint header
+    /// and the change log's framing; no section payload is loaded. `Ok(None)`
+    /// when nothing has been committed there yet.
+    /// [`Self::published_generation`] reads the manifest alone.
     pub fn open(dir: &Path) -> Result<Option<Catalog>, OpenError> {
         Ok(crate::log::Published::open(dir)?.map(crate::log::Published::into_catalog))
+    }
+
+    /// The generation stored in `dir`'s manifest. Does not open the snapshot
+    /// or the change log. `Ok(None)` when nothing has been published, including
+    /// a missing directory — the same answer as [`Self::open`]. When `open`
+    /// succeeds, [`Self::generation`] equals this value. A manifest that
+    /// decodes while the snapshot or log does not still yields that
+    /// generation; `open` returns the error instead.
+    pub fn published_generation(dir: &Path) -> Result<Option<Generation>, OpenError> {
+        Ok(read_manifest(dir)?.map(|manifest| manifest.generation))
     }
 
     pub(crate) fn open_checkpoint(file: File, manifest: &Manifest) -> Result<Catalog, OpenError> {
