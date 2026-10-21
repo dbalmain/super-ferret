@@ -13,7 +13,7 @@ use ferret_query::{Query, Row};
 
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
-use crate::find_json::{FrameOutput, diagnostic_to, generation};
+use crate::find_json::{FrameOutput, diagnostic_to, emit_parts, generation};
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
 use crate::search::json_row;
@@ -246,10 +246,13 @@ pub(crate) fn search_request(
             let catalog = session.catalog();
             bytes_read = catalog.bytes_read();
             let mut output_error = None;
-            // Reused across rows. A fresh pair per row dominated dense
-            // listings: two allocations, then a full JSON parse on the client.
+            // JSON rows reuse these buffers. Plain search sends `path\n`
+            // through find's raw frames and does not build a row object.
             let mut encoded = Vec::with_capacity(256);
             let mut framed = Vec::with_capacity(320);
+            let mut raw_line = Vec::with_capacity(256);
+            let mut record = 0u64;
+            let raw = destination.raw_output();
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
@@ -272,16 +275,29 @@ pub(crate) fn search_request(
                         if request.capabilities.iter().any(|c| c == "test-panic") {
                             panic!("injected query panic");
                         }
-                        encoded.clear();
-                        json_row(&mut encoded, catalog, row);
-                        framed.clear();
-                        let mut object = Object::new(&mut framed);
-                        object.str("id", &request.id).str("event", "row");
-                        object.raw_fields(&encoded[1..encoded.len() - 1]);
-                        object.end();
-                        if let Err(error) = destination.send(&framed) {
-                            output_error = Some(error);
-                            return ControlFlow::Break(());
+                        if raw {
+                            raw_line.clear();
+                            raw_line.extend_from_slice(row.path);
+                            raw_line.push(b'\n');
+                            record += 1;
+                            if let Err(error) =
+                                emit_parts(destination, &request.id, "stdout", record, &raw_line)
+                            {
+                                output_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
+                        } else {
+                            encoded.clear();
+                            json_row(&mut encoded, catalog, row);
+                            framed.clear();
+                            let mut object = Object::new(&mut framed);
+                            object.str("id", &request.id).str("event", "row");
+                            object.raw_fields(&encoded[1..encoded.len() - 1]);
+                            object.end();
+                            if let Err(error) = destination.send(&framed) {
+                                output_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
                         }
                         first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
                         rows += 1;

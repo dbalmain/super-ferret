@@ -399,29 +399,6 @@ fn status(value: u64) -> io::Result<Exit> {
         _ => Err(io::Error::other("invalid native status")),
     }
 }
-/// Path of a search row whose `path` string has no escapes and no
-/// `path_base64`. Anything else, including a different event, returns
-/// `None` so the caller uses the general parser.
-fn plain_search_path<'a>(line: &'a [u8], id: &str) -> Option<&'a [u8]> {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let rest = line.strip_prefix(br#"{"id":""#)?;
-    let rest = rest.strip_prefix(id.as_bytes())?;
-    let rest = rest.strip_prefix(br#"","event":"row","path":""#)?;
-    let end = rest
-        .iter()
-        .position(|&byte| byte == b'"' || byte == b'\\')?;
-    if rest[end] != b'"' {
-        return None;
-    }
-    let path = &rest[..end];
-    let after = &rest[end + 1..];
-    if !after.starts_with(br#","type":"#) || !line.ends_with(b"}") {
-        return None;
-    }
-    Some(path)
-}
-
 fn bytes(value: &Value, plain: &str, base64: &str) -> io::Result<Vec<u8>> {
     if let Some(encoded) = field_text(value, base64) {
         protocol::base64_decode(encoded)
@@ -506,7 +483,10 @@ fn query(
         scan_uncovered
             .then_some(b"scan-uncovered".as_slice())
             .into_iter()
-            .chain((matches!(op, "find" | "grep") && !json).then_some(b"raw-output-v1".as_slice())),
+            .chain(
+                (matches!(op, "find" | "grep" | "search") && !json)
+                    .then_some(b"raw-output-v1".as_slice()),
+            ),
     );
     if let Some(grep) = &grep {
         grep.encode(&mut object);
@@ -549,22 +529,6 @@ fn query(
                     io::ErrorKind::UnexpectedEof,
                     "daemon closed the connection",
                 ));
-            }
-            // A plain search row is `path` plus metadata the non-json client
-            // discards. Parsing that object allocated a string per field;
-            // copying the unescaped path out of the line is the same bytes.
-            if op == "search"
-                && !json
-                && let Some(path) = plain_search_path(&line, op)
-            {
-                rows += 1;
-                write(&mut out, path, &mut output_failure)?;
-                write(&mut out, b"\n", &mut output_failure)?;
-                first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                if rows == 1 {
-                    out.flush().inspect_err(|_| output_failure = true)?;
-                }
-                continue;
             }
             let value = protocol::parse_object(&line).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid daemon event")
@@ -629,12 +593,24 @@ fn query(
                     }
                 }
                 Some("stdout" | "stderr")
-                    if matches!(op, "find" | "grep" | "index" | "roots-remove") =>
+                    if matches!(op, "find" | "grep" | "search" | "index" | "roots-remove") =>
                 {
                     if !json {
                         read_payload(&mut reader, &value, raw_output, &mut payload)?;
                         let data = &payload;
                         if field_text(&value, "event") == Some("stdout") {
+                            // A payload is not a row count: a path may contain
+                            // a newline, and a long path splits across parts.
+                            // `end.rows` is the count. A broken pipe arrives
+                            // before that event, so the first payload still
+                            // counts as a match.
+                            if op == "search" && !data.is_empty() {
+                                if rows == 0 {
+                                    rows = 1;
+                                }
+                                first_row
+                                    .get_or_insert_with(|| started.elapsed().as_micros() as i128);
+                            }
                             write(&mut out, data, &mut output_failure)?;
                             if first_frame
                                 || grep_tty
@@ -688,6 +664,11 @@ fn query(
                 }
                 Some("end") => {
                     out.flush().inspect_err(|_| output_failure = true)?;
+                    if op == "search"
+                        && let Some(reported) = field_number(&value, "rows")
+                    {
+                        rows = reported;
+                    }
                     let exit = status(
                         field_number(&value, "exit")
                             .ok_or_else(|| io::Error::other("missing native status"))?,
@@ -839,24 +820,5 @@ mod tests {
             }
         }
         Ok(())
-    }
-
-    #[test]
-    fn plain_search_rows_copy_the_path_and_leave_escapes_to_the_parser() {
-        let line = b"{\"id\":\"search\",\"event\":\"row\",\"path\":\"/tmp/a.txt\",\"type\":\"file\",\"size\":1,\"mtime\":2,\"doc\":3}\n";
-        assert_eq!(plain_search_path(line, "search"), Some(&b"/tmp/a.txt"[..]));
-        let escaped =
-            b"{\"id\":\"search\",\"event\":\"row\",\"path\":\"/tmp/a\\\"b\",\"type\":\"file\"}";
-        assert_eq!(plain_search_path(escaped, "search"), None);
-        // `\\` is one backslash. Copying through the closer would keep both
-        // slashes and still look like a normal row, so this must fall back.
-        let slash = br#"{"id":"search","event":"row","path":"/tmp/a\\b","type":"file"}"#;
-        assert_eq!(plain_search_path(slash, "search"), None);
-        let encoded = b"{\"id\":\"search\",\"event\":\"row\",\"path\":\"/tmp/a\",\"path_base64\":\"L3RtcC9h\",\"type\":\"file\"}";
-        assert_eq!(plain_search_path(encoded, "search"), None);
-        assert_eq!(
-            plain_search_path(br#"{"id":"search","event":"begin"}"#, "search"),
-            None
-        );
     }
 }

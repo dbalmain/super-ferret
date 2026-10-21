@@ -258,16 +258,20 @@ status and timings. A parse or runtime failure still gets a begin/end block,
 with null generation when no view was selected. Never manufacture end after
 transport failure.
 
-Socket hosts advertise optional `raw-output-v1`. A native find or grep client
-opts in through the request capability of the same name. Each stdout/stderr
+Socket hosts advertise optional `raw-output-v1`. A native find, grep, or
+non-json search client opts in through the request capability of the same name.
+Each stdout/stderr
 header retains `id`, `event`, `record`, `part` and `last`, replacing the base64
 field with `length` (at most 65,536). Exactly that many raw bytes follow the
 header's LF; the next JSON envelope begins immediately afterward, without an
 extra separator. Header and payload share the destination lock and stream
 sequence. Control, end and explicit flush envelopes remain JSON. A truncated
 payload is transport failure, and clients reject oversized/unnegotiated lengths.
-Peers without the capability retain base64 JSON. Public JSON find and batch
-stdout retain their existing JSON-only format. Existing build-mismatch owner
+Peers without the capability retain base64 JSON. Non-json search frames are
+the path bytes plus a newline; the end event's `rows` is the match count,
+because a path may contain a newline. `--json` search keeps row events.
+Public JSON find and batch stdout retain their existing JSON-only format.
+Existing build-mismatch owner
 replacement still applies independently of this optional codec negotiation.
 A successful `--files -q` ends with `cancelled: false`: it returns from the
 serial listing without cancelling the connection, which remains reusable.

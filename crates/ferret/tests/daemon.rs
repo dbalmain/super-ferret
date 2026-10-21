@@ -2191,6 +2191,141 @@ fn raw_output_negotiation_is_per_request_and_preserves_legacy_peers() {
     }
 }
 
+// A non-json search through the real daemon prints the same path bytes as
+// in-process, including a newline and a non-UTF-8 byte. Counting newlines or
+// printing the JSON escaping of that name would not match.
+#[test]
+fn daemon_search_prints_raw_paths_the_in_process_client_prints() {
+    let tree = Tree::new();
+    let name = b"odd\n\xffmarker.txt";
+    fs::write(
+        tree.base
+            .join("src")
+            .join(std::ffi::OsString::from_vec(name.to_vec())),
+        b"odd\n",
+    )
+    .unwrap();
+    let indexed = tree.local(&["index", "src"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    tree.start(&[]);
+
+    let remote = tree.run(&["search", "ext:txt"]);
+    let local = tree.local(&["search", "ext:txt"]);
+    assert_eq!(remote.status.code(), Some(0), "{remote:?}");
+    assert_eq!(local.status.code(), Some(0), "{local:?}");
+    assert_eq!(remote.stdout, local.stdout);
+    assert_eq!(remote.stderr, local.stderr);
+    assert!(
+        remote
+            .stdout
+            .windows(name.len())
+            .any(|window| window == name),
+        "daemon output lost the newline or the non-UTF-8 byte: {:02x?}",
+        remote.stdout
+    );
+    // The name itself contains a newline, so the printed record is two lines
+    // and still one row.
+    assert_eq!(
+        remote.stdout.iter().filter(|&&byte| byte == b'\n').count(),
+        2
+    );
+    let hit = socket_log(&tree);
+    assert!(hit.contains("\"query\":[\"ext:txt\"]"), "{hit}");
+    assert_eq!(number(&hit, "exit"), Some(0), "{hit}");
+    assert_eq!(number(&hit, "rows"), Some(1), "{hit}");
+    assert!(number(&hit, "first_row_us").is_some(), "{hit}");
+
+    let limited = tree.run(&["search", "--limit", "1", "*"]);
+    let limited_local = tree.local(&["search", "--limit", "1", "*"]);
+    assert_eq!(limited.status.code(), limited_local.status.code());
+    assert_eq!(limited.stdout, limited_local.stdout);
+    assert_eq!(limited.status.code(), Some(0), "{limited:?}");
+    let limited_log = socket_log(&tree);
+    assert_eq!(number(&limited_log, "rows"), Some(1), "{limited_log}");
+    assert_eq!(number(&limited_log, "exit"), Some(0), "{limited_log}");
+    assert!(
+        number(&limited_log, "first_row_us").is_some(),
+        "{limited_log}"
+    );
+
+    let miss = tree.run(&["search", "no-such-zz"]);
+    let miss_local = tree.local(&["search", "no-such-zz"]);
+    assert_eq!(miss.status.code(), Some(1), "{miss:?}");
+    assert_eq!(miss_local.status.code(), Some(1), "{miss_local:?}");
+    assert!(miss.stdout.is_empty());
+    assert_eq!(miss.stdout, miss_local.stdout);
+    let miss_log = socket_log(&tree);
+    assert_eq!(number(&miss_log, "rows"), Some(0), "{miss_log}");
+    assert_eq!(number(&miss_log, "exit"), Some(1), "{miss_log}");
+    assert!(miss_log.contains("\"first_row_us\":null"), "{miss_log}");
+
+    let json = tree.run(&["search", "--json", "ext:txt"]);
+    let json_local = tree.local(&["search", "--json", "ext:txt"]);
+    assert_eq!(json.status.code(), Some(0), "{json:?}");
+    assert_eq!(json.stdout, json_local.stdout);
+    let text = String::from_utf8(json.stdout.clone()).expect("json rows are UTF-8");
+    assert!(text.contains("path_base64"), "{text}");
+    assert!(!json.stdout.windows(name.len()).any(|window| window == name));
+
+    let (mut peer, _) = tree.connect();
+    let legacy = r#"{"id":"search","op":"search","args":["ext:txt"],"capabilities":[]}"#;
+    peer.get_mut()
+        .write_all(format!("{legacy}\n").as_bytes())
+        .unwrap();
+    assert!(line(&mut peer).contains("\"event\":\"begin\""));
+    let row = line(&mut peer);
+    assert!(row.contains("\"event\":\"row\""), "{row}");
+    assert!(row.contains("path_base64"), "{row}");
+    assert!(!row.contains("\"length\":"), "{row}");
+    let end = line(&mut peer);
+    assert!(end.contains("\"event\":\"end\""), "{end}");
+    assert_eq!(number(&end, "exit"), Some(0), "{end}");
+    assert_eq!(number(&end, "rows"), Some(1), "{end}");
+    assert!(number(&end, "first_row_us").is_some(), "{end}");
+
+    let raw =
+        r#"{"id":"search","op":"search","args":["ext:txt"],"capabilities":["raw-output-v1"]}"#;
+    peer.get_mut()
+        .write_all(format!("{raw}\n").as_bytes())
+        .unwrap();
+    assert!(line(&mut peer).contains("\"event\":\"begin\""));
+    let header = line(&mut peer);
+    assert!(header.contains("\"event\":\"stdout\""), "{header}");
+    assert_eq!(
+        number(&header, "length"),
+        Some(local.stdout.len() as u32),
+        "{header}"
+    );
+    let mut payload = vec![0; local.stdout.len()];
+    peer.read_exact(&mut payload).unwrap();
+    assert_eq!(payload, local.stdout);
+    let end = line(&mut peer);
+    assert!(end.contains("\"event\":\"end\""), "{end}");
+    assert_eq!(number(&end, "rows"), Some(1), "{end}");
+    assert_eq!(number(&end, "exit"), Some(0), "{end}");
+
+    let none = r#"{"id":"search","op":"search","args":["ext:txt"],"capabilities":["raw-output-v1"],"limit":0}"#;
+    peer.get_mut()
+        .write_all(format!("{none}\n").as_bytes())
+        .unwrap();
+    assert!(line(&mut peer).contains("\"event\":\"begin\""));
+    let end = line(&mut peer);
+    assert!(end.contains("\"event\":\"end\""), "{end}");
+    assert!(!end.contains("\"event\":\"stdout\""), "{end}");
+    assert_eq!(number(&end, "exit"), Some(1), "{end}");
+    assert_eq!(number(&end, "rows"), Some(0), "{end}");
+    assert!(end.contains("\"first_row_us\":null"), "{end}");
+}
+
+fn socket_log(tree: &Tree) -> String {
+    let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
+    log.lines()
+        .rev()
+        .find(|line| line.contains("\"host\":\"socket\""))
+        .unwrap_or_else(|| panic!("no socket search in {log}"))
+        .to_owned()
+}
+
 // Search starts a daemon and answers its first query locally. Grep must do the
 // same, including --files, rather than waiting for the new owner to load.
 #[test]
