@@ -86,7 +86,19 @@ impl Tree {
         self.start_at(extra, &self.base)
     }
     fn start_at(&self, extra: &[(&str, &str)], cwd: &std::path::Path) -> u32 {
-        let mut cmd = fixture::command(DAEMON, &self.base);
+        self.start_command(extra, cwd, fixture::command(DAEMON, &self.base))
+    }
+    fn start_limited(&self, limits: &str) -> u32 {
+        let mut command = fixture::command("bash", &self.base);
+        command.args(["-c", &format!("{limits}; exec \"$@\""), "bash", DAEMON]);
+        self.start_command(&[], &self.base, command)
+    }
+    fn start_command(
+        &self,
+        extra: &[(&str, &str)],
+        cwd: &std::path::Path,
+        mut cmd: Command,
+    ) -> u32 {
         cmd.current_dir(cwd);
         cmd.env_remove("FERRET_NO_DAEMON")
             .env("FERRET_DAEMON_IDLE_MS", "30000")
@@ -2061,4 +2073,33 @@ fn find_and_grep_refuse_the_same_incompatible_owner_hellos() {
     }
     server.join().unwrap();
     fs::remove_file(socket).unwrap();
+}
+
+// A socket caller used to size verifier/capture pools before any server grant,
+// so a typo could abort every connection and the resident writer.
+#[test]
+fn daemon_grep_bounds_client_threads_before_allocating_and_survives_bad_counts() {
+    let tree = Tree::new();
+    tree.start_limited("ulimit -v 2097152; ulimit -c 0");
+    let (mut peer, _) = tree.connect();
+    for threads in [100_000_000_u64, 0, u64::MAX, 1] {
+        let request = format!(
+            r#"{{"id":"g","op":"grep","args":["main","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":{},"pattern_files":[]}}}}"#,
+            tree.base.display(),
+            threads
+        );
+        peer.get_mut()
+            .write_all(format!("{request}\n").as_bytes())
+            .unwrap();
+        if threads == 0 || threads == u64::MAX {
+            let response = line(&mut peer);
+            assert!(response.contains("\"event\":\"error\""), "{response}");
+            assert!(response.contains("invalid field"), "{response}");
+        } else {
+            let response = block(&mut peer, b"");
+            assert!(response.contains("\"event\":\"end\""), "{response}");
+            assert_eq!(number(&response, "exit"), Some(0), "{response}");
+        }
+    }
+    assert!(tree.run(&["grep", "main", "src"]).status.success());
 }

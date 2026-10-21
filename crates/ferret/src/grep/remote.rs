@@ -185,7 +185,9 @@ pub(crate) fn serve(
         pin: Some(pin),
         live: None,
         cwd: &cwd,
-        threads: options.threads,
+        // The resident engine owns the verification grant; client options
+        // must never size pools before being bounded by that grant.
+        threads: options.threads.min(pin.search_threads()),
         runtime: &runtime,
         start,
     };

@@ -82,6 +82,12 @@ impl GrepOptions {
             return None;
         };
         let threads = usize::try_from(value.field("threads")?.number()?).ok()?;
+        // The capture ceiling is (2T + 1) * 4 MiB. Reject counts whose
+        // size arithmetic is nonsense even though the host grants fewer.
+        threads
+            .checked_mul(2)?
+            .checked_add(1)?
+            .checked_mul(4 << 20)?;
         (threads > 0).then_some(Self {
             color: boolean("color")?,
             heading: boolean("heading")?,
