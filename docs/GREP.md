@@ -17,6 +17,27 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
 | `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
 
+Indexed directory content searches and `--files` use the resident daemon (D111 A), falling
+back to the shared in-process host when it is unavailable or refuses the hello.
+The client resolves presentation, terminal defaults, search threads, cwd and
+pattern files. Only requests whose every operand is a directory route; any
+explicit file, missing operand or `-` keeps the whole request local, because
+ferretd would resolve its spelling again in its own process, where
+`/proc/self/fd/N`, `/dev/fd/N` or `/proc/self/cwd` name its descriptors and
+cwd, not the client's. Directory operands that resolve through such a procfs
+link (`openat2` with `RESOLVE_NO_MAGICLINKS`) or onto procfs stay local too.
+Explicit-file-only searches, `-u`/`-uu` and `--live` stay local; `--live`
+loads only catalog roots, not the resident engine. Names-only directory
+requests reuse the resident catalog; the fallback retains the existing
+four-section lazy open. Debug `FERRET_TEST_*` injections also stay local.
+
+When no daemon is running, the first indexed directory content or `--files`
+call starts one and answers in-process immediately, as search does. Later calls
+use the ready owner. Find and grep share endpoint ownership/mode, namespace /
+credentials, index identity, protocol and incarnation checks, plus the existing
+build-mismatch drain/replacement path. A loading, refused or pre-hello-closed
+owner still causes query fallback; D110's behavior is unchanged.
+
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
 data. Missing/incompatible indexes or unindexed directory starts exit 2 with
 index/live advice. Mixed operands use their respective sources. Help/version
@@ -180,7 +201,7 @@ which was quadratic on long lines and ran the engine's slow Unicode-`\b`
 fallback over non-ASCII text. Captures and replacement still use the whole
 source line. Uncoloured, unnumbered plain records combine path,
 separator, data and LF through the capture's vectored writer. Grep shares one
-capture allocation budget of (2T+1) × 4 MiB for configured concurrency T (D93,
+capture allocation budget per request of (2T+1) × 4 MiB for configured concurrency T (D93,
 D109 B), covering workers, queued groups and the publisher's current capture.
 Above 4 MiB, a file takes the streaming slot when available, sends its captured
 prefix, and streams the rest in 64 KiB chunks (D103 A). While another file
@@ -355,8 +376,13 @@ caches, sixteen host descriptors and six descriptors per active operation,
 including reopened parents, input files and simultaneous context spools during
 compaction. It always permits one operation; additional workers wait when the
 limit is tight, without changing the thread count or warning. At limit 1,024
-with sixteen workers, every worker and the producer fit and admission takes no
-mutex. Each read reserves its whole allowance through the closing check, so a
+with sixteen workers, every worker and the producer fit and local admission
+takes no mutex. Daemon queries reserve fixed shares of the process allowance;
+query admission falls below four when fewer complete allowances exist. At
+NOFILE=64 two admitted requests each retain one allowance, so a stopped output
+consumer cannot starve the other. Client thread requests are capped at the
+resident engine's search-verification grant before sizing pools; each request
+keeps its own capture pool. Each read reserves its whole allowance through the closing check, so a
 stream holding the publisher never needs a descriptor permit held by another
 reader. Capture-byte waits preserve this order: descriptor admission
 before reading or capturing, and no further admission until that read closes;
@@ -866,7 +892,9 @@ diagnostic, after any walk error it reported (D99). A file selected but
 skipped by the index, or failing to open, still counts as searched. An
 explicit path (`.` included) or stdin keeps exit 1, silent. A context-spool
 fault names the input and temporary file in `TMPDIR`, never stdout; it fails
-only that file, preserving any prefix already streamed.
+only that file, preserving any prefix already streamed. Through the daemon the
+spool goes to the client's `TMPDIR`, made absolute against the client's cwd,
+never ferretd's.
 Error wording differs from rg; diagnostic presence and exit status are tested.
 
 ## Shared engine and crate seams
@@ -882,8 +910,8 @@ D71 remains separate; grep arguments are patterns.
 `ferret` owns CLI/output/XDG and policy adapters. Reuse `Engine::pin`/
 `QuerySession` and find's `EntrySource`/`CatalogSource`/`LiveWalk`; factor
 constructors preserving find behavior, never parse synthetic find commands.
-Keep pins through output. Direct input stays local; resident queries later use
-the existing host seam. `ferret-policy` owns globs/hidden/size/binary; adapters
+Keep pins through output. Direct-only input stays local; indexed directory
+queries use the shared host through the daemon (D111 A). `ferret-policy` owns globs/hidden/size/binary; adapters
 pass selection to query. No new edge/format: query cannot depend on policy.
 
 **M1 internal prerequisite:** factor find source constructors, then supply a
@@ -1099,6 +1127,29 @@ rg's comparable p90, fix enumeration/streaming or reopen D72; if new-name misses
 harm agents, reopen D73. No global refresh, new positional index or PCRE engine
 is justified merely by a compatibility rank.
 
+### D111 daemon measurements (2026-10-21)
+
+Warm release binaries, 62 copied source files (1.09 MB), one rare-literal
+match, identical search trees with 64,318 or 251,062 catalog names. Hyperfine
+`-N`, ten warmups and 100 runs, one benchmark at a time; the daemon's initial
+backstop completed and its writer was idle before measurement. Default index
+setting: 16 search threads. Means in milliseconds:
+
+| Catalog names | In-process grep | Daemon grep | rg 15.2.0 |
+| ---: | ---: | ---: | ---: |
+| 64,318 | 10.82 | 2.53 | 3.69 |
+| 251,062 | 31.69 | 2.54 | same tree |
+
+Dense inverted output (30,522 lines, 1,574,130 bytes), one search thread,
+Hyperfine `--shell=bash`, ten warmups / 30 runs: local 14.77 ms versus daemon
+23.98 ms at 64k names, **62% slower**. A small-index control is 7.36 versus
+24.51 ms, exposing roughly 17.15 ms of additional transport/codec work for
+1.57 MB. This exceeds the 10% framing budget. Proposed follow-up: negotiate
+length-delimited raw stdout/stderr payloads, preserving stream order, explicit
+flush boundaries, cancellation and native end status; JSON remains the control
+codec. Round 1 retained find's base64 JSON frames; Round 2 implements the negotiated
+raw payload codec described in S1B.md.
+
 ## Answered decisions (checked 2026-10-16)
 
 D72 A: automatic grep scans; `search --scan` remains explicit. D73 A+D:
@@ -1109,3 +1160,20 @@ with this document’s earlier D47 recommendation; its provisional status was
 stale, not its visibility choice. D75 D replaces the earlier raw-input A:
 strip initial UTF-8 BOMs everywhere; retain the approved UTF-16 difference.
 No new unresolved product decision was needed for these corrections.
+
+**Round 2 raw frames (2026-10-21):** negotiated `raw-output-v1` keeps JSON
+headers/control and sends exact-length stdout/stderr bytes. Native find shares
+the codec; JSON find keeps its public envelopes. The same dense profile on a
+frozen 62-source-file snapshot (30,558 lines / 1,576,029 output bytes), warm
+Hyperfine `-N`, ten warmups / 30 runs at one search thread: daemon **7.77 ms**
+versus local **14.94 ms** at 64k names. Small-index control: **7.78 versus
+7.41 ms**, only **4.9% overhead**. Startup at the default 16 threads, 100 runs:
+64k **2.69 ms**, 251k **2.66 ms**, local 64k 10.86 ms, rg 3.52 ms. The initial
+backstop completed and the writer was idle before measurement. This resolves
+Round 1's dense-output framing limitation.
+
+**Round 2 names-only routing:** `--files` on the same frozen tree, warm `-N`,
+ten warmups / 100 runs: before routing **2.66 / 6.30 ms** at 64k / 251k names;
+after routing **1.91 / 2.00 ms**. Local controls remain 2.74 / 6.22 ms. The
+resident path lists from its pinned catalog; unavailable-daemon fallback still
+uses the four-section lazy open, with identical names, ordering and exits.

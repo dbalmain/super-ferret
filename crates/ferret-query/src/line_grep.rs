@@ -7,6 +7,7 @@ use std::io::{self, Read};
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ferret_verify::{Grep, GrepFlags, LineFlags};
 
@@ -23,7 +24,7 @@ pub use descriptors::{IoBudget, IoPermit};
 pub enum Command {
     Help,
     Version,
-    Search(Plan),
+    Search(Box<Plan>),
     Files(Names),
 }
 
@@ -104,6 +105,10 @@ pub struct Plan {
     pub multiline: bool,
     pub json: bool,
     pub replacement: Option<Box<ferret_verify::Replacement>>,
+    /// Where before-context windows spill. `None`, as parsed, reads the
+    /// process's temporary directory when a spool is created; a resident host
+    /// serving another process sets that caller's absolute directory.
+    pub spill_dir: Option<Arc<Path>>,
     #[cfg(test)]
     force_per_line: bool,
 }
@@ -192,6 +197,26 @@ impl std::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+/// Whether directory operand `path`, resolved against this process's cwd,
+/// names the same directory from any other process given that cwd: its
+/// resolution jumps through no procfs magic link (`/proc/self/cwd`,
+/// `/proc/self/fd/N`, their `/dev/fd` aliases and symlinks to them) and ends
+/// outside procfs, whose `self` entries differ by reader. A host that hands
+/// an operand's spelling to another process keeps any other operand in its
+/// own. Kernels without `openat2` answer false.
+pub fn same_in_every_process(path: &Path) -> bool {
+    use rustix::fs::{CWD, Mode, OFlags, PROC_SUPER_MAGIC, ResolveFlags};
+    rustix::fs::openat2(
+        CWD,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    )
+    .and_then(rustix::fs::fstatfs)
+    .is_ok_and(|filesystem| filesystem.f_type != PROC_SUPER_MAGIC)
+}
 
 /// Parse rg spellings, clusters, attached values and `--`. Glob validation
 /// follows in the policy adapter, still before input resolution.
@@ -593,7 +618,7 @@ pub fn parse_with(
             None,
         )
     };
-    Ok(Command::Search(Plan {
+    Ok(Command::Search(Box::new(Plan {
         #[cfg(test)]
         force_per_line: false,
         grep,
@@ -616,7 +641,8 @@ pub fn parse_with(
         text: text_mode,
         multiline,
         json,
-    }))
+        spill_dir: None,
+    })))
 }
 
 // Each -u occurrence applies its next widening step at that argv position.
@@ -850,7 +876,7 @@ fn scan_records(
     let rendering = plan.output == Output::Lines && (!plan.quiet || plan.json);
     let after = if rendering { plan.after } else { 0 };
     let before_lines = if rendering { plan.before } else { 0 };
-    let mut before = context::Before::new(before_lines, stopped);
+    let mut before = context::Before::new(before_lines, stopped, plan.spill_dir.clone());
     let mut trailing = 0;
     let mut limited = false;
     let mut emit = |line: Line<'_>| {
@@ -1185,6 +1211,31 @@ fn scan_records(
 mod tests {
     use super::*;
     use ferret_verify::Trigrams;
+
+    #[test]
+    fn process_relative_directories_are_not_the_same_in_every_process() {
+        let here = std::env::current_dir().unwrap();
+        assert!(same_in_every_process(Path::new(".")));
+        assert!(same_in_every_process(&here));
+        let symlinked =
+            std::env::temp_dir().join(format!("ferret-cwd-link-{}", std::process::id()));
+        std::os::unix::fs::symlink(&here, &symlinked).unwrap();
+        assert!(same_in_every_process(&symlinked));
+        std::fs::remove_file(&symlinked).unwrap();
+        let descriptor = std::fs::File::open(&here).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&descriptor);
+        for path in [
+            "/proc/self/cwd".to_owned(),
+            format!("/proc/self/fd/{fd}"),
+            format!("/dev/fd/{fd}"),
+            "/proc/self".to_owned(),
+            "/proc/self/fd".to_owned(),
+        ] {
+            assert!(Path::new(&path).is_dir(), "{path}");
+            assert!(!same_in_every_process(Path::new(&path)), "{path}");
+        }
+        assert!(!same_in_every_process(Path::new("Cargo.toml")));
+    }
 
     // Compare the actual scanner with its old path, including the source
     // metadata consumed by plain rendering, replacement and JSON encoding.

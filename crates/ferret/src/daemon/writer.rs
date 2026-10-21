@@ -27,7 +27,7 @@ pub(super) struct Command {
     reply: mpsc::SyncSender<Result<ferret_crawl::Report, ferret_crawl::IndexError>>,
 }
 pub(super) enum Message {
-    Command(Command),
+    Command(Box<Command>),
     Intake,
 }
 #[derive(Default)]
@@ -596,10 +596,10 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
     host.writer_pending.fetch_add(1, Ordering::AcqRel);
     if host
         .writer_send
-        .try_send(Message::Command(Command {
+        .try_send(Message::Command(Box::new(Command {
             request: request.clone(),
             reply,
-        }))
+        })))
         .is_err()
     {
         host.writer_pending.fetch_sub(1, Ordering::AcqRel);

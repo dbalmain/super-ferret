@@ -757,6 +757,21 @@ D54 adds resident interned names and row postings in catalog, and a name-term
 index/planner in query using text's tokenizer, retaining BFS. These catalog
 row postings do not change the content-index boundary. D55 remains open.
 
+Indexed directory grep (D111 A) uses the same host with an explicit pinned
+session, cwd, stdout writer and stderr sink. Its client sends resolved terminal,
+colour, heading, numbering and thread settings, pattern-file bytes and its
+absolute temporary directory, where before-context spools spill; the server
+never resolves those against its own environment. Stdout/stderr frames
+preserve host flush boundaries and grep's native 0/1/2 exits. Connection hangup
+or cancel stops grep through the scheduler's existing cancellation flag.
+The server caps requested grep threads at its resident search-verification
+grant before sizing pools. Descriptor allowances reserve fixed shares per
+admitted request because RLIMIT_NOFILE and retained parent caches are
+process-wide. Query admission is at most four and falls to the number of
+complete read allowances at low descriptor limits (two at NOFILE=64). A stalled
+request cannot consume another admitted request's share. Each request retains
+its own capture budget and streaming owner.
+
 Ordinary queries connect to the daemon, spawning it on first use; unavailable
 background operation or `FERRET_NO_DAEMON` uses the same engine in process.
 D56 A keeps effectful find in the local client; live/information-only find

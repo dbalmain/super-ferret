@@ -256,6 +256,32 @@ status and timings. A parse or runtime failure still gets a begin/end block,
 with null generation when no view was selected. Never manufacture end after
 transport failure.
 
+Socket hosts advertise optional `raw-output-v1`. A native find or grep client
+opts in through the request capability of the same name. Each stdout/stderr
+header retains `id`, `event`, `record`, `part` and `last`, replacing the base64
+field with `length` (at most 65,536). Exactly that many raw bytes follow the
+header's LF; the next JSON envelope begins immediately afterward, without an
+extra separator. Header and payload share the destination lock and stream
+sequence. Control, end and explicit flush envelopes remain JSON. A truncated
+payload is transport failure, and clients reject oversized/unnegotiated lengths.
+Peers without the capability retain base64 JSON. Public JSON find and batch
+stdout retain their existing JSON-only format. Existing build-mismatch owner
+replacement still applies independently of this optional codec negotiation.
+A successful `--files -q` ends with `cancelled: false`: it returns from the
+serial listing without cancelling the connection, which remains reusable.
+
+D111 adds `op: "grep"` with ordinary content or `--files` argv and an absolute `cwd`.
+The required `grep` object carries explicit boolean `color`, `heading`,
+`numbers` and `tty`, a positive `threads` count, and `pattern_files`: byte
+strings in parser read order, including pattern stdin, and `temp_dir`, the
+absolute directory where before-context windows spill (the client's `TMPDIR`
+made absolute; a batch caller names its own). The client resolves these before
+connecting. Oversized requests use the same in-process fallback
+as find. Grep's stdout and stderr use find's byte frames; an empty stdout
+frame with `flush: true` asks the client to publish the accepted prefix at a
+host flush boundary. The end exit is grep's native 0/1/2. `grep --json` remains
+rg JSON inside stdout frames, rather than exposing the daemon envelope.
+
 Find requests add optional `capabilities`, an array of strings, and
 `child_stdin`, the string `"null"` or `"inherit"`. Unknown optional fields and
 unknown capability names are ignored; neither grants a known capability.

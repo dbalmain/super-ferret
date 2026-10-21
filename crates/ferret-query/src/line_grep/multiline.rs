@@ -501,7 +501,7 @@ mod tests {
         else {
             panic!("search")
         };
-        plan
+        *plan
     }
 
     #[test]

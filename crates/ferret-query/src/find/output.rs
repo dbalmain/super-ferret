@@ -24,6 +24,7 @@ pub struct OutputBuffer {
     len: u64,
     checkpoint: u64,
     memory_limit: usize,
+    spill_dir: Option<Arc<Path>>,
 }
 
 struct Spill {
@@ -74,11 +75,23 @@ impl OutputBuffer {
         self
     }
 
+    /// Spill into `dir` instead of the process's temporary directory, which
+    /// is read when the spill is created. A resident host serving another
+    /// process's request passes that caller's resolved directory.
+    pub fn with_spill_dir(mut self, dir: Arc<Path>) -> Self {
+        self.spill_dir = Some(dir);
+        self
+    }
+
     fn append(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let limit = self.memory_limit.max(MEMORY_LIMIT);
         if self.file.is_none() && self.bytes.len() + bytes.len() > limit {
+            let dir = self
+                .spill_dir
+                .as_deref()
+                .map_or_else(std::env::temp_dir, Path::to_path_buf);
             loop {
-                let path = std::env::temp_dir().join(format!(
+                let path = dir.join(format!(
                     "ferret-output-{}-{}",
                     std::process::id(),
                     NEXT.fetch_add(1, Ordering::Relaxed)

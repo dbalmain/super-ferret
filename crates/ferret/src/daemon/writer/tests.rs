@@ -63,10 +63,11 @@ fn command(host: &Host, root: &std::path::Path) -> Result<ferret_crawl::Report, 
     let (reply, receive) = mpsc::sync_channel(1);
     host.writer_pending.fetch_add(1, Ordering::AcqRel);
     host.writer_send
-        .send(Message::Command(Command {
+        .send(Message::Command(Box::new(Command {
             request: Request {
                 id: "index".into(),
                 op: Op::Index,
+                grep: None,
                 args: vec![Vec::new(), root.as_os_str().as_bytes().to_vec()],
                 cwd: None,
                 limit: None,
@@ -75,7 +76,7 @@ fn command(host: &Host, root: &std::path::Path) -> Result<ferret_crawl::Report, 
                 start_unix_ns: None,
             },
             reply,
-        }))
+        })))
         .unwrap_or_else(|_| panic!("writer channel"));
     receive
         .recv_timeout(Duration::from_secs(5))

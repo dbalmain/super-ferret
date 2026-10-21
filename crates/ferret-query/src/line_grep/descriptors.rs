@@ -23,8 +23,25 @@ impl IoBudget {
     /// When every worker plus the feed producer fits, admissions are free of
     /// locking. At limit 1,024, sixteen workers take this path.
     pub fn new(workers: usize) -> Self {
-        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
-        let slots = capacity(limit);
+        Self::bounded(workers, process_capacity())
+    }
+
+    /// Maximum concurrent requests with at least one complete operation's
+    /// allowance each. The host must enforce this limit before admitting work.
+    pub fn request_limit(maximum: usize) -> usize {
+        requests(process_capacity(), maximum)
+    }
+
+    /// A fixed share of the process allowance for one admitted request. The
+    /// host must admit at most [`Self::request_limit`] requests concurrently,
+    /// using the same maximum. Unused shares stay reserved: output backpressure
+    /// in one request must never consume another request's progress allowance.
+    pub fn for_request(workers: usize, maximum: usize) -> Self {
+        let slots = process_capacity();
+        Self::bounded(workers, slots / requests(slots, maximum))
+    }
+
+    fn bounded(workers: usize, slots: usize) -> Self {
         Self {
             available: (slots <= workers).then(|| Mutex::new(slots)),
             freed: Condvar::new(),
@@ -73,11 +90,20 @@ impl Drop for IoPermit<'_> {
     }
 }
 
+fn process_capacity() -> usize {
+    capacity(rustix::process::getrlimit(rustix::process::Resource::Nofile).current)
+}
+
 fn capacity(limit: Option<u64>) -> usize {
     limit.map_or(usize::MAX, |limit| {
         let retained = (limit / 4).min(1024) * 2;
         (limit.saturating_sub(retained + 16) / 6).max(1) as usize
     })
+}
+
+// Never more requests than complete allowances, so no share rounds to zero.
+fn requests(slots: usize, maximum: usize) -> usize {
+    maximum.clamp(1, slots)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -94,6 +120,22 @@ mod tests {
         assert_eq!(capacity(Some(64)), 2);
         assert!(capacity(Some(1024)) > 16);
         assert_eq!(capacity(None), usize::MAX);
+    }
+
+    // At NOFILE=64 two requests get one allowance each; a third would round
+    // a share to zero, so the limit falls instead.
+    #[test]
+    fn request_shares_never_round_to_zero_or_exceed_the_process_allowance() {
+        assert_eq!(requests(capacity(Some(64)), 4), 2);
+        assert_eq!(requests(capacity(Some(8)), 4), 1);
+        for limit in [Some(8), Some(64), Some(79), Some(80), Some(1024), None] {
+            let slots = capacity(limit);
+            for maximum in [0, 1, 4] {
+                let admitted = requests(slots, maximum);
+                assert!(admitted >= 1 && slots / admitted >= 1);
+                assert!(admitted * (slots / admitted) <= slots);
+            }
+        }
     }
 
     #[test]

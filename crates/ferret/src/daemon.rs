@@ -10,7 +10,8 @@ mod client;
 mod endpoint;
 mod writer;
 pub(crate) use client::{
-    daemon_stats as stats_json, daemon_status as status, find, search, writer_command as write,
+    daemon_stats as stats_json, daemon_status as status, find, grep, search,
+    writer_command as write,
 };
 
 use std::ffi::OsString;
@@ -188,7 +189,9 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         identity: endpoint.identity.clone(),
         context: advertised_context()?,
         build: test_build(),
-        query_limit: QUERIES.min(ferret_crawl::default_workers()),
+        query_limit: ferret_query::line_grep::IoBudget::request_limit(
+            QUERIES.min(ferret_crawl::default_workers()),
+        ),
         format: advertised_format(),
         writer_send,
         writer_status: Mutex::new(writer::Status::default()),
@@ -353,7 +356,13 @@ fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
             .int("pid", std::process::id())
             .byte_strings(
                 "capabilities",
-                [b"query-only".as_slice(), b"cancel", b"drain", b"writer"],
+                [
+                    b"query-only".as_slice(),
+                    b"cancel",
+                    b"drain",
+                    b"writer",
+                    b"raw-output-v1",
+                ],
             )
             .object("limits", |o| {
                 o.int("line", protocol::MAX_LINE_BYTES as u64)
@@ -622,7 +631,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                     continue;
                 }
             };
-            let _permit = if matches!(request.op, Op::Search | Op::Find) {
+            let _permit = if matches!(request.op, Op::Search | Op::Find | Op::Grep) {
                 let Some(permit) = admit(host, &cancelled) else {
                     break;
                 };
@@ -630,8 +639,15 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
             } else {
                 None
             };
+            let output = destination.clone().with_raw_output(
+                matches!(request.op, Op::Find | Op::Grep)
+                    && request
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "raw-output-v1"),
+            );
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute(host, &request, &destination)
+                execute(host, &request, &output)
             }));
             match result {
                 Ok(result) => result?,
@@ -654,7 +670,11 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     result
 }
 fn runtime_status(request: &Request) -> u8 {
-    if request.op == Op::Find { 1 } else { 3 }
+    match request.op {
+        Op::Find => 1,
+        Op::Grep => 2,
+        _ => 3,
+    }
 }
 fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
     if matches!(request.op, Op::Index | Op::RootsRemove) {
@@ -710,6 +730,9 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
             unreachable!("writer requests routed before query selection")
         }
         Op::Search => crate::batch::search_request(request, Some(session), None, destination),
+        Op::Grep => {
+            crate::batch::grep_request(request, Some(session), destination, host.query_limit)
+        }
         Op::Find => {
             // Clear all action grants. Even a direct socket caller cannot ask
             // the daemon to execute, prompt, delete or open an output file.
