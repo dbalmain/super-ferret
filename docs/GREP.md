@@ -42,10 +42,12 @@ owner still causes query fallback; D110's behavior is unchanged.
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
 data. Incompatible indexes exit 2 with reindexing advice. An absent index or
 uncovered directory selects an in-process live search, without opening the
-content index or contacting the daemon. An operand is covered only when both
-its canonical path and its spelling, with `.` and `..` folded, lie under a
-configured root: the catalog resolves the spelling, so an alias into a root
-(`alias -> root`) is searched live. Mixed covered/uncovered requests stay
+content index or contacting the daemon. An operand is covered only when its
+canonical path lies under a configured root and the catalog's resolver can
+resolve its spelling: routing walks the stored root spellings over the live
+filesystem with the same resolver (`find::resolve_in`), following symlinks
+inside a root before a later `..`. So an alias into a root (`alias -> root`)
+is searched live, while `root/link/../..` stays a snapshot request. Mixed covered/uncovered requests stay
 local: each covered operand uses the snapshot, each uncovered operand walks
 live, in operand order. Covered-only requests retain daemon routing.
 
@@ -60,7 +62,11 @@ so a stray `.git` above a scratch directory makes it a work tree. Ancestor
 `.rgignore` rules, up to `/`, do not, so naming a subdirectory or a nested
 repository keeps them. A `.git` file whose gitdir has no `commondir` (`git
 init --separate-git-dir`) contributes no `info/exclude`; through a `commondir`
-the common directory's applies. D13 indexing reads both. Slash-anchored global
+the common directory's applies. D13 indexing reads both. An ignore input that
+cannot be read (an unreadable `.ignore`, `.gitignore`, `info/exclude` or
+`.git`, or a gitfile naming no gitdir), in an ancestor or inside the tree, is
+skipped silently and the rules that loaded still apply, as in rg; `--live`
+keeps D13's error. Slash-anchored global
 patterns are relative to the command's cwd, including when an operand starts a
 nested work tree. Hidden entries are skipped unless requested or whitelisted by ignore rules. Named
 ignored operands are searched, while ancestor rules still apply inside them.

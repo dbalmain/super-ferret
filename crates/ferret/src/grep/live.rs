@@ -92,20 +92,21 @@ impl Anchors {
             .unwrap_or_default();
         // The catalog resolves an operand by its spelling, so a canonical
         // match alone would claim an alias (`alias -> root`) the catalog
-        // cannot name. Covered needs both, as resolution does.
-        let spellings: Vec<PathBuf> = paths
-            .iter()
-            .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
-            .collect();
+        // cannot name. Covered needs both.
+        let spellings = Spellings(
+            paths
+                .iter()
+                .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+                .collect(),
+        );
         let mut anchors = Self::from_paths(&index, "".into(), paths)?;
         anchors.fallback = true;
         let mut uncovered = Vec::new();
         for input in inputs {
             if let Input::Directory(path) = input {
                 let real = fs::canonicalize(path).map_err(|e| e.to_string())?;
-                let spelled = lexical(path).map_err(|e| e.to_string())?;
                 if !anchors.roots.iter().any(|root| real.starts_with(root))
-                    || !spellings.iter().any(|root| spelled.starts_with(root))
+                    || !spellings.resolves(path)
                 {
                     uncovered.push(path.clone());
                 }
@@ -269,20 +270,43 @@ impl Anchors {
     }
 }
 
-// The absolute spelling with `.` and `..` folded lexically, as the catalog
-// resolves an operand: a symlink's target is not consulted.
-fn lexical(path: &Path) -> io::Result<PathBuf> {
-    let mut folded = PathBuf::new();
-    for component in std::path::absolute(path)?.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                folded.pop();
-            }
-            other => folded.push(other),
-        }
+/// Stored root spellings over the live filesystem: the catalog's namespace
+/// as far as routing needs it, without loading names. [`resolve_in`] walks it
+/// exactly as it walks the catalog, so the two agree on which spellings
+/// resolve while the snapshot's symlinks match the disk.
+///
+/// [`resolve_in`]: ferret_query::find::resolve_in
+struct Spellings(Vec<PathBuf>);
+
+impl Spellings {
+    /// Whether the catalog can resolve `path`'s spelling, as a start
+    /// resolves: following a final symlink, else the link itself. A missing
+    /// child inside a root, or any other fault, still belongs to the
+    /// snapshot, which reports it.
+    fn resolves(&self, path: &Path) -> bool {
+        [true, false]
+            .into_iter()
+            .any(|follow| !matches!(ferret_query::find::resolve_in(self, path, follow), Ok(None)))
     }
-    Ok(folded)
+}
+
+impl ferret_query::find::Namespace for Spellings {
+    type Node = (PathBuf, fs::FileType);
+    fn resolve(&self, path: &Path) -> Option<(Self::Node, bool)> {
+        if !self.0.iter().any(|root| path.starts_with(root)) {
+            return None;
+        }
+        let kind = fs::symlink_metadata(path).ok()?.file_type();
+        Some(((path.to_owned(), kind), false))
+    }
+    fn link_target(&self, (path, kind): &Self::Node) -> Option<PathBuf> {
+        kind.is_symlink()
+            .then(|| fs::read_link(path).ok())
+            .flatten()
+    }
+    fn is_directory(&self, (_, kind): &Self::Node) -> bool {
+        kind.is_dir()
+    }
 }
 
 // read_link expands aliases even when their targets have disappeared.
@@ -604,11 +628,14 @@ fn load_kind(
                 None => eprintln!("{warning}"),
             }
         }
+        // Rg silently does without an ignore input it cannot read (an
+        // unreadable `.ignore`, `.git` or exclude, a gitfile naming no
+        // gitdir) and applies what did load; D13's --live keeps it fatal.
         ferret_crawl::Event::Io {
             path: relative,
             error,
             ..
-        } if fault.is_none() => {
+        } if fault.is_none() && !grep => {
             fault = Some(io::Error::new(
                 error.kind(),
                 format!("{}: {error}", path.join(relative).display()),

@@ -435,3 +435,84 @@ fn new_directory_under_a_root_names_working_remedies() {
         );
     }
 }
+
+// Rg does without an ignore input it cannot read, silently, and applies the
+// rules that did load: in an ancestor of the operand or inside the tree, for
+// `.ignore`, `.gitignore`, `info/exclude`, an unreadable `.git` directory and
+// a gitfile naming no gitdir. Each case keeps a readable rule in force so a
+// tool that dropped everything would still disagree.
+#[test]
+fn unreadable_policy_inputs_are_skipped_silently() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new("unreadable-inputs");
+    f.write("repo/.gitignore", b"from-gitignore\n");
+    f.write("repo/.ignore", b"from-ignore\n");
+    f.write("repo/leaf/inner/.ignore", b"from-inner\n");
+    fs::create_dir_all(f.tree.join("repo/.git/info")).unwrap();
+    fs::write(f.tree.join("repo/.git/info/exclude"), b"from-exclude\n").unwrap();
+    for path in [
+        "from-gitignore",
+        "from-ignore",
+        "from-exclude",
+        "keep",
+        "inner/from-inner",
+        "inner/stay",
+    ] {
+        f.write(&format!("repo/leaf/{path}"), b"hit\n");
+    }
+    let leaf = f.tree.join("repo/leaf");
+    for (input, mode) in [
+        ("repo/.ignore", 0o644),
+        ("repo/.gitignore", 0o644),
+        ("repo/.git/info/exclude", 0o644),
+        ("repo/.git", 0o755),
+        ("repo/leaf/inner/.ignore", 0o644),
+    ] {
+        let path = f.tree.join(input);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            fs::read(&path).is_err() && fs::read_dir(&path).is_err(),
+            "{input} is still readable; run the tests as an unprivileged user"
+        );
+        f.compare(&leaf, &["-l", "hit", "."], true);
+        f.compare(&f.tree, &["-l", "hit", "repo/leaf"], true);
+        let output = f.ferret(&leaf, &["-l", "hit", "."]);
+        assert!(output.stderr.is_empty(), "{input}: {output:?}");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    fs::rename(f.tree.join("repo/.git"), f.base.join("moved-git")).unwrap();
+    f.write("repo/.git", b"gitdir: ../missing\n");
+    f.compare(&leaf, &["-l", "hit", "."], true);
+    let output = f.ferret(&leaf, &["-l", "hit", "."]);
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+// The catalog follows a recorded symlink before applying the `..` after it,
+// so `root/link/../..` with `link -> deep/sub` names `root` itself: covered,
+// answered from the snapshot as find answers it, not walked live.
+#[test]
+fn parent_components_after_a_symlink_resolve_as_the_catalog_does() {
+    let f = Fixture::new("link-parents");
+    f.write("root/deep/sub/.keep", b"");
+    std::os::unix::fs::symlink("deep/sub", f.tree.join("root/link")).unwrap();
+    f.write("root/old", b"hit\n");
+    f.index(&f.tree.join("root"));
+    f.write("root/new", b"hit\n");
+    for args in [
+        &["-l", "hit", "root/link/../.."][..],
+        &["--files", "root/link/../.."],
+    ] {
+        let output = f.ferret(&f.tree, args);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"root/link/../../old\n", "{args:?}");
+    }
+    let mut find = f.command(std::ffi::OsStr::new(env!("CARGO_BIN_EXE_ferret")), &f.tree);
+    let find = find
+        .arg("--index")
+        .arg(f.base.join("index"))
+        .args(["find", "root/link/../..", "-type", "f", "-name", "old"])
+        .output()
+        .unwrap();
+    assert_eq!(find.stdout, b"root/link/../../old\n", "{find:?}");
+}
