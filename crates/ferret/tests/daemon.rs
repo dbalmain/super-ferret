@@ -1135,11 +1135,26 @@ fn search_broken_pipe_is_quiet_and_sigint_cancels_without_killing_host() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     let format = "z".repeat(100_000);
-    let mut command = fixture::command(FERRET, &tree.base);
+    // Rust's spawn keeps an inherited SIGINT ignore and an inherited block; it
+    // only resets SIGPIPE. A non-interactive shell cannot undo an ignore it was
+    // started with (`trap - INT` leaves SIG_IGN), so `kill -INT` is a no-op and
+    // find exits 0 once the pipe drains. Establish the default in this child.
+    let mut command = fixture::command(std::env::var_os("FERRET_PYTHON").unwrap(), &tree.base);
     command
         .env_remove("FERRET_NO_DAEMON")
         .env("FERRET_DAEMON_BIN", DAEMON)
-        .args(["find", "src", "-printf", &format])
+        .args([
+            "-c",
+            "import os, signal, sys\n\
+             signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})\n\
+             signal.signal(signal.SIGINT, signal.SIG_DFL)\n\
+             os.execvp(sys.argv[1], sys.argv[1:])\n",
+            FERRET,
+            "find",
+            "src",
+            "-printf",
+            &format,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
@@ -2316,6 +2331,9 @@ fn daemon_grep_spills_context_into_the_clients_temporary_directory() {
     for temp in [client.as_os_str(), "client-tmp".as_ref(), gone.as_os_str()] {
         let grep = |local: bool| {
             let mut command = tree.command(&["grep", "-B100", "red", "src"]);
+            // Both hosts publish files as workers finish. A byte-for-byte
+            // compare is the spill check, so one thread keeps walk order.
+            command.env("FERRET_SEARCH_THREADS", "1");
             command.env("TMPDIR", temp);
             if local {
                 command.env("FERRET_NO_DAEMON", "1");
