@@ -160,13 +160,14 @@ fn handle(
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .or_else(|| dirs.map(|dirs| dirs.data.clone()));
-            // A lazy open reads only the header and log, so an unchanged
-            // generation costs no resident rebuild.
+            // The manifest generation is enough to see that the resident
+            // engine is stale. The snapshot and change log open only when
+            // Engine::open actually reloads.
             if let Some(path) = next.as_deref()
-                && let Ok(Some(peek)) = ferret_catalog::Catalog::open(path)
+                && let Ok(Some(peek)) = ferret_catalog::Catalog::published_generation(path)
                 && engine
                     .as_ref()
-                    .is_none_or(|current| current.generation() != peek.generation())
+                    .is_none_or(|current| current.generation() != peek)
                 && let Ok(Some(reloaded)) = Engine::open(path)
             {
                 *engine = Some(reloaded);
