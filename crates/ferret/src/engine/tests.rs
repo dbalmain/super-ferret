@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use ferret_crawl::{IndexOptions, Refresh, RefreshReason, RefreshRequest, RefreshScope, index};
 
-use ferret_catalog::NameId;
+use ferret_catalog::{NameId, Target};
 
 use super::*;
 
@@ -27,15 +27,35 @@ impl Tree {
         fs::create_dir_all(base.join("root")).unwrap();
         let tree = Self(base);
         tree.add(0, files);
-        let base = &tree.0;
+        tree.reindex();
+        tree
+    }
+    /// Indexes the root again from scratch: a new checkpoint holding
+    /// whatever the test wrote since.
+    fn reindex(&self) {
         index(
-            &base.join("index"),
-            &[base.join("root")],
+            &self.0.join("index"),
+            &[self.0.join("root")],
             Refresh::All,
             &IndexOptions::default(),
         )
         .unwrap();
-        tree
+    }
+    /// An engine over everything written so far, all of it in the
+    /// checkpoint rather than an overlay, whose refreshes stay in that
+    /// epoch: the default limits compact once 1% of a small tree changes.
+    fn compacted_engine(&self) -> Engine {
+        self.reindex();
+        let mut writer = ferret_catalog::WriterSession::open(&self.0.join("index")).unwrap();
+        writer.set_compaction_limits(ferret_catalog::CompactionLimits {
+            dirty_percent: 100,
+            dead_percent: 100,
+            ..ferret_catalog::CompactionLimits::default()
+        });
+        let engine = Engine::from_writer(writer);
+        engine.compact().unwrap();
+        assert_eq!(engine.pin().catalog().changed_names().count(), 0);
+        engine
     }
     fn engine(&self) -> Engine {
         Engine::from_writer(ferret_catalog::WriterSession::open(&self.0.join("index")).unwrap())
@@ -87,18 +107,16 @@ impl Drop for Tree {
     }
 }
 
-/// The warmed old generation does not excuse doing cold preparation before
-/// checking an already-cancelled query on the newly published generation.
+/// A predecessor whose caches were never built does not trigger eager work
+/// during publication, and cancellation still leaves the new view cold.
 #[test]
 fn cancelled_cold_query_after_publication_does_not_publish_derived_caches() {
     let tree = Tree::with_files(128);
     let engine = tree.engine();
     let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
     let old = engine.pin();
-    old.search_content(&query, None, None, |_| ControlFlow::Continue(()))
-        .unwrap();
-    assert!(old.derived.docs.get().is_some());
-    assert!(old.derived.live.get().is_some());
+    assert!(old.derived.docs.get().is_none());
+    assert!(old.derived.live.get().is_none());
     tree.publish(&engine);
     let cold = engine.pin();
     assert_ne!(old.generation(), cold.generation());
@@ -121,6 +139,268 @@ fn cancelled_cold_query_after_publication_does_not_publish_derived_caches() {
             .rows
             > 0
     );
+}
+
+/// A generation that adds, removes, renames and edits documents, and gives
+/// one document a second name while taking one from another, carries the
+/// previous view's built sets forward rather than leaving them for the next
+/// query, and what it carries equals a fresh build. The removed document's
+/// id is the discriminating case: a set that only gains survives it.
+#[test]
+fn adopted_derived_sets_match_a_fresh_build_after_document_and_link_changes() {
+    let tree = Tree::with_files(300);
+    let dir = tree.0.join("root/d0");
+    fs::hard_link(dir.join("3.txt"), dir.join("3.alias")).unwrap();
+    fs::write(dir.join("5.copy"), b"alpha 5").unwrap();
+    let engine = tree.compacted_engine();
+    let previous = engine.pin();
+    warm(&previous);
+    let removed = document_named(previous.catalog(), b"1.txt");
+    let gained = document_named(previous.catalog(), b"2.txt");
+    let lost = document_named(previous.catalog(), b"3.txt");
+    let edited = document_named(previous.catalog(), b"4.txt");
+    let shared = document_named(previous.catalog(), b"5.txt");
+    assert_eq!(document_named(previous.catalog(), b"5.copy"), shared);
+    assert_eq!(previous.doc_names().unwrap().names(lost.0).len(), 2);
+    assert_eq!(previous.doc_names().unwrap().names(shared.0).len(), 2);
+
+    fs::rename(dir.join("0.txt"), dir.join("renamed.txt")).unwrap();
+    fs::remove_file(dir.join("1.txt")).unwrap();
+    fs::hard_link(dir.join("2.txt"), dir.join("2.alias")).unwrap();
+    fs::remove_file(dir.join("3.alias")).unwrap();
+    fs::write(dir.join("4.txt"), b"alpha edited in place").unwrap();
+    fs::write(dir.join("5.copy"), b"alpha no longer a copy").unwrap();
+    fs::write(dir.join("added.txt"), b"alpha added").unwrap();
+    tree.refresh(&engine);
+
+    let adopted = engine.pin();
+    assert_adopted_and_fresh(&adopted);
+    assert!(
+        !adopted.live().contains(removed.0),
+        "removed DocId survived adoption"
+    );
+    assert!(!adopted.live().contains(edited.0));
+    let names = adopted.doc_names().unwrap();
+    assert_eq!(names.names(gained.0).len(), 2);
+    assert_eq!(names.names(lost.0).len(), 1);
+    assert_eq!(names.names(shared.0).len(), 1);
+    for added in [&b"renamed.txt"[..], b"added.txt", b"4.txt", b"5.copy"] {
+        let doc = document_named(adopted.catalog(), added);
+        assert!(adopted.live().contains(doc.0));
+        assert_eq!(names.names(doc.0).len(), 1);
+    }
+
+    // A second generation adopts from an adopted view.
+    fs::remove_file(dir.join("2.alias")).unwrap();
+    tree.refresh(&engine);
+    let second = engine.pin();
+    assert_adopted_and_fresh(&second);
+    assert_eq!(second.doc_names().unwrap().names(gained.0).len(), 1);
+}
+
+/// An inode that had no document and gains one under a name the overlay
+/// never rewrote: no previous row holds that name, so DocNames is left for
+/// the first query to build, while the live set is still carried.
+#[test]
+fn a_kept_name_gaining_a_document_leaves_doc_names_to_the_full_build() {
+    let tree = Tree::with_files(300);
+    let file = tree.0.join("root/d0/binary.dat");
+    fs::write(&file, b"alpha\0binary").unwrap();
+    let engine = tree.compacted_engine();
+    let previous = engine.pin();
+    warm(&previous);
+    assert!(
+        previous
+            .catalog()
+            .doc(inode_named(previous.catalog(), b"binary.dat"))
+            .is_none()
+    );
+
+    fs::write(&file, b"alpha now text").unwrap();
+    tree.refresh(&engine);
+
+    let next = engine.pin();
+    let doc = next
+        .catalog()
+        .doc(inode_named(next.catalog(), b"binary.dat"))
+        .unwrap();
+    assert!(next.derived.live.get().is_some(), "live set not adopted");
+    assert!(
+        next.derived.docs.get().is_none(),
+        "DocNames adopted without the kept name"
+    );
+    assert_eq!(next.live(), &live_documents(next.catalog()));
+    assert!(next.live().contains(doc.0));
+    assert_eq!(next.doc_names().unwrap().names(doc.0).len(), 1);
+}
+
+/// Distinct inodes with identical content share one document, so renaming
+/// one of many copies touches a row as long as the catalog's copies. The
+/// overlay holds one changed name; rebuilding that row would cost every
+/// copy's name before publication, and the cumulative overlay would
+/// re-seed it on every later refresh of the epoch. DocNames is left for
+/// the first query to build instead, which builds it correctly; the live
+/// set is still carried.
+#[test]
+fn renaming_one_of_many_identical_files_leaves_doc_names_to_the_full_build() {
+    let tree = Tree::with_files(0);
+    for i in 0..300 {
+        let dir = tree.0.join("root").join(format!("d{}", i / 100));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{i}.txt")), b"alpha identical").unwrap();
+    }
+    let engine = tree.compacted_engine();
+    let previous = engine.pin();
+    warm(&previous);
+    let shared = document_named(previous.catalog(), b"0.txt");
+    assert_eq!(previous.doc_names().unwrap().names(shared.0).len(), 300);
+
+    fs::rename(
+        tree.0.join("root/d0/0.txt"),
+        tree.0.join("root/d2/moved.txt"),
+    )
+    .unwrap();
+    tree.refresh(&engine);
+
+    let next = engine.pin();
+    assert_eq!(
+        previous.generation().checkpoint,
+        next.generation().checkpoint
+    );
+    assert!(next.derived.live.get().is_some(), "live set not adopted");
+    assert!(
+        next.derived.docs.get().is_none(),
+        "adoption expanded the shared 300-name row"
+    );
+    assert_eq!(next.live(), &live_documents(next.catalog()));
+    let fresh = DocNames::new(next.catalog()).unwrap();
+    let built = next.doc_names().unwrap();
+    for doc in 0..next.catalog().next_doc().0 {
+        assert_eq!(built.names(doc), fresh.names(doc), "document {doc}");
+    }
+    assert_eq!(built.names(shared.0).len(), 300);
+}
+
+/// A catalog publication that pinned the old content view before a content
+/// publication landed keeps the newer content view rather than restoring
+/// the one it pinned. Production callers both hold `Engine.writer` today;
+/// this drives the two publishers concurrently, as moving merges off the
+/// writer thread will. `select` is held on the retired list after its pin,
+/// the window in which the content view changes.
+#[test]
+fn a_catalog_publication_keeps_a_content_view_published_after_its_pin() {
+    let tree = Tree::with_files(4);
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let pinned = engine.pin();
+    let newer = Arc::new(
+        ferret_index::View::open_with_threads(
+            &tree.0.join("index").join(CONTENT_DIR),
+            &catalog_view(pinned.catalog(), pinned.live()),
+            1,
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(!Arc::ptr_eq(pinned.content.as_ref().unwrap(), &newer));
+    // The next catalog view, committed but not yet published.
+    fs::write(tree.0.join("root/new.txt"), b"new publication").unwrap();
+    let view = ferret_crawl::refresh(
+        engine.writer.lock().unwrap().as_mut().unwrap(),
+        RefreshRequest {
+            expected_generation: pinned.generation(),
+            scopes: vec![RefreshScope::Root(tree.0.join("root"))],
+            rename_hints: Vec::new(),
+            reason: RefreshReason::Burst,
+        },
+        &IndexOptions::default(),
+    )
+    .unwrap()
+    .view;
+    let pins = || Arc::strong_count(&engine.current.read().unwrap().names);
+    let before = pins();
+
+    let retired = engine.retired.lock().unwrap();
+    std::thread::scope(|scope| {
+        let select = scope.spawn(|| engine.select(view));
+        while pins() == before {
+            std::thread::yield_now();
+        }
+        engine.select_content(newer.clone());
+        drop(retired);
+        select.join().unwrap();
+    });
+
+    let current = engine.pin();
+    assert_ne!(current.generation(), pinned.generation());
+    assert!(
+        Arc::ptr_eq(current.content.as_ref().unwrap(), &newer),
+        "select restored the content view it pinned"
+    );
+}
+
+/// A compaction starts a new checkpoint epoch, whose ids the previous sets
+/// do not describe: the new view is cold until a query builds it.
+#[test]
+fn a_new_checkpoint_epoch_leaves_derived_sets_unbuilt() {
+    let tree = Tree::with_files(4);
+    let engine = tree.engine();
+    tree.publish(&engine);
+    let previous = engine.pin();
+    warm(&previous);
+
+    engine.compact().unwrap();
+
+    let next = engine.pin();
+    assert_ne!(
+        previous.generation().checkpoint,
+        next.generation().checkpoint
+    );
+    assert!(next.derived.live.get().is_none());
+    assert!(next.derived.docs.get().is_none());
+    assert_eq!(next.live(), &live_documents(next.catalog()));
+}
+
+/// Builds both derived sets through the query path, as the first content
+/// query on a view does.
+fn warm(session: &QuerySession) {
+    let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+    session
+        .search_content(&query, None, None, |_| ControlFlow::Continue(()))
+        .unwrap();
+    assert!(session.derived.live.get().is_some());
+    assert!(session.derived.docs.get().is_some());
+}
+
+/// Both sets were carried by `select`, before any query, and equal what a
+/// full build of the view makes.
+fn assert_adopted_and_fresh(session: &QuerySession) {
+    assert!(session.derived.live.get().is_some(), "live set not adopted");
+    assert!(session.derived.docs.get().is_some(), "DocNames not adopted");
+    assert_eq!(session.live(), &live_documents(session.catalog()));
+    let fresh = DocNames::new(session.catalog()).unwrap();
+    let adopted = session.doc_names().unwrap();
+    for doc in 0..session.catalog().next_doc().0 {
+        assert_eq!(adopted.names(doc), fresh.names(doc), "document {doc}");
+    }
+}
+
+fn inode_named(catalog: &Catalog, name: &[u8]) -> ferret_catalog::InoId {
+    catalog
+        .name_reader()
+        .runs_from(NameId(0))
+        .find_map(|(id, edge)| match edge.target() {
+            Target::Inode(inode) if edge.bytes == name && catalog.is_live_name(id) => Some(inode),
+            _ => None,
+        })
+        .expect("live name exists")
+}
+
+fn document_named(catalog: &Catalog, name: &[u8]) -> ferret_catalog::DocId {
+    catalog
+        .doc(inode_named(catalog, name))
+        .expect("name has a document")
 }
 
 /// Each derived-state builder over a catalog of many thousand documents

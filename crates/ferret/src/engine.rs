@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
-use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
+use ferret_catalog::{Catalog, Generation, OpenError, Section, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
 use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged, Pinned};
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
@@ -59,11 +59,50 @@ struct Threads {
 }
 
 /// Structures derived from one catalog view for content queries (docs/S2.md
-/// § Liveness; D30 C, built when a query first needs them).
+/// § Liveness; D30 C, built when a query first needs them, or adopted from
+/// the previous view).
 #[derive(Default)]
 struct Derived {
     live: OnceLock<DocSet>,
     docs: OnceLock<DocNames>,
+}
+
+impl Derived {
+    /// `previous`'s built structures carried forward to `view`, at a cost
+    /// bounded by `view`'s overlay rather than its catalog. Only within one
+    /// checkpoint epoch, where `view` descends from `previous`; a
+    /// structure `previous` never built, or one that cannot be carried,
+    /// stays unbuilt for the first query to build, as across epochs.
+    fn adopt(previous: &QuerySession, view: &Catalog) -> Self {
+        let derived = Self::default();
+        let (from, to) = (previous.generation(), view.generation());
+        if from.incarnation != to.incarnation
+            || from.checkpoint != to.checkpoint
+            || from.sequence > to.sequence
+        {
+            return derived;
+        }
+        if let Some(live) = previous.derived.live.get()
+            && view.load(&[Section::Docs]).is_ok()
+        {
+            let mut live = live.clone();
+            live.grow_to(view.next_doc().0);
+            for (doc, is_live) in view.changed_docs() {
+                if is_live {
+                    live.insert(doc.0);
+                } else {
+                    live.remove(doc.0);
+                }
+            }
+            let _ = derived.live.set(live);
+        }
+        if let Some(docs) = previous.derived.docs.get()
+            && let Ok(Some(docs)) = DocNames::adopt(view, &previous.catalog, docs)
+        {
+            let _ = derived.docs.set(docs);
+        }
+        derived
+    }
 }
 
 impl Engine {
@@ -354,6 +393,7 @@ impl Engine {
     fn select(&self, view: Catalog) {
         let previous = self.pin();
         let names = Arc::new(NameIndex::adopt(&view, Some(&previous.names)));
+        let derived = Derived::adopt(&previous, &view);
         let mut retired = self
             .retired
             .lock()
@@ -365,16 +405,21 @@ impl Engine {
         ));
         drop(retired);
         let incarnation = view.generation().incarnation;
-        *self
+        let mut current = self
             .current
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The content view is read under the lock, not from `previous`: a
+        // content publication since the pin is newer and must survive.
+        let content = current
+            .content
+            .take()
+            .filter(|content| content.manifest().incarnation == incarnation);
+        *current = QuerySession {
             catalog: view,
             names,
-            content: previous
-                .content
-                .filter(|content| content.manifest().incarnation == incarnation),
-            derived: Arc::default(),
+            content,
+            derived: Arc::new(derived),
             threads: previous.threads,
         };
     }

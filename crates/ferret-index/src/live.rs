@@ -47,6 +47,25 @@ impl DocSet {
         }
     }
 
+    /// Removes `doc`; an id outside this set's bound is ignored.
+    pub fn remove(&mut self, doc: u32) {
+        if doc < self.bound {
+            let (word, bit) = (doc as usize / 64, 1u64 << (doc % 64));
+            if self.words[word] & bit != 0 {
+                self.words[word] &= !bit;
+                self.len -= 1;
+            }
+        }
+    }
+
+    /// Extends the bound while preserving all members. Doc ids are never
+    /// reused within a catalog epoch, so an adopted set only grows.
+    pub fn grow_to(&mut self, bound: u32) {
+        assert!(bound >= self.bound, "a live set bound cannot shrink");
+        self.words.resize((bound as usize).div_ceil(64), 0);
+        self.bound = bound;
+    }
+
     /// This set's members at or above `from`, and those of `extra` that
     /// are members: a view's uncovered set, with the same bound. Asks
     /// `cancelled` before allocating, after every [`DocSet::CHECK_EVERY`]
