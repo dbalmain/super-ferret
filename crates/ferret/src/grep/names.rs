@@ -9,7 +9,27 @@ use std::io::IsTerminal;
 use super::*;
 
 pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bool) -> Exit {
-    if !plan.traversal.unrestricted
+    let inputs = resolve_inputs(&plan.paths, true);
+    let routing = if !plan.traversal.unrestricted && !plan.traversal.live {
+        match live::Anchors::routing(index, &inputs) {
+            Ok(anchors) => Some(anchors),
+            Err(error) => return failure(&error),
+        }
+    } else {
+        None
+    };
+    if plan.traversal.follow
+        && !plan.traversal.unrestricted
+        && routing
+            .as_ref()
+            .is_none_or(|anchors| anchors.any_covered(&inputs))
+    {
+        return failure(
+            "-L is supported for uncovered directories and -u; use -u to follow links in an indexed tree",
+        );
+    }
+    if routing.as_ref().is_none_or(live::Anchors::all_covered)
+        && !plan.traversal.unrestricted
         && !plan.traversal.live
         && !test_injections()
         && daemon_operands(&resolve_inputs(&plan.paths, true))
@@ -30,7 +50,7 @@ pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bo
         // As in `block_stdout`: live policy warnings bypass the writer.
         !plan.presentation.null && !plan.traversal.live,
     );
-    match execute(plan, index, &mut writer, &cancelled) {
+    match execute_routed(plan, index, routing, &mut writer, &cancelled) {
         Ok(exit) => exit,
         Err(error) => failure(&error),
     }
@@ -42,7 +62,7 @@ fn open_catalog(index: Option<&Path>) -> Result<Catalog, String> {
         .map_err(|error| format!("{}: {error}; re-index this directory", index.display()))?
         .ok_or_else(|| {
             format!(
-                "no index in {}; run ferret index DIR, use -u, or use --live with a covering catalog root",
+                "no index in {}; run ferret index DIR, use -u, or omit --live to search uncovered paths",
                 index.display()
             )
         })?;
@@ -54,9 +74,28 @@ fn open_catalog(index: Option<&Path>) -> Result<Catalog, String> {
     Ok(catalog)
 }
 
+#[cfg(test)]
 fn execute(
     plan: &Names,
     index: Option<&Path>,
+    writer: &mut impl Write,
+    cancelled: &AtomicBool,
+) -> Result<Exit, String> {
+    let routing = if !plan.traversal.unrestricted && !plan.traversal.live {
+        Some(live::Anchors::routing(
+            index,
+            &resolve_inputs(&plan.paths, true),
+        )?)
+    } else {
+        None
+    };
+    execute_routed(plan, index, routing, writer, cancelled)
+}
+
+fn execute_routed(
+    plan: &Names,
+    index: Option<&Path>,
+    routing: Option<live::Anchors>,
     writer: &mut impl Write,
     cancelled: &AtomicBool,
 ) -> Result<Exit, String> {
@@ -68,6 +107,9 @@ fn execute(
             matches!(input, Input::Directory(_))
                 && !plan.traversal.unrestricted
                 && !plan.traversal.live
+                && routing
+                    .as_ref()
+                    .is_none_or(|anchors| anchors.any_covered(&inputs))
         })
         .then(|| open_catalog(index))
         .transpose()?;
@@ -79,7 +121,7 @@ fn execute(
     {
         Some(live::Anchors::open(index)?)
     } else {
-        None
+        routing
     };
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let stderr = |message: &str| {
@@ -166,7 +208,7 @@ impl Listing<'_> {
         let flush_each = plan.presentation.null || plan.traversal.live || runtime.tty;
         for input in &inputs {
             if let Input::Directory(path) = input
-                && let Some(anchors) = live
+                && let Some(anchors) = live.filter(|anchors| anchors.walks(path))
             {
                 anchors
                     .validate(path)
@@ -176,13 +218,14 @@ impl Listing<'_> {
         if let Some(catalog) = catalog {
             for input in &inputs {
                 if let Input::Directory(path) = input
+                    && !live.is_some_and(|anchors| anchors.walks(path))
                     && let Some(Err(error)) =
                         sources::Directory::new(path, Some(catalog), cwd, false)
                             .map_err(|e| e.to_string())?
                             .next(true)
                 {
                     return Err(format!(
-                        "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
+                        "{}: {}; index this directory, use -u, or omit --live to search uncovered paths",
                         error.path.display(),
                         error.error
                     ));
@@ -230,6 +273,7 @@ impl Listing<'_> {
                     let stopped = || cancelled.load(Ordering::Acquire);
                     let mut policy = live
                         .as_ref()
+                        .filter(|anchors| anchors.walks(&path))
                         .map(|anchors| anchors.start(&path, &stopped))
                         .transpose()
                         .map_err(|e| e.to_string())?;
@@ -237,9 +281,10 @@ impl Listing<'_> {
                         &path,
                         catalog,
                         cwd,
-                        plan.traversal.unrestricted || live.is_some(),
+                        plan.traversal.unrestricted || policy.is_some(),
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .following_links(plan.traversal.follow);
                     let mut descend = true;
                     while let Some(entry) =
                         source.next_with_cancel(descend, &mut || Ok(()), &mut || {

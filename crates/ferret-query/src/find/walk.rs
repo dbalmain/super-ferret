@@ -710,6 +710,14 @@ impl LiveWalk {
         Self::new(paths, Options::at(cwd))
     }
 
+    /// Follows descendant symlinks, diagnosing ancestor cycles.
+    pub fn following_links(mut self, follow: bool) -> Self {
+        if follow {
+            self.options.follow = Follow::All;
+        }
+        self
+    }
+
     /// Keeps each listed directory open while its entries are visited, so
     /// that a host can open a listed name beneath the directory it was listed
     /// in ([`Entry::directory_handle`]) instead of resolving its path again,

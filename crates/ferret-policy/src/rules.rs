@@ -79,6 +79,8 @@ struct State {
     git: Option<WorkTree>,
     /// Root first.
     ferret: Vec<Layer>,
+    ignore: Vec<Layer>,
+    rgignore: Vec<Layer>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,6 +161,69 @@ impl DirRules {
             traversing: false,
         };
         (rules, errors)
+    }
+
+    /// Rg's directory rules, without ferret defaults or a content size cap.
+    /// Git sources apply only inside a work tree; `.ignore` and `.rgignore`
+    /// each outrank every git source, including closer gitignore files.
+    pub fn grep_root(
+        root: &Path,
+        global: Option<&str>,
+        files: IgnoreFiles<'_>,
+        ignore: Option<&str>,
+        rgignore: Option<&str>,
+    ) -> (Self, Vec<PatternError>) {
+        let (mut rules, mut errors) =
+            Self::root(root, global, files, Config { size_cap: u64::MAX });
+        rules.add_grep_files(root, ignore, rgignore, &mut errors);
+        (rules, errors)
+    }
+
+    /// Enters a directory even when it was explicitly named and ignored.
+    /// The parent's rules continue applying to entries inside it.
+    pub fn grep_enter(
+        &self,
+        name: &OsStr,
+        files: IgnoreFiles<'_>,
+        ignore: Option<&str>,
+        rgignore: Option<&str>,
+    ) -> (Self, Vec<PatternError>) {
+        let (mut rules, mut errors) = self.enter(name, files);
+        let dir = rules.shared.root.join(&rules.path);
+        rules.add_grep_files(&dir, ignore, rgignore, &mut errors);
+        (rules, errors)
+    }
+
+    fn add_grep_files(
+        &mut self,
+        dir: &Path,
+        ignore: Option<&str>,
+        rgignore: Option<&str>,
+        errors: &mut Vec<PatternError>,
+    ) {
+        if ignore.is_none() && rgignore.is_none() {
+            return;
+        }
+        let mut state = (*self.state).clone();
+        for (name, text, layers) in [
+            (".ignore", ignore, &mut state.ignore),
+            (".rgignore", rgignore, &mut state.rgignore),
+        ] {
+            if let Some(text) = text {
+                layers.extend(
+                    Layer::compile(
+                        IgnoreFile::Grep(dir.join(name)),
+                        text,
+                        false,
+                        &self.shared.lists,
+                        errors,
+                    )
+                    .live(),
+                );
+            }
+        }
+        self.list = self.shared.list(&state, Some(&self.list));
+        self.state = Arc::new(state);
     }
 
     /// Rules for child directory `name`, which [`decide`](Self::decide)
@@ -308,6 +373,18 @@ impl State {
                     .filter_map(Layer::live)
                     .collect(),
             }),
+            ignore: self
+                .ignore
+                .iter()
+                .map(&mut step)
+                .filter_map(Layer::live)
+                .collect(),
+            rgignore: self
+                .rgignore
+                .iter()
+                .map(&mut step)
+                .filter_map(Layer::live)
+                .collect(),
             ferret: self
                 .ferret
                 .iter()
@@ -352,7 +429,12 @@ impl State {
             .git
             .iter()
             .flat_map(|tree| tree.exclude.iter().chain(&tree.ignores));
-        self.global.iter().chain(git).chain(&self.ferret)
+        self.global
+            .iter()
+            .chain(git)
+            .chain(&self.ferret)
+            .chain(&self.ignore)
+            .chain(&self.rgignore)
     }
 
     /// Every layer's rules for this directory, lowest precedence first.

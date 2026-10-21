@@ -7,7 +7,6 @@ use fixture::Fixture;
 use std::fs;
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn nested_gitignore_negation_directory_anchor_and_double_star() {
     let f = Fixture::new("nested-gitignore");
     f.repo();
@@ -37,7 +36,6 @@ fn nested_gitignore_negation_directory_anchor_and_double_star() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn operand_subdirectory_uses_parent_ignore_rules() {
     let f = Fixture::new("parent-rules");
     f.repo();
@@ -55,7 +53,6 @@ fn operand_subdirectory_uses_parent_ignore_rules() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn named_ignored_directory_is_searched_with_parent_rules_inside() {
     let f = Fixture::new("named-ignored-dir");
     f.repo();
@@ -76,7 +73,6 @@ fn named_ignored_file_is_searched() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn cwd_inside_ignored_directory_still_applies_parent_rules() {
     let f = Fixture::new("cwd-ignored-dir");
     f.repo();
@@ -88,18 +84,13 @@ fn cwd_inside_ignored_directory_still_applies_parent_rules() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
-fn git_info_exclude_and_configured_global_excludes_apply() {
+fn git_info_exclude_and_default_global_excludes_apply() {
     let f = Fixture::new("exclude-sources");
     f.repo();
     fs::write(f.tree.join(".git/info/exclude"), b"info.txt\n").unwrap();
-    let global = f.base.join("home/global-ignore");
+    let global = f.base.join("home/config/git/ignore");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
     fs::write(&global, b"global.txt\n").unwrap();
-    fs::write(
-        f.base.join("home/.gitconfig"),
-        format!("[core]\n\texcludesFile = {}\n", global.display()),
-    )
-    .unwrap();
     for path in ["info.txt", "global.txt", "visible.txt"] {
         f.write(path, b"hit\n");
     }
@@ -107,7 +98,6 @@ fn git_info_exclude_and_configured_global_excludes_apply() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn ignore_file_precedence_gitignore_ignore_then_rgignore() {
     let f = Fixture::new("ignore-precedence");
     f.repo();
@@ -121,7 +111,6 @@ fn ignore_file_precedence_gitignore_ignore_then_rgignore() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn ignore_files_outside_git_repository() {
     let f = Fixture::new("no-repo-ignore-files");
     f.write(".gitignore", b"git.txt\n");
@@ -134,7 +123,6 @@ fn ignore_files_outside_git_repository() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn nested_git_repository_uses_its_own_rules() {
     let f = Fixture::new("nested-repo");
     f.repo();
@@ -148,7 +136,6 @@ fn nested_git_repository_uses_its_own_rules() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn hidden_entries_are_skipped_unless_hidden_is_set() {
     let f = Fixture::new("hidden");
     f.repo();
@@ -165,7 +152,6 @@ fn hidden_entries_are_skipped_unless_hidden_is_set() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn ferret_default_skip_directories_are_searched_by_rg() {
     let f = Fixture::new("default-skip-directories");
     f.repo();
@@ -194,7 +180,6 @@ fn default_output_matches_rg_line_output() {
 }
 
 #[test]
-#[ignore = "D112 B: uncovered fallback not built yet"]
 fn symlinked_directory_is_skipped_unless_follow_is_set() {
     use std::os::unix::fs::symlink;
 

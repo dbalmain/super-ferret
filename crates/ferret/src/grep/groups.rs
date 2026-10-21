@@ -414,22 +414,33 @@ pub(super) fn read_file(
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
 ) -> ReadOutcome {
+    read_file_policy(path, listed, plan, each, stopped, false)
+}
+
+fn read_file_policy(
+    path: &Path,
+    listed: Option<&engine::reader::Parent>,
+    plan: &Plan,
+    each: ferret_query::Consumer<'_>,
+    stopped: &dyn Fn() -> bool,
+    rg: bool,
+) -> ReadOutcome {
     let recursive = listed.is_some();
-    let cap = (recursive && !plan.traversal.unrestricted)
+    let cap = (recursive && !plan.traversal.unrestricted && !rg)
         .then(|| ferret_policy::Config::default().size_cap);
     let mut pass = |input: &mut dyn Read, size| {
         if recursive && !plan.text {
             // Unrestricted recursion follows rg's initial scan-window
             // binary gate, including early quiet/name modes. Policy walks
             // retain D13's indexing sniffer; explicit files bypass both.
-            let probe = if plan.traversal.unrestricted {
+            let probe = if plan.traversal.unrestricted || rg {
                 CHUNK
             } else {
                 ferret_policy::SNIFF_LEN
             };
             let mut buffered = io::BufReader::with_capacity(probe, input);
             let head = buffered.fill_buf()?;
-            let binary = if plan.traversal.unrestricted {
+            let binary = if plan.traversal.unrestricted || rg {
                 head.contains(&0)
             } else {
                 ferret_policy::sniff(head) == ferret_policy::Content::Binary
@@ -543,7 +554,7 @@ pub(super) enum Job {
     Direct(PathBuf, PathBuf),
     /// A walked file and the directory it was listed in, which it is opened
     /// beneath, never through a symlink.
-    Listed(PathBuf, PathBuf, engine::reader::Parent),
+    Listed(PathBuf, PathBuf, engine::reader::Parent, bool),
     Checked(PathBuf, NameId, u32),
     /// A catalogued name with no document, searched under `-a` because it is
     /// binary: read through the checked catalog walk, uncached.
@@ -556,7 +567,7 @@ impl Job {
     fn path(&self) -> &Path {
         match self {
             Self::Direct(p, _)
-            | Self::Listed(p, _, _)
+            | Self::Listed(p, _, _, _)
             | Self::Checked(p, _, _)
             | Self::Binary(p, _)
             | Self::Failed(p, _)
@@ -569,7 +580,7 @@ impl Job {
     /// would otherwise keep its directory's descriptor open.
     fn finished(self) -> Self {
         match self {
-            Self::Listed(path, actual, _) => Self::Direct(path, actual),
+            Self::Listed(path, actual, _, _) => Self::Direct(path, actual),
             job => job,
         }
     }
@@ -750,10 +761,10 @@ fn prepare(
             false,
             target,
         )?,
-        Job::Listed(_, actual, directory) => observe_streaming(
+        Job::Listed(_, actual, directory, rg) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file(actual, Some(directory), plan, each, stopped),
+            &mut |each| read_file_policy(actual, Some(directory), plan, each, stopped, *rg),
             false,
             target,
         )?,
@@ -1224,7 +1235,9 @@ pub(super) fn walk<W: Write>(
                                 };
                                 schedule::run(
                                     &schedule,
-                                    sources::live(&path, &filter.cwd).retaining_parents(),
+                                    sources::live(&path, &filter.cwd)
+                                        .following_links(filter.traversal.follow)
+                                        .retaining_parents(),
                                     Walked {
                                         descend: true,
                                         policy: policy.map(live::Policy::deferring),
@@ -1482,6 +1495,7 @@ impl Filter<'_> {
         {
             return None;
         }
+        let rg = policy.as_ref().is_some_and(|policy| policy.rg());
         if let Some(policy) = policy {
             match policy.accepts(entry, true, stopped) {
                 Ok(true) => {}
@@ -1517,6 +1531,12 @@ impl Filter<'_> {
                 Job::Checked(entry.path().to_owned(), name, doc.0),
             ));
         }
+        if self.traversal.follow {
+            return Some((
+                0,
+                Job::Direct(entry.path().to_owned(), self.cwd.join(entry.path())),
+            ));
+        }
         // Content walks retain parents or, past their budget, the parent's
         // identity; every name a catalogued listing, which opens no
         // directory, yields is catalogued.
@@ -1535,7 +1555,12 @@ impl Filter<'_> {
         };
         Some((
             0,
-            Job::Listed(entry.path().to_owned(), self.cwd.join(entry.path()), parent),
+            Job::Listed(
+                entry.path().to_owned(),
+                self.cwd.join(entry.path()),
+                parent,
+                rg,
+            ),
         ))
     }
 }
@@ -1608,7 +1633,7 @@ impl<'a> Source<'a> {
     /// Whether a directory operand walks the live tree, which [`walk`] can
     /// spread over workers.
     pub(super) fn walks_live(&self) -> bool {
-        (self.filter.traversal.unrestricted || self.live.is_some())
+        (self.filter.traversal.unrestricted || self.inputs.as_slice().iter().any(|input| matches!(input, Input::Directory(path) if self.live.is_some_and(|anchors| anchors.walks(path)))))
             && self
                 .inputs
                 .as_slice()
@@ -1682,6 +1707,7 @@ impl<'a> Source<'a> {
                 Input::Directory(path) => {
                     self.policy = match self
                         .live
+                        .filter(|anchors| anchors.walks(&path))
                         .map(|anchors| anchors.start(&path, stopped))
                         .transpose()
                     {
@@ -1692,9 +1718,15 @@ impl<'a> Source<'a> {
                         &path,
                         self.filter.catalog,
                         &self.filter.cwd,
-                        self.filter.traversal.unrestricted || self.live.is_some(),
+                        self.filter.traversal.unrestricted || self.policy.is_some(),
                     ) {
-                        Ok(source) => self.source = Some(source.retaining_parents()),
+                        Ok(source) => {
+                            self.source = Some(
+                                source
+                                    .following_links(self.filter.traversal.follow)
+                                    .retaining_parents(),
+                            )
+                        }
                         Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
                     }
                     self.descend = true;
@@ -1744,6 +1776,7 @@ mod tests {
             "display/file".into(),
             actual,
             engine::reader::Parent::Closed(stat.dev(), stat.ino()),
+            false,
         ));
         let fork = || -> Option<Box<CheckedReader<'_>>> { None };
         run(

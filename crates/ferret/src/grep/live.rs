@@ -18,6 +18,8 @@ const NONBLOCK: i32 = 0x800;
 #[derive(Clone)]
 pub(super) struct Anchors {
     roots: Arc<[PathBuf]>,
+    uncovered: Arc<[PathBuf]>,
+    fallback: bool,
     faults: Arc<[(PathBuf, io::Error)]>,
     global: Arc<str>,
     index: Arc<Path>,
@@ -59,10 +61,70 @@ impl Anchors {
         roots.dedup();
         Ok(Self {
             roots: roots.into(),
+            uncovered: Arc::default(),
+            fallback: false,
             faults: faults.into(),
             global,
             index: index.to_owned().into(),
         })
+    }
+    /// Resolves coverage before either the engine or the daemon is opened.
+    pub fn routing(index: Option<&Path>, inputs: &[Input]) -> Result<Self, String> {
+        let index = index_path(index)?;
+        let mut anchors = if Catalog::snapshot_path(&index)
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            Self::load(&index, "".into())?
+        } else {
+            Self {
+                roots: Arc::default(),
+                uncovered: Arc::default(),
+                fallback: true,
+                faults: Arc::default(),
+                global: "".into(),
+                index: index.into(),
+            }
+        };
+        anchors.fallback = true;
+        let mut uncovered = Vec::new();
+        for input in inputs {
+            if let Input::Directory(path) = input {
+                let real = fs::canonicalize(path).map_err(|e| e.to_string())?;
+                if !anchors.roots.iter().any(|root| real.starts_with(root)) {
+                    uncovered.push(real);
+                }
+            }
+        }
+        anchors.uncovered = uncovered.into();
+        if !anchors.uncovered.is_empty() {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                });
+            anchors.global = config
+                .map(|p| read_global(&p.join("git/ignore")))
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+                .into();
+        }
+        Ok(anchors)
+    }
+    pub fn walks(&self, path: &Path) -> bool {
+        !self.fallback || fs::canonicalize(path).is_ok_and(|real| self.uncovered.contains(&real))
+    }
+    pub fn all_covered(&self) -> bool {
+        self.uncovered.is_empty()
+    }
+    pub fn any_covered(&self, inputs: &[Input]) -> bool {
+        inputs
+            .iter()
+            .any(|input| matches!(input, Input::Directory(path) if !self.walks(path)))
     }
     pub fn search_threads(&self) -> usize {
         engine::search_threads_for(&self.index)
@@ -79,7 +141,9 @@ impl Anchors {
                 format!("policy root {}: {error}", root.display()),
             ));
         }
-        if !self.roots.iter().any(|root| current.starts_with(root)) {
+        if !self.roots.iter().any(|root| current.starts_with(root))
+            && !self.uncovered.contains(&current)
+        {
             return Err(io::Error::other(
                 "directory is outside configured roots; index it or use --no-ignore",
             ));
@@ -88,6 +152,9 @@ impl Anchors {
     }
     pub fn start(&self, path: &Path, stopped: &dyn Fn() -> bool) -> io::Result<Policy> {
         let real = self.validate(path)?;
+        if self.fallback {
+            return self.start_rg(path, real, stopped);
+        }
         let root = self
             .roots
             .iter()
@@ -130,6 +197,40 @@ impl Anchors {
             spelling: path.to_owned(),
             real: real.clone(),
             stack: vec![(real, state)],
+            warnings: None,
+        })
+    }
+    fn start_rg(
+        &self,
+        path: &Path,
+        real: PathBuf,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<Policy> {
+        let root = real
+            .ancestors()
+            .find(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
+            .unwrap_or(&real);
+        let mut rules = load_rg(root, None, Some(&self.global), None, stopped)?;
+        let mut at = root.to_owned();
+        for component in real
+            .strip_prefix(root)
+            .map_err(io::Error::other)?
+            .components()
+        {
+            at.push(component);
+            rules = load_rg(&at, Some(&rules), None, None, stopped)?;
+        }
+        Ok(Policy {
+            anchors: self.clone(),
+            spelling: path.to_owned(),
+            real: real.clone(),
+            stack: vec![(
+                real.clone(),
+                State::Rules {
+                    root: root.to_owned(),
+                    rules,
+                },
+            )],
             warnings: None,
         })
     }
@@ -238,6 +339,9 @@ pub(super) struct Policy {
     warnings: Option<Vec<String>>,
 }
 impl Policy {
+    pub fn rg(&self) -> bool {
+        self.anchors.fallback
+    }
     /// Holds warnings from directories' rules for [`Self::take_warnings`],
     /// so a worker can print them under its own ordering.
     pub fn deferring(mut self) -> Self {
@@ -313,7 +417,11 @@ impl Policy {
             let next = match (decision, state) {
                 (Decision::Descend, State::Rules { root, rules }) => State::Rules {
                     root: root.clone(),
-                    rules: enter(rules, &path, self.warnings.as_mut(), stopped)?,
+                    rules: if self.anchors.fallback {
+                        load_rg(&path, Some(rules), None, self.warnings.as_mut(), stopped)?
+                    } else {
+                        enter(rules, &path, self.warnings.as_mut(), stopped)?
+                    },
                 },
                 (Decision::Traverse, State::Rules { root, rules }) => State::Rules {
                     root: root.clone(),
@@ -349,37 +457,55 @@ fn load(
     mut warnings: Option<&mut Vec<String>>,
     stopped: &dyn Fn() -> bool,
 ) -> io::Result<DirRules> {
+    load_kind(path, parent, global, warnings.take(), stopped, false)
+}
+
+fn load_rg(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    warnings: Option<&mut Vec<String>>,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<DirRules> {
+    load_kind(path, parent, global, warnings, stopped, true)
+}
+fn load_kind(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    mut warnings: Option<&mut Vec<String>>,
+    stopped: &dyn Fn() -> bool,
+    grep: bool,
+) -> io::Result<DirRules> {
     if stopped() {
         return Err(io::ErrorKind::ConnectionAborted.into());
     }
     let mut fault = None;
-    let rules =
-        ferret_crawl::load_policy(
-            path,
-            parent,
-            global,
-            Config::default(),
-            |event| match event {
-                ferret_crawl::Event::Pattern(error) => {
-                    let warning = format!("ferret: warning: ignore pattern skipped: {error}");
-                    match warnings.as_deref_mut() {
-                        Some(warnings) => warnings.push(warning),
-                        None => eprintln!("{warning}"),
-                    }
-                }
-                ferret_crawl::Event::Io {
-                    path: relative,
-                    error,
-                    ..
-                } if fault.is_none() => {
-                    fault = Some(io::Error::new(
-                        error.kind(),
-                        format!("{}: {error}", path.join(relative).display()),
-                    ));
-                }
-                _ => {}
-            },
-        )?;
+    let mut visit = |event: ferret_crawl::Event<'_, ()>| match event {
+        ferret_crawl::Event::Pattern(error) => {
+            let warning = format!("ferret: warning: ignore pattern skipped: {error}");
+            match warnings.as_deref_mut() {
+                Some(warnings) => warnings.push(warning),
+                None => eprintln!("{warning}"),
+            }
+        }
+        ferret_crawl::Event::Io {
+            path: relative,
+            error,
+            ..
+        } if fault.is_none() => {
+            fault = Some(io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.join(relative).display()),
+            ));
+        }
+        _ => {}
+    };
+    let rules = if grep {
+        ferret_crawl::load_grep_policy(path, parent, global, &mut visit)
+    } else {
+        ferret_crawl::load_policy(path, parent, global, Config::default(), &mut visit)
+    }?;
     if stopped() {
         return Err(io::ErrorKind::ConnectionAborted.into());
     }

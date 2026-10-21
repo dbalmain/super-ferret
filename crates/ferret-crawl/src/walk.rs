@@ -381,25 +381,82 @@ pub fn load_policy(
     config: Config,
     visit: impl FnMut(Event<'_, ()>),
 ) -> io::Result<DirRules> {
-    let fd = open_path(path, child_dir_flags(), Mode::empty())?;
+    load_query_policy(path, parent, global, config, false, visit)
+}
+
+/// Loads rg's git, `.ignore` and `.rgignore` inputs with the crawler's scoped
+/// reads. Ferret ignore files are not consulted; content has no size cap.
+/// Diagnostics and directory-open failures follow [`load_policy`].
+pub fn load_grep_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    load_query_policy(
+        path,
+        parent,
+        global,
+        Config { size_cap: u64::MAX },
+        true,
+        visit,
+    )
+}
+
+fn load_query_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    config: Config,
+    grep: bool,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    let fd = open_path(
+        path,
+        if grep {
+            root_dir_flags()
+        } else {
+            child_dir_flags()
+        },
+        Mode::empty(),
+    )?;
     let boundaries = BoundaryIndex::default();
     let mut walker = Walker::new(path, &boundaries, visit);
     let loaded = walker.load_ignores(
         fd.as_fd(),
         |name| {
-            !matches!(
-                statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW),
-                Err(Errno::NOENT)
-            )
+            !(grep && name == ".ferretignore")
+                && !matches!(
+                    statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW),
+                    Err(Errno::NOENT)
+                )
         },
         parent.is_some_and(DirRules::in_work_tree),
         (),
     );
+    let ignore = grep
+        .then(|| walker.read_named(fd.as_fd(), ".ignore", ()))
+        .flatten();
+    let rgignore = grep
+        .then(|| walker.read_named(fd.as_fd(), ".rgignore", ()))
+        .flatten();
     let (rules, errors) = if let Some(parent) = parent {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "policy directory has no name")
         })?;
-        parent.enter(name, loaded.files())
+        if grep {
+            parent.grep_enter(name, loaded.files(), ignore.as_deref(), rgignore.as_deref())
+        } else {
+            parent.enter(name, loaded.files())
+        }
+    } else if grep {
+        DirRules::grep_root(
+            path,
+            global.filter(|_| loaded.git_root),
+            loaded.files(),
+            ignore.as_deref(),
+            rgignore.as_deref(),
+        )
     } else {
         DirRules::root(path, global, loaded.files(), config)
     };

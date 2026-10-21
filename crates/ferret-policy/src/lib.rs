@@ -186,6 +186,8 @@ pub enum IgnoreFile {
     GitExclude(PathBuf),
     /// The user's global ignore file.
     Global,
+    /// An rg-specific `.ignore` or `.rgignore`, by absolute path.
+    Grep(PathBuf),
 }
 
 /// An ignore file the policy could not fully use. Non-fatal: as in git, a bad
@@ -208,7 +210,7 @@ pub enum PatternError {
 impl fmt::Display for IgnoreFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ferret(path) | Self::Git(path) | Self::GitExclude(path) => {
+            Self::Ferret(path) | Self::Git(path) | Self::GitExclude(path) | Self::Grep(path) => {
                 write!(f, "{}", path.display())
             }
             Self::Global => f.write_str("global ignore file"),
