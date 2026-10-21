@@ -20,12 +20,16 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 Indexed directory content searches and `--files` use the resident daemon (D111 A), falling
 back to the shared in-process host when it is unavailable or refuses the hello.
 The client resolves presentation, terminal defaults, search threads, cwd and
-pattern files. Mixed explicit files travel with a directory request; requests
-including search stdin remain local. Explicit-file-only searches,
-`-u`/`-uu` and `--live` stay local; `--live` loads only catalog roots, not the
-resident engine. Names-only directory requests reuse the resident catalog;
-the fallback retains the existing four-section lazy open. Names-only `-` is
-just a label and can accompany a remote directory listing. Debug `FERRET_TEST_*` injections also stay local.
+pattern files. Only requests whose every operand is a directory route; any
+explicit file, missing operand or `-` keeps the whole request local, because
+ferretd would resolve its spelling again in its own process, where
+`/proc/self/fd/N`, `/dev/fd/N` or `/proc/self/cwd` name its descriptors and
+cwd, not the client's. Directory operands that resolve through such a procfs
+link (`openat2` with `RESOLVE_NO_MAGICLINKS`) or onto procfs stay local too.
+Explicit-file-only searches, `-u`/`-uu` and `--live` stay local; `--live`
+loads only catalog roots, not the resident engine. Names-only directory
+requests reuse the resident catalog; the fallback retains the existing
+four-section lazy open. Debug `FERRET_TEST_*` injections also stay local.
 
 When no daemon is running, the first indexed directory content or `--files`
 call starts one and answers in-process immediately, as search does. Later calls

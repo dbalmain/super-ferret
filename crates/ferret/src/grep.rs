@@ -141,10 +141,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(cwd) => cwd,
         Err(error) => return failure(&error.to_string()),
     };
-    if recursive
+    if daemon_operands(&inputs)
         && !plan.traversal.unrestricted
         && !plan.traversal.live
-        && !inputs.iter().any(|input| matches!(input, Input::Stdin))
         && !test_injections()
         && let Ok(index) = index_path(index)
         && let Some(exit) = remote::run(args, &pattern_files, &plan, tty, &index)
@@ -564,6 +563,16 @@ fn resolve_inputs_at(paths: &[PathBuf], names_only: bool, cwd: &Path) -> Vec<Inp
             }
         })
         .collect()
+}
+
+/// D111 routes a request through ferretd only when every operand is a
+/// directory that names the same directory there. A file operand's identity
+/// belongs to this process (an inherited `/proc/self/fd/N`, say), and ferretd
+/// would resolve its spelling again in its own, so mixed requests stay here.
+fn daemon_operands(inputs: &[Input]) -> bool {
+    inputs.iter().all(
+        |input| matches!(input, Input::Directory(path) if line_grep::same_in_every_process(path)),
+    )
 }
 
 fn readable_stdin() -> bool {

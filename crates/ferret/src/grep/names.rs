@@ -12,9 +12,7 @@ pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bo
     if !plan.traversal.unrestricted
         && !plan.traversal.live
         && !test_injections()
-        && resolve_inputs(&plan.paths, true)
-            .iter()
-            .any(|input| matches!(input, Input::Directory(_)))
+        && daemon_operands(&resolve_inputs(&plan.paths, true))
     {
         if let Err(error) = selection(plan) {
             return failure(&error);

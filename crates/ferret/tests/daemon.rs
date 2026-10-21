@@ -2155,14 +2155,14 @@ fn stopped_grep_consumer_leaves_a_descriptor_share_for_another_request() {
 fn daemon_grep_spills_context_into_the_clients_temporary_directory() {
     let tree = Tree::new();
     fs::write(tree.base.join("src/a"), b"red\n").unwrap();
-    assert!(tree.local(&["index", "src"]).status.success());
     let mut context = Vec::new();
     for _ in 0..100 {
         context.extend_from_slice(&[b'x'; 1024]);
         context.push(b'\n');
     }
     context.extend_from_slice(b"red\n");
-    fs::write(tree.base.join("context"), context).unwrap();
+    fs::write(tree.base.join("src/context"), context).unwrap();
+    assert!(tree.local(&["index", "src"]).status.success());
     fs::create_dir(tree.base.join("client-tmp")).unwrap();
     let missing = tree.base.join("missing-tmp");
     tree.start_at(
@@ -2173,7 +2173,7 @@ fn daemon_grep_spills_context_into_the_clients_temporary_directory() {
     let gone = tree.base.join("client-gone");
     for temp in [client.as_os_str(), "client-tmp".as_ref(), gone.as_os_str()] {
         let grep = |local: bool| {
-            let mut command = tree.command(&["grep", "-B100", "red", "context", "src"]);
+            let mut command = tree.command(&["grep", "-B100", "red", "src"]);
             command.env("TMPDIR", temp);
             if local {
                 command.env("FERRET_NO_DAEMON", "1");
@@ -2199,4 +2199,115 @@ fn daemon_grep_spills_context_into_the_clients_temporary_directory() {
             assert!(stderr.is_empty(), "{stderr}");
         }
     }
+}
+
+// A file operand's identity belongs to the client: `/proc/self/fd/N` and its
+// aliases name the client's descriptor, and `/proc/self/cwd` its cwd. Mixed
+// requests and process-relative directories therefore stay in process; the
+// daemon here runs from `/`, without descriptor 99.
+#[test]
+fn mixed_grep_operands_keep_the_clients_process_identity() {
+    let tree = descriptor_tree();
+    tree.start_at(&[], std::path::Path::new("/"));
+    let mut differing = Vec::new();
+    for case in descriptor_cases() {
+        let local = grep_with_descriptor(&tree, &case, true);
+        let remote = grep_with_descriptor(&tree, &case, false);
+        if (remote.status.code(), &remote.stdout, &remote.stderr)
+            != (local.status.code(), &local.stdout, &local.stderr)
+        {
+            differing.push(format!("{case:?}: local {local:?}, daemon {remote:?}"));
+        }
+    }
+    assert!(differing.is_empty(), "{differing:#?}");
+    let local = grep_with_descriptor(&tree, &["red", "/proc/self/fd/99", "src"], true);
+    assert!(local.status.success(), "{local:?}");
+    assert_eq!(
+        local.stdout,
+        b"/proc/self/fd/99:red descriptor-only\nsrc/main.rs:red main\n"
+    );
+}
+
+// The routing half of the test above, observed at the socket: those requests
+// never connect, while directory-only content and --files requests do.
+#[test]
+fn only_directory_only_grep_requests_reach_the_daemon() {
+    let tree = descriptor_tree();
+    let (listener, hello, socket) = tree.fake_owner();
+    let hello = hello.replace(",\"raw-output-v1\"", "");
+    for case in descriptor_cases() {
+        let output = grep_with_descriptor(&tree, &case, false);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{case:?} connected to the daemon: {output:?}"
+        );
+    }
+    for case in [
+        &["red", "src"][..],
+        &["--files", "src"],
+        &["red", "src", "."],
+    ] {
+        let server = std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let mut stream = accept_peer(&listener);
+                stream.set_read_timeout(Some(BOUND)).unwrap();
+                stream.write_all(hello.as_bytes()).unwrap();
+                let mut reader = BufReader::new(stream);
+                let request = line(&mut reader);
+                reader.get_mut().write_all(b"{\"id\":\"grep\",\"event\":\"begin\"}\n{\"id\":\"grep\",\"event\":\"stdout\",\"bytes_base64\":\"c2VydmVkCg==\"}\n{\"id\":\"grep\",\"event\":\"end\",\"exit\":0}\n").unwrap();
+                request
+            });
+            let output = grep_with_descriptor(&tree, case, false);
+            assert!(output.status.success(), "{case:?} {output:?}");
+            assert_eq!(output.stdout, b"served\n", "{case:?}");
+            server.join().unwrap()
+        });
+        assert!(server.contains("\"op\":\"grep\""), "{server}");
+    }
+    fs::remove_file(socket).unwrap();
+}
+
+fn descriptor_tree() -> Tree {
+    let tree = Tree::new();
+    fs::write(tree.base.join("src/main.rs"), b"red main\n").unwrap();
+    fs::write(tree.base.join("fdinput"), b"red descriptor-only\n").unwrap();
+    symlink("/proc/self/fd/99", tree.base.join("fdlink")).unwrap();
+    symlink("/proc/self/cwd/src", tree.base.join("cwdlink")).unwrap();
+    assert!(tree.local(&["index", "src"]).status.success());
+    tree
+}
+
+// Inherited regular-file descriptor 99 by its aliases, and the client's cwd
+// as a directory, each alone and beside the indexed `src`.
+fn descriptor_cases() -> Vec<Vec<&'static str>> {
+    let mut cases = Vec::new();
+    for operand in [
+        "/proc/self/fd/99",
+        "/dev/fd/99",
+        "fdlink",
+        "/proc/self/cwd/src",
+        "cwdlink",
+    ] {
+        for mode in [&["red"][..], &["--files"]] {
+            cases.push([mode, &[operand, "src"]].concat());
+            cases.push([mode, &[operand]].concat());
+        }
+    }
+    cases
+}
+
+fn grep_with_descriptor(tree: &Tree, args: &[&str], local: bool) -> Output {
+    let mut command = fixture::bounded_command("bash", &tree.base);
+    command
+        .current_dir(&tree.base)
+        .env_remove("FERRET_NO_DAEMON")
+        .env("FERRET_DAEMON_BIN", DAEMON)
+        .env("FERRET_DAEMON_STARTUP_MS", "1500")
+        .env("FERRET_SEARCH_THREADS", "1")
+        .args(["-c", r#"exec "$@" 99<fdinput"#, "grep-fd", FERRET, "grep"])
+        .args(args);
+    if local {
+        command.env("FERRET_NO_DAEMON", "1");
+    }
+    command.output().unwrap()
 }

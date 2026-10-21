@@ -198,6 +198,26 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Whether directory operand `path`, resolved against this process's cwd,
+/// names the same directory from any other process given that cwd: its
+/// resolution jumps through no procfs magic link (`/proc/self/cwd`,
+/// `/proc/self/fd/N`, their `/dev/fd` aliases and symlinks to them) and ends
+/// outside procfs, whose `self` entries differ by reader. A host that hands
+/// an operand's spelling to another process keeps any other operand in its
+/// own. Kernels without `openat2` answer false.
+pub fn same_in_every_process(path: &Path) -> bool {
+    use rustix::fs::{CWD, Mode, OFlags, PROC_SUPER_MAGIC, ResolveFlags};
+    rustix::fs::openat2(
+        CWD,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    )
+    .and_then(rustix::fs::fstatfs)
+    .is_ok_and(|filesystem| filesystem.f_type != PROC_SUPER_MAGIC)
+}
+
 /// Parse rg spellings, clusters, attached values and `--`. Glob validation
 /// follows in the policy adapter, still before input resolution.
 pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
@@ -1191,6 +1211,31 @@ fn scan_records(
 mod tests {
     use super::*;
     use ferret_verify::Trigrams;
+
+    #[test]
+    fn process_relative_directories_are_not_the_same_in_every_process() {
+        let here = std::env::current_dir().unwrap();
+        assert!(same_in_every_process(Path::new(".")));
+        assert!(same_in_every_process(&here));
+        let symlinked =
+            std::env::temp_dir().join(format!("ferret-cwd-link-{}", std::process::id()));
+        std::os::unix::fs::symlink(&here, &symlinked).unwrap();
+        assert!(same_in_every_process(&symlinked));
+        std::fs::remove_file(&symlinked).unwrap();
+        let descriptor = std::fs::File::open(&here).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&descriptor);
+        for path in [
+            "/proc/self/cwd".to_owned(),
+            format!("/proc/self/fd/{fd}"),
+            format!("/dev/fd/{fd}"),
+            "/proc/self".to_owned(),
+            "/proc/self/fd".to_owned(),
+        ] {
+            assert!(Path::new(&path).is_dir(), "{path}");
+            assert!(!same_in_every_process(Path::new(&path)), "{path}");
+        }
+        assert!(!same_in_every_process(Path::new("Cargo.toml")));
+    }
 
     // Compare the actual scanner with its old path, including the source
     // metadata consumed by plain rendering, replacement and JSON encoding.
