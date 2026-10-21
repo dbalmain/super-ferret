@@ -431,6 +431,34 @@ impl Catalog {
             })
     }
 
+    /// Name rows the selected overlay replaced since the checkpoint, each
+    /// with whether it is live in this view: tombstones included, also for
+    /// names born earlier in the epoch. Bounded by the overlay's name rows.
+    /// Requires Names.
+    pub fn changed_names(&self) -> impl Iterator<Item = (NameId, bool)> + '_ {
+        self.overlay
+            .iter()
+            .flat_map(|overlay| overlay.projection(Family::Namespace).records(overlay::NAME))
+            .filter_map(|record| match record {
+                Record::NamePut { id, .. } => Some((NameId(*id), true)),
+                Record::NameDelete { id } => Some((NameId(*id), false)),
+                _ => None,
+            })
+    }
+
+    /// Inodes whose stat row, document included, the selected overlay
+    /// replaced since the checkpoint. Bounded by the overlay's inode rows.
+    /// Requires [`Section::Doc`].
+    pub fn changed_inodes(&self) -> impl Iterator<Item = InoId> + '_ {
+        self.overlay
+            .iter()
+            .flat_map(|overlay| overlay.projection(Family::Inodes).records(overlay::INODE))
+            .filter_map(|record| match record {
+                Record::InodePut { id, .. } => Some(InoId(*id)),
+                _ => None,
+            })
+    }
+
     /// Base edges overwritten or removed by the selected generation.
     pub fn suppressed_base_names(&self) -> impl Iterator<Item = NameId> + '_ {
         self.overlay
@@ -1620,7 +1648,21 @@ impl Catalog {
     pub(crate) fn base_hash(&self, row: u32) -> Hash {
         self.hash(row as usize)
     }
-    pub(crate) fn changed_docs(&self) -> impl Iterator<Item = &Record> {
+    /// Document rows the selected overlay replaced since the checkpoint,
+    /// each with whether it is live in this view. Bounded by the overlay's
+    /// document rows; the checkpoint's table is not read. Requires
+    /// [`Section::Docs`].
+    pub fn changed_docs(&self) -> impl Iterator<Item = (DocId, bool)> + '_ {
+        self.overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Docs).records(overlay::DOC))
+            .filter_map(|record| match record {
+                Record::DocPut { id, .. } => Some((DocId(*id), true)),
+                Record::DocDelete { id } => Some((DocId(*id), false)),
+                _ => None,
+            })
+    }
+    pub(crate) fn changed_doc_records(&self) -> impl Iterator<Item = &Record> {
         self.overlay
             .iter()
             .flat_map(|o| o.projection(Family::Docs).records(overlay::DOC))

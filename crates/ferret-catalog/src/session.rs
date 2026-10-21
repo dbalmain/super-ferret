@@ -70,7 +70,7 @@ impl WriterSession {
         let mut documents: Vec<_> = (0..view.base_doc_count()).collect();
         documents.sort_by_cached_key(|&row| view.base_hash(row));
         let mut document_changes = BTreeMap::new();
-        for record in view.changed_docs() {
+        for record in view.changed_doc_records() {
             match record {
                 Record::DocPut { id, hash, .. } => {
                     document_changes.insert(*hash, Some(DocId(*id)));
