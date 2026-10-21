@@ -99,7 +99,7 @@ pub struct Budget<'a> {
     pub cancelled: &'a dyn Fn() -> bool,
     /// Called before each bounded index-file transfer: the shared background
     /// pacer, or a no-op for explicit commands. An error aborts the transfer.
-    /// A merge charges each input page once, however often it reads it.
+    /// A merge charges an input page once per run of nearby reads of it.
     /// Document reads are paced separately by the host's reader.
     pub pace: &'a dyn Fn(usize) -> io::Result<()>,
 }
@@ -1200,48 +1200,71 @@ struct Paced<'a> {
     pace: &'a dyn Fn(usize) -> io::Result<()>,
 }
 
-/// A merge input with the host's pacer in front of its reads, charged once
-/// per page. Checked reads widen to whole chunks, so a merge's cursors read
-/// most pages many times over, and each repeat is a page-cache hit the
-/// limiter has already been charged for.
+/// Distinct pages per merge input that count as recently read, so a repeat
+/// read of them is not charged again.
+///
+/// A merge reads each input through three interleaved cursors (dictionary
+/// blocks, postings, fingerprints), and a checked chunk read spans two file
+/// pages because sections start at the end of the head. In a trace of the
+/// merges on a 120k-file index, more than 99.9% of repeat touches of a page
+/// came with at most 7 other pages touched in between. A window of 8 charged
+/// 1.034× the distinct pages read, as did 16; 3 charged 6.6×, and charging
+/// every read 47×. 16 is twice the observed reach, and costs 128 bytes per
+/// input whatever its size.
+const RECENT_PAGES: usize = 16;
+
+/// A merge input with the host's pacer in front of its reads. A read charges
+/// the whole [`CHUNK`]-byte pages it touches, except those among the input's
+/// [`RECENT_PAGES`] most recently touched: checked reads widen to whole
+/// chunks, so the merge's cursors re-read the same few pages many times in
+/// quick succession, and charging each re-read made pacing tens of times the
+/// real I/O.
+///
+/// The guarantee is that a page leaving the window is charged again on its
+/// next read, whether the page cache kept it or not. A re-read inside the
+/// window is free even if the kernel evicted the page in between, so that
+/// real I/O goes unpaced; it needs pressure severe enough to evict one of the
+/// last 64 KiB read from that input.
 struct PacedInput<'a> {
     file: &'a File,
     pace: &'a dyn Fn(usize) -> io::Result<()>,
     size: u64,
-    /// One bit per [`CHUNK`]-byte page of the file, set once it is charged.
-    charged: RefCell<Vec<u64>>,
+    /// The most recently touched pages, newest first; [`u64::MAX`] is empty.
+    recent: RefCell<[u64; RECENT_PAGES]>,
 }
 
 impl<'a> PacedInput<'a> {
+    fn new(file: &'a File, pace: &'a dyn Fn(usize) -> io::Result<()>) -> io::Result<Self> {
+        Ok(Self {
+            file,
+            pace,
+            size: file.size()?,
+            recent: RefCell::new([u64::MAX; RECENT_PAGES]),
+        })
+    }
+
     fn open(
         file: &'a File,
         pace: &'a dyn Fn(usize) -> io::Result<()>,
     ) -> Result<Segment<Self>, ReadError> {
-        let size = file.size()?;
-        let pages = size.div_ceil(CHUNK as u64);
-        Segment::open(Self {
-            file,
-            pace,
-            size,
-            charged: RefCell::new(vec![0; pages.div_ceil(64) as usize]),
-        })
+        Segment::open(Self::new(file, pace)?)
     }
 
-    /// Bytes of the pages `[start, end)` touches that no earlier read did,
-    /// which are charged from now on.
+    /// Bytes of the pages `[start, end)` touches that are not among the
+    /// recently touched, all of which become the most recent.
     fn uncharged(&self, start: u64, end: u64) -> u64 {
         let page = CHUNK as u64;
-        let mut charged = self.charged.borrow_mut();
+        let mut recent = self.recent.borrow_mut();
         let mut bytes = 0;
-        for p in start / page..end.div_ceil(page) {
-            // Past the end the read itself fails.
-            let Some(word) = charged.get_mut((p / 64) as usize) else {
-                break;
-            };
-            let bit = 1 << (p % 64);
-            if *word & bit == 0 {
-                *word |= bit;
-                bytes += self.size.min((p + 1) * page).saturating_sub(p * page);
+        // Past the end the read itself fails.
+        for p in start / page..end.min(self.size).div_ceil(page) {
+            match recent.iter().position(|&r| r == p) {
+                Some(i) => recent[..=i].rotate_right(1),
+                None => {
+                    recent.rotate_right(1);
+                    recent[0] = p;
+                    bytes += self.size.min((p + 1) * page) - p * page;
+                }
             }
         }
         bytes
@@ -1256,12 +1279,80 @@ impl ReadAt for PacedInput<'_> {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         for (i, piece) in buf.chunks_mut(64 << 10).enumerate() {
             let at = offset + (i * (64 << 10)) as u64;
+            #[cfg(test)]
+            input_trace::record(self.file, self.size, at, piece.len());
+            #[cfg(test)]
+            let _charging = input_trace::Charging::start();
             // Called even when nothing is new: the pacer is also the
             // merge's cancellation check.
             (self.pace)(self.uncharged(at, at + piece.len() as u64) as usize)?;
             ReadAt::read_exact_at(self.file, piece, at)?;
         }
         Ok(())
+    }
+}
+
+/// What merge inputs read, and which pacer calls charge them, for tests
+/// that check the charges against the reads.
+#[cfg(test)]
+pub(crate) mod input_trace {
+    use std::cell::{Cell, RefCell};
+    use std::fs::File;
+
+    /// One input read: the file (by address and size) and the span.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Read {
+        pub file: usize,
+        pub size: u64,
+        pub offset: u64,
+        pub len: usize,
+    }
+
+    thread_local! {
+        static READS: RefCell<Option<Vec<Read>>> = const { RefCell::new(None) };
+        static CHARGING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn record(file: &File, size: u64, offset: u64, len: usize) {
+        READS.with_borrow_mut(|reads| {
+            if let Some(reads) = reads {
+                let file = std::ptr::from_ref(file) as usize;
+                reads.push(Read {
+                    file,
+                    size,
+                    offset,
+                    len,
+                });
+            }
+        });
+    }
+
+    /// Marks the pacer calls made while it lives as input charges.
+    pub(super) struct Charging;
+
+    impl Charging {
+        pub(super) fn start() -> Self {
+            CHARGING.set(true);
+            Self
+        }
+    }
+
+    impl Drop for Charging {
+        fn drop(&mut self) {
+            CHARGING.set(false);
+        }
+    }
+
+    /// Whether the pacer is being called for a merge input's read.
+    pub(crate) fn charging() -> bool {
+        CHARGING.get()
+    }
+
+    /// Runs `f`, returning its result and every input read on this thread.
+    pub(crate) fn during<T>(f: impl FnOnce() -> T) -> (T, Vec<Read>) {
+        READS.set(Some(Vec::new()));
+        let result = f();
+        (result, READS.take().unwrap_or_default())
     }
 }
 

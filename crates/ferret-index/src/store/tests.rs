@@ -1278,13 +1278,14 @@ fn wide_text(doc: u32) -> Vec<u8> {
     words.join(" ").into_bytes()
 }
 
-/// An index over [`wide_text`] in several segments.
-fn wide_index(dir: &Dir, catalog: &Catalog) -> IndexWriter {
+/// An index over [`wide_text`] in several segments of about `bytes` of
+/// text each.
+fn wide_index(dir: &Dir, catalog: &Catalog, bytes: u64) -> IndexWriter {
     let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
     loop {
         let followed = writer
-            .follow(&catalog.view(), &budget(20_000), &mut |doc, bytes| {
-                bytes.extend_from_slice(&wide_text(doc));
+            .follow(&catalog.view(), &budget(bytes), &mut |doc, text| {
+                text.extend_from_slice(&wide_text(doc));
                 Ok(())
             })
             .unwrap();
@@ -1297,38 +1298,119 @@ fn wide_index(dir: &Dir, catalog: &Catalog) -> IndexWriter {
     writer
 }
 
+/// Bytes of the distinct file pages `reads` touch, counted from the spans
+/// alone.
+fn touched_bytes(reads: &[input_trace::Read]) -> u64 {
+    let page = CHUNK as u64;
+    let pages: BTreeSet<(usize, u64, u64)> = reads
+        .iter()
+        .flat_map(|r| {
+            let end = r.offset + r.len as u64;
+            (r.offset / page..end.div_ceil(page)).map(move |p| (r.file, r.size, p))
+        })
+        .collect();
+    pages
+        .iter()
+        .map(|&(_, size, p)| size.min((p + 1) * page) - p * page)
+        .sum()
+}
+
 #[test]
-fn a_merge_charges_the_pacer_for_each_input_page_once() {
+fn a_merge_charges_the_pacer_for_input_pages_it_reads() {
     let dir = Dir::new("charge-once");
-    let catalog = Catalog::new(600, &[]);
-    let mut writer = wide_index(&dir, &catalog);
-    let paced = std::cell::Cell::new(0);
+    let catalog = Catalog::new(2400, &[]);
+    let mut writer = wide_index(&dir, &catalog, 80_000);
+    let (input, other) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
     let pace = |bytes: usize| {
-        paced.set(paced.get() + bytes as u64);
+        let counter = if input_trace::charging() {
+            &input
+        } else {
+            &other
+        };
+        counter.set(counter.get() + bytes as u64);
         Ok(())
     };
     let budget = Budget {
         pace: &pace,
         ..Budget::unbounded()
     };
-    let merged = writer.merge_all(&catalog.view(), &budget).unwrap().unwrap();
-    // Reads charge at most the inputs. The writer charges its output, and
-    // at most twice more for a postings section spilled to scratch and
-    // copied back.
+    let (merged, reads) = input_trace::during(|| writer.merge_all(&catalog.view(), &budget));
+    let merged = merged.unwrap().unwrap();
+    let page = CHUNK as u64;
     assert!(
-        paced.get() <= merged.read + 3 * merged.written,
-        "paced {} for {} read and {} written",
-        paced.get(),
-        merged.read,
+        reads.iter().any(|r| r.offset % page != 0),
+        "no unaligned read"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|r| r.size % page != 0 && r.offset + r.len as u64 > r.size / page * page),
+        "no read of a final partial page"
+    );
+    // Every page read is charged at least once. Repeat reads of the pages
+    // nearby are not charged again, so the inputs, some larger than the
+    // window, are charged within an eighth of their distinct pages (3% over
+    // when written); charging every read was 240 times them.
+    let touched = touched_bytes(&reads);
+    let (input, other) = (input.get(), other.get());
+    assert!(
+        touched <= input && input <= touched + touched / 8,
+        "input paced {input} for {touched} touched"
+    );
+    // The writer charges its output, and at most twice more for a postings
+    // section spilled to scratch and copied back.
+    assert!(
+        other <= 3 * merged.written,
+        "output paced {other} for {} written",
         merged.written
     );
+}
+
+#[test]
+fn a_merge_input_charges_a_page_again_once_it_leaves_the_window() {
+    let dir = Dir::new("charge-window");
+    fs::create_dir_all(&dir.0).unwrap();
+    let page = CHUNK as u64;
+    let pages = RECENT_PAGES as u64 + 2;
+    let size = pages * page + 100;
+    let path = dir.0.join("input");
+    fs::write(&path, vec![7; size as usize]).unwrap();
+    let file = File::open(&path).unwrap();
+    let paced = RefCell::new(Vec::new());
+    let pace = |bytes: usize| {
+        paced.borrow_mut().push(bytes as u64);
+        Ok(())
+    };
+    let input = PacedInput::new(&file, &pace).unwrap();
+    let charge = |offset: u64, len: usize| {
+        let mut buf = vec![0; len];
+        input.read_exact_at(&mut buf, offset).unwrap();
+        assert_eq!(buf, vec![7; len]);
+        paced.borrow_mut().drain(..).collect::<Vec<_>>()
+    };
+    // An unaligned span charges both whole pages it touches; a repeat is
+    // free but still calls the pacer.
+    assert_eq!(charge(100, CHUNK), [2 * page]);
+    assert_eq!(charge(page - 1, 2), [0]);
+    // The final partial page charges only the bytes the file has.
+    assert_eq!(charge(size - 10, 10), [100]);
+    assert_eq!(charge(pages * page, 1), [0]);
+    // Touching a window's worth of other pages pushes pages 0 and 1 and the
+    // final page out.
+    for p in 2..pages {
+        assert_eq!(charge(p * page, CHUNK), [page], "page {p}");
+    }
+    assert_eq!(charge(pages * page + 1, 1), [100]);
+    assert_eq!(charge(0, 1), [page]);
+    // The last page the loop read is still among the most recent.
+    assert_eq!(charge((pages - 1) * page + 5, 5), [0]);
 }
 
 #[test]
 fn a_merge_still_checks_each_input_chunk() {
     let dir = Dir::new("charge-once-corrupt");
     let catalog = Catalog::new(600, &[]);
-    let mut writer = wide_index(&dir, &catalog);
+    let mut writer = wide_index(&dir, &catalog, 20_000);
     let path = dir.0.join(writer.view().manifest().segments[1].file_name());
     let segment = Segment::open(File::open(&path).unwrap()).unwrap();
     let (blocks, postings) = (
