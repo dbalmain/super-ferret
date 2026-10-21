@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
+use ferret_catalog::Catalog;
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
 use crate::cli::{self, Exit};
@@ -23,7 +24,27 @@ pub(crate) const PERMISSION_WARNING: &str =
 /// unindexed walk (`-I`, a configured `find_no_ignore`, or an information
 /// plan), `Some` for a catalog-backed walk, or an error message (without a
 /// `find: ` prefix) describing why neither is available.
-fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<Engine>, String> {
+enum CatalogView {
+    Engine(Box<Engine>),
+    Lightweight(Box<Catalog>),
+}
+
+fn open_action_catalog(index: &Path, plan: &Plan) -> Result<Catalog, String> {
+    let catalog = Catalog::open(index)
+        .map_err(|error| format!("{}: {error}; re-index or use -I", index.display()))?
+        .ok_or_else(|| {
+            format!(
+                "no index in {}; run ferret index DIR or use -I",
+                index.display()
+            )
+        })?;
+    catalog
+        .load(&plan.catalog_sections())
+        .map_err(|error| format!("{}: {error}; re-index or use -I", index.display()))?;
+    Ok(catalog)
+}
+
+fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<CatalogView>, String> {
     if plan.no_ignore() || plan.is_information() {
         return Ok(None);
     }
@@ -51,8 +72,14 @@ fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<Engine>, 
     let Some(index) = index else {
         return Err("cannot locate index; set --index or FERRET_INDEX, or use -I".to_owned());
     };
+    if plan.has_side_effects() {
+        return open_action_catalog(&index, plan)
+            .map(Box::new)
+            .map(CatalogView::Lightweight)
+            .map(Some);
+    }
     match Engine::open(&index) {
-        Ok(Some(engine)) => Ok(Some(engine)),
+        Ok(Some(engine)) => Ok(Some(CatalogView::Engine(Box::new(engine)))),
         Ok(None) => Err(format!(
             "no index in {}; run ferret index DIR or use -I",
             index.display()
@@ -126,7 +153,12 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     let mut effects = Output::Stdout;
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
-        Some(engine) => engine.pin().find(&plan, effects.clone(), workers),
+        Some(CatalogView::Engine(engine)) => engine.pin().find(&plan, effects.clone(), workers),
+        Some(CatalogView::Lightweight(catalog)) => plan.run_parallel(
+            plan.parallel_catalog_source(*catalog),
+            effects.clone(),
+            workers,
+        ),
         None => plan.run_parallel(plan.live_source(), effects.clone(), workers),
     };
     let outcome = match result {
@@ -235,7 +267,12 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     let host = FrameOutput::new(ID, ChildStdin::Inherit).with_warning_stderr();
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
-        Some(engine) => engine.pin().find(&plan, host.clone(), workers),
+        Some(CatalogView::Engine(engine)) => engine.pin().find(&plan, host.clone(), workers),
+        Some(CatalogView::Lightweight(catalog)) => plan.run_parallel(
+            plan.parallel_catalog_source(*catalog),
+            host.clone(),
+            workers,
+        ),
         None => plan.run_parallel(plan.live_source(), host.clone(), workers),
     };
     let status = match result {
@@ -361,8 +398,44 @@ fn parse_config(text: &str) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use std::io::BufWriter;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    #[test]
+    fn action_catalog_open_does_not_build_resident_names() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ferret-find-light-open-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = directory.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("one"), b"one").unwrap();
+        let index = directory.join("index");
+        ferret_crawl::index(
+            &index,
+            std::slice::from_ref(&root),
+            ferret_crawl::Refresh::All,
+            &ferret_crawl::IndexOptions::default(),
+        )
+        .unwrap();
+        let plan = Plan::parse(&[
+            root.into_os_string(),
+            "-exec".into(),
+            "true".into(),
+            "{}".into(),
+            "+".into(),
+        ])
+        .unwrap();
+
+        let catalog = open_action_catalog(&index, &plan).unwrap();
+
+        assert!(plan.has_side_effects());
+        assert!(catalog.resident_names().is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn config_accepts_one_boolean_and_rejects_ambiguous_settings() {
