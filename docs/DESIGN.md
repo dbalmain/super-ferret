@@ -764,8 +764,9 @@ absolute temporary directory, where before-context spools spill; the server
 never resolves those against its own environment. Stdout/stderr frames
 preserve host flush boundaries and grep's native 0/1/2 exits. Connection hangup
 or cancel stops grep through the scheduler's existing cancellation flag.
-The server caps requested grep threads at its resident search-verification
-grant before sizing pools. Descriptor allowances reserve fixed shares per
+The server takes grep threads from the shared query-worker pool, capped by the
+requested count and the resident search-verification grant, before sizing
+pools. Descriptor allowances reserve fixed shares per
 admitted request because RLIMIT_NOFILE and retained parent caches are
 process-wide. Query admission is at most four and falls to the number of
 complete read allowances at low descriptor limits (two at NOFILE=64). A stalled
