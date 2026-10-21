@@ -3,7 +3,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -165,12 +165,16 @@ impl std::fmt::Display for ConnectError {
         }
     }
 }
+struct Connected {
+    reader: BufReader<UnixStream>,
+    raw_output: bool,
+}
 fn connect(
     endpoint: &Endpoint,
     index: &Path,
     can_spawn: bool,
     writer: bool,
-) -> Result<BufReader<UnixStream>, ConnectError> {
+) -> Result<Connected, ConnectError> {
     let mut observed_owner = false;
     connect_owner(endpoint, index, can_spawn, writer, &mut observed_owner).map_err(|error| {
         if !observed_owner {
@@ -191,7 +195,7 @@ fn connect_owner(
     can_spawn: bool,
     writer: bool,
     observed_owner: &mut bool,
-) -> io::Result<BufReader<UnixStream>> {
+) -> io::Result<Connected> {
     let incarnation = ferret_catalog::Catalog::open(index)
         .ok()
         .flatten()
@@ -281,7 +285,10 @@ fn connect_owner(
                             return Err(io::Error::other("incompatible catalog incarnation"));
                         }
                         reader.get_ref().set_read_timeout(None)?;
-                        return Ok(reader);
+                        return Ok(Connected {
+                            reader,
+                            raw_output: has_capability(&hello, "raw-output-v1"),
+                        });
                     }
                     _ => return Err(io::Error::other("daemon could not open the catalog")),
                 }
@@ -337,6 +344,28 @@ fn bytes(value: &Value, plain: &str, base64: &str) -> io::Result<Vec<u8>> {
             .ok_or_else(|| io::Error::other("missing byte field in daemon event"))
     }
 }
+/// Consume a bounded exact-length payload before looking for another JSON
+/// envelope. EOF in a payload is a transport failure, never a partial success.
+fn read_payload(
+    reader: &mut impl Read,
+    value: &Value,
+    negotiated: bool,
+    payload: &mut Vec<u8>,
+) -> io::Result<()> {
+    if let Some(length) = value.field("length") {
+        let length = length
+            .number()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n <= crate::transport::MAX_RAW_BYTES && negotiated)
+            .ok_or_else(|| io::Error::other("invalid or unnegotiated raw output length"))?;
+        payload.resize(length, 0);
+        reader.read_exact(payload)
+    } else {
+        *payload = bytes(value, "bytes", "bytes_base64")?;
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct Options {
     limit: Option<u64>,
@@ -383,7 +412,10 @@ fn query(
         .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
     object.byte_strings(
         "capabilities",
-        scan_uncovered.then_some(b"scan-uncovered".as_slice()),
+        scan_uncovered
+            .then_some(b"scan-uncovered".as_slice())
+            .into_iter()
+            .chain((matches!(op, "find" | "grep") && !json).then_some(b"raw-output-v1".as_slice())),
     );
     if let Some(grep) = &grep {
         grep.encode(&mut object);
@@ -391,7 +423,10 @@ fn query(
     object.end();
     protocol::parse_request(&request).ok()?;
     request.push(b'\n');
-    let mut reader = match connect(
+    let Connected {
+        mut reader,
+        raw_output,
+    } = match connect(
         &endpoint,
         &index,
         matches!(op, "search" | "find" | "grep"),
@@ -413,6 +448,7 @@ fn query(
     let result = (|| -> io::Result<Exit> {
         reader.get_mut().write_all(&request)?;
         let mut line = Vec::new();
+        let mut payload = Vec::new();
         let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
         let mut err = io::stderr().lock();
         loop {
@@ -474,9 +510,10 @@ fn query(
                     if matches!(op, "find" | "grep" | "index" | "roots-remove") =>
                 {
                     if !json {
-                        let data = bytes(&value, "bytes", "bytes_base64")?;
+                        read_payload(&mut reader, &value, raw_output, &mut payload)?;
+                        let data = &payload;
                         if field_text(&value, "event") == Some("stdout") {
-                            write(&mut out, &data, &mut output_failure)?;
+                            write(&mut out, data, &mut output_failure)?;
                             if first_frame
                                 || grep_tty
                                 || matches!(value.field("flush"), Some(Value::Bool(true)))
@@ -491,9 +528,9 @@ fn query(
                             if op == "grep" {
                                 // Local grep diagnostics ignore a closed
                                 // stderr.
-                                let _ = err.write_all(&data).and_then(|()| err.flush());
+                                let _ = err.write_all(data).and_then(|()| err.flush());
                             } else {
-                                err.write_all(&data)?;
+                                err.write_all(data)?;
                                 err.flush()?;
                             }
                         }
@@ -633,4 +670,52 @@ fn query(
 
 fn write(writer: &mut impl Write, bytes: &[u8], failed: &mut bool) -> io::Result<()> {
     writer.write_all(bytes).inspect_err(|_| *failed = true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A truncated or unnegotiated raw frame must never turn its prefix into a
+    // successful query or make the client allocate an advertised giant length.
+    #[test]
+    fn output_payloads_are_bounded_negotiated_and_exact() -> io::Result<()> {
+        let mut payload = Vec::new();
+        for (header, negotiated, input, expected) in [
+            (
+                br#"{"length":3}"#.as_slice(),
+                true,
+                b"a\0\xff".as_slice(),
+                None,
+            ),
+            (
+                br#"{"length":3}"#,
+                true,
+                b"a",
+                Some(io::ErrorKind::UnexpectedEof),
+            ),
+            (
+                br#"{"length":3}"#,
+                false,
+                b"abc",
+                Some(io::ErrorKind::Other),
+            ),
+            (
+                br#"{"length":65537}"#,
+                true,
+                b"",
+                Some(io::ErrorKind::Other),
+            ),
+            (br#"{"length":true}"#, true, b"", Some(io::ErrorKind::Other)),
+            (br#"{"bytes_base64":"YQD/"}"#, false, b"", None),
+        ] {
+            let value = protocol::parse_object(header).ok_or_else(|| io::Error::other("header"))?;
+            let result = read_payload(&mut &input[..], &value, negotiated, &mut payload);
+            assert_eq!(result.err().map(|error| error.kind()), expected);
+            if expected.is_none() {
+                assert_eq!(payload, b"a\0\xff");
+            }
+        }
+        Ok(())
+    }
 }

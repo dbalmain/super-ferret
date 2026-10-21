@@ -1828,3 +1828,77 @@ fn grep_falls_back_when_a_peer_closes_before_hello_or_refuses_it() {
         peer.join().unwrap();
     }
 }
+
+#[test]
+fn a_client_accepts_legacy_frames_when_raw_output_is_not_advertised() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let (_, hello) = tree.connect();
+    let socket = tree.socket();
+    {
+        let mut children = tree.children.lock().unwrap();
+        children[0].kill().unwrap();
+        children[0].wait().unwrap();
+    }
+    fs::remove_file(&socket).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(BOUND)).unwrap();
+        stream
+            .write_all(hello.replace(",\"raw-output-v1\"", "").as_bytes())
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let request = line(&mut reader);
+        assert!(request.contains("\"op\":\"grep\""));
+        reader.get_mut().write_all(b"{\"id\":\"grep\",\"event\":\"begin\"}\n{\"id\":\"grep\",\"event\":\"stdout\",\"bytes_base64\":\"bGVnYWN5Cg==\"}\n{\"id\":\"grep\",\"event\":\"end\",\"exit\":0}\n").unwrap();
+    });
+    let output = tree.run(&["grep", "main", "src"]);
+    server.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"legacy\n");
+    assert!(output.stderr.is_empty());
+    fs::remove_file(socket).unwrap();
+}
+
+// Opt-in is per request, including when a legacy request follows a raw one
+// on the same connection. Existing clients must never receive raw payloads.
+#[test]
+fn raw_output_negotiation_is_per_request_and_preserves_legacy_peers() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let (mut peer, hello) = tree.connect();
+    assert!(hello.contains("raw-output-v1"));
+    for raw in [false, true, false] {
+        let capabilities = if raw { r#"["raw-output-v1"]"# } else { "[]" };
+        let request = format!(
+            r#"{{"id":"g","op":"grep","args":["main","src"],"cwd":"{}","capabilities":{},"grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[]}}}}"#,
+            tree.base.display(),
+            capabilities
+        );
+        peer.get_mut()
+            .write_all(format!("{request}\n").as_bytes())
+            .unwrap();
+        assert!(line(&mut peer).contains("\"event\":\"begin\""));
+        let header = line(&mut peer);
+        assert!(header.contains("\"event\":\"stdout\""));
+        if raw {
+            let expected = b"src/main.rs:fn main() {}\n";
+            assert_eq!(number(&header, "length"), Some(expected.len() as u32));
+            let mut bytes = vec![0; expected.len()];
+            peer.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+        } else {
+            assert!(header.contains("\"bytes_base64\":"));
+            assert!(!header.contains("\"length\":"));
+        }
+        loop {
+            let next = line(&mut peer);
+            if next.contains("\"event\":\"end\"") {
+                assert_eq!(number(&next, "exit"), Some(0));
+                break;
+            }
+        }
+    }
+}

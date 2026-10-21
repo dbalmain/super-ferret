@@ -1129,7 +1129,8 @@ Hyperfine `--shell=bash`, ten warmups / 30 runs: local 14.77 ms versus daemon
 1.57 MB. This exceeds the 10% framing budget. Proposed follow-up: negotiate
 length-delimited raw stdout/stderr payloads, preserving stream order, explicit
 flush boundaries, cancellation and native end status; JSON remains the control
-codec. The current slice retains find's base64 JSON frames.
+codec. Round 1 retained find's base64 JSON frames; Round 2 implements the negotiated
+raw payload codec described in S1B.md.
 
 ## Answered decisions (checked 2026-10-16)
 
@@ -1141,3 +1142,14 @@ with this document’s earlier D47 recommendation; its provisional status was
 stale, not its visibility choice. D75 D replaces the earlier raw-input A:
 strip initial UTF-8 BOMs everywhere; retain the approved UTF-16 difference.
 No new unresolved product decision was needed for these corrections.
+
+**Round 2 raw frames (2026-10-21):** negotiated `raw-output-v1` keeps JSON
+headers/control and sends exact-length stdout/stderr bytes. Native find shares
+the codec; JSON find keeps its public envelopes. The same dense profile on a
+frozen 62-source-file snapshot (30,558 lines / 1,576,029 output bytes), warm
+Hyperfine `-N`, ten warmups / 30 runs at one search thread: daemon **7.77 ms**
+versus local **14.94 ms** at 64k names. Small-index control: **7.78 versus
+7.41 ms**, only **4.9% overhead**. Startup at the default 16 threads, 100 runs:
+64k **2.69 ms**, 251k **2.66 ms**, local 64k 10.86 ms, rg 3.52 ms. The initial
+backstop completed and the writer was idle before measurement. This resolves
+Round 1's dense-output framing limitation.

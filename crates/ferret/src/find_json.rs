@@ -340,10 +340,16 @@ fn frame(
         .str("event", event)
         .int("record", record)
         .int("part", part)
-        .bool("last", last)
-        .str("bytes_base64", &base64(bytes));
-    object.end();
-    destination.send(&line)
+        .bool("last", last);
+    if destination.raw_output() {
+        object.int("length", bytes.len() as u64);
+        object.end();
+        destination.send_payload(&line, bytes)
+    } else {
+        object.str("bytes_base64", &base64(bytes));
+        object.end();
+        destination.send(&line)
+    }
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -419,4 +425,88 @@ pub(crate) fn diagnostic_to(
     }
     object.end();
     destination.send(&line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    // Raw payloads may contain NUL, invalid UTF-8 and complete fake envelopes.
+    // Neither frame batching nor the next header may interpret those bytes.
+    #[test]
+    fn socket_frames_preserve_parts_and_arbitrary_bytes_with_both_codecs() -> io::Result<()> {
+        let payload = b"\xff\0\n{\"event\":\"end\"}\n".repeat(4000);
+        for raw in [false, true] {
+            let (writer, reader) = UnixStream::pair()?;
+            reader.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let destination =
+                Destination::socket(writer, Arc::new(AtomicBool::new(false)))?.with_raw_output(raw);
+            std::thread::scope(|scope| -> io::Result<()> {
+                let send = scope.spawn(|| -> io::Result<()> {
+                    emit_parts(&destination, "g", "stdout", 7, &payload)?;
+                    emit_parts(&destination, "g", "stderr", 8, b"diagnostic\n")?;
+                    emit_to(&destination, "g", "end", |o| {
+                        o.int("exit", 2);
+                    })
+                });
+                let mut reader = BufReader::new(reader);
+                let mut received = Vec::new();
+                for (part, chunk) in payload.chunks(PART).enumerate() {
+                    let mut line = Vec::new();
+                    reader.read_until(b'\n', &mut line)?;
+                    let value = crate::protocol::parse_object(&line)
+                        .ok_or_else(|| io::Error::other("header"))?;
+                    assert_eq!(
+                        value
+                            .field("record")
+                            .and_then(crate::protocol::Value::number),
+                        Some(7)
+                    );
+                    assert_eq!(
+                        value.field("part").and_then(crate::protocol::Value::number),
+                        Some(part as u64)
+                    );
+                    let bytes = if raw {
+                        assert_eq!(
+                            value
+                                .field("length")
+                                .and_then(crate::protocol::Value::number),
+                            Some(chunk.len() as u64)
+                        );
+                        let mut bytes = vec![0; chunk.len()];
+                        reader.read_exact(&mut bytes)?;
+                        bytes
+                    } else {
+                        let encoded = value
+                            .field("bytes_base64")
+                            .and_then(crate::protocol::Value::text)
+                            .ok_or_else(|| io::Error::other("base64"))?;
+                        crate::protocol::base64_decode(encoded)
+                            .ok_or_else(|| io::Error::other("base64"))?
+                    };
+                    received.extend(bytes);
+                }
+                assert_eq!(received, payload);
+                let mut line = String::new();
+                reader.read_line(&mut line)?;
+                assert!(line.contains("\"event\":\"stderr\""));
+                if raw {
+                    let mut bytes = [0; 11];
+                    reader.read_exact(&mut bytes)?;
+                    assert_eq!(&bytes, b"diagnostic\n");
+                }
+                line.clear();
+                reader.read_line(&mut line)?;
+                assert!(line.contains("\"exit\":2"));
+                send.join()
+                    .map_err(|_| io::Error::other("sender panicked"))??;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 }

@@ -256,6 +256,18 @@ status and timings. A parse or runtime failure still gets a begin/end block,
 with null generation when no view was selected. Never manufacture end after
 transport failure.
 
+Socket hosts advertise optional `raw-output-v1`. A native find or grep client
+opts in through the request capability of the same name. Each stdout/stderr
+header retains `id`, `event`, `record`, `part` and `last`, replacing the base64
+field with `length` (at most 65,536). Exactly that many raw bytes follow the
+header's LF; the next JSON envelope begins immediately afterward, without an
+extra separator. Header and payload share the destination lock and stream
+sequence. Control, end and explicit flush envelopes remain JSON. A truncated
+payload is transport failure, and clients reject oversized/unnegotiated lengths.
+Peers without the capability retain base64 JSON. Public JSON find and batch
+stdout retain their existing JSON-only format. Existing build-mismatch owner
+replacement still applies independently of this optional codec negotiation.
+
 D111 adds `op: "grep"` with ordinary grep argv and an absolute `cwd`.
 The required `grep` object carries explicit boolean `color`, `heading`,
 `numbers` and `tty`, a positive `threads` count, and `pattern_files`: byte

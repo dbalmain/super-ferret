@@ -201,7 +201,16 @@ fn full_capture_budget_still_lets_the_streamer_finish() {
     let mut jobs = (0..3).map(|n| Job::Checked(format!("file-{n}").into(), NameId(n), n));
     run(
         &mut host,
-        |_| jobs.next().map(|job| (0, job)),
+        |_| {
+            let job = jobs.next()?;
+            // At limit 64, two waiters can occupy both read admissions and
+            // prevent the owner they wait for from ever starting. Admit the
+            // owner before offering jobs that wait for its publication.
+            if !matches!(job, Job::Checked(_, NameId(0), _)) {
+                started.wait();
+            }
+            Some((0, job))
+        },
         &fork,
         None,
         3,

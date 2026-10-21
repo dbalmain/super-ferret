@@ -6,7 +6,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-const FLUSH_AT: usize = 64 * 1024;
+pub(crate) const MAX_RAW_BYTES: usize = 64 * 1024;
+const FLUSH_AT: usize = MAX_RAW_BYTES;
 
 #[derive(Default)]
 struct Buffer {
@@ -14,13 +15,18 @@ struct Buffer {
     saw_data: bool,
 }
 impl Buffer {
-    fn send(
+    fn send(&mut self, line: &[u8], write: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+        self.send_payload(line, &[], write)
+    }
+    fn send_payload(
         &mut self,
         line: &[u8],
+        payload: &[u8],
         mut write: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         self.pending.extend_from_slice(line);
         self.pending.push(b'\n');
+        self.pending.extend_from_slice(payload);
         let data = contains(line, b"\"event\":\"row\"") || contains(line, b"\"event\":\"stdout\"");
         let first_data = data && !self.saw_data;
         if data {
@@ -50,6 +56,7 @@ pub(crate) enum Destination {
     Socket {
         writer: Arc<Mutex<SocketWriter>>,
         cancelled: Arc<AtomicBool>,
+        raw_output: bool,
     },
 }
 pub(crate) struct SocketWriter {
@@ -75,7 +82,36 @@ impl Destination {
                 buffer: Buffer::default(),
             })),
             cancelled,
+            raw_output: false,
         })
+    }
+    pub(crate) fn with_raw_output(mut self, enabled: bool) -> Self {
+        if let Self::Socket { raw_output, .. } = &mut self {
+            *raw_output = enabled;
+        }
+        self
+    }
+    pub(crate) fn raw_output(&self) -> bool {
+        matches!(
+            self,
+            Self::Socket {
+                raw_output: true,
+                ..
+            }
+        )
+    }
+    /// Header and exact-length payload share the socket lock and batch. Only
+    /// the JSON header determines flush boundaries; arbitrary payload bytes
+    /// must never be inspected as envelopes or interleaved with another frame.
+    pub(crate) fn send_payload(&self, header: &[u8], payload: &[u8]) -> io::Result<()> {
+        let Self::Socket { writer, .. } = self else {
+            return Err(io::Error::other("raw output requires a socket"));
+        };
+        let mut writer = writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let SocketWriter { stream, buffer } = &mut *writer;
+        buffer.send_payload(header, payload, |bytes| stream.write_all(bytes))
     }
     pub(crate) fn cancellation(&self) -> Option<&AtomicBool> {
         match self {

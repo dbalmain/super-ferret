@@ -354,7 +354,13 @@ fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
             .int("pid", std::process::id())
             .byte_strings(
                 "capabilities",
-                [b"query-only".as_slice(), b"cancel", b"drain", b"writer"],
+                [
+                    b"query-only".as_slice(),
+                    b"cancel",
+                    b"drain",
+                    b"writer",
+                    b"raw-output-v1",
+                ],
             )
             .object("limits", |o| {
                 o.int("line", protocol::MAX_LINE_BYTES as u64)
@@ -631,8 +637,15 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
             } else {
                 None
             };
+            let output = destination.clone().with_raw_output(
+                matches!(request.op, Op::Find | Op::Grep)
+                    && request
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "raw-output-v1"),
+            );
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute(host, &request, &destination)
+                execute(host, &request, &output)
             }));
             match result {
                 Ok(result) => result?,
