@@ -556,9 +556,11 @@ all roots; with paths it adds/refreshes those roots. Roots-remove is a D34 barri
 The compatible hello advertises `writer` alongside the read-only query capability.
 Replies use begin, bounded stdout/stderr parts, a byte-valued originating-host log
 record, and end, after checked publication and watch adoption. Sending commits
-the client to that command: transport failure never replays it. Index does not
-spawn a host when none is running. `FERRET_NO_DAEMON` preserves direct indexing;
-a retained-lock conflict fails promptly with owner/status advice.
+the client to that command: transport failure never replays it. A direct index
+or roots remove spawns a host only after that call has returned the writer lock,
+never before and never when one already ran the command. `FERRET_NO_DAEMON`
+preserves direct indexing without a spawn; a retained-lock conflict fails
+promptly with owner/status advice.
 
 ### Watches and reconciliation
 
@@ -708,7 +710,9 @@ spawning one. Without a host, status opens the local checked catalog and sets
 `host_running:false`; unavailable freshness history and watch coverage are null,
 not a claim of coverage. `stats --json` uses the same selected pin and adds the
 human census (including raw/unknown counts, histogram bins, extensions, content,
-hard-link and duplicate state) and D54 storage/planner counters.
+hard-link and duplicate state) and D54 storage/planner counters. Text `stats`
+asks a running daemon for that same pin and does not spawn one; without a
+daemon it reads the published catalog locally.
 
 | State | JSON fields and types |
 | --- | --- |

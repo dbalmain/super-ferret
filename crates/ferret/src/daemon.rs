@@ -10,13 +10,14 @@ mod client;
 mod endpoint;
 mod writer;
 pub(crate) use client::{
-    daemon_stats as stats_json, daemon_status as status, find, grep, search,
-    writer_command as write,
+    daemon_stats as stats_json, daemon_stats_text as stats_text, daemon_status as status, find,
+    grep, search, spawn_resident, writer_command as write,
 };
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufReader, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -676,6 +677,36 @@ fn runtime_status(request: &Request) -> u8 {
         _ => 3,
     }
 }
+/// Human stats for `--stats-text`. The census is the pin's. The log budget
+/// is the resident writer's, read after the pin: a commit in between can
+/// move that line ahead of the census. The optional path is the client's
+/// index display, so the header matches a local `ferret stats`.
+fn stats_report(host: &Host, request: &Request, session: &QuerySession) -> Option<String> {
+    if request
+        .args
+        .first()
+        .is_none_or(|arg| arg.as_slice() != b"--stats-text")
+    {
+        return None;
+    }
+    let usage = {
+        let loaded = host
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Loaded::Ready(engine) = &*loaded else {
+            return None;
+        };
+        engine.log_budget()?
+    };
+    let shown = request
+        .args
+        .get(1)
+        .map(|bytes| PathBuf::from(OsStr::from_bytes(bytes)))
+        .unwrap_or_else(|| host.index.clone());
+    Some(crate::stats::text(&shown, &usage, session.catalog()))
+}
+
 fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
     if matches!(request.op, Op::Index | Op::RootsRemove) {
         return writer::execute(host, request, destination);
@@ -749,32 +780,42 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
                 host.workers,
             )
         }
-        Op::Status | Op::Reload => emit_to(
-            destination,
-            &request.id,
-            if request.op == Op::Status {
-                "status"
+        Op::Status | Op::Reload => {
+            let report = if request.op == Op::Status {
+                stats_report(host, request, &session)
             } else {
-                "reload"
-            },
-            |o| {
-                generation(o, Some(session.generation()));
-                o.int("engine_opens", Engine::open_count())
-                    .int("bytes", session.resident_bytes());
-                writer::fields(host, o);
-                crate::status::resources(o);
-                crate::status::catalog_fields(o, &session);
-                let engine = host
-                    .engine
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Loaded::Ready(engine) = &*engine {
-                    o.integers("pinned_internal_epochs", engine.pinned_epochs());
-                }
-                if request.args == [b"--stats".to_vec()] {
-                    crate::stats::json_fields(o, &session);
-                }
-            },
-        ),
+                None
+            };
+            emit_to(
+                destination,
+                &request.id,
+                if request.op == Op::Status {
+                    "status"
+                } else {
+                    "reload"
+                },
+                |o| {
+                    generation(o, Some(session.generation()));
+                    o.int("engine_opens", Engine::open_count())
+                        .int("bytes", session.resident_bytes());
+                    writer::fields(host, o);
+                    crate::status::resources(o);
+                    crate::status::catalog_fields(o, &session);
+                    let engine = host
+                        .engine
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Loaded::Ready(engine) = &*engine {
+                        o.integers("pinned_internal_epochs", engine.pinned_epochs());
+                    }
+                    if request.args == [b"--stats".to_vec()] {
+                        crate::stats::json_fields(o, &session);
+                    }
+                    if let Some(report) = &report {
+                        o.str("report", report);
+                    }
+                },
+            )
+        }
     }
 }

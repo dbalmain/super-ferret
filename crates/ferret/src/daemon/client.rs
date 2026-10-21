@@ -115,6 +115,28 @@ pub(crate) fn daemon_stats(context: &Context) -> Exit {
     .unwrap_or_else(|| crate::status::local(context, true))
 }
 
+/// Text `ferret stats`. Asks a running daemon and does not start one.
+/// The report is the daemon pin's census; no daemon reads the published
+/// catalog locally, same as `stats --json`'s fallback.
+pub(crate) fn daemon_stats_text(context: &Context) -> Exit {
+    query(
+        &context.index,
+        &[
+            OsString::from("--stats-text"),
+            context.index.as_os_str().to_owned(),
+        ],
+        "status",
+        false,
+        Options {
+            text_report: true,
+            ..Options::default()
+        },
+        SystemTime::now(),
+        None,
+    )
+    .unwrap_or_else(|| crate::stats::run(context))
+}
+
 fn spawn(endpoint: &Endpoint, index: &Path) -> io::Result<()> {
     let binary = std::env::var_os("FERRET_DAEMON_BIN")
         .map(PathBuf::from)
@@ -135,6 +157,26 @@ fn spawn(endpoint: &Endpoint, index: &Path) -> io::Result<()> {
     });
     Ok(())
 }
+
+/// Starts ferretd for `index` and returns without waiting. The caller must
+/// already have dropped the catalog writer lock: this is the same `spawn` a
+/// search uses on a miss, and a spawn that overlaps that lock races the new
+/// process for it. `FERRET_NO_DAEMON`, or an endpoint that cannot be opened,
+/// does not spawn. A spawn error is ignored so a finished index still
+/// reports its own outcome.
+pub(crate) fn spawn_resident(index: &Path) {
+    if std::env::var_os("FERRET_NO_DAEMON").is_some() {
+        return;
+    }
+    let Ok(index) = fs::canonicalize(index) else {
+        return;
+    };
+    let Ok(endpoint) = Endpoint::open(&index) else {
+        return;
+    };
+    let _ = spawn(&endpoint, &index);
+}
+
 fn field_text<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
     value.field(field)?.text()
 }
@@ -394,6 +436,8 @@ struct Options {
     limit: Option<u64>,
     scan_uncovered: bool,
     grep: Option<crate::protocol::GrepOptions>,
+    /// Print the status event's `report` text instead of its JSON line.
+    text_report: bool,
 }
 fn query(
     index: &Path,
@@ -408,6 +452,7 @@ fn query(
         limit,
         scan_uncovered,
         grep,
+        text_report,
     } = options;
     let started = Instant::now();
     let grep_tty = grep.as_ref().is_some_and(|options| options.tty);
@@ -499,7 +544,13 @@ fn query(
                     }
                 }
                 Some("status") if op == "status" => {
-                    write(&mut out, &line, &mut output_failure)?;
+                    if text_report {
+                        let report = field_text(&value, "report")
+                            .ok_or_else(|| io::Error::other("missing stats report"))?;
+                        write(&mut out, report.as_bytes(), &mut output_failure)?;
+                    } else {
+                        write(&mut out, &line, &mut output_failure)?;
+                    }
                     out.flush().inspect_err(|_| output_failure = true)?;
                     return Ok(Exit::Ok);
                 }

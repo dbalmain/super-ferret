@@ -2,11 +2,14 @@
 //! what it holds (ROADMAP S1): entries by type, depth and name length,
 //! content states, file sizes, extensions, hard links and duplicate
 //! content. Reads every section, so it costs what the file costs to read.
+//! A running daemon answers from its selected pin and is not started by
+//! this command; otherwise the published catalog is read locally.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
-use ferret_catalog::{Catalog, ContentState, Kind, NameId, Target};
+use ferret_catalog::{BudgetUsage, Catalog, ContentState, Kind, NameId, Target};
 
 use crate::cli::{Context, Exit, error};
 use crate::index::bytes;
@@ -39,8 +42,14 @@ pub fn run(context: &Context) -> Exit {
         error(&e.to_string());
         return Exit::Error;
     }
+    crate::cli::print("stats", text(&context.index, &usage, &catalog).as_bytes())
+}
+
+/// The human census. `index` is the path printed in the header, which for a
+/// daemon answer is the client's path rather than the daemon's canonical one.
+pub(crate) fn text(index: &Path, usage: &BudgetUsage, catalog: &Catalog) -> String {
     let mut text = String::new();
-    let _ = writeln!(text, "index {}", context.index.display());
+    let _ = writeln!(text, "index {}", index.display());
     let _ = writeln!(
         text,
         "log {} bytes / 67108864, {} records / 500000, {} transactions",
@@ -56,8 +65,8 @@ pub fn run(context: &Context) -> Exit {
         usage.dead_inodes,
         usage.dead_names
     );
-    report(&catalog, &mut Census::of(&catalog), &mut text);
-    crate::cli::print("stats", text.as_bytes())
+    report(catalog, &mut Census::of(catalog), &mut text);
+    text
 }
 
 /// Buckets `0`, `1`, `2–3`, `4–7`, …: bucket `i > 0` holds `2^(i-1)` up to
