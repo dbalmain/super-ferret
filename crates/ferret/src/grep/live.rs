@@ -84,21 +84,23 @@ impl Anchors {
     /// Resolves coverage before either the engine or the daemon is opened.
     pub fn routing(index: Option<&Path>, inputs: &[Input]) -> Result<Self, String> {
         let index = index_path(index)?;
-        let paths = Catalog::open(&index)
-            .map_err(|e| e.to_string())?
-            .map(|catalog| catalog.configured_paths())
+        let catalog = Catalog::open(&index).map_err(|e| e.to_string())?;
+        let paths = catalog
+            .as_ref()
+            .map(Catalog::configured_paths)
             .transpose()
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
         // The catalog resolves an operand by its spelling, so a canonical
         // match alone would claim an alias (`alias -> root`) the catalog
         // cannot name. Covered needs both.
-        let spellings = Spellings(
-            paths
+        let spellings = Spellings {
+            roots: paths
                 .iter()
                 .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
                 .collect(),
-        );
+            crossed: std::cell::Cell::new(false),
+        };
         let mut anchors = Self::from_paths(&index, "".into(), paths)?;
         anchors.fallback = true;
         let mut uncovered = Vec::new();
@@ -106,7 +108,7 @@ impl Anchors {
             if let Input::Directory(path) = input {
                 let real = fs::canonicalize(path).map_err(|e| e.to_string())?;
                 if !anchors.roots.iter().any(|root| real.starts_with(root))
-                    || !spellings.resolves(path)
+                    || !spellings.resolves(path, catalog.as_ref())?
                 {
                     uncovered.push(path.clone());
                 }
@@ -271,38 +273,66 @@ impl Anchors {
 }
 
 /// Stored root spellings over the live filesystem: the catalog's namespace
-/// as far as routing needs it, without loading names. [`resolve_in`] walks it
-/// exactly as it walks the catalog, so the two agree on which spellings
-/// resolve while the snapshot's symlinks match the disk.
+/// for spellings that cross no symlink inside a root, without loading names.
+/// [`resolve_in`] walks it as it walks the catalog. A symlink inside a root
+/// may sit in an opaque (ignored) directory the catalog stops at, or may
+/// have changed since the crawl, so a spelling that crosses one is resolved
+/// in the catalog itself.
 ///
 /// [`resolve_in`]: ferret_query::find::resolve_in
-struct Spellings(Vec<PathBuf>);
+struct Spellings {
+    roots: Vec<PathBuf>,
+    /// Set when a walk met a symlink inside a root.
+    crossed: std::cell::Cell<bool>,
+}
 
 impl Spellings {
-    /// Whether the catalog can resolve `path`'s spelling, as a start
-    /// resolves: following a final symlink, else the link itself. A missing
-    /// child inside a root, or any other fault, still belongs to the
-    /// snapshot, which reports it.
-    fn resolves(&self, path: &Path) -> bool {
-        [true, false]
-            .into_iter()
-            .any(|follow| !matches!(ferret_query::find::resolve_in(self, path, follow), Ok(None)))
+    /// Whether the catalog can resolve `path`'s spelling. Spellings that
+    /// cross an in-root symlink load the catalog's name sections (never
+    /// content) and ask it.
+    fn resolves(&self, path: &Path, catalog: Option<&Catalog>) -> Result<bool, String> {
+        self.crossed.set(false);
+        let resolves = resolvable(self, path);
+        match catalog {
+            Some(catalog) if self.crossed.get() => {
+                catalog
+                    .load(ferret_query::find::CatalogSource::sections())
+                    .map_err(|e| e.to_string())?;
+                Ok(resolvable(catalog, path))
+            }
+            _ => Ok(resolves),
+        }
     }
+}
+
+/// Whether a start spelled `path` resolves, as a start does: following a
+/// final symlink, else the link itself. A missing child inside the
+/// namespace, or any other fault, still belongs to the snapshot, which
+/// reports it.
+fn resolvable(namespace: &impl ferret_query::find::Namespace, path: &Path) -> bool {
+    [true, false].into_iter().any(|follow| {
+        !matches!(
+            ferret_query::find::resolve_in(namespace, path, follow),
+            Ok(None)
+        )
+    })
 }
 
 impl ferret_query::find::Namespace for Spellings {
     type Node = (PathBuf, fs::FileType);
     fn resolve(&self, path: &Path) -> Option<(Self::Node, bool)> {
-        if !self.0.iter().any(|root| path.starts_with(root)) {
+        if !self.roots.iter().any(|root| path.starts_with(root)) {
             return None;
         }
         let kind = fs::symlink_metadata(path).ok()?.file_type();
         Some(((path.to_owned(), kind), false))
     }
     fn link_target(&self, (path, kind): &Self::Node) -> Option<PathBuf> {
-        kind.is_symlink()
-            .then(|| fs::read_link(path).ok())
-            .flatten()
+        if !kind.is_symlink() {
+            return None;
+        }
+        self.crossed.set(true);
+        fs::read_link(path).ok()
     }
     fn is_directory(&self, (_, kind): &Self::Node) -> bool {
         kind.is_dir()

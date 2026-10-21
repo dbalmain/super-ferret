@@ -5,6 +5,7 @@ mod fixture;
 
 use fixture::{Fixture, sorted};
 use std::fs;
+use std::path::PathBuf;
 
 #[test]
 fn nested_gitignore_negation_directory_anchor_and_double_star() {
@@ -515,4 +516,72 @@ fn parent_components_after_a_symlink_resolve_as_the_catalog_does() {
         .output()
         .unwrap();
     assert_eq!(find.stdout, b"root/link/../../old\n", "{find:?}");
+    // Retargeted after the crawl to the same directory through an outside
+    // alias: the catalog's recorded link still decides.
+    std::os::unix::fs::symlink("root", f.tree.join("alias")).unwrap();
+    fs::remove_file(f.tree.join("root/link")).unwrap();
+    std::os::unix::fs::symlink(f.tree.join("alias/deep/sub"), f.tree.join("root/link")).unwrap();
+    let output = f.ferret(&f.tree, &["-l", "hit", "root/link/../.."]);
+    assert_eq!(output.stdout, b"root/link/../../old\n", "{output:?}");
+}
+
+// A symlink inside an opaque (ferret-ignored) directory is not in the
+// catalog, which resolves the spelling to that opaque boundary and uses its
+// own live fallback. Following the disk link out through an alias, and so
+// routing to rg's policy, would apply `.gitignore` and lose `drop`.
+#[test]
+fn symlink_inside_an_opaque_directory_resolves_as_the_catalog_does() {
+    let f = Fixture::new("opaque-link");
+    fs::write(f.base.join("home/config/ferret/ignore"), b"target/\n").unwrap();
+    f.write("root/.git/HEAD", b"ref: refs/heads/main\n");
+    f.write("root/.gitignore", b"drop\n");
+    f.write("root/drop", b"hit\n");
+    f.write("root/deep/sub/.keep", b"");
+    fs::create_dir(f.tree.join("root/target")).unwrap();
+    std::os::unix::fs::symlink("root", f.tree.join("alias")).unwrap();
+    std::os::unix::fs::symlink(
+        f.tree.join("alias/deep/sub"),
+        f.tree.join("root/target/link"),
+    )
+    .unwrap();
+    f.index(&f.tree.join("root"));
+    let output = f.ferret(&f.tree, &["-l", "hit", "root/target/link/../.."]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"root/target/link/../../drop\n");
+}
+
+// Rg follows a symlinked `.git`: one that does not resolve (a loop, or a
+// dangling link) starts no work tree, so neither `.gitignore` nor the global
+// excludes apply; one to a file or directory does, and through a directory
+// link its `info/exclude` applies too.
+#[test]
+fn symlinked_git_counts_only_when_it_resolves() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new("git-symlinks");
+    let global = f.base.join("home/config/git/ignore");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(&global, b"global\n").unwrap();
+    fs::create_dir_all(f.base.join("gitdir/info")).unwrap();
+    fs::write(f.base.join("gitdir/info/exclude"), b"excluded\n").unwrap();
+    fs::write(f.base.join("junk"), b"not a gitdir line\n").unwrap();
+    for (case, target) in [
+        ("loop", PathBuf::from(".git")),
+        ("dangling", PathBuf::from("nowhere")),
+        ("file", f.base.join("junk")),
+        ("directory", f.base.join("gitdir")),
+    ] {
+        f.write(&format!("{case}/.gitignore"), b"local\n");
+        for path in ["keep", "local", "global", "excluded"] {
+            f.write(&format!("{case}/{path}"), b"hit\n");
+        }
+        symlink(target, f.tree.join(case).join(".git")).unwrap();
+        f.compare(&f.tree.join(case), &["-l", "hit", "."], true);
+    }
+    f.compare(&f.tree, &["-l", "hit", "."], true);
+    let lone = f.ferret(&f.tree.join("loop"), &["-l", "hit", "."]);
+    assert_eq!(
+        sorted(&lone.stdout),
+        ["./excluded", "./global", "./keep", "./local"]
+    );
 }

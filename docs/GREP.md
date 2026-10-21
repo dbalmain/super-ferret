@@ -44,10 +44,14 @@ data. Incompatible indexes exit 2 with reindexing advice. An absent index or
 uncovered directory selects an in-process live search, without opening the
 content index or contacting the daemon. An operand is covered only when its
 canonical path lies under a configured root and the catalog's resolver can
-resolve its spelling: routing walks the stored root spellings over the live
-filesystem with the same resolver (`find::resolve_in`), following symlinks
-inside a root before a later `..`. So an alias into a root (`alias -> root`)
-is searched live, while `root/link/../..` stays a snapshot request. Mixed covered/uncovered requests stay
+resolve its spelling. Routing walks the stored root spellings over the live
+filesystem with the same resolver (`find::resolve_in`), without loading
+names; a spelling that crosses a symlink inside a root (which may sit in an
+opaque directory the catalog stops at, or have changed since the crawl) is
+resolved in the catalog itself, loading its name and link sections but never
+content. So an alias into a root (`alias -> root`) is searched live, while
+`root/link/../..` and a link inside an ignored `target/` stay snapshot
+requests. Mixed covered/uncovered requests stay
 local: each covered operand uses the snapshot, each uncovered operand walks
 live, in operand order. Covered-only requests retain daemon routing.
 
@@ -56,8 +60,10 @@ The D112 fallback reads `.gitignore` from the work-tree top down,
 `.ignore`, and `.rgignore`, in increasing precedence. It applies no ferret
 ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
 read `core.excludesFile`. As in rg 15.2.0, the three git sources apply only
-in directories inside a work tree: any ancestor holding a `.git` entry counts,
-so a stray `.git` above a scratch directory makes it a work tree. Ancestor
+in directories inside a work tree: any ancestor holding a `.git` that
+resolves counts (a stray `.git` above a scratch directory makes it a work
+tree); a symlinked `.git` is followed, and one that loops or dangles starts
+none. Ancestor
 `.gitignore` rules stop at a nested work tree's top; ancestor `.ignore` and
 `.rgignore` rules, up to `/`, do not, so naming a subdirectory or a nested
 repository keeps them. A `.git` file whose gitdir has no `commondir` (`git

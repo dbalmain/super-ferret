@@ -386,8 +386,9 @@ pub fn load_policy(
 
 /// Loads rg's git, `.ignore` and `.rgignore` inputs with the crawler's scoped
 /// reads. Ferret ignore files are not consulted; content has no size cap.
-/// As in rg, a `.git` file contributes `info/exclude` only through a
-/// `commondir`. Diagnostics and directory-open failures follow
+/// As in rg, a symlinked `.git` is followed (one that does not resolve
+/// starts no work tree), and a `.git` file contributes `info/exclude` only
+/// through a `commondir`. Diagnostics and directory-open failures follow
 /// [`load_policy`].
 pub fn load_grep_policy(
     path: &Path,
@@ -426,7 +427,7 @@ fn load_query_policy(
     )?;
     let boundaries = BoundaryIndex::default();
     let mut walker = Walker::new(path, &boundaries, visit);
-    walker.common_exclude_only = grep;
+    walker.rg_git = grep;
     let loaded = walker.load_ignores(
         fd.as_fd(),
         |name| {
@@ -881,9 +882,12 @@ struct Walker<'b, F> {
     /// [`DENTS_BYTES`].
     dents: Vec<u8>,
     visit: F,
-    /// Rg's reading of a `.git` file: `info/exclude` applies only through a
-    /// `commondir`, never from a gitdir without one. D13 reads both.
-    common_exclude_only: bool,
+    /// Rg's reading of `.git`, for grep's policy loads: a symlinked `.git`
+    /// is followed, so one that does not resolve (dangling, or a loop)
+    /// starts no work tree; and a `.git` file's `info/exclude` applies only
+    /// through a `commondir`. D13 opens nothing through a symlinked `.git`,
+    /// counts any `.git` entry, and reads a gitdir's own exclude.
+    rg_git: bool,
 }
 
 /// A worker's `getdents` buffer. 32 KiB holds several hundred entries of
@@ -1128,7 +1132,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             rel: Vec::with_capacity(256),
             dents: Vec::with_capacity(DENTS_BYTES),
             visit,
-            common_exclude_only: false,
+            rg_git: false,
         }
     }
 
@@ -1805,9 +1809,15 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     }
 
     fn probe_git(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
-        match openat(dir, DOT_GIT, child_dir_flags(), Mode::empty()) {
+        let flags = if self.rg_git {
+            root_dir_flags()
+        } else {
+            child_dir_flags()
+        };
+        match openat(dir, DOT_GIT, flags, Mode::empty()) {
             Ok(fd) => GitProbe::Directory(fd),
             Err(Errno::NOENT) => GitProbe::Missing,
+            Err(Errno::LOOP) if self.rg_git => GitProbe::Missing,
             Err(Errno::LOOP) => GitProbe::Present,
             Err(Errno::NOTDIR) => self.probe_git_file(dir, token),
             Err(error) => self.probe_git_failed(dir, error, token),
@@ -1838,7 +1848,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// `.git` is not a directory. `O_NOFOLLOW` so a symlink that appeared
     /// since the listing is not a gitdir file.
     fn probe_git_file(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
-        match openat(dir, DOT_GIT, nofollow_file_flags(), Mode::empty()) {
+        let flags = if self.rg_git {
+            nofollow_file_flags() - OFlags::NOFOLLOW
+        } else {
+            nofollow_file_flags()
+        };
+        match openat(dir, DOT_GIT, flags, Mode::empty()) {
             Ok(fd) => match read_regular(fd) {
                 Ok(Some(bytes)) => GitProbe::File(bytes),
                 Ok(None) => GitProbe::Present,
@@ -1899,7 +1914,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let Some((common, commondir)) = self.common_dir(gitdir, token) else {
             return (None, None);
         };
-        let excluded = commondir.is_some() || !self.common_exclude_only;
+        let excluded = commondir.is_some() || !self.rg_git;
         let (kind, common_path) = match commondir {
             Some(text) => (WorkTreeKind::Linked, gitdir_path.join(text)),
             None if in_work_tree => (WorkTreeKind::Submodule, gitdir_path),
