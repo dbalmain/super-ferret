@@ -6333,3 +6333,77 @@ Options:
 Fact that would change it: trees where over-cap text files are common and
 large enough that every grep reads gigabytes; then a cap configurable per
 root, not a fixed exclusion.
+
+## D114 — A content merge blocks catalog refreshes in the daemon
+
+**Status: open, 2026-10-21.**
+
+Question: once the merge-pacing bug is fixed, should content merges move off
+the daemon's writer thread so that a file edit becomes searchable while a
+merge runs, and should the merge policy stop rewriting a mid-sized segment on
+every few edits?
+
+Evidence (**measured** on a 120k-file synthetic tree, daemon running, a loop
+of one-file edits each followed by a `text:` search; report in the session
+handoff, `stall-diagnosis.md`):
+
+- Normally an edit is searchable in 0.23 s (the watch debounce plus a
+  refresh). One edit in nine took 5.7 s (11.0 s for the first merge).
+- Each edit's content follow writes a one-document segment. The merge policy
+  groups every segment under 5.6 MiB, so every nine edits it rewrites the same
+  5.8 MB, 13.4k-document segment together with nine one-document ones.
+- Watch traffic cancels a merge twice; the third attempt is protected from
+  cancellation (`daemon/writer/content.rs`, so merges cannot starve) and holds
+  `Engine.writer` for its whole run. The refresh that publishes the edit waits
+  behind it.
+- The merge took ~6 s, of which 5.68 s was pacing: every postings read is
+  rounded to a checksummed 4 KiB chunk and charged to the 32 MiB/s limiter
+  each time, so 5.77 MB of input charged ~180 MB. Unpaced: 0.29 s. That is a
+  bug and is being fixed now regardless of this decision ("fix A"); with a
+  throwaway version the worst case fell to 0.49 s.
+- Controls: protection disabled, worst case 0.24 s but 29 consecutive
+  cancelled merges and segments growing 10 → 39 (the starvation the protection
+  prevents); merges suppressed, 0.44 s; content follow suppressed, every edit
+  searchable in 0.22–0.25 s, because an edited file gets a new DocId the
+  content index does not cover and the query verifies its bytes directly. A
+  catalog refresh alone gives a correct, fresh text answer.
+- After fix A a protected merge still blocks refresh for about 0.1 s per MiB of
+  merge input (**estimate**): a merge into a 40 MB segment would be a 4–6 s
+  window. Under a steady edit loop every merge becomes protected after two
+  cancellations.
+
+Options:
+
+- **1 — fix A only.** No further work. Worst case 0.5 s at this merge size;
+  larger merges keep a multi-second window, proportional to merge input.
+- **2 — fix A, then B: merges off the writer thread.** Run `merge_content` on
+  its own thread holding only the content-index mutex and a pinned catalog
+  view; refreshes stay on the writer and proceed beside it; follow skips (try
+  lock) while a merge holds the content index, and uncovered documents are
+  verified directly meanwhile (bounded by the 10,000-document
+  `IndexIncomplete` limit). Watch traffic then never interrupts a merge, so the
+  cancellation counter and the protection go away. Costs a concurrency slice
+  (Sol-class): a second nice-19 thread; closing a publication race in
+  `Engine::select`, which reads the previous pin before taking the write lock
+  and could overwrite a just-published merged content view with a stale one;
+  status reporting two concurrent operations. Merges and refreshes share CPU
+  and limiter tokens. Expected 0.23 s at any merge size (**estimate**, backed
+  by the two controls).
+- **3 — option 2 plus G: small segments merge among themselves.** In the merge
+  policy's `choose`, a group whose top is above `TIER_FLOOR` stops absorbing
+  floor-level segments, so nine one-document segments merge into one ~10 KB
+  segment instead of rewriting the 5.8 MB one. A few lines in `merge.rs`, plus
+  correcting the policy's documented "Lucene's span" rationale. Routine
+  edit-loop merges become milliseconds and write amplification in an edit loop
+  falls by roughly 500× (**estimate**); costs up to ~9 extra small segments per
+  level in steady state, slightly more query fan-out. Once A and B land, G no
+  longer affects latency, only disk writes.
+
+Recommendation: **2**. Fastest and simplest disagree: 1 is the simplest and
+removes about 92% of the measured stall; 2 is the fastest and makes edit
+latency independent of merge size, which is the agent loop's worst case. G is
+worth doing for write amplification but is not needed for latency.
+
+What would change it: a merge-size trace from the daemon on a real tree under
+agent traffic showing merges never much above ~6 MB; then 1 is enough and B
+can wait.
