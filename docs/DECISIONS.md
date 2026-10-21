@@ -6189,6 +6189,10 @@ still applying the parent directories' rules inside it. Checked with rg
 `target/c.log`. Behaviour is pinned by differential tests against the dev
 shell's `FERRET_RG`, not by reading rg's source. A's message fixes land too.
 
+> Dave: I agree with what you said above.
+
+(Confirms that reading, including dropping the 8 MiB cap in the fallback.)
+
 Question: when `ferret grep PATTERN DIR` names a directory that no index
 covers, should it fail as it does today, or search the directory, and with
 which ignore rules?
