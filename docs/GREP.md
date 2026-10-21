@@ -62,13 +62,16 @@ ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
 read `core.excludesFile`. As in rg 15.2.0, the three git sources apply only
 in directories inside a work tree: any ancestor holding a `.git` that
 resolves counts (a stray `.git` above a scratch directory makes it a work
-tree); a symlinked `.git` is followed, and one that loops or dangles starts
-none. Ancestor
+tree); a symlinked `.git` is followed, and one that does not resolve (a loop,
+a dangling link, or a component that cannot be traversed) starts none. An
+execute-only directory still resolves, and its `info/exclude` is read by name.
+Ancestor
 `.gitignore` rules stop at a nested work tree's top; ancestor `.ignore` and
 `.rgignore` rules, up to `/`, do not, so naming a subdirectory or a nested
 repository keeps them. A `.git` file whose gitdir has no `commondir` (`git
 init --separate-git-dir`) contributes no `info/exclude`; through a `commondir`
-the common directory's applies. D13 indexing reads both. An ignore input that
+the common directory's applies, including when that directory is execute-only.
+D13 indexing reads both. An ignore input that
 cannot be read (an unreadable `.ignore`, `.gitignore`, `info/exclude` or
 `.git`, or a gitfile naming no gitdir), in an ancestor or inside the tree, is
 skipped silently and the rules that loaded still apply, as in rg; `--live`
