@@ -791,6 +791,10 @@ until follow catches up; `--scan-uncovered` explicitly permits the larger scan.
 Watch traffic never cancels a merge. Commands, battery pause, drain and shutdown
 still cancel at cooperative checkpoints. Writer teardown cancels and joins the
 merge before releasing the catalog lock, then removes the socket (D110).
+A fatal accept error and a dead accept thread leave through that teardown.
+ECONNABORTED, EINTR, EPROTO, EMFILE, ENFILE, ENOBUFS and ENOMEM are logged
+once per streak and retried; EMFILE and ENFILE pause briefly so a full
+descriptor table cannot spin the listener.
 Content publications check incarnation, high water and monotonic manifest
 sequence under the publication lock, including reader opens; catalog publication
 preserves the latest matching content view under that same lock. Status reports

@@ -554,6 +554,16 @@ fn serve(
             }
         }
     }
+    drop(content_state);
+    // The merge worker is joined. This thread still holds the catalog lock
+    // until it returns. A test can hold that window open (D110).
+    #[cfg(debug_assertions)]
+    if host.stop.load(Ordering::Acquire) {
+        let delay = duration("FERRET_DAEMON_TEST_STOP_DELAY_MS", 0);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
     Ok(())
 }
 fn global_inputs(watch: Option<&Arc<Watch>>, engine: &Engine, context: &crate::cli::Context) {
