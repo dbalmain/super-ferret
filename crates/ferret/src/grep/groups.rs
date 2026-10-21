@@ -429,26 +429,8 @@ fn read_file_policy(
     let cap = (recursive && !plan.traversal.unrestricted && !rg)
         .then(|| ferret_policy::Config::default().size_cap);
     let mut pass = |input: &mut dyn Read, size| {
-        if recursive && !plan.text {
-            // Unrestricted recursion follows rg's initial scan-window
-            // binary gate, including early quiet/name modes. Policy walks
-            // retain D13's indexing sniffer; explicit files bypass both.
-            let probe = if plan.traversal.unrestricted || rg {
-                CHUNK
-            } else {
-                ferret_policy::SNIFF_LEN
-            };
-            let mut buffered = io::BufReader::with_capacity(probe, input);
-            let head = buffered.fill_buf()?;
-            let binary = if plan.traversal.unrestricted || rg {
-                head.contains(&0)
-            } else {
-                ferret_policy::sniff(head) == ferret_policy::Content::Binary
-            };
-            if binary {
-                return Ok(());
-            }
-            each(&mut buffered, size)
+        if recursive {
+            read_content(input, size, plan, rg, each)
         } else {
             each(input, size)
         }
@@ -456,6 +438,54 @@ fn read_file_policy(
     match listed {
         None => engine::reader::direct(path, cap, &mut pass, stopped),
         Some(parent) => engine::reader::listed(parent, path, cap, &mut pass, stopped),
+    }
+}
+
+// The size cap bounds content indexing, not grep. Catalogued oversized files
+// and candidates that grew past the cap use rg's initial binary window.
+fn read_catalogued(
+    read: &mut CheckedReader<'_>,
+    name: NameId,
+    plan: &Plan,
+    each: ferret_query::Consumer<'_>,
+    stopped: &dyn Fn() -> bool,
+    unindexed: bool,
+) -> ReadOutcome {
+    let mut pass = |input: &mut dyn Read, size| {
+        if unindexed || size > ferret_policy::DEFAULT_SIZE_CAP {
+            read_content(input, size, plan, true, each)
+        } else {
+            each(input, size)
+        }
+    };
+    read(name, ReadRequest::Stream(&mut pass, stopped))
+}
+
+fn read_content(
+    input: &mut dyn Read,
+    size: u64,
+    plan: &Plan,
+    rg: bool,
+    each: ferret_query::Consumer<'_>,
+) -> io::Result<()> {
+    if plan.text {
+        return each(input, size);
+    }
+    // Rg recursion probes its first scan window even in quiet/name modes.
+    // D13 --live retains the indexing sniffer instead.
+    let rg = rg || plan.traversal.unrestricted;
+    let probe = if rg { CHUNK } else { ferret_policy::SNIFF_LEN };
+    let mut buffered = io::BufReader::with_capacity(probe, input);
+    let head = buffered.fill_buf()?;
+    let binary = if rg {
+        head.contains(&0)
+    } else {
+        ferret_policy::sniff(head) == ferret_policy::Content::Binary
+    };
+    if binary {
+        Ok(())
+    } else {
+        each(&mut buffered, size)
     }
 }
 
@@ -556,9 +586,9 @@ pub(super) enum Job {
     /// beneath, never through a symlink.
     Listed(PathBuf, PathBuf, engine::reader::Parent, bool),
     Checked(PathBuf, NameId, u32),
-    /// A catalogued name with no document, searched under `-a` because it is
-    /// binary: read through the checked catalog walk, uncached.
-    Binary(PathBuf, NameId),
+    /// A catalogued file omitted from content indexing: oversized, or binary
+    /// under -a. Read through the checked catalog walk, uncached.
+    Unindexed(PathBuf, NameId),
     Failed(PathBuf, String),
     // Catalog posting absence only: explicit/live inputs always read bytes.
     Absent(PathBuf),
@@ -569,7 +599,7 @@ impl Job {
             Self::Direct(p, _)
             | Self::Listed(p, _, _, _)
             | Self::Checked(p, _, _)
-            | Self::Binary(p, _)
+            | Self::Unindexed(p, _)
             | Self::Failed(p, _)
             | Self::Absent(p) => p,
         }
@@ -729,7 +759,7 @@ fn prepare(
             let observed = observe_streaming(
                 &render,
                 buffer,
-                &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
+                &mut |each| read_catalogued(read, *name, plan, each, stopped, false),
                 eligible,
                 target,
             )?;
@@ -742,14 +772,14 @@ fn prepare(
                 observed
             }
         }
-        Job::Binary(_, name) => {
+        Job::Unindexed(_, name) => {
             let Some(read) = read else {
                 return Err(io::Error::other("catalogued input has no checked reader"));
             };
             observe_streaming(
                 &render,
                 buffer,
-                &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
+                &mut |each| read_catalogued(read, *name, plan, each, stopped, true),
                 false,
                 target,
             )?
@@ -1519,10 +1549,12 @@ impl Filter<'_> {
         if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
             let inode = catalog.name(name).child;
             let Some(doc) = catalog.doc(inode) else {
-                if self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary {
+                if catalog.inode(inode).stat.size > ferret_policy::DEFAULT_SIZE_CAP
+                    || self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary
+                {
                     return Some((
                         catalog.inode(inode).stat.size,
-                        Job::Binary(entry.path().to_owned(), name),
+                        Job::Unindexed(entry.path().to_owned(), name),
                     ));
                 }
                 return None;

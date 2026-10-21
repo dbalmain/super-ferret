@@ -550,12 +550,12 @@ fn direct_inputs_help_and_version_do_not_need_an_index_or_config() {
 }
 
 #[test]
-fn changed_candidates_over_the_cap_report_errors() {
+fn changed_candidates_over_the_cap_are_searched() {
     let fixture = Fixture::new("changed-size");
-    fixture.write("one.rs", &vec![b'r'; 8 * 1024 * 1024 + 1]);
-    let output = fixture.ferret(&["grep", "lantern", "."], None);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(!output.stderr.is_empty());
+    let mut bytes = vec![b'r'; 8 * 1024 * 1024 + 1];
+    bytes.extend_from_slice(b"\nlantern grown\n");
+    fixture.write("one.rs", &bytes);
+    fixture.compare(&["lantern", "."], None);
 }
 
 #[test]
@@ -2961,7 +2961,7 @@ fn m6_live_binary_depth_and_operand_matrix() {
 }
 
 #[test]
-fn m6_recursive_cap_is_independent_of_text_and_freshness() {
+fn m6_live_cap_does_not_limit_indexed_grep() {
     let fixture = Fixture::new("live-cap");
     fs::create_dir(fixture.tree().join("large")).unwrap();
     fixture.write("large/big", b"red\n");
@@ -2971,12 +2971,13 @@ fn m6_recursive_cap_is_independent_of_text_and_freshness() {
         .unwrap();
     file.set_len(9 << 20).unwrap();
     assert!(fixture.ferret(&["index", "."], None).status.success());
-    for flags in [vec!["-a"], vec!["--live", "-a"]] {
+    // D113 removes the indexed cap; explicit D13 --live retains it.
+    for (flags, exit) in [(vec!["-a"], 0), (vec!["--live", "-a"], 1)] {
         let mut args = vec!["grep"];
         args.extend(flags);
         args.extend(["-q", "red", "large"]);
         let result = fixture.ferret(&args, None);
-        assert_eq!(result.status.code(), Some(1), "{result:?}");
+        assert_eq!(result.status.code(), Some(exit), "{result:?}");
     }
     for args in [
         vec!["--live", "-auq", "red", "large"],

@@ -2326,3 +2326,115 @@ fn grep_with_descriptor(tree: &Tree, args: &[&str], local: bool) -> Output {
     }
     command.output().unwrap()
 }
+
+// D113: these names have no content document, but their catalogued sizes
+// require a checked live read beside the postings, in both hosts.
+#[test]
+fn indexed_grep_reads_over_cap_text_locally_and_through_the_daemon() {
+    compare_over_cap_grep("text", None);
+}
+
+#[test]
+fn indexed_grep_applies_rg_binary_gate_to_over_cap_files_in_both_hosts() {
+    compare_over_cap_grep("binary", Some(1));
+}
+
+#[test]
+fn indexed_grep_keeps_rg_early_matches_before_a_late_binary_byte_in_both_hosts() {
+    compare_over_cap_grep("late-binary", Some(128 * 1024));
+}
+
+fn compare_over_cap_grep(name: &str, nul: Option<usize>) {
+    let tree = Tree::new();
+    let path = format!("src/large-{name}");
+    let mut bytes = vec![b'x'; 8 * 1024 * 1024 + 1];
+    if let Some(at) = nul {
+        bytes[..7].copy_from_slice(b"needle\n");
+        bytes[at] = 0;
+    }
+    bytes.extend_from_slice(b"\nneedle tail\n");
+    fs::write(tree.base.join(&path), bytes).unwrap();
+    assert!(tree.local(&["index", "src"]).status.success());
+    tree.start(&[]);
+    let rg =
+        std::env::var_os("FERRET_RG").unwrap_or_else(|| panic!("dev shell supplies pinned rg"));
+    let version = Command::new(&rg).arg("--version").output().unwrap();
+    assert!(version.stdout.starts_with(b"ripgrep 15.2.0\n"));
+    // Unlimited late-NUL counts retain GREP.md's established first-NUL
+    // stopping policy; cap removal does not change that separate contract.
+    let profiles: &[&[&str]] = if nul.is_some_and(|at| at > 64 * 1024) {
+        &[
+            &[],
+            &["-l"],
+            &["-q"],
+            &["--files-without-match"],
+            &["-a", "-l"],
+            &["-a", "--count"],
+        ]
+    } else {
+        &[
+            &[],
+            &["-l"],
+            &["-q"],
+            &["--count"],
+            &["--files-without-match"],
+            &["-a", "-l"],
+            &["-a", "--count"],
+        ]
+    };
+    for &flags in profiles {
+        let args = [flags, &["needle", "src"]].concat();
+        let oracle = fixture::command(&rg, &tree.base)
+            .args(&args)
+            .output()
+            .unwrap();
+        for local in [true, false] {
+            let mut command = tree.command(&["grep"]);
+            command.args(&args).env("FERRET_SEARCH_THREADS", "1");
+            if local {
+                command.env("FERRET_NO_DAEMON", "1");
+            }
+            let actual = command.output().unwrap();
+            assert_eq!(
+                actual.status.code(),
+                oracle.status.code(),
+                "{name} {flags:?} local={local}: {actual:?} vs {oracle:?}"
+            );
+            if flags.is_empty() && nul.is_some_and(|at| at > 64 * 1024) {
+                // GREP.md discards buffered plain lines at the first NUL and
+                // uses its established diagnostic instead of rg's warning.
+                assert!(
+                    oracle
+                        .stdout
+                        .windows(b": WARNING:".len())
+                        .any(|part| part == b": WARNING:")
+                );
+                assert_eq!(
+                    actual.stdout,
+                    format!("{path}: binary file matches\n").as_bytes()
+                );
+            } else {
+                let lines = |bytes: &[u8]| {
+                    let mut lines: Vec<_> = bytes
+                        .split(|&byte| byte == b'\n')
+                        .map(<[u8]>::to_vec)
+                        .collect();
+                    lines.sort();
+                    lines
+                };
+                assert_eq!(
+                    lines(&actual.stdout),
+                    lines(&oracle.stdout),
+                    "{name} {flags:?} local={local}"
+                );
+            }
+            // Both hosts may render the same binary warning with their own
+            // wording; the suppression and match decisions must agree.
+            assert_eq!(
+                actual.stderr.is_empty(),
+                oracle.stderr.is_empty(),
+                "{name} {flags:?} local={local}: {actual:?} vs {oracle:?}"
+            );
+        }
+    }
+}

@@ -304,8 +304,8 @@ impl Documents {
         }
     }
 
-    /// Uses the same size cap as a crawl configured with this policy. Product
-    /// indexing and querying both use the default policy (8 MiB).
+    /// Uses this content size cap. Indexing and structured search retain the
+    /// default 8 MiB policy; grep removes the cap for its checked live reads.
     pub fn with_config(mut self, config: ferret_policy::Config) -> Self {
         self.config = config;
         self

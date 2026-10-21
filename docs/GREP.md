@@ -407,13 +407,17 @@ even a full budget cannot prevent that owner from replaying its prefix and
 finishing. Capture-space waiters poll cancellation at most every 20 ms, as
 descriptor waiters do; dropping captures or finishing a stream also wakes them.
 
-Indexed recursive content excludes policy's non-content files (binary-sniffed
-and over the default 8 MiB cap); name listing includes them. Changed candidates
-that exceed the cap report an error, rather than silently disappear. `-a`
-scans catalog-visible binary files but retains the recursive cap. Explicit
-files/stdin and unrestricted live mode stream without that indexing cap;
-multiline buffers whole input with fallible allocation and cancellation.
-Oversize/allocation failures are errors, never truncation or a no-match answer.
+Indexed recursive content skips catalogued binary files unless `-a` is set.
+**D113:** the default 8 MiB cap bounds content indexing only. Catalogued files
+above it are read live beside posting candidates, using rg's initial
+recursive binary probe and the existing first-NUL output policy below.
+Candidates that grow past the cap are also searched. These reads retain
+the checked catalog path and stat bracket and never enter the document cache
+as an old version. `-a` also removes binary suppression for oversized files.
+Explicit files/stdin, uncovered fallback and unrestricted walks have no size
+cap. D13 `--live` retains its indexing policy cap. Multiline buffers whole
+input with fallible allocation and cancellation; allocation failures are
+errors, never truncation or a no-match answer.
 
 ## Ignore rules and visibility
 
@@ -426,8 +430,8 @@ Cases where rg can search what indexed grep cannot: ferret-only global or
 `.ferretignore` exclusions; positive `-g` that overrides an index exclusion;
 `--hidden` when the hidden tree was ferret-excluded (notably `.git`);
 rg reinclusion that ferret's traversal did not retain (including different
-negation precedence); new names; and content omitted by the size/binary
-policy. Explicit starts/live mode are the exceptions above. `--hidden` alone
+negation precedence); new names; and catalogued binary content without `-a`.
+Explicit starts/live mode are the exceptions above. `--hidden` alone
 does not undo ferret ignore rules. **M3 clarification (2026-10-17):**
 `-.` aliases `--hidden`; `--no-hidden` reverses it in argv order. The hidden
 switch applies equally to content and name modes, without weakening negative
@@ -671,8 +675,8 @@ contract as line mode (D103 A).
 There is **no small peak-memory bound** for explicit files, stdin or unrestricted
 multiline input. The whole input buffer and line/span metadata grow with the
 input and match count; rendered-capture and host-cache budgets do not cap them.
-Indexed and policy-preserving input retain their existing size cap. No extra
-cap is imposed on explicit, stdin or unrestricted input.
+Only D13 `--live` retains its policy size cap. Indexed and uncovered grep,
+explicit files, stdin and unrestricted input have no content size cap.
 
 **Separators and headings follow printed records** (D98, fuzz B4). A file's
 heading, an inter-file separator and a `--` are each printed only before a
@@ -871,7 +875,8 @@ Detect NUL in each read chunk, without waiting for LF or EOF (review R1,
 2026-10-16). A producer that holds its stream open after NUL does not hold the
 query open. For non-binary input with no LF, line buffering grows with the line:
 explicit files and stdin have no invented cap and use fallible allocation;
-recursive input retains its existing file size cap. Capture buffering bounds rendered output
+indexed and uncovered recursive grep also have no size cap (D112/D113).
+D13 `--live` retains its policy cap. Capture buffering bounds rendered output
 memory, not this input-line buffer.
 If a selected line preceded it, plain line/span output prints
 `PATH: binary file matches` on stdout instead (stdin label: `(standard input)`).
@@ -1212,3 +1217,12 @@ without loading the name tables or opening content. A regression test damages
 an unrelated content manifest and still requires uncovered content and names
 searches to succeed without contacting a daemon. Mixed requests stay local
 with an operand barrier between catalog and live sources.
+
+
+**D113 final startup check:** on the same frozen catalog and tree, fresh
+isolated runtime directories and daemon PID verified from hello before and
+after each run: original binary **1.880 ms**, final D112+D113 binary
+**1.958 ms** (standard deviations 0.130 / 0.139 ms; ten warmups / 100 runs,
+Hyperfine `-N`). The observed difference is **+0.078 ms**. Existing late-NUL
+count/diagnostic policy remains as documented above; D113 shares that policy
+rather than introducing a separate binary-output contract for large files.

@@ -303,7 +303,11 @@ impl Execution<'_> {
             Err(error) => return runtime.failure(&error.to_string()),
         };
         let documents = match pin
-            .map(|pin| ferret_crawl::Documents::by_name(pin.catalog()))
+            .map(|pin| {
+                ferret_crawl::Documents::by_name(pin.catalog()).map(|documents| {
+                    documents.with_config(ferret_policy::Config { size_cap: u64::MAX })
+                })
+            })
             .transpose()
         {
             Ok(documents) => documents,
