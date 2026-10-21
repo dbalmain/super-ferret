@@ -117,7 +117,17 @@ impl Tree {
             .iter()
             .any(|(name, _)| *name == "FERRET_DAEMON_IDLE_MS")
         {
-            ready(UnixStream::connect(socket).unwrap());
+            // The socket file appears at bind, a moment before listen.
+            let mut stream = None;
+            wait(|| match UnixStream::connect(&socket) {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => false,
+                Err(error) => panic!("{error}"),
+            });
+            ready(stream.unwrap());
         }
         pid
     }
