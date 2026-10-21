@@ -223,6 +223,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         tty,
         warned: AtomicBool::new(false),
         descriptors: None,
+        defer_stdout: false,
     };
     let stdout = io::stdout();
     Execution {
@@ -244,6 +245,10 @@ struct Runtime<'a> {
     tty: bool,
     warned: AtomicBool,
     descriptors: Option<std::sync::Arc<line_grep::IoBudget>>,
+    /// Redirected daemon content stays in the block buffer across groups.
+    /// In-process hosts, terminals and live walks leave this off and publish
+    /// each group.
+    defer_stdout: bool,
 }
 
 impl Runtime<'_> {
@@ -843,14 +848,17 @@ impl<W: Write> Host<'_, W> {
             }
         });
         let published = self.publish(path, result, output);
-        // NUL names retain std's existing line buffering and diagnostic
-        // ordering, including a pending name when the next operand fails.
+        // NUL names keep their line buffer. Redirected path and count
+        // listings share the block buffer until an operand boundary.
         if nul_names(self.plan) || buffered_path_output(self.plan, self.tty()) {
             return published;
         }
-        // Surface even a short final group's write error before another
-        // operand, diagnostic, quiet return or stdin barrier can run.
-        self.writer.flush()?;
+        // Redirected daemon content shares that buffer, so a group is not
+        // its own socket frame. A failed publish still flushes: the accepted
+        // prefix has to leave the buffer before the error returns.
+        if published.is_err() || !self.runtime.is_some_and(|runtime| runtime.defer_stdout) {
+            self.writer.flush()?;
+        }
         published
     }
 

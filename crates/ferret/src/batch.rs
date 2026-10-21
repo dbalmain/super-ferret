@@ -13,7 +13,7 @@ use ferret_query::{Query, Row};
 
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
-use crate::find_json::{FrameOutput, diagnostic_to, generation};
+use crate::find_json::{FrameOutput, RawStdout, diagnostic_to, generation};
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
 use crate::search::json_row;
@@ -246,6 +246,13 @@ pub(crate) fn search_request(
             let catalog = session.catalog();
             bytes_read = catalog.bytes_read();
             let mut output_error = None;
+            // JSON rows reuse these buffers. Plain search appends `path\n`
+            // to find's 64 KiB frame buffer and does not build a row object.
+            // `rows` counts paths; a newline inside a path is not a row.
+            let mut encoded = Vec::with_capacity(256);
+            let mut framed = Vec::with_capacity(320);
+            let mut raw_out = RawStdout::new(1);
+            let raw = destination.raw_output();
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
@@ -268,16 +275,26 @@ pub(crate) fn search_request(
                         if request.capabilities.iter().any(|c| c == "test-panic") {
                             panic!("injected query panic");
                         }
-                        let mut bytes = Vec::new();
-                        json_row(&mut bytes, catalog, row);
-                        let mut output = Vec::new();
-                        let mut object = Object::new(&mut output);
-                        object.str("id", &request.id).str("event", "row");
-                        object.raw_fields(&bytes[1..bytes.len() - 1]);
-                        object.end();
-                        if let Err(error) = destination.send(&output) {
-                            output_error = Some(error);
-                            return ControlFlow::Break(());
+                        if raw {
+                            if let Err(error) = raw_out
+                                .write(destination, &request.id, row.path)
+                                .and_then(|()| raw_out.write(destination, &request.id, b"\n"))
+                            {
+                                output_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
+                        } else {
+                            encoded.clear();
+                            json_row(&mut encoded, catalog, row);
+                            framed.clear();
+                            let mut object = Object::new(&mut framed);
+                            object.str("id", &request.id).str("event", "row");
+                            object.raw_fields(&encoded[1..encoded.len() - 1]);
+                            object.end();
+                            if let Err(error) = destination.send(&framed) {
+                                output_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
                         }
                         first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
                         rows += 1;
@@ -289,6 +306,12 @@ pub(crate) fn search_request(
                     },
                 )
             };
+            if raw
+                && output_error.is_none()
+                && let Err(error) = raw_out.finish(destination, &request.id)
+            {
+                return Err(error);
+            }
             if let Some(error) = output_error {
                 return Err(error);
             }

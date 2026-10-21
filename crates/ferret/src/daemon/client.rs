@@ -483,7 +483,10 @@ fn query(
         scan_uncovered
             .then_some(b"scan-uncovered".as_slice())
             .into_iter()
-            .chain((matches!(op, "find" | "grep") && !json).then_some(b"raw-output-v1".as_slice())),
+            .chain(
+                (matches!(op, "find" | "grep" | "search") && !json)
+                    .then_some(b"raw-output-v1".as_slice()),
+            ),
     );
     if let Some(grep) = &grep {
         grep.encode(&mut object);
@@ -520,7 +523,16 @@ fn query(
         let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
         let mut err = io::stderr().lock();
         loop {
-            let value = event(&mut reader, &mut line)?;
+            line.clear();
+            if crate::batch::read_line_bounded(&mut reader, &mut line)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "daemon closed the connection",
+                ));
+            }
+            let value = protocol::parse_object(&line).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid daemon event")
+            })?;
             if field_text(&value, "id") != Some(op) {
                 return Err(io::Error::other("wrong daemon query tag"));
             }
@@ -581,12 +593,24 @@ fn query(
                     }
                 }
                 Some("stdout" | "stderr")
-                    if matches!(op, "find" | "grep" | "index" | "roots-remove") =>
+                    if matches!(op, "find" | "grep" | "search" | "index" | "roots-remove") =>
                 {
                     if !json {
                         read_payload(&mut reader, &value, raw_output, &mut payload)?;
                         let data = &payload;
                         if field_text(&value, "event") == Some("stdout") {
+                            // A payload is not a row count: a path may contain
+                            // a newline, and a long path splits across parts.
+                            // `end.rows` is the count. A broken pipe arrives
+                            // before that event, so the first payload still
+                            // counts as a match.
+                            if op == "search" && !data.is_empty() {
+                                if rows == 0 {
+                                    rows = 1;
+                                }
+                                first_row
+                                    .get_or_insert_with(|| started.elapsed().as_micros() as i128);
+                            }
                             write(&mut out, data, &mut output_failure)?;
                             if first_frame
                                 || grep_tty
@@ -640,6 +664,11 @@ fn query(
                 }
                 Some("end") => {
                     out.flush().inspect_err(|_| output_failure = true)?;
+                    if op == "search"
+                        && let Some(reported) = field_number(&value, "rows")
+                    {
+                        rows = reported;
+                    }
                     let exit = status(
                         field_number(&value, "exit")
                             .ok_or_else(|| io::Error::other("missing native status"))?,

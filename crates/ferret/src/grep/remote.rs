@@ -91,6 +91,7 @@ pub(crate) fn serve(
         tty: request.grep.as_ref().is_some_and(|options| options.tty),
         warned: AtomicBool::new(false),
         descriptors: None,
+        defer_stdout: false,
     };
     let Some(options) = &request.grep else {
         return Ok(runtime.failure("missing resolved grep environment"));
@@ -196,6 +197,9 @@ pub(crate) fn serve(
     if plan.max_count == Some(0) {
         return Ok(Exit::NoMatch);
     }
+    // Same block buffer as in-process content, but a per-group flush would
+    // emit one socket frame per file. `commit` still flushes a failed publish.
+    runtime.defer_stdout = block_stdout(&plan) && !options.tty;
     let execution = Execution {
         plan: &plan,
         selection: &selection,

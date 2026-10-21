@@ -812,7 +812,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                 None
             };
             let output = destination.clone().with_raw_output(
-                matches!(request.op, Op::Find | Op::Grep)
+                matches!(request.op, Op::Find | Op::Grep | Op::Search)
                     && request
                         .capabilities
                         .iter()

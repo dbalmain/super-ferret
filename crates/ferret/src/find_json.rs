@@ -116,9 +116,7 @@ impl Effects for FrameOutput<'_> {
         let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
         let mut writer = FrameWriter {
             host: self,
-            record,
-            part: 0,
-            pending: Vec::with_capacity(PART),
+            raw: RawStdout::new(record),
         };
         buffer.write_to(&mut writer)?;
         writer.finish()
@@ -252,26 +250,41 @@ impl FrameOutput<'_> {
     }
 }
 
-struct FrameWriter<'host, 'id> {
-    host: &'host FrameOutput<'id>,
+/// Find's stdout chunking. Bytes fill `PART` and each full part is one raw
+/// frame; the tail is its own frame. Search uses the same buffer, so a plain
+/// daemon search writes many `path\n` lines into those frames.
+pub(crate) struct RawStdout {
     record: u64,
     part: u64,
     pending: Vec<u8>,
 }
-impl Write for FrameWriter<'_, '_> {
-    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
-        let total = bytes.len();
+
+impl RawStdout {
+    pub(crate) fn new(record: u64) -> Self {
+        Self {
+            record,
+            part: 0,
+            pending: Vec::with_capacity(PART),
+        }
+    }
+
+    pub(crate) fn write(
+        &mut self,
+        destination: &Destination,
+        id: &str,
+        mut bytes: &[u8],
+    ) -> io::Result<()> {
         while !bytes.is_empty() {
             if self.pending.len() == PART {
-                self.host.track(frame(
-                    &self.host.destination,
-                    self.host.id,
+                frame(
+                    destination,
+                    id,
                     "stdout",
                     self.record,
                     self.part,
                     &self.pending,
                     false,
-                ))?;
+                )?;
                 self.part += 1;
                 self.pending.clear();
             }
@@ -279,6 +292,35 @@ impl Write for FrameWriter<'_, '_> {
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
         }
+        Ok(())
+    }
+
+    pub(crate) fn finish(&mut self, destination: &Destination, id: &str) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            frame(
+                destination,
+                id,
+                "stdout",
+                self.record,
+                self.part,
+                &self.pending,
+                true,
+            )?;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+}
+
+struct FrameWriter<'host, 'id> {
+    host: &'host FrameOutput<'id>,
+    raw: RawStdout,
+}
+impl Write for FrameWriter<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let total = bytes.len();
+        self.host
+            .track(self.raw.write(&self.host.destination, self.host.id, bytes))?;
         Ok(total)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -287,19 +329,8 @@ impl Write for FrameWriter<'_, '_> {
 }
 impl FrameWriter<'_, '_> {
     fn finish(&mut self) -> io::Result<()> {
-        if !self.pending.is_empty() {
-            self.host.track(frame(
-                &self.host.destination,
-                self.host.id,
-                "stdout",
-                self.record,
-                self.part,
-                &self.pending,
-                true,
-            ))?;
-            self.pending.clear();
-        }
-        Ok(())
+        self.host
+            .track(self.raw.finish(&self.host.destination, self.host.id))
     }
 }
 pub(crate) fn emit_parts(
