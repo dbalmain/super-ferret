@@ -632,3 +632,26 @@ fn a_corrupt_settings_file_falls_back_without_failing_the_search() {
     assert_eq!(rows, 4);
     assert_eq!(pin.search_threads(), expected_threads(None));
 }
+
+/// Merge, follow and reader opens may reach publication out of order once
+/// merges stop taking the catalog writer mutex. Genuine manifest successors
+/// must survive delayed publication of an older sequence.
+#[test]
+fn an_older_content_publication_cannot_replace_a_newer_sequence() {
+    let tree = Tree::with_files(4);
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let older = engine.pin().content.unwrap();
+    tree.publish(&engine);
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let newer = engine.pin().content.unwrap();
+    assert!(newer.manifest().sequence > older.manifest().sequence);
+
+    engine.select_content(older);
+    assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
+    // An absent reader open used to assign None directly, discarding even
+    // a newer view already published for this catalog generation.
+    engine.open_content(&tree.0.join("absent")).unwrap();
+    assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
+}

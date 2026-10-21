@@ -291,6 +291,7 @@ impl Engine {
         let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let live = live_documents(&view);
+        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let opened = IndexWriter::open_with_threads(
             &catalog_dir.join(CONTENT_DIR),
             &catalog_view(&view, &live),
@@ -298,7 +299,7 @@ impl Engine {
         )
         .map_err(Error::Content)?;
         let published = opened.view();
-        *self.content.lock().map_err(|_| Error::WriterPanicked)? = Some(opened);
+        *content = Some(opened);
         self.select_content(published);
         Ok(())
     }
@@ -316,12 +317,8 @@ impl Engine {
             pin.search_threads(),
         )
         .map_err(Error::Content)?;
-        let mut current = self
-            .current
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.generation() == pin.generation() {
-            current.content = view.map(Arc::new);
+        if let Some(view) = view {
+            self.select_content(Arc::new(view));
         }
         Ok(())
     }
@@ -376,7 +373,8 @@ impl Engine {
         merged.map_err(Error::Content)
     }
 
-    /// Publishes a content view beside the current catalog view.
+    /// Publishes a content view beside the current catalog view. Publishers
+    /// can finish out of order: manifest sequence must never go backwards.
     fn select_content(&self, content: Arc<ferret_index::View>) {
         let mut current = self
             .current
@@ -385,6 +383,10 @@ impl Engine {
         let manifest = content.manifest();
         if manifest.incarnation == current.generation().incarnation
             && manifest.high_water <= current.catalog.next_doc().0
+            && current
+                .content
+                .as_ref()
+                .is_none_or(|selected| selected.manifest().sequence <= manifest.sequence)
         {
             current.content = Some(content);
         }
