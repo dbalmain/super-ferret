@@ -30,6 +30,26 @@ pub(super) fn run(
     )
 }
 
+pub(super) fn names(
+    args: &[OsString],
+    plan: &line_grep::Names,
+    tty: bool,
+    index: &Path,
+) -> Option<Exit> {
+    crate::daemon::grep(
+        index,
+        args,
+        GrepOptions {
+            color: plan.presentation.color.enabled(),
+            heading: plan.presentation.heading.unwrap_or(false),
+            numbers: false,
+            tty,
+            threads: 1,
+            pattern_files: Vec::new(),
+        },
+    )
+}
+
 pub(crate) fn serve(
     request: &Request,
     pin: Option<&engine::QuerySession>,
@@ -92,9 +112,40 @@ pub(crate) fn serve(
             .cloned()
             .ok_or_else(|| io::Error::other("missing grep pattern-file bytes"))
     });
+    let flush = || {
+        crate::find_json::emit_to(destination, &request.id, "stdout", |o| {
+            o.str("bytes", "").bool("flush", true);
+        })?;
+        destination.flush()
+    };
+    let writer = FrameWriter {
+        emit: &emit,
+        flush: &flush,
+    };
     let mut plan = match parsed {
         Ok(line_grep::Command::Search(plan)) => plan,
-        Ok(_) => return Ok(runtime.failure("socket grep requires a content search")),
+        Ok(line_grep::Command::Files(mut plan)) => {
+            plan.presentation.color = if options.color {
+                line_grep::Color::Always
+            } else {
+                line_grep::Color::Never
+            };
+            plan.presentation.heading = Some(options.heading);
+            if plan.traversal.live || plan.traversal.unrestricted {
+                return Ok(runtime.failure("socket grep requires indexed directory operands"));
+            }
+            let Some(pin) = pin else {
+                return Ok(runtime.failure("no index available"));
+            };
+            let block = !plan.presentation.null;
+            return Ok(with_writer(writer, block && !options.tty, |mut writer| {
+                match super::names::pinned(&plan, pin.catalog(), &cwd, &mut writer, &runtime) {
+                    Ok(exit) => exit,
+                    Err(error) => runtime.failure(&error),
+                }
+            }));
+        }
+        Ok(_) => return Ok(runtime.failure("socket grep requires a search or file listing")),
         Err(error) => return Ok(runtime.failure(&error.to_string())),
     };
     plan.presentation.color = if options.color {
@@ -128,16 +179,6 @@ pub(crate) fn serve(
     if plan.max_count == Some(0) {
         return Ok(Exit::NoMatch);
     }
-    let flush = || {
-        crate::find_json::emit_to(destination, &request.id, "stdout", |o| {
-            o.str("bytes", "").bool("flush", true);
-        })?;
-        destination.flush()
-    };
-    let writer = FrameWriter {
-        emit: &emit,
-        flush: &flush,
-    };
     let execution = Execution {
         plan: &plan,
         selection: &selection,
@@ -148,16 +189,27 @@ pub(crate) fn serve(
         runtime: &runtime,
         start,
     };
-    // Match the local block/line buffering, including pending NUL names before
-    // diagnostics and the explicit operand/group flush points in the host.
-    if block_stdout(&plan) && !options.tty {
+    Ok(with_writer(
+        writer,
+        block_stdout(&plan) && !options.tty,
+        |writer| execution.run(inputs, writer),
+    ))
+}
+
+// Discard failed publication buffers instead of retrying from Drop. Both grep
+// hosts retain their original block/line choices and explicit flush points.
+fn with_writer(
+    writer: FrameWriter<'_>,
+    block: bool,
+    execute: impl FnOnce(&mut dyn Write) -> Exit,
+) -> Exit {
+    if block {
         let mut writer = BufWriter::with_capacity(64 << 10, writer);
-        let exit = execution.run(inputs, &mut writer);
-        // Never retry a failed publication from BufWriter::drop.
+        let exit = execute(&mut writer);
         let _ = writer.into_parts();
-        Ok(exit)
+        exit
     } else {
-        Ok(execution.run(inputs, LineWriter::new(writer)))
+        execute(&mut LineWriter::new(writer))
     }
 }
 

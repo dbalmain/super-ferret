@@ -1,5 +1,6 @@
-//! Names-only grep uses find's namespace sources without opening an engine or
-//! preparing document identities, postings, or content sections.
+//! Shared names-only host over find's namespace sources. The local adapter
+//! loads catalog namespace sections; remote::serve supplies its pinned catalog.
+//! Neither path prepares document identities, postings or content sections.
 
 use ferret_catalog::Catalog;
 use ferret_query::line_grep::Names;
@@ -7,7 +8,23 @@ use std::io::IsTerminal;
 
 use super::*;
 
-pub(super) fn run(plan: &Names, index: Option<&Path>) -> Exit {
+pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bool) -> Exit {
+    if !plan.traversal.unrestricted
+        && !plan.traversal.live
+        && !test_injections()
+        && resolve_inputs(&plan.paths, true)
+            .iter()
+            .any(|input| matches!(input, Input::Directory(_)))
+    {
+        if let Err(error) = selection(plan) {
+            return failure(&error);
+        }
+        if let Ok(index) = index_path(index)
+            && let Some(exit) = remote::names(args, plan, tty, &index)
+        {
+            return exit;
+        }
+    }
     let cancelled = AtomicBool::new(false);
     let stdout = io::stdout();
     let mut writer = output::Writer::new(
@@ -45,14 +62,8 @@ fn execute(
     writer: &mut impl Write,
     cancelled: &AtomicBool,
 ) -> Result<Exit, String> {
-    let mut selection = GrepSelection::default().with_hidden(plan.hidden);
-    for glob in &plan.globs {
-        selection
-            .push(glob)
-            .map_err(|error| format!("glob {glob:?}: {error}"))?;
-    }
+    let selection = selection(plan)?;
     let inputs = resolve_inputs(&plan.paths, true);
-    let flush_each = plan.presentation.null || plan.traversal.live || io::stdout().is_terminal();
     let catalog = inputs
         .iter()
         .any(|input| {
@@ -72,223 +83,314 @@ fn execute(
     } else {
         None
     };
-    for input in &inputs {
-        if let Input::Directory(path) = input
-            && let Some(anchors) = &live
-        {
-            anchors
-                .validate(path)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-    }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(catalog) = &catalog {
+    let stderr = |message: &str| {
+        cli::error(message);
+        Ok(())
+    };
+    let runtime = Runtime {
+        cancelled,
+        stderr: &stderr,
+        tty: io::stdout().is_terminal(),
+        warned: AtomicBool::new(false),
+        descriptors: None,
+    };
+    Listing {
+        plan,
+        selection,
+        inputs,
+        catalog: catalog.as_ref(),
+        live: live.as_ref(),
+        cwd: &cwd,
+        runtime: &runtime,
+    }
+    .run(writer)
+}
+
+fn selection(plan: &Names) -> Result<GrepSelection, String> {
+    let mut selection = GrepSelection::default().with_hidden(plan.hidden);
+    for glob in &plan.globs {
+        selection
+            .push(glob)
+            .map_err(|error| format!("glob {glob:?}: {error}"))?;
+    }
+    Ok(selection)
+}
+
+/// Lists against the request's resident pin without loading catalog sections
+/// or consulting the daemon's cwd, terminal or environment.
+pub(super) fn pinned(
+    plan: &Names,
+    catalog: &Catalog,
+    cwd: &Path,
+    writer: &mut impl Write,
+    runtime: &Runtime<'_>,
+) -> Result<Exit, String> {
+    let defaults = [PathBuf::from(".")];
+    let paths = if plan.paths.is_empty() {
+        &defaults[..]
+    } else {
+        &plan.paths
+    };
+    Listing {
+        plan,
+        selection: selection(plan)?,
+        inputs: resolve_inputs_at(paths, true, cwd),
+        catalog: Some(catalog),
+        live: None,
+        cwd,
+        runtime,
+    }
+    .run(writer)
+}
+
+struct Listing<'a> {
+    plan: &'a Names,
+    selection: GrepSelection,
+    inputs: Vec<Input>,
+    catalog: Option<&'a Catalog>,
+    live: Option<&'a live::Anchors>,
+    cwd: &'a Path,
+    runtime: &'a Runtime<'a>,
+}
+impl Listing<'_> {
+    fn run(self, writer: &mut impl Write) -> Result<Exit, String> {
+        let Self {
+            plan,
+            selection,
+            inputs,
+            catalog,
+            live,
+            cwd,
+            runtime,
+        } = self;
+        let cancelled = runtime.cancelled;
+        let flush_each = plan.presentation.null || plan.traversal.live || runtime.tty;
         for input in &inputs {
             if let Input::Directory(path) = input
-                && let Some(Err(error)) = sources::Directory::new(path, Some(catalog), &cwd, false)
-                    .map_err(|e| e.to_string())?
-                    .next(true)
+                && let Some(anchors) = live
             {
-                return Err(format!(
-                    "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
-                    error.path.display(),
-                    error.error
-                ));
+                anchors
+                    .validate(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
-    }
-    let mut errors = false;
-    for input in &inputs {
-        if let Input::Failed(path, error) = input {
-            if diagnostic(
-                writer,
-                cancelled,
-                &format!("grep: {}: {error}", path.display()),
-            )? {
-                return Ok(Exit::Ok);
-            }
-            errors = true;
-        }
-    }
-    let mut listed = false;
-    for input in inputs {
-        if cancelled.load(Ordering::Acquire) {
-            break;
-        }
-        match input {
-            Input::File(path, _) => {
-                if emit(plan, writer, cancelled, &path, flush_each, &mut listed)? {
-                    return Ok(Exit::Ok);
+        if let Some(catalog) = catalog {
+            for input in &inputs {
+                if let Input::Directory(path) = input
+                    && let Some(Err(error)) =
+                        sources::Directory::new(path, Some(catalog), cwd, false)
+                            .map_err(|e| e.to_string())?
+                            .next(true)
+                {
+                    return Err(format!(
+                        "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
+                        error.path.display(),
+                        error.error
+                    ));
                 }
             }
-            Input::Stdin => {
-                if emit(
-                    plan,
+        }
+        let mut errors = false;
+        for input in &inputs {
+            if let Input::Failed(path, error) = input {
+                if diagnostic(
                     writer,
-                    cancelled,
-                    Path::new("-"),
-                    flush_each,
-                    &mut listed,
+                    runtime,
+                    &format!("grep: {}: {error}", path.display()),
                 )? {
                     return Ok(Exit::Ok);
                 }
+                errors = true;
             }
-            Input::Failed(_, _) => {}
-            Input::Directory(path) => {
-                let stopped = || cancelled.load(Ordering::Acquire);
-                let mut policy = live
-                    .as_ref()
-                    .map(|anchors| anchors.start(&path, &stopped))
-                    .transpose()
+        }
+        let mut listed = false;
+        for input in inputs {
+            if cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            match input {
+                Input::File(path, _) => {
+                    if emit(plan, writer, cancelled, &path, flush_each, &mut listed)? {
+                        return Ok(Exit::Ok);
+                    }
+                }
+                Input::Stdin => {
+                    if emit(
+                        plan,
+                        writer,
+                        cancelled,
+                        Path::new("-"),
+                        flush_each,
+                        &mut listed,
+                    )? {
+                        return Ok(Exit::Ok);
+                    }
+                }
+                Input::Failed(_, _) => {}
+                Input::Directory(path) => {
+                    let stopped = || cancelled.load(Ordering::Acquire);
+                    let mut policy = live
+                        .as_ref()
+                        .map(|anchors| anchors.start(&path, &stopped))
+                        .transpose()
+                        .map_err(|e| e.to_string())?;
+                    let mut source = sources::Directory::new(
+                        &path,
+                        catalog,
+                        cwd,
+                        plan.traversal.unrestricted || live.is_some(),
+                    )
                     .map_err(|e| e.to_string())?;
-                let mut source = sources::Directory::new(
-                    &path,
-                    catalog.as_ref(),
-                    &cwd,
-                    plan.traversal.unrestricted || live.is_some(),
-                )
-                .map_err(|e| e.to_string())?;
-                let mut descend = true;
-                while let Some(entry) =
-                    source.next_with_cancel(descend, &mut || Ok(()), &mut || {
-                        cancelled.load(Ordering::Acquire)
-                    })
-                {
-                    descend = false;
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            if diagnostic(
-                                writer,
-                                cancelled,
-                                &format!("grep: {}: {}", error.path.display(), error.error),
-                            )? {
-                                return Ok(Exit::Ok);
+                    let mut descend = true;
+                    while let Some(entry) =
+                        source.next_with_cancel(descend, &mut || Ok(()), &mut || {
+                            cancelled.load(Ordering::Acquire)
+                        })
+                    {
+                        descend = false;
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                if diagnostic(
+                                    writer,
+                                    runtime,
+                                    &format!("grep: {}: {}", error.path.display(), error.error),
+                                )? {
+                                    return Ok(Exit::Ok);
+                                }
+                                errors = true;
+                                continue;
                             }
-                            errors = true;
+                        };
+                        if plan
+                            .traversal
+                            .max_depth
+                            .is_some_and(|limit| entry.depth() > limit)
+                        {
                             continue;
                         }
-                    };
-                    if plan
-                        .traversal
-                        .max_depth
-                        .is_some_and(|limit| entry.depth() > limit)
-                    {
-                        continue;
-                    }
-                    let relative = entry
-                        .path()
-                        .strip_prefix(&cwd)
-                        .unwrap_or(entry.path())
-                        .as_os_str()
-                        .as_bytes();
-                    match entry.kind() {
-                        Ok(FileKind::Directory) => {
-                            descend = plan
-                                .traversal
-                                .max_depth
-                                .is_none_or(|limit| entry.depth() < limit)
-                                && selection.descend(relative, entry.depth())
-                                && !selection.hides_stripped(
-                                    entry.path().as_os_str().as_bytes(),
-                                    relative,
-                                    entry.depth(),
-                                );
-                            if descend && let Some(policy) = &mut policy {
-                                match policy.accepts(entry, false, &stopped) {
-                                    Ok(allowed) => descend = allowed,
-                                    Err(error) => {
-                                        errors = true;
-                                        descend = false;
-                                        if diagnostic(
-                                            writer,
-                                            cancelled,
-                                            &format!("grep: {}: {error}", entry.path().display()),
-                                        )? {
-                                            return Ok(Exit::Ok);
+                        let relative = entry
+                            .path()
+                            .strip_prefix(cwd)
+                            .unwrap_or(entry.path())
+                            .as_os_str()
+                            .as_bytes();
+                        match entry.kind() {
+                            Ok(FileKind::Directory) => {
+                                descend = plan
+                                    .traversal
+                                    .max_depth
+                                    .is_none_or(|limit| entry.depth() < limit)
+                                    && selection.descend(relative, entry.depth())
+                                    && !selection.hides_stripped(
+                                        entry.path().as_os_str().as_bytes(),
+                                        relative,
+                                        entry.depth(),
+                                    );
+                                if descend && let Some(policy) = &mut policy {
+                                    match policy.accepts(entry, false, &stopped) {
+                                        Ok(allowed) => descend = allowed,
+                                        Err(error) => {
+                                            errors = true;
+                                            descend = false;
+                                            if diagnostic(
+                                                writer,
+                                                runtime,
+                                                &format!(
+                                                    "grep: {}: {error}",
+                                                    entry.path().display()
+                                                ),
+                                            )? {
+                                                return Ok(Exit::Ok);
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Ok(FileKind::File)
-                            if selection.allows(relative, entry.depth())
-                                && !selection.hides_stripped(
-                                    entry.path().as_os_str().as_bytes(),
-                                    relative,
-                                    entry.depth(),
-                                ) =>
-                        {
-                            if let Some(policy) = &mut policy {
-                                match policy.accepts(entry, false, &stopped) {
-                                    Ok(true) => {}
-                                    Ok(false) => continue,
-                                    Err(error) => {
-                                        errors = true;
-                                        if diagnostic(
-                                            writer,
-                                            cancelled,
-                                            &format!("grep: {}: {error}", entry.path().display()),
-                                        )? {
-                                            return Ok(Exit::Ok);
+                            Ok(FileKind::File)
+                                if selection.allows(relative, entry.depth())
+                                    && !selection.hides_stripped(
+                                        entry.path().as_os_str().as_bytes(),
+                                        relative,
+                                        entry.depth(),
+                                    ) =>
+                            {
+                                if let Some(policy) = &mut policy {
+                                    match policy.accepts(entry, false, &stopped) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue,
+                                        Err(error) => {
+                                            errors = true;
+                                            if diagnostic(
+                                                writer,
+                                                runtime,
+                                                &format!(
+                                                    "grep: {}: {error}",
+                                                    entry.path().display()
+                                                ),
+                                            )? {
+                                                return Ok(Exit::Ok);
+                                            }
+                                            continue;
                                         }
-                                        continue;
                                     }
                                 }
+                                if emit(
+                                    plan,
+                                    writer,
+                                    cancelled,
+                                    entry.path(),
+                                    flush_each,
+                                    &mut listed,
+                                )? {
+                                    return Ok(Exit::Ok);
+                                }
                             }
-                            if emit(
-                                plan,
-                                writer,
-                                cancelled,
-                                entry.path(),
-                                flush_each,
-                                &mut listed,
-                            )? {
-                                return Ok(Exit::Ok);
+                            Ok(_) => {}
+                            Err(error) => {
+                                if diagnostic(
+                                    writer,
+                                    runtime,
+                                    &format!("grep: {}: {error}", entry.path().display()),
+                                )? {
+                                    return Ok(Exit::Ok);
+                                }
+                                errors = true;
                             }
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            if diagnostic(
-                                writer,
-                                cancelled,
-                                &format!("grep: {}: {error}", entry.path().display()),
-                            )? {
-                                return Ok(Exit::Ok);
-                            }
-                            errors = true;
                         }
                     }
                 }
             }
+            if !flush_each && let Some(error) = flush_output(writer, cancelled)? {
+                return Ok(error);
+            }
         }
-        if !flush_each && let Some(error) = flush_output(writer, cancelled)? {
-            return Ok(error);
+        if let Some(exit) = flush_output(writer, cancelled)? {
+            return Ok(exit);
         }
+        Ok(if errors {
+            Exit::Usage
+        } else if listed {
+            Exit::Ok
+        } else {
+            Exit::NoMatch
+        })
     }
-    if let Some(exit) = flush_output(writer, cancelled)? {
-        return Ok(exit);
-    }
-    Ok(if errors {
-        Exit::Usage
-    } else if listed {
-        Exit::Ok
-    } else {
-        Exit::NoMatch
-    })
 }
 
 /// Flush accepted names before a diagnostic so stderr cannot overtake them.
 /// A closed pipe remains a quiet success (D94).
 fn diagnostic(
     writer: &mut impl Write,
-    cancelled: &AtomicBool,
+    runtime: &Runtime<'_>,
     message: &str,
 ) -> Result<bool, String> {
+    let cancelled = runtime.cancelled;
     if flush_output(writer, cancelled)?.is_some() {
         return Ok(true);
     }
-    cli::error(message);
+    (runtime.stderr)(message).map_err(|error| error.to_string())?;
     Ok(false)
 }
 

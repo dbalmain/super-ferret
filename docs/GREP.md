@@ -17,13 +17,15 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
 | `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
 
-Indexed directory content searches use the resident daemon (D111 A), falling
+Indexed directory content searches and `--files` use the resident daemon (D111 A), falling
 back to the shared in-process host when it is unavailable or refuses the hello.
 The client resolves presentation, terminal defaults, search threads, cwd and
 pattern files. Mixed explicit files travel with a directory request; requests
-including search stdin remain local. `--files`, explicit-file-only searches,
+including search stdin remain local. Explicit-file-only searches,
 `-u`/`-uu` and `--live` stay local; `--live` loads only catalog roots, not the
-resident engine. Debug `FERRET_TEST_*` injections also stay local.
+resident engine. Names-only directory requests reuse the resident catalog;
+the fallback retains the existing four-section lazy open. Names-only `-` is
+just a label and can accompany a remote directory listing. Debug `FERRET_TEST_*` injections also stay local.
 
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
 data. Missing/incompatible indexes or unindexed directory starts exit 2 with
@@ -1153,3 +1155,9 @@ versus local **14.94 ms** at 64k names. Small-index control: **7.78 versus
 64k **2.69 ms**, 251k **2.66 ms**, local 64k 10.86 ms, rg 3.52 ms. The initial
 backstop completed and the writer was idle before measurement. This resolves
 Round 1's dense-output framing limitation.
+
+**Round 2 names-only routing:** `--files` on the same frozen tree, warm `-N`,
+ten warmups / 100 runs: before routing **2.66 / 6.30 ms** at 64k / 251k names;
+after routing **1.91 / 2.00 ms**. Local controls remain 2.74 / 6.22 ms. The
+resident path lists from its pinned catalog; unavailable-daemon fallback still
+uses the four-section lazy open, with identical names, ordering and exits.

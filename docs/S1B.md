@@ -268,7 +268,7 @@ Peers without the capability retain base64 JSON. Public JSON find and batch
 stdout retain their existing JSON-only format. Existing build-mismatch owner
 replacement still applies independently of this optional codec negotiation.
 
-D111 adds `op: "grep"` with ordinary grep argv and an absolute `cwd`.
+D111 adds `op: "grep"` with ordinary content or `--files` argv and an absolute `cwd`.
 The required `grep` object carries explicit boolean `color`, `heading`,
 `numbers` and `tty`, a positive `threads` count, and `pattern_files`: byte
 strings in parser read order, including pattern stdin. The client resolves

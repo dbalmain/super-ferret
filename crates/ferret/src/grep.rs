@@ -110,8 +110,8 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             if let Some(exit) = context_error(global_json) {
                 return exit;
             }
-            presentation::resolve(&mut plan.presentation);
-            return names::run(&plan, index);
+            let tty = presentation::resolve(&mut plan.presentation);
+            return names::run(&plan, index, args, tty);
         }
         line_grep::Command::Search(plan) => plan,
     };
@@ -145,7 +145,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         && !plan.traversal.unrestricted
         && !plan.traversal.live
         && !inputs.iter().any(|input| matches!(input, Input::Stdin))
-        && !std::env::vars_os().any(|(key, _)| key.as_bytes().starts_with(b"FERRET_TEST_"))
+        && !test_injections()
         && let Ok(index) = index_path(index)
         && let Some(exit) = remote::run(args, &pattern_files, &plan, tty, &index)
     {
@@ -453,6 +453,10 @@ impl Execution<'_> {
             Exit::NoMatch
         }
     }
+}
+
+fn test_injections() -> bool {
+    std::env::vars_os().any(|(key, _)| key.as_bytes().starts_with(b"FERRET_TEST_"))
 }
 
 fn context_error(global_json: bool) -> Option<Exit> {

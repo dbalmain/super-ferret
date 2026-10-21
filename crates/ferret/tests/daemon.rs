@@ -1574,6 +1574,18 @@ fn directory_grep_matches_local_output_errors_and_exits() {
         std::path::Path::new("/"),
     );
     let matrix: &[&[&str]] = &[
+        &["--files", "src"],
+        &["--files", "-0", "src"],
+        &["--files", "--color=always", "src"],
+        &["--files", "-g", "*.rs", "src"],
+        &["--files", "--hidden", "src"],
+        &["--files", "src", "missing", "src/main.rs"],
+        &["--files", "--max-depth", "0", "src"],
+        &["--files", "-q", "missing", "src"],
+        &["--files", "-q", "src"],
+        &["--files", "-f", "missing-patterns", "src"],
+        &["--files", "src", "-"],
+        &["--files", "src/main.rs", "src"],
         &["red", "src"],
         &["-l", "red", "src"],
         &["-c", "red", "src"],
@@ -1633,6 +1645,22 @@ fn directory_grep_matches_local_output_errors_and_exits() {
             assert_eq!(merged(false).stdout, merged(true).stdout, "merged {case:?}");
         }
     }
+    // --files must still default to '.' with piped stdin, under client cwd.
+    let default_files = |local| {
+        let mut command = tree.command(&["grep", "--files"]);
+        command
+            .current_dir(tree.base.join("src"))
+            .stdin(Stdio::piped());
+        if local {
+            command.env("FERRET_NO_DAEMON", "1");
+        }
+        command.output().unwrap()
+    };
+    let local = default_files(true);
+    let remote = default_files(false);
+    assert_eq!(remote.status.code(), local.status.code());
+    assert_eq!(remote.stdout, local.stdout);
+    assert_eq!(remote.stderr, local.stderr);
     let closed_stderr = |local| {
         let mut command = fixture::bounded_command("bash", &tree.base);
         command
@@ -1737,35 +1765,41 @@ fn grep_pipe_close_and_disconnect_release_workers_and_all_query_slots() {
 fn daemon_grep_uses_the_clients_terminal_defaults() {
     let tree = Tree::new();
     tree.start(&[("NO_COLOR", "1"), ("TERM", "dumb")]);
-    for (term, no_color) in [("xterm", false), ("dumb", false), ("xterm", true)] {
-        let run = |local| {
-            let mut command =
-                fixture::bounded_command(std::env::var_os("FERRET_PYTHON").unwrap(), &tree.base);
-            command
-                .env_remove("FERRET_NO_DAEMON")
-                .env("FERRET_SEARCH_THREADS", "1")
-                .env("TERM", term)
-                .env_remove("NO_COLOR")
-                .args([
-                    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/grep_pty.py"),
-                    FERRET,
-                    "grep",
-                    "main",
-                    "src",
-                ]);
-            if no_color {
-                command.env("NO_COLOR", "1");
-            }
-            if local {
-                command.env("FERRET_NO_DAEMON", "1");
-            }
-            command.output().unwrap()
-        };
-        let local = run(true);
-        let remote = run(false);
-        assert!(remote.status.success(), "{remote:?}");
-        assert_eq!(remote.stdout, local.stdout, "{term}, NO_COLOR={no_color}");
-        assert_eq!(remote.stderr, local.stderr);
+    for args in [
+        &["grep", "main", "src"][..],
+        &["grep", "--files", "src"],
+        &["grep", "--files", "-0", "src"],
+    ] {
+        for (term, no_color) in [("xterm", false), ("dumb", false), ("xterm", true)] {
+            let run = |local| {
+                let mut command = fixture::bounded_command(
+                    std::env::var_os("FERRET_PYTHON").unwrap(),
+                    &tree.base,
+                );
+                command
+                    .env_remove("FERRET_NO_DAEMON")
+                    .env("FERRET_SEARCH_THREADS", "1")
+                    .env("TERM", term)
+                    .env_remove("NO_COLOR")
+                    .args([
+                        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/grep_pty.py"),
+                        FERRET,
+                    ])
+                    .args(args);
+                if no_color {
+                    command.env("NO_COLOR", "1");
+                }
+                if local {
+                    command.env("FERRET_NO_DAEMON", "1");
+                }
+                command.output().unwrap()
+            };
+            let local = run(true);
+            let remote = run(false);
+            assert!(remote.status.success(), "{remote:?}");
+            assert_eq!(remote.stdout, local.stdout, "{term}, NO_COLOR={no_color}");
+            assert_eq!(remote.stderr, local.stderr);
+        }
     }
 }
 
@@ -1793,39 +1827,41 @@ fn daemon_grep_reports_thread_shortfalls_once_per_request() {
 
 #[test]
 fn grep_falls_back_when_a_peer_closes_before_hello_or_refuses_it() {
-    for refuse in [false, true] {
-        let tree = Tree::new();
-        let directory = tree.base.join("home/runtime/ferret");
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let metadata = fs::metadata(tree.base.join("index")).unwrap();
-        let socket = directory.join(format!("{:x}-{:x}.sock", metadata.dev(), metadata.ino()));
-        let listener = UnixListener::bind(&socket).unwrap();
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let peer = std::thread::spawn(move || {
-            let until = Instant::now() + BOUND;
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        if refuse {
-                            stream.write_all(b"{}\n").unwrap();
+    for args in [&["grep", "main", "src"][..], &["grep", "--files", "src"]] {
+        for refuse in [false, true] {
+            let tree = Tree::new();
+            let directory = tree.base.join("home/runtime/ferret");
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let metadata = fs::metadata(tree.base.join("index")).unwrap();
+            let socket = directory.join(format!("{:x}-{:x}.sock", metadata.dev(), metadata.ino()));
+            let listener = UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let peer = std::thread::spawn(move || {
+                let until = Instant::now() + BOUND;
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            if refuse {
+                                stream.write_all(b"{}\n").unwrap();
+                            }
+                            return;
                         }
-                        return;
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < until,
+                                "grep never attempted its daemon route"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept: {error}"),
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < until,
-                            "grep never attempted its daemon route"
-                        );
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept: {error}"),
                 }
-            }
-        });
-        parity(&tree, &["grep", "main", "src"]);
-        peer.join().unwrap();
+            });
+            parity(&tree, args);
+            peer.join().unwrap();
+        }
     }
 }
 
