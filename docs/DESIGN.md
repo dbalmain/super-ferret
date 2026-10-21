@@ -782,6 +782,20 @@ No-daemon indexing stays direct and fails promptly against a daemon-held lock.
 Queries pin the last checked view while refresh/recovery runs. Recovery retains
 the same lock and revalidates the durable prefix before rebuilding writer lookups.
 
+D114 runs content merges on a separate nice-19 thread with the content-index
+mutex and the catalog pin used for admission. Catalog refreshes continue on the
+writer. Follow uses try-lock and retries after a merge; edited documents receive
+new uncovered DocIds and queries verify their bytes directly. Above 10,000
+uncovered live documents, default content queries return `IndexIncomplete`
+until follow catches up; `--scan-uncovered` explicitly permits the larger scan.
+Watch traffic never cancels a merge. Commands, battery pause, drain and shutdown
+still cancel at cooperative checkpoints. Writer teardown cancels and joins the
+merge before releasing the catalog lock, then removes the socket (D110).
+Content publications check incarnation, high water and monotonic manifest
+sequence under the publication lock, including reader opens; catalog publication
+preserves the latest matching content view under that same lock. Status reports
+`merge_running` beside the writer's `current_operation` and `writer_busy`.
+
 Crawl owns one nonblocking rustix inotify instance and compact physical-identity,
 parent/name locators, independent of catalog ids. It arms through observed handles
 before listing; a separate thread drains during refresh/compaction. A 200 ms

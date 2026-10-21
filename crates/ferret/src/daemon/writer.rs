@@ -39,6 +39,7 @@ pub(super) struct Status {
     pub refreshes: u64,
     pub last_reason: Option<RefreshReason>,
     pub operation: Option<&'static str>,
+    pub merge_running: bool,
     pub input_usage: ferret_catalog::InputUsage,
     pub error: Option<String>,
     pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
@@ -581,6 +582,8 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     status.blocked = None;
     status.fallback_backstop = false;
 }
+// A merge does not keep an otherwise idle host alive: writer teardown
+// cancels and joins it before close_writer and socket removal (D110).
 pub(super) fn busy(host: &Host) -> bool {
     matches!(
         *host
@@ -713,6 +716,7 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
                 "idle"
             },
         )
+        .bool("merge_running", s.merge_running)
         .int("refreshes", s.refreshes);
     if let Some(reason) = s.last_reason {
         o.str("last_refresh_reason", &format!("{reason:?}"));

@@ -1463,6 +1463,10 @@ fn drain_during_streaming_merge_keeps_inputs_and_restart_finishes_it() {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().starts_with("tmp-"))
     );
+    assert!(tree.socket().is_none(), "drain left its socket behind");
+    let writer = ferret_catalog::WriterSession::open(&tree.path("index"))
+        .unwrap_or_else(|e| panic!("catalog lock survived merge drain: {e}"));
+    drop(writer);
     manifest_equals_clean(&tree);
     fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
     tree.start(&[]);
@@ -1587,44 +1591,8 @@ fn deferred_catalog_retry_does_not_spin_on_an_expired_content_deadline() {
     assert!(used < 10, "deferred writer spun for {used} CPU ticks");
 }
 
-/// Real admitted watch work cancelled and discarded every streaming attempt.
-/// After two cancellations of these inputs, a third attempt must finish while
-/// unrelated watch traffic waits behind it.
-#[test]
-fn watch_traffic_cannot_restart_the_same_merge_forever() {
-    fn counters(tree: &Tree) -> (u64, u64, u64) {
-        let pid = tree
-            .daemon
-            .as_ref()
-            .unwrap_or_else(|| panic!("daemon"))
-            .id();
-        let stat =
-            fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_else(|e| panic!("stat: {e}"));
-        let fields: Vec<_> = stat
-            .rsplit_once(") ")
-            .unwrap_or_else(|| panic!("stat fields"))
-            .1
-            .split_whitespace()
-            .collect();
-        let ticks = fields[11]
-            .parse::<u64>()
-            .unwrap_or_else(|e| panic!("utime: {e}"))
-            + fields[12]
-                .parse::<u64>()
-                .unwrap_or_else(|e| panic!("stime: {e}"));
-        let io =
-            fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_else(|e| panic!("io: {e}"));
-        let count = |key| {
-            io.lines()
-                .find_map(|line| {
-                    line.strip_prefix(key)
-                        .and_then(|s| s.trim().parse::<u64>().ok())
-                })
-                .unwrap_or_else(|| panic!("io field {key}"))
-        };
-        (ticks, count("rchar:"), count("wchar:"))
-    }
-    let mut tree = Tree::new();
+/// Hold a real streaming merge after temporary output has reached disk.
+fn held_merge(tree: &mut Tree, extra: &[(&str, &str)]) -> (PathBuf, UnixStream) {
     for i in 0..600 {
         let text = (0..400)
             .map(|j| format!("word{i}part{j} "))
@@ -1632,111 +1600,112 @@ fn watch_traffic_cannot_restart_the_same_merge_forever() {
         write(tree.path(&format!("src/merge-{i}.txt")), &text);
     }
     tree.success(tree.local(&["index", "src"]));
-    let input = ferret_index::Manifest::read(&tree.path("index/index"))
-        .unwrap_or_else(|e| panic!("manifest: {e}"))
-        .unwrap_or_else(|| panic!("manifest missing"))
-        .segments
-        .into_iter()
-        .max_by_key(|entry| entry.bytes)
-        .unwrap_or_else(|| panic!("merge input"));
-    let input_path = tree.path("index/index").join(input.file_name());
-    let gate = gate(&tree, "merge");
+    let gate = gate(tree, "merge");
     let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
-    tree.start(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    let mut env = extra.to_vec();
+    env.push(("FERRET_CONTENT_TEST_GATE", gate_text));
+    tree.start(&env);
+    let client = tree.hold();
     for i in 0..240 {
         fs::remove_file(tree.path(&format!("src/merge-{i}.txt")))
             .unwrap_or_else(|e| panic!("delete: {e}"));
     }
     wait(|| gate.join("merge.reached").exists());
-    let retry_before = counters(&tree);
-    let mut third_setup = None;
-    let mut discarded_bytes = 0;
-    for round in 0..2 {
-        assert!(input_path.exists(), "the selection must remain the same");
-        discarded_bytes += fs::read_dir(tree.path("index/index"))
-            .unwrap_or_else(|e| panic!("index: {e}"))
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("tmp-"))
-            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
-            .sum::<u64>();
-        let before = number(&tree.status(), "refreshes");
-        fs::remove_file(gate.join("merge.reached")).unwrap_or_else(|e| panic!("checkpoint: {e}"));
+    (gate, client)
+}
+
+/// Watch traffic used to cancel two merges, then wait behind a protected
+/// third attempt. Every refresh must now publish beside the same held merge.
+#[test]
+fn watch_traffic_cannot_restart_the_same_merge_forever() {
+    let mut tree = Tree::new();
+    let (gate, _client) = held_merge(&mut tree, &[("FERRET_WATCH_TEST_REFRESH_DELAY_MS", "100")]);
+    let before = number(&tree.status(), "refreshes");
+    for round in 0..3 {
         write(
             tree.path("src/right/traffic.txt"),
             &format!("traffic round{round}"),
         );
-        wait(|| number(&tree.status(), "refreshes") > before);
-        if round == 1 {
-            third_setup = Some((counters(&tree), Instant::now()));
-        }
-        wait(|| gate.join("merge.reached").exists());
-    }
-    let (third_before, third_started) = third_setup.unwrap_or_else(|| panic!("third attempt"));
-    let prefix_wall = third_started.elapsed();
-    let retry_after = counters(&tree);
-    println!(
-        "MERGE_RETRIES cpu_ticks={} rchar={} wchar={}",
-        retry_after.0 - retry_before.0,
-        retry_after.1 - retry_before.1,
-        retry_after.2 - retry_before.2
-    );
-    let before = number(&tree.status(), "refreshes");
-    write(tree.path("src/right/traffic.txt"), "traffic third round");
-    wait(|| {
+        wait(|| tree.status().contains("\"current_operation\":\"refresh\""));
+        let concurrent = tree.status();
+        assert!(
+            concurrent.contains("\"merge_running\":true"),
+            "{concurrent}"
+        );
+        wait(|| number(&tree.status(), "refreshes") > before + round);
         let status = tree.status();
-        number(&status, "refreshes") > before
-            || (number(&status, "pending_scopes") > 0
-                && number(&status, "oldest_pending_ms") >= 400)
-    });
-    let status = tree.status();
-    println!(
-        "MERGE_PROGRESS input_bytes={} cancellations=2 discarded_partial_bytes={discarded_bytes}",
-        input.bytes
-    );
-    assert_eq!(
-        number(&status, "refreshes"),
-        before,
-        "watch work cancelled the protected third attempt: {status}"
-    );
-    assert!(input_path.exists());
-    let protected_before = counters(&tree);
-    let started = Instant::now();
-    fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
-    let mut bursts = 0;
-    let until = Instant::now() + BOUND;
-    let mut next_burst = Instant::now();
-    while input_path.exists() {
-        if Instant::now() >= next_burst {
-            write(
-                tree.path("src/right/traffic.txt"),
-                &format!("steady traffic {bursts}"),
-            );
-            bursts += 1;
-            next_burst = Instant::now() + Duration::from_millis(10);
-        }
-        assert!(Instant::now() < until, "steady traffic starved merge");
-        std::thread::sleep(Duration::from_millis(1));
+        assert!(status.contains("\"merge_running\":true"), "{status}");
+        assert!(gate.join("merge").exists());
+        assert!(
+            tree.success(tree.run(&["search", &format!("text:round{round}")]))
+                .stdout
+                .ends_with(b"traffic.txt\n")
+        );
     }
-    let completion = started.elapsed();
-    let protected_after = counters(&tree);
-    println!(
-        "MERGE_PROTECTED_FULL cpu_ticks={} rchar={} wchar={} active_wall_ms={} (excludes_held_gate)",
-        protected_after.0 - third_before.0,
-        protected_after.1 - third_before.1,
-        protected_after.2 - third_before.2,
-        (prefix_wall + completion).as_millis()
-    );
-    println!(
-        "MERGE_PROTECTED cpu_ticks={} rchar={} wchar={}",
-        protected_after.0 - protected_before.0,
-        protected_after.1 - protected_before.1,
-        protected_after.2 - protected_before.2
-    );
-    wait(|| number(&tree.status(), "refreshes") > before);
-    println!(
-        "MERGE_PROGRESS protected_completion_wall_ms={} queued_watch_wait_wall_ms={} bursts={bursts}",
-        completion.as_millis(),
-        started.elapsed().as_millis()
-    );
+    fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
+    wait(|| tree.status().contains("\"merge_running\":false"));
+    wait(|| number(&tree.status(), "uncovered") == 0);
     tree.converges();
+}
+
+/// Follow used to block on the merge's mutex. It must skip while the new
+/// DocId remains uncovered, letting the query verify the edited bytes directly.
+#[test]
+fn follow_skips_a_running_merge_and_queries_verify_the_edit() {
+    let mut tree = Tree::new();
+    let (gate, _client) = held_merge(&mut tree, &[]);
+    let before = number(&tree.status(), "refreshes");
+    write(tree.path("src/right/edit.txt"), "uncoveredneedle");
+    wait(|| number(&tree.status(), "refreshes") > before);
+    // Wait through several follow deadlines; follow must leave the writer
+    // free even though the merge's content mutex is still held.
+    std::thread::sleep(Duration::from_millis(350));
+    let status = tree.status();
+    assert_eq!(number(&status, "uncovered"), 1, "{status}");
+    assert!(status.contains("\"writer_busy\":false"), "{status}");
+    assert!(status.contains("\"merge_running\":true"), "{status}");
+    let output = tree.success(tree.run(&["search", "text:uncoveredneedle"]));
+    assert!(output.stdout.ends_with(b"edit.txt\n"));
+    fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
+    wait(|| number(&tree.status(), "uncovered") == 0);
+    assert!(
+        tree.success(tree.run(&["search", "text:uncoveredneedle"]))
+            .stdout
+            .ends_with(b"edit.txt\n")
+    );
+}
+
+/// Idle expiry must cancel background merges rather than waiting indefinitely
+/// for their content mutex. Socket removal still follows catalog lock release.
+#[test]
+fn idle_exit_cancels_a_streaming_merge_and_releases_the_catalog_lock() {
+    let mut tree = Tree::new();
+    let (gate, client) = held_merge(&mut tree, &[("FERRET_DAEMON_IDLE_MS", "1500")]);
+    let socket = tree.socket().unwrap_or_else(|| panic!("socket"));
+    drop(client);
+    wait(|| !socket.exists());
+    let daemon = tree.daemon.as_mut().unwrap_or_else(|| panic!("daemon"));
+    wait(|| {
+        daemon
+            .try_wait()
+            .unwrap_or_else(|e| panic!("wait: {e}"))
+            .is_some()
+    });
+    assert!(
+        daemon
+            .wait()
+            .unwrap_or_else(|e| panic!("exit: {e}"))
+            .success()
+    );
+    assert!(
+        gate.join("merge").exists(),
+        "test must not release the merge"
+    );
+    // Opening a replacement writer after the socket vanishes pins D110's
+    // lock-before-socket ordering, including the joined merge thread.
+    let writer = ferret_catalog::WriterSession::open(&tree.path("index"))
+        .unwrap_or_else(|e| panic!("catalog lock survived idle exit: {e}"));
+    drop(writer);
+    tree.daemon.take();
+    manifest_equals_clean(&tree);
 }

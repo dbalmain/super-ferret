@@ -26,7 +26,8 @@ static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 pub struct Engine {
     current: RwLock<QuerySession>,
     writer: Mutex<Option<WriterSession>>,
-    /// The content index, kept under `writer`'s lock: lock `writer` first.
+    /// Content mutation is independent of catalog refresh. When both are
+    /// needed, lock `writer` first; merges hold only this mutex and a pin.
     content: Mutex<Option<IndexWriter>>,
     retired: Mutex<Vec<(u64, Weak<NameIndex>)>>,
 }
@@ -291,6 +292,7 @@ impl Engine {
         let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let live = live_documents(&view);
+        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let opened = IndexWriter::open_with_threads(
             &catalog_dir.join(CONTENT_DIR),
             &catalog_view(&view, &live),
@@ -298,7 +300,7 @@ impl Engine {
         )
         .map_err(Error::Content)?;
         let published = opened.view();
-        *self.content.lock().map_err(|_| Error::WriterPanicked)? = Some(opened);
+        *content = Some(opened);
         self.select_content(published);
         Ok(())
     }
@@ -306,8 +308,9 @@ impl Engine {
     /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] for
     /// reading, for a query-only engine: no writer lock, nothing repaired
     /// or removed. An index that is absent or does not fit the catalog view
-    /// leaves the engine without one, which content queries treat as
-    /// nothing covered. Segments open on the search thread count.
+    /// leaves a fresh engine without one, which content queries treat as
+    /// nothing covered. A newer published view survives a delayed open.
+    /// Segments open on the search thread count.
     pub fn open_content(&self, catalog_dir: &Path) -> Result<(), Error> {
         let pin = self.pin();
         let view = ferret_index::View::open_with_threads(
@@ -316,12 +319,8 @@ impl Engine {
             pin.search_threads(),
         )
         .map_err(Error::Content)?;
-        let mut current = self
-            .current
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.generation() == pin.generation() {
-            current.content = view.map(Arc::new);
+        if let Some(view) = view {
+            self.select_content(Arc::new(view));
         }
         Ok(())
     }
@@ -339,44 +338,99 @@ impl Engine {
         let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        self.follow_locked(&view, index, budget, limiter)
+    }
+
+    /// Like [`Engine::follow_content`], but skips without waiting while a
+    /// merge owns the content index. The caller must retry after the merge;
+    /// catalog refreshes still publish uncovered documents for verification.
+    pub fn try_follow_content(
+        &self,
+        budget: &Budget,
+        limiter: Option<Arc<ferret_catalog::bulk::Limiter>>,
+    ) -> Result<Option<Followed>, Error> {
+        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let mut content = match self.content.try_lock() {
+            Ok(content) => content,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WriterPanicked),
+        };
+        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        self.follow_locked(&view, index, budget, limiter).map(Some)
+    }
+
+    fn follow_locked(
+        &self,
+        view: &Catalog,
+        index: &mut IndexWriter,
+        budget: &Budget,
+        limiter: Option<Arc<ferret_catalog::bulk::Limiter>>,
+    ) -> Result<Followed, Error> {
         let pin = self.pin();
         let live = pin.live();
         let names = pin.doc_names().map_err(Error::Catalog)?;
-        let mut documents = ferret_crawl::Documents::by_name(&view).map_err(Error::Catalog)?;
+        let mut documents = ferret_crawl::Documents::by_name(view).map_err(Error::Catalog)?;
         if let Some(limiter) = limiter {
             documents = documents.with_limiter(limiter);
         }
-        let followed = index.follow(&catalog_view(&view, live), budget, &mut |doc, bytes| {
+        let followed = index.follow(&catalog_view(view, live), budget, &mut |doc, bytes| {
             let Some(&name) = names.names(doc).first() else {
                 return Err(Fault::Unreadable);
             };
             documents
-                .read_name(&view, name, bytes)
+                .read_name(view, name, bytes)
                 .map_err(|_| Fault::Unreadable)
         });
         let published = index.view();
-        drop(content);
         self.select_content(published);
-        drop(writer);
         followed.map_err(Error::Content)
     }
 
-    /// One merge step of the content index, if its policy wants one.
+    /// One merge step of the content index, if its policy wants one. Holds
+    /// only the content mutex and a catalog pin, so refreshes can publish
+    /// while the merge streams its immutable inputs.
     pub fn merge_content(&self, budget: &Budget) -> Result<Option<Merged>, Error> {
-        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
-        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let index = content.as_mut().ok_or(Error::NoContentIndex)?;
         let pin = self.pin();
-        let merged = index.merge_if_needed(&catalog_view(&view, pin.live()), budget);
-        let published = index.view();
-        drop(content);
-        self.select_content(published);
-        drop(writer);
+        self.merge_locked(index, &pin, budget)
+    }
+
+    /// Uses the same catalog pin that admitted the daemon's merge resources.
+    /// A content publisher that overtook admission invalidates that attempt;
+    /// never reconcile a newer index backwards against an old catalog pin.
+    pub(crate) fn merge_content_at(
+        &self,
+        pin: &QuerySession,
+        budget: &Budget,
+    ) -> Result<Option<Merged>, Error> {
+        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
+        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        let view = index.view();
+        if view.manifest().incarnation != pin.generation().incarnation
+            || pin
+                .content()
+                .is_none_or(|admitted| view.manifest().sequence != admitted.manifest().sequence)
+        {
+            return Ok(None);
+        }
+        self.merge_locked(index, pin, budget)
+    }
+
+    fn merge_locked(
+        &self,
+        index: &mut IndexWriter,
+        pin: &QuerySession,
+        budget: &Budget,
+    ) -> Result<Option<Merged>, Error> {
+        let merged = index.merge_if_needed(&catalog_view(pin.catalog(), pin.live()), budget);
+        self.select_content(index.view());
         merged.map_err(Error::Content)
     }
 
-    /// Publishes a content view beside the current catalog view.
+    /// Publishes a content view beside the current catalog view. Publishers
+    /// can finish out of order: manifest sequence must never go backwards.
     fn select_content(&self, content: Arc<ferret_index::View>) {
         let mut current = self
             .current
@@ -385,6 +439,10 @@ impl Engine {
         let manifest = content.manifest();
         if manifest.incarnation == current.generation().incarnation
             && manifest.high_water <= current.catalog.next_doc().0
+            && current
+                .content
+                .as_ref()
+                .is_none_or(|selected| selected.manifest().sequence <= manifest.sequence)
         {
             current.content = Some(content);
         }

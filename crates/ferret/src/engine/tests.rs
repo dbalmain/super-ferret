@@ -283,10 +283,9 @@ fn renaming_one_of_many_identical_files_leaves_doc_names_to_the_full_build() {
 
 /// A catalog publication that pinned the old content view before a content
 /// publication landed keeps the newer content view rather than restoring
-/// the one it pinned. Production callers both hold `Engine.writer` today;
-/// this drives the two publishers concurrently, as moving merges off the
-/// writer thread will. `select` is held on the retired list after its pin,
-/// the window in which the content view changes.
+/// the one it pinned. This drives the two publishers concurrently, as the
+/// daemon does when merging beside a refresh. `select` is held on the retired
+/// list after its pin, the window in which the content view changes.
 #[test]
 fn a_catalog_publication_keeps_a_content_view_published_after_its_pin() {
     let tree = Tree::with_files(4);
@@ -631,4 +630,135 @@ fn a_corrupt_settings_file_falls_back_without_failing_the_search() {
     .unwrap();
     assert_eq!(rows, 4);
     assert_eq!(pin.search_threads(), expected_threads(None));
+}
+
+/// Merge, follow and reader opens may reach publication out of order once
+/// merges stop taking the catalog writer mutex. Genuine manifest successors
+/// must survive delayed publication of an older sequence.
+#[test]
+fn an_older_content_publication_cannot_replace_a_newer_sequence() {
+    let tree = Tree::with_files(4);
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let older = engine.pin().content.unwrap();
+    let saved = tree.0.join("older/index");
+    fs::create_dir_all(&saved).unwrap();
+    for entry in fs::read_dir(tree.0.join("index/index")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), saved.join(entry.file_name())).unwrap();
+        }
+    }
+    tree.publish(&engine);
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let newer = engine.pin().content.unwrap();
+    assert!(newer.manifest().sequence > older.manifest().sequence);
+
+    engine.select_content(older);
+    assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
+    engine.open_content(&tree.0.join("older")).unwrap();
+    assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
+    // An absent reader open used to assign None directly, discarding even
+    // a newer view already published for this catalog generation.
+    engine.open_content(&tree.0.join("absent")).unwrap();
+    assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
+}
+
+/// The merge formerly owned Engine.writer for its entire streaming pass.
+/// Hold it in the real pacer, then require a refresh, a skipped follow and
+/// direct verification to finish before releasing it.
+#[test]
+fn refresh_and_direct_verification_proceed_beside_a_held_merge() {
+    let tree = Tree::with_files(100);
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    for i in 0..40 {
+        fs::remove_file(tree.0.join(format!("root/d0/{i}.txt"))).unwrap();
+    }
+    tree.refresh(&engine);
+    fs::write(tree.0.join("root/edited.txt"), b"uncoveredneedle").unwrap();
+    let (reached, held) = std::sync::mpsc::sync_channel(1);
+    let (release, resume) = std::sync::mpsc::sync_channel(1);
+    let (refreshed, finished) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let merge = scope.spawn(|| {
+            let resume = Mutex::new(Some(resume));
+            let pace = |_| {
+                if let Some(resume) = resume.lock().unwrap().take() {
+                    reached.send(()).unwrap();
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                Ok(())
+            };
+            engine.merge_content(&Budget {
+                pace: &pace,
+                ..Budget::unbounded()
+            })
+        });
+        held.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refresh = scope.spawn(|| {
+            tree.refresh(&engine);
+            refreshed.send(()).unwrap();
+        });
+        let completed = finished.recv_timeout(std::time::Duration::from_secs(1));
+        let verified = completed.is_ok().then(|| {
+            assert!(
+                engine
+                    .try_follow_content(&Budget::unbounded(), None)
+                    .unwrap()
+                    .is_none()
+            );
+            let query =
+                Query::from_args([b"text:uncoveredneedle".as_slice()], SystemTime::now()).unwrap();
+            engine
+                .pin()
+                .search_content(&query, None, None, |_| ControlFlow::Continue(()))
+                .unwrap()
+                .rows
+        });
+        release.send(()).unwrap();
+        assert!(merge.join().unwrap().unwrap().is_some());
+        refresh.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "refresh waited for the held content merge"
+        );
+        assert_eq!(verified, Some(1));
+    });
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let pin = engine.pin();
+    assert!(
+        Pinned::new(pin.content(), pin.live())
+            .uncovered()
+            .is_empty()
+    );
+}
+
+/// Admission pins can lag a later follow before the merge worker takes the
+/// content mutex. Reconciling against that old frontier would discard the
+/// newer durable index, even if publication's sequence check hid the damage.
+#[test]
+fn an_overtaken_merge_admission_cannot_reconcile_newer_content_backwards() {
+    let tree = Tree::with_files(4);
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let admitted = engine.pin();
+    tree.publish(&engine);
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let newer = engine.pin().content.unwrap();
+    assert!(newer.manifest().high_water > admitted.catalog.next_doc().0);
+    assert!(
+        engine
+            .merge_content_at(&admitted, &Budget::unbounded())
+            .unwrap()
+            .is_none()
+    );
+    let content = engine.content.lock().unwrap();
+    assert!(Arc::ptr_eq(&content.as_ref().unwrap().view(), &newer));
 }

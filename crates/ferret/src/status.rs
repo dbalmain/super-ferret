@@ -79,6 +79,7 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
     let mut o = Object::new(&mut out);
     o.bool("host_running", false)
         .str("current_operation", "idle")
+        .bool("merge_running", false)
         .null("last_successful_refresh")
         .null("last_complete_backstop")
         .int("watch_installed", 0)
