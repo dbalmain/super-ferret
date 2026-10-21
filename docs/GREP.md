@@ -892,8 +892,8 @@ D71 remains separate; grep arguments are patterns.
 `ferret` owns CLI/output/XDG and policy adapters. Reuse `Engine::pin`/
 `QuerySession` and find's `EntrySource`/`CatalogSource`/`LiveWalk`; factor
 constructors preserving find behavior, never parse synthetic find commands.
-Keep pins through output. Direct input stays local; resident queries later use
-the existing host seam. `ferret-policy` owns globs/hidden/size/binary; adapters
+Keep pins through output. Direct-only input stays local; indexed directory
+queries use the shared host through the daemon (D111 A). `ferret-policy` owns globs/hidden/size/binary; adapters
 pass selection to query. No new edge/format: query cannot depend on policy.
 
 **M1 internal prerequisite:** factor find source constructors, then supply a
@@ -1108,6 +1108,28 @@ engine exceeds half of verification, revisit D17. If broad scans are over 2×
 rg's comparable p90, fix enumeration/streaming or reopen D72; if new-name misses
 harm agents, reopen D73. No global refresh, new positional index or PCRE engine
 is justified merely by a compatibility rank.
+
+### D111 daemon measurements (2026-10-21)
+
+Warm release binaries, 62 copied source files (1.09 MB), one rare-literal
+match, identical search trees with 64,318 or 251,062 catalog names. Hyperfine
+`-N`, ten warmups and 100 runs, one benchmark at a time; the daemon's initial
+backstop completed and its writer was idle before measurement. Default index
+setting: 16 search threads. Means in milliseconds:
+
+| Catalog names | In-process grep | Daemon grep | rg 15.2.0 |
+| ---: | ---: | ---: | ---: |
+| 64,318 | 10.82 | 2.53 | 3.69 |
+| 251,062 | 31.69 | 2.54 | same tree |
+
+Dense inverted output (30,522 lines, 1,574,130 bytes), one search thread,
+Hyperfine `--shell=bash`, ten warmups / 30 runs: local 14.77 ms versus daemon
+23.98 ms at 64k names, **62% slower**. A small-index control is 7.36 versus
+24.51 ms, exposing roughly 17.15 ms of additional transport/codec work for
+1.57 MB. This exceeds the 10% framing budget. Proposed follow-up: negotiate
+length-delimited raw stdout/stderr payloads, preserving stream order, explicit
+flush boundaries, cancellation and native end status; JSON remains the control
+codec. The current slice retains find's base64 JSON frames.
 
 ## Answered decisions (checked 2026-10-16)
 
