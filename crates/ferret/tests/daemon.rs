@@ -2317,6 +2317,76 @@ fn daemon_search_prints_raw_paths_the_in_process_client_prints() {
     assert!(end.contains("\"first_row_us\":null"), "{end}");
 }
 
+// One frame per path would still print the right bytes and still report
+// `rows` from the end event. A full frame holds many paths, and every frame
+// stays within find's 64 KiB part. Dropping the shared buffer fails this.
+#[test]
+fn daemon_search_raw_frames_batch_paths_to_64_kib() {
+    let tree = Tree::new();
+    let src = tree.base.join("src");
+    let count = 2000u32;
+    for i in 0..count {
+        fs::write(src.join(format!("f{i:05}.txt")), b"x\n").unwrap();
+    }
+    let indexed = tree.local(&["index", "src"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    tree.start(&[]);
+
+    let local = tree.local(&["search", "ext:txt"]);
+    let remote = tree.run(&["search", "ext:txt"]);
+    assert_eq!(remote.status.code(), Some(0), "{remote:?}");
+    assert_eq!(local.status.code(), Some(0), "{local:?}");
+    assert_eq!(remote.stdout, local.stdout);
+    assert!(local.stdout.len() > 64 * 1024, "{}", local.stdout.len());
+    let logged = socket_log(&tree);
+    assert_eq!(number(&logged, "rows"), Some(count), "{logged}");
+    assert_eq!(number(&logged, "exit"), Some(0), "{logged}");
+    assert!(number(&logged, "first_row_us").is_some(), "{logged}");
+
+    let (mut peer, _) = tree.connect();
+    let raw =
+        r#"{"id":"search","op":"search","args":["ext:txt"],"capabilities":["raw-output-v1"]}"#;
+    peer.get_mut()
+        .write_all(format!("{raw}\n").as_bytes())
+        .unwrap();
+    assert!(line(&mut peer).contains("\"event\":\"begin\""));
+    let mut joined = Vec::new();
+    let mut lengths = Vec::new();
+    let mut first_full = None;
+    loop {
+        let header = line(&mut peer);
+        if header.contains("\"event\":\"end\"") {
+            assert_eq!(number(&header, "rows"), Some(count), "{header}");
+            assert_eq!(number(&header, "exit"), Some(0), "{header}");
+            assert!(number(&header, "first_row_us").is_some(), "{header}");
+            break;
+        }
+        assert!(header.contains("\"event\":\"stdout\""), "{header}");
+        let len = number(&header, "length").unwrap() as usize;
+        assert!(len <= 64 * 1024 && len > 0, "{header}");
+        let mut payload = vec![0; len];
+        peer.read_exact(&mut payload).unwrap();
+        if len == 64 * 1024 && first_full.is_none() {
+            first_full = Some(payload.clone());
+        }
+        lengths.push(len);
+        joined.extend_from_slice(&payload);
+    }
+    assert_eq!(joined, local.stdout);
+    assert!(lengths.len() > 1, "{lengths:?}");
+    assert!(
+        lengths[..lengths.len() - 1]
+            .iter()
+            .all(|len| *len == 64 * 1024),
+        "{lengths:?}"
+    );
+    let full = first_full.expect("a 64 KiB frame");
+    assert!(
+        full.iter().filter(|byte| **byte == b'\n').count() > 1,
+        "a full frame held one path"
+    );
+}
+
 fn socket_log(tree: &Tree) -> String {
     let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
     log.lines()
