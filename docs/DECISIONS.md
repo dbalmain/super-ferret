@@ -5967,7 +5967,9 @@ heavy output from multi-GiB single files mattering; only C fixes that.
 
 ## D110 — A client that connects while ferretd is exiting
 
-**Status: open, 2026-10-21.**
+**Status: answered B, 2026-10-21.** Writer clients wait for the leaving daemon.
+
+> Dave: Also, agree on D110.
 
 Question: when a client connects to a ferretd that has already decided to exit,
 should the daemon stop that from happening, or should the client wait and
@@ -6336,7 +6338,9 @@ root, not a fixed exclusion.
 
 ## D114 — A content merge blocks catalog refreshes in the daemon
 
-**Status: open, 2026-10-21.**
+**Status: answered 2, 2026-10-21.** Pacing fix now; then merges move off the writer thread.
+
+> Dave: go with D114 option 2
 
 Question: once the merge-pacing bug is fixed, should content merges move off
 the daemon's writer thread so that a file edit becomes searchable while a
