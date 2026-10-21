@@ -38,12 +38,59 @@ pub const MAX_NESTING_DEPTH: u32 = 8;
 pub(crate) struct Request {
     pub id: String,
     pub op: Op,
+    pub grep: Option<GrepOptions>,
     pub args: Vec<Vec<u8>>,
     pub cwd: Option<Vec<u8>>,
     pub limit: Option<u64>,
     pub capabilities: Vec<String>,
     pub child_stdin: Option<ChildStdin>,
     pub start_unix_ns: Option<u64>,
+}
+
+/// Client-resolved grep environment. Pattern-file bytes travel with the
+/// request so the socket host never opens client-relative files or stdin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrepOptions {
+    pub color: bool,
+    pub heading: bool,
+    pub numbers: bool,
+    pub tty: bool,
+    pub threads: usize,
+    pub pattern_files: Vec<Vec<u8>>,
+}
+
+impl GrepOptions {
+    pub(crate) fn encode(&self, object: &mut crate::json::Object<'_>) {
+        object.object("grep", |o| {
+            o.bool("color", self.color)
+                .bool("heading", self.heading)
+                .bool("numbers", self.numbers)
+                .bool("tty", self.tty)
+                .int("threads", self.threads as u64)
+                .byte_strings(
+                    "pattern_files",
+                    self.pattern_files.iter().map(Vec::as_slice),
+                );
+        });
+    }
+    fn parse(value: &Value) -> Option<Self> {
+        let boolean = |name| match value.field(name)? {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        };
+        let Value::Arr(files) = value.field("pattern_files")? else {
+            return None;
+        };
+        let threads = usize::try_from(value.field("threads")?.number()?).ok()?;
+        (threads > 0).then_some(Self {
+            color: boolean("color")?,
+            heading: boolean("heading")?,
+            numbers: boolean("numbers")?,
+            tty: boolean("tty")?,
+            threads,
+            pattern_files: files.iter().map(byte_value).collect::<Option<_>>()?,
+        })
+    }
 }
 
 /// Child stdin policy, independent of the host's request transport.
@@ -58,6 +105,7 @@ pub(crate) enum ChildStdin {
 pub(crate) enum Op {
     Search,
     Find,
+    Grep,
     Status,
     Reload,
     Index,
@@ -69,6 +117,7 @@ impl Op {
         match name {
             "search" => Some(Op::Search),
             "find" => Some(Op::Find),
+            "grep" => Some(Op::Grep),
             "status" => Some(Op::Status),
             "reload" => Some(Op::Reload),
             "index" => Some(Op::Index),
@@ -290,6 +339,12 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
     Ok(Request {
         id,
         op,
+        grep: match find_field(fields, "grep") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                Some(GrepOptions::parse(value).ok_or(RequestErrorKind::InvalidField("grep"))?)
+            }
+        },
         args,
         cwd,
         limit,
@@ -787,6 +842,7 @@ mod tests {
             Request {
                 id: "a".into(),
                 op: Op::Search,
+                grep: None,
                 args: vec![],
                 cwd: None,
                 limit: None,
@@ -1060,10 +1116,11 @@ mod tests {
         }
 
         fn op(&mut self) -> Op {
-            match self.below(4) {
+            match self.below(5) {
                 0 => Op::Search,
                 1 => Op::Find,
                 2 => Op::Status,
+                3 => Op::Grep,
                 _ => Op::Reload,
             }
         }
@@ -1074,6 +1131,14 @@ mod tests {
             Request {
                 id: self.id(),
                 op: self.op(),
+                grep: self.bool().then(|| GrepOptions {
+                    color: self.bool(),
+                    heading: self.bool(),
+                    numbers: self.bool(),
+                    tty: self.bool(),
+                    threads: self.below(32) + 1,
+                    pattern_files: vec![self.bytes(24)],
+                }),
                 args,
                 cwd: self.bool().then(|| self.bytes(24)),
                 limit: self.bool().then(|| self.next() % 1_000_000),
@@ -1106,12 +1171,16 @@ mod tests {
             match req.op {
                 Op::Search => "search",
                 Op::Find => "find",
+                Op::Grep => "grep",
                 Op::Status => "status",
                 Op::Reload => "reload",
                 Op::Index => "index",
                 Op::RootsRemove => "roots-remove",
             },
         );
+        if let Some(grep) = &req.grep {
+            grep.encode(&mut obj);
+        }
         obj.byte_strings("args", req.args.iter().map(|a| a.as_slice()));
         obj.opt_byte_value("cwd", req.cwd.as_deref());
         obj.opt_int("limit", req.limit.map(|l| l as i128));

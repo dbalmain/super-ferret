@@ -302,7 +302,7 @@ impl FrameWriter<'_, '_> {
         Ok(())
     }
 }
-fn emit_parts(
+pub(crate) fn emit_parts(
     destination: &Destination,
     id: &str,
     event: &str,

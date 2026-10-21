@@ -16,7 +16,7 @@ mod live;
 mod names;
 mod output;
 mod presentation;
-mod remote;
+pub(crate) mod remote;
 mod sources;
 
 use ferret_catalog::NameId;
@@ -81,9 +81,9 @@ enum Input {
     Failed(PathBuf, io::Error),
 }
 
-/// Runs the resolved grep profile locally. Help/version bypass configuration
-/// and index resolution; all search errors use grep's status 2, including
-/// output failures.
+/// Runs grep through the resident daemon when eligible. Help/version bypass
+/// configuration and index resolution; all search errors use grep's status 2,
+/// including output failures.
 pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let start = std::time::Instant::now();
     let mut pattern_files = Vec::new();
@@ -92,7 +92,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             let mut bytes = Vec::new();
             io::stdin().lock().read_to_end(&mut bytes)?;
             bytes
-        } else { fs::read(path)? };
+        } else {
+            fs::read(path)?
+        };
         pattern_files.push(bytes.clone());
         Ok(bytes)
     }) {
@@ -139,7 +141,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(cwd) => cwd,
         Err(error) => return failure(&error.to_string()),
     };
-    if recursive && !plan.traversal.unrestricted && !plan.traversal.live
+    if recursive
+        && !plan.traversal.unrestricted
+        && !plan.traversal.live
         && !inputs.iter().any(|input| matches!(input, Input::Stdin))
         && !std::env::vars_os().any(|(key, _)| key.as_bytes().starts_with(b"FERRET_TEST_"))
         && let Ok(index) = index_path(index)
@@ -165,18 +169,45 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     };
     let pin = engine.as_ref().map(Engine::pin);
     let threads = pin.as_ref().map_or_else(
-        || live.as_ref().map_or_else(|| {
-            let available = std::thread::available_parallelism().map_or(1, |n| n.get());
-            engine::search_threads(engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()), None, available)
-        }, live::Anchors::search_threads),
+        || {
+            live.as_ref().map_or_else(
+                || {
+                    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+                    engine::search_threads(
+                        engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()),
+                        None,
+                        available,
+                    )
+                },
+                live::Anchors::search_threads,
+            )
+        },
         engine::QuerySession::search_threads,
     );
     let cancelled = AtomicBool::new(false);
-    let stderr = |message: &str| { cli::error(message); Ok(()) };
-    let runtime = Runtime { cancelled: &cancelled, stderr: &stderr, tty, warned: AtomicBool::new(false) };
+    let stderr = |message: &str| {
+        cli::error(message);
+        Ok(())
+    };
+    let runtime = Runtime {
+        cancelled: &cancelled,
+        stderr: &stderr,
+        tty,
+        warned: AtomicBool::new(false),
+        descriptors: None,
+    };
     let stdout = io::stdout();
-    execute(&plan, inputs, &selection, pin.as_ref(), live.as_ref(), &cwd, threads,
-        output::Writer::new(&stdout, block_stdout(&plan)), &runtime, start)
+    Execution {
+        plan: &plan,
+        selection: &selection,
+        pin: pin.as_ref(),
+        live: live.as_ref(),
+        cwd: &cwd,
+        threads,
+        runtime: &runtime,
+        start,
+    }
+    .run(inputs, output::Writer::new(&stdout, block_stdout(&plan)))
 }
 
 struct Runtime<'a> {
@@ -184,6 +215,7 @@ struct Runtime<'a> {
     stderr: &'a (dyn Fn(&str) -> io::Result<()> + Sync),
     tty: bool,
     warned: AtomicBool,
+    descriptors: Option<std::sync::Arc<line_grep::IoBudget>>,
 }
 
 impl Runtime<'_> {
@@ -192,209 +224,234 @@ impl Runtime<'_> {
         Exit::Usage
     }
     fn output_failure(&self, error: &io::Error) -> Exit {
-        if error.kind() == io::ErrorKind::BrokenPipe { Exit::Ok }
-        else { self.failure(&format!("writing stdout: {error}")) }
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            Exit::Ok
+        } else {
+            self.failure(&format!("writing stdout: {error}"))
+        }
     }
 }
 
 // Both hosts supply the same resolved environment and pinned generation.
-#[allow(clippy::too_many_arguments)] // Explicit host dependencies, shared by the local and socket adapters.
-fn execute<W: Write>(plan: &Plan, inputs: Vec<Input>, selection: &GrepSelection,
-    pin: Option<&engine::QuerySession>, live: Option<&live::Anchors>, cwd: &Path,
-    threads: usize, writer: W, runtime: &Runtime<'_>, start: std::time::Instant) -> Exit {
-    let cancelled = runtime.cancelled;
-    let stopped = || cancelled.load(Ordering::Acquire);
-    let recursive = inputs.iter().any(|input| matches!(input, Input::Directory(_)));
-    let candidates = if !plan.invert {
-        match pin
-            .map(|pin| pin.grep_candidates(&plan.grep, &stopped))
+struct Execution<'a> {
+    plan: &'a Plan,
+    selection: &'a GrepSelection,
+    pin: Option<&'a engine::QuerySession>,
+    live: Option<&'a live::Anchors>,
+    cwd: &'a Path,
+    threads: usize,
+    runtime: &'a Runtime<'a>,
+    start: std::time::Instant,
+}
+
+impl Execution<'_> {
+    fn run<W: Write>(self, inputs: Vec<Input>, writer: W) -> Exit {
+        let Self {
+            plan,
+            selection,
+            pin,
+            live,
+            cwd,
+            threads,
+            runtime,
+            start,
+        } = self;
+        let cancelled = runtime.cancelled;
+        let stopped = || cancelled.load(Ordering::Acquire);
+        let recursive = inputs
+            .iter()
+            .any(|input| matches!(input, Input::Directory(_)));
+        let candidates = if !plan.invert {
+            match pin
+                .map(|pin| pin.grep_candidates(&plan.grep, &stopped))
+                .transpose()
+            {
+                Ok(candidates) => candidates,
+                Err(error) => return runtime.failure(&error.to_string()),
+            }
+        } else {
+            None
+        };
+        let names = match pin.map(|pin| pin.doc_names_until(stopped)).transpose() {
+            Ok(names) => names.flatten(),
+            Err(error) => return runtime.failure(&error.to_string()),
+        };
+        let documents = match pin
+            .map(|pin| ferret_crawl::Documents::by_name(pin.catalog()))
             .transpose()
         {
-            Ok(candidates) => candidates,
+            Ok(documents) => documents,
             Err(error) => return runtime.failure(&error.to_string()),
-        }
-    } else {
-        None
-    };
-    let names = match pin
-        .map(|pin| pin.doc_names_until(stopped))
-        .transpose()
-    {
-        Ok(names) => names.flatten(),
-        Err(error) => return runtime.failure(&error.to_string()),
-    };
-    let documents = match pin
-        .map(|pin| ferret_crawl::Documents::by_name(pin.catalog()))
-        .transpose()
-    {
-        Ok(documents) => documents,
-        Err(error) => return runtime.failure(&error.to_string()),
-    };
-    for input in &inputs {
-        if let Input::Directory(path) = input {
-            if let Some(anchors) = &live {
-                if let Err(error) = anchors.validate(path) {
-                    return runtime.failure(&format!("{}: {error}", path.display()));
-                }
-            } else if let Some(pin) = &pin {
-                let mut source =
-                    match sources::Directory::new(path, Some(pin.catalog()), &cwd, false) {
-                        Ok(source) => source,
-                        Err(error) => return runtime.failure(&error.to_string()),
-                    };
-                if let Some(Err(error)) = source.next(true) {
-                    return runtime.failure(&format!(
+        };
+        for input in &inputs {
+            if let Input::Directory(path) = input {
+                if let Some(anchors) = live {
+                    if let Err(error) = anchors.validate(path) {
+                        return runtime.failure(&format!("{}: {error}", path.display()));
+                    }
+                } else if let Some(pin) = pin {
+                    let mut source =
+                        match sources::Directory::new(path, Some(pin.catalog()), cwd, false) {
+                            Ok(source) => source,
+                            Err(error) => return runtime.failure(&error.to_string()),
+                        };
+                    if let Some(Err(error)) = source.next(true) {
+                        return runtime.failure(&format!(
                         "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
                         error.path.display(),
                         error.error
                     ));
+                    }
                 }
             }
         }
-    }
-    let mut host = Host {
-        plan: &plan,
-        filename: plan
-            .presentation
-            .filename
-            .unwrap_or(recursive || inputs.len() > 1),
-        writer,
-        runtime: Some(runtime),
-        buffer: Vec::new(),
-        matched: false,
-        emitted_group: false,
-        json_stats: json::Stats::default(),
-        errors: false,
-        cancelled: Some(&cancelled),
-    };
-    // rg diagnoses failed explicit operands before searching, even when an
-    // earlier operand supplies a quiet match.
-    let mut resolved = Vec::new();
-    for input in inputs {
-        if let Input::Failed(path, error) = input {
-            if let Err(error) = host.error(&path, &error) {
-                return runtime.output_failure(&error);
-            }
-        } else {
-            resolved.push(input);
-        }
-    }
-    let inputs = resolved;
-    let fork = || {
-        pin
-            .zip(documents.as_ref())
-            .map(|(pin, documents)| engine::reader::checked(pin.catalog(), documents))
-    };
-    // D99: with no path operand, a walk whose filters selected no file is
-    // diagnosed at exit.
-    let mut searched = false;
-    let mut inputs = inputs.into_iter().peekable();
-    'inputs: while inputs.peek().is_some() {
-        let mut segment = Vec::new();
-        while inputs.peek().is_some_and(|input| {
-            !matches!(input, Input::Stdin) && (!buffered_path_output(plan, runtime.tty) || segment.is_empty())
-        }) {
-            if let Some(input) = inputs.next() {
-                segment.push(input);
-            }
-        }
-        if !segment.is_empty() {
-            let threads = if segment
-                .iter()
-                .any(|input| matches!(input, Input::Directory(_)))
-            {
-                threads
+        let mut host = Host {
+            plan,
+            filename: plan
+                .presentation
+                .filename
+                .unwrap_or(recursive || inputs.len() > 1),
+            writer,
+            runtime: Some(runtime),
+            buffer: Vec::new(),
+            matched: false,
+            emitted_group: false,
+            json_stats: json::Stats::default(),
+            errors: false,
+            cancelled: Some(cancelled),
+        };
+        // rg diagnoses failed explicit operands before searching, even when an
+        // earlier operand supplies a quiet match.
+        let mut resolved = Vec::new();
+        for input in inputs {
+            if let Input::Failed(path, error) = input {
+                if let Err(error) = host.error(&path, &error) {
+                    return runtime.output_failure(&error);
+                }
             } else {
-                threads.min(segment.len())
-            };
-            let mut source = groups::Source::new(
-                segment,
-                pin.map(|p| p.catalog()),
-                candidates.as_ref(),
-                &selection,
-                cwd.to_owned(),
-            )
-            .with_traversal(plan.traversal, plan.text)
-            .with_live(live.as_ref())
-            .with_absence(plan.universe() == line_grep::Universe::Searchable);
-            let walked = (threads > 1 && source.walks_live())
-                .then(|| groups::walk(&mut host, &mut source, threads, &cancelled, &mut searched));
-            let serial = match walked {
-                None => Some(threads),
-                Some(Ok(groups::Walk::Done)) => None,
-                // D108 B: the calling thread searches the operands alone.
-                Some(Ok(groups::Walk::Refused(cause))) => {
-                    if let Err(error) = host.report_shortfall(&ferret_query::Shortfall {
-                        running: 1,
-                        asked: threads,
-                        cause,
-                    }) { return runtime.output_failure(&error); }
-                    Some(1)
+                resolved.push(input);
+            }
+        }
+        let inputs = resolved;
+        let fork = || {
+            pin.zip(documents.as_ref())
+                .map(|(pin, documents)| engine::reader::checked(pin.catalog(), documents))
+        };
+        // D99: with no path operand, a walk whose filters selected no file is
+        // diagnosed at exit.
+        let mut searched = false;
+        let mut inputs = inputs.into_iter().peekable();
+        'inputs: while inputs.peek().is_some() {
+            let mut segment = Vec::new();
+            while inputs.peek().is_some_and(|input| {
+                !matches!(input, Input::Stdin)
+                    && (!buffered_path_output(plan, runtime.tty) || segment.is_empty())
+            }) {
+                if let Some(input) = inputs.next() {
+                    segment.push(input);
                 }
-                Some(Err(error)) => return runtime.output_failure(&error),
-            };
-            if let Some(threads) = serial {
-                let result = groups::run(
-                    &mut host,
-                    |stopped| source.next(stopped),
-                    &fork,
-                    names,
-                    threads,
-                    &cancelled,
-                );
-                searched |= source.searched();
-                if let Err(error) = result {
+            }
+            if !segment.is_empty() {
+                let threads = if segment
+                    .iter()
+                    .any(|input| matches!(input, Input::Directory(_)))
+                {
+                    threads
+                } else {
+                    threads.min(segment.len())
+                };
+                let mut source = groups::Source::new(
+                    segment,
+                    pin.map(|p| p.catalog()),
+                    candidates.as_ref(),
+                    selection,
+                    cwd.to_owned(),
+                )
+                .with_traversal(plan.traversal, plan.text)
+                .with_live(live)
+                .with_absence(plan.universe() == line_grep::Universe::Searchable);
+                let walked = (threads > 1 && source.walks_live()).then(|| {
+                    groups::walk(&mut host, &mut source, threads, cancelled, &mut searched)
+                });
+                let serial = match walked {
+                    None => Some(threads),
+                    Some(Ok(groups::Walk::Done)) => None,
+                    // D108 B: the calling thread searches the operands alone.
+                    Some(Ok(groups::Walk::Refused(cause))) => {
+                        if let Err(error) = host.report_shortfall(&ferret_query::Shortfall {
+                            running: 1,
+                            asked: threads,
+                            cause,
+                        }) {
+                            return runtime.output_failure(&error);
+                        }
+                        Some(1)
+                    }
+                    Some(Err(error)) => return runtime.output_failure(&error),
+                };
+                if let Some(threads) = serial {
+                    let result = groups::run(
+                        &mut host,
+                        |stopped| source.next(stopped),
+                        &fork,
+                        names,
+                        threads,
+                        cancelled,
+                    );
+                    searched |= source.searched();
+                    if let Err(error) = result {
+                        return runtime.output_failure(&error);
+                    }
+                }
+                if plan.quiet && host.matched {
+                    if !plan.json {
+                        return Exit::Ok;
+                    }
+                    break 'inputs;
+                }
+                if buffered_path_output(plan, runtime.tty)
+                    && let Err(error) = host.writer.flush()
+                {
                     return runtime.output_failure(&error);
                 }
             }
-            if plan.quiet && host.matched {
-                if !plan.json {
-                    return Exit::Ok;
+            if matches!(inputs.peek(), Some(Input::Stdin)) {
+                inputs.next();
+                searched = true;
+                if let Err(error) = host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX) {
+                    return runtime.output_failure(&error);
                 }
-                break 'inputs;
-            }
-            if buffered_path_output(plan, runtime.tty)
-                && let Err(error) = host.writer.flush()
-            {
-                return runtime.output_failure(&error);
+                if plan.quiet && host.matched {
+                    if !plan.json {
+                        return Exit::Ok;
+                    }
+                    break 'inputs;
+                }
             }
         }
-        if matches!(inputs.peek(), Some(Input::Stdin)) {
-            inputs.next();
-            searched = true;
-            if let Err(error) = host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX) {
-                return runtime.output_failure(&error);
-            }
-            if plan.quiet && host.matched {
-                if !plan.json {
-                    return Exit::Ok;
-                }
-                break 'inputs;
-            }
+        if plan.json
+            && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start)
+        {
+            return runtime.output_failure(&error);
         }
-    }
-    if plan.json
-        && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start)
-    {
-        return runtime.output_failure(&error);
-    }
-    if let Err(error) = host.writer.flush() {
-        return runtime.output_failure(&error);
-    }
-    if plan.quiet && host.matched {
-        Exit::Ok
-    } else if plan.paths.is_empty() && !searched {
-        let _ = (runtime.stderr)(
-            "grep: no files were searched; a glob, depth, hidden or ignore filter probably \
+        if let Err(error) = host.writer.flush() {
+            return runtime.output_failure(&error);
+        }
+        if plan.quiet && host.matched {
+            Exit::Ok
+        } else if plan.paths.is_empty() && !searched {
+            let _ = (runtime.stderr)(
+                "grep: no files were searched; a glob, depth, hidden or ignore filter probably \
              excluded every file under the current directory",
-        );
-        Exit::Usage
-    } else if host.errors {
-        Exit::Usage
-    } else if host.matched {
-        Exit::Ok
-    } else {
-        Exit::NoMatch
+            );
+            Exit::Usage
+        } else if host.errors {
+            Exit::Usage
+        } else if host.matched {
+            Exit::Ok
+        } else {
+            Exit::NoMatch
+        }
     }
 }
 
@@ -480,13 +537,17 @@ fn resolve_inputs(paths: &[PathBuf], names_only: bool) -> Vec<Input> {
     } else {
         paths
     };
+    resolve_inputs_at(paths, names_only, Path::new("."))
+}
+
+fn resolve_inputs_at(paths: &[PathBuf], names_only: bool, cwd: &Path) -> Vec<Input> {
     paths
         .iter()
         .map(|path| {
             if path == Path::new("-") {
                 return Input::Stdin;
             }
-            match fs::metadata(path) {
+            match fs::metadata(cwd.join(path)) {
                 Ok(metadata) if metadata.is_dir() => Input::Directory(path.clone()),
                 Ok(metadata) if metadata.is_file() || names_only => {
                     Input::File(path.clone(), metadata.len())
@@ -531,8 +592,7 @@ fn block_stdout(plan: &Plan) -> bool {
 /// Redirected path/count records may share the block buffer until an operand
 /// or diagnostic boundary. Ttys, NUL names and live policy keep line output.
 fn buffered_path_output(plan: &Plan, tty: bool) -> bool {
-    !tty
-        && !plan.traversal.live
+    !tty && !plan.traversal.live
         && !nul_names(plan)
         && !plan.json
         && matches!(
@@ -547,20 +607,41 @@ fn nul_names(plan: &Plan) -> bool {
         && !plan.json
 }
 
+fn report_shortfall(
+    runtime: Option<&Runtime<'_>>,
+    shortfall: &ferret_query::Shortfall,
+) -> io::Result<()> {
+    if runtime.is_none_or(|runtime| !runtime.warned.swap(true, Ordering::AcqRel)) {
+        let message = format!(
+            "grep: searching with {} of {} threads: {}",
+            shortfall.running, shortfall.asked, shortfall.cause
+        );
+        if let Some(runtime) = runtime {
+            (runtime.stderr)(&message)?;
+        } else {
+            cli::error(&message);
+        }
+    }
+    Ok(())
+}
+
 impl<W: Write> Host<'_, W> {
     fn tty(&self) -> bool {
-        self.runtime.map_or_else(stdout_is_terminal, |runtime| runtime.tty)
+        self.runtime
+            .map_or_else(stdout_is_terminal, |runtime| runtime.tty)
     }
     fn diagnostic(&self, message: &str) -> io::Result<()> {
-        if let Some(runtime) = self.runtime { (runtime.stderr)(message) }
-        else { cli::error(message); Ok(()) }
+        if let Some(runtime) = self.runtime {
+            (runtime.stderr)(message)
+        } else {
+            cli::error(message);
+            Ok(())
+        }
     }
     fn report_shortfall(&self, shortfall: &ferret_query::Shortfall) -> io::Result<()> {
-        if self.runtime.is_none_or(|runtime| !runtime.warned.swap(true, Ordering::AcqRel)) {
-            self.diagnostic(&format!("grep: searching with {} of {} threads: {}", shortfall.running, shortfall.asked, shortfall.cause))?;
-        }
-        Ok(())
+        report_shortfall(self.runtime, shortfall)
     }
+
     fn error(&mut self, path: &Path, error: &dyn std::fmt::Display) -> io::Result<()> {
         if !nul_names(self.plan) {
             self.writer.flush()?;
@@ -885,7 +966,7 @@ mod tests {
             };
             let mut host = Host {
                 plan: &plan,
-            runtime: None,
+                runtime: None,
                 filename: false,
                 writer: Vec::new(),
                 buffer: Vec::new(),
@@ -953,7 +1034,7 @@ mod tests {
             };
             let mut host = Host {
                 plan: &plan,
-            runtime: None,
+                runtime: None,
                 filename: false,
                 writer: Vec::new(),
                 buffer: Vec::new(),
@@ -1031,7 +1112,7 @@ mod tests {
                 };
                 let mut host = Host {
                     plan: &plan,
-            runtime: None,
+                    runtime: None,
                     filename: false,
                     writer: Vec::new(),
                     buffer: Vec::new(),
@@ -1116,7 +1197,7 @@ mod tests {
         for mode in 0..4 {
             let mut host = Host {
                 plan: &plan,
-            runtime: None,
+                runtime: None,
                 filename: false,
                 writer: Vec::new(),
                 buffer: Vec::new(),
@@ -1287,7 +1368,7 @@ mod tests {
             for failure in [false, true] {
                 let mut host = Host {
                     plan: &plan,
-            runtime: None,
+                    runtime: None,
                     filename: false,
                     writer: Vec::new(),
                     buffer: Vec::new(),

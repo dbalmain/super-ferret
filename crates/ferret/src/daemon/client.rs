@@ -36,6 +36,7 @@ pub(crate) fn search(
         Options {
             limit,
             scan_uncovered,
+            ..Options::default()
         },
         now,
         Some(context),
@@ -43,6 +44,25 @@ pub(crate) fn search(
 }
 pub(crate) fn find(index: &Path, args: &[OsString], json: bool, now: SystemTime) -> Option<Exit> {
     query(index, args, "find", json, Options::default(), now, None)
+}
+
+pub(crate) fn grep(
+    index: &Path,
+    args: &[OsString],
+    options: crate::protocol::GrepOptions,
+) -> Option<Exit> {
+    query(
+        index,
+        args,
+        "grep",
+        false,
+        Options {
+            grep: Some(options),
+            ..Options::default()
+        },
+        SystemTime::now(),
+        None,
+    )
 }
 
 pub(crate) fn writer_command(
@@ -321,6 +341,7 @@ fn bytes(value: &Value, plain: &str, base64: &str) -> io::Result<Vec<u8>> {
 struct Options {
     limit: Option<u64>,
     scan_uncovered: bool,
+    grep: Option<crate::protocol::GrepOptions>,
 }
 fn query(
     index: &Path,
@@ -334,8 +355,10 @@ fn query(
     let Options {
         limit,
         scan_uncovered,
+        grep,
     } = options;
     let started = Instant::now();
+    let grep_tty = grep.as_ref().is_some_and(|options| options.tty);
     if std::env::var_os("FERRET_NO_DAEMON").is_some() {
         return None;
     }
@@ -362,10 +385,18 @@ fn query(
         "capabilities",
         scan_uncovered.then_some(b"scan-uncovered".as_slice()),
     );
+    if let Some(grep) = &grep {
+        grep.encode(&mut object);
+    }
     object.end();
     protocol::parse_request(&request).ok()?;
     request.push(b'\n');
-    let mut reader = match connect(&endpoint, &index, matches!(op, "search" | "find"), writer) {
+    let mut reader = match connect(
+        &endpoint,
+        &index,
+        matches!(op, "search" | "find" | "grep"),
+        writer,
+    ) {
         Ok(reader) => reader,
         Err(ConnectError::NoOwner(_)) => return None,
         Err(error) if writer => {
@@ -439,19 +470,32 @@ fn query(
                         out.flush().inspect_err(|_| output_failure = true)?;
                     }
                 }
-                Some("stdout" | "stderr") if matches!(op, "find" | "index" | "roots-remove") => {
+                Some("stdout" | "stderr")
+                    if matches!(op, "find" | "grep" | "index" | "roots-remove") =>
+                {
                     if !json {
                         let data = bytes(&value, "bytes", "bytes_base64")?;
                         if field_text(&value, "event") == Some("stdout") {
                             write(&mut out, &data, &mut output_failure)?;
-                            if first_frame {
+                            if first_frame
+                                || grep_tty
+                                || matches!(value.field("flush"), Some(Value::Bool(true)))
+                            {
                                 out.flush().inspect_err(|_| output_failure = true)?;
-                                first_frame = false;
+                                if !data.is_empty() {
+                                    first_frame = false;
+                                }
                             }
                         } else {
                             out.flush().inspect_err(|_| output_failure = true)?;
-                            err.write_all(&data)?;
-                            err.flush()?;
+                            if op == "grep" {
+                                // Local grep diagnostics ignore a closed
+                                // stderr.
+                                let _ = err.write_all(&data).and_then(|()| err.flush());
+                            } else {
+                                err.write_all(&data)?;
+                                err.flush()?;
+                            }
                         }
                     }
                 }
@@ -498,8 +542,8 @@ fn query(
                             && let Some(context) = context
                         {
                             cli::error(&format!("{}: {message}", context.index.display()));
-                        } else if op == "find" {
-                            cli::error(&format!("find: {message}"));
+                        } else if matches!(op, "find" | "grep") {
+                            cli::error(&format!("{op}: {message}"));
                         } else {
                             cli::error(message);
                         }
@@ -515,11 +559,15 @@ fn query(
         Ok(exit) => exit,
         Err(error) if output_failure => {
             cancel(reader.get_mut());
-            if op == "search" && error.kind() == io::ErrorKind::BrokenPipe {
+            if op == "grep" && error.kind() == io::ErrorKind::BrokenPipe {
+                Exit::Ok
+            } else if op == "search" && error.kind() == io::ErrorKind::BrokenPipe {
                 if rows > 0 { Exit::Ok } else { Exit::NoMatch }
             } else {
                 cli::error(&format!("{op}: writing stdout: {error}"));
-                if op == "find" {
+                if op == "grep" {
+                    Exit::Usage
+                } else if op == "find" {
                     Exit::NoMatch
                 } else {
                     Exit::Error
@@ -529,7 +577,11 @@ fn query(
         Err(error) => {
             cancel(reader.get_mut());
             cli::error(&format!("daemon transport failure: {error}"));
-            Exit::Error
+            if op == "grep" {
+                Exit::Usage
+            } else {
+                Exit::Error
+            }
         }
     };
     if let Some(context) = context.filter(|_| op == "search") {

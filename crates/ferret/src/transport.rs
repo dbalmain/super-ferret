@@ -89,6 +89,22 @@ impl Destination {
             Self::Socket { cancelled, .. } => cancelled.load(Ordering::Acquire),
         }
     }
+    /// Publishes an explicit host flush boundary even below the frame batch
+    /// size.
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        match self {
+            Self::Stdout => Ok(()),
+            Self::Socket { writer, .. } => {
+                let mut writer = writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let SocketWriter { stream, buffer } = &mut *writer;
+                stream.write_all(&buffer.pending)?;
+                buffer.pending.clear();
+                Ok(())
+            }
+        }
+    }
     pub(crate) fn send(&self, line: &[u8]) -> io::Result<()> {
         match self {
             Self::Stdout => stdout_buffer()

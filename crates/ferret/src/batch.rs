@@ -189,6 +189,11 @@ fn handle(
             dirs,
             &Destination::Stdout,
         ),
+        Op::Grep => grep_request(
+            request,
+            engine.as_ref().map(Engine::pin),
+            &Destination::Stdout,
+        ),
         Op::Find => find_request(
             request,
             launch_cwd,
@@ -547,4 +552,20 @@ fn log_search(dirs: Option<&Dirs>, request: &Request, at: SystemTime, log: &Sear
         o.end();
         let _ = crate::log::append(&dirs.state, &line);
     }
+}
+
+/// Grep shares find's byte frames and the connection's cancellation flag.
+pub(crate) fn grep_request(
+    request: &Request,
+    session: Option<QuerySession>,
+    destination: &Destination,
+) -> io::Result<()> {
+    event_to(destination, request, "begin", |o| {
+        generation(o, session.as_ref().map(QuerySession::generation))
+    })?;
+    let exit = crate::grep::remote::serve(request, session.as_ref(), destination)?;
+    event_to(destination, request, "end", |o| {
+        o.int("exit", exit as u8)
+            .bool("cancelled", destination.cancelled());
+    })
 }

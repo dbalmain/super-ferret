@@ -256,6 +256,16 @@ status and timings. A parse or runtime failure still gets a begin/end block,
 with null generation when no view was selected. Never manufacture end after
 transport failure.
 
+D111 adds `op: "grep"` with ordinary grep argv and an absolute `cwd`.
+The required `grep` object carries explicit boolean `color`, `heading`,
+`numbers` and `tty`, a positive `threads` count, and `pattern_files`: byte
+strings in parser read order, including pattern stdin. The client resolves
+these before connecting. Oversized requests use the same in-process fallback
+as find. Grep's stdout and stderr use find's byte frames; an empty stdout
+frame with `flush: true` asks the client to publish the accepted prefix at a
+host flush boundary. The end exit is grep's native 0/1/2. `grep --json` remains
+rg JSON inside stdout frames, rather than exposing the daemon envelope.
+
 Find requests add optional `capabilities`, an array of strings, and
 `child_stdin`, the string `"null"` or `"inherit"`. Unknown optional fields and
 unknown capability names are ignored; neither grants a known capability.

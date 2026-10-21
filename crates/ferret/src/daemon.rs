@@ -10,7 +10,8 @@ mod client;
 mod endpoint;
 mod writer;
 pub(crate) use client::{
-    daemon_stats as stats_json, daemon_status as status, find, search, writer_command as write,
+    daemon_stats as stats_json, daemon_status as status, find, grep, search,
+    writer_command as write,
 };
 
 use std::ffi::OsString;
@@ -622,7 +623,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                     continue;
                 }
             };
-            let _permit = if matches!(request.op, Op::Search | Op::Find) {
+            let _permit = if matches!(request.op, Op::Search | Op::Find | Op::Grep) {
                 let Some(permit) = admit(host, &cancelled) else {
                     break;
                 };
@@ -654,7 +655,11 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     result
 }
 fn runtime_status(request: &Request) -> u8 {
-    if request.op == Op::Find { 1 } else { 3 }
+    match request.op {
+        Op::Find => 1,
+        Op::Grep => 2,
+        _ => 3,
+    }
 }
 fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
     if matches!(request.op, Op::Index | Op::RootsRemove) {
@@ -710,6 +715,7 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
             unreachable!("writer requests routed before query selection")
         }
         Op::Search => crate::batch::search_request(request, Some(session), None, destination),
+        Op::Grep => crate::batch::grep_request(request, Some(session), destination),
         Op::Find => {
             // Clear all action grants. Even a direct socket caller cannot ask
             // the daemon to execute, prompt, delete or open an output file.

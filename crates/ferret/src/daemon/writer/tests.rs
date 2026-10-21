@@ -67,6 +67,7 @@ fn command(host: &Host, root: &std::path::Path) -> Result<ferret_crawl::Report, 
             request: Request {
                 id: "index".into(),
                 op: Op::Index,
+                grep: None,
                 args: vec![Vec::new(), root.as_os_str().as_bytes().to_vec()],
                 cwd: None,
                 limit: None,

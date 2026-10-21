@@ -539,11 +539,11 @@ pub(super) fn emit(
 }
 
 pub(super) enum Job {
-    /// An explicit file operand, opened by its path.
-    Direct(PathBuf),
+    /// An explicit file: display spelling and absolute lookup path.
+    Direct(PathBuf, PathBuf),
     /// A walked file and the directory it was listed in, which it is opened
     /// beneath, never through a symlink.
-    Listed(PathBuf, engine::reader::Parent),
+    Listed(PathBuf, PathBuf, engine::reader::Parent),
     Checked(PathBuf, NameId, u32),
     /// A catalogued name with no document, searched under `-a` because it is
     /// binary: read through the checked catalog walk, uncached.
@@ -555,8 +555,8 @@ pub(super) enum Job {
 impl Job {
     fn path(&self) -> &Path {
         match self {
-            Self::Direct(p)
-            | Self::Listed(p, _)
+            Self::Direct(p, _)
+            | Self::Listed(p, _, _)
             | Self::Checked(p, _, _)
             | Self::Binary(p, _)
             | Self::Failed(p, _)
@@ -569,7 +569,7 @@ impl Job {
     /// would otherwise keep its directory's descriptor open.
     fn finished(self) -> Self {
         match self {
-            Self::Listed(path, _) => Self::Direct(path),
+            Self::Listed(path, actual, _) => Self::Direct(path, actual),
             job => job,
         }
     }
@@ -743,17 +743,17 @@ fn prepare(
                 target,
             )?
         }
-        Job::Direct(path) => observe_streaming(
+        Job::Direct(_, actual) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file(path, None, plan, each, stopped),
+            &mut |each| read_file(actual, None, plan, each, stopped),
             false,
             target,
         )?,
-        Job::Listed(path, directory) => observe_streaming(
+        Job::Listed(_, actual, directory) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file(path, Some(directory), plan, each, stopped),
+            &mut |each| read_file(actual, Some(directory), plan, each, stopped),
             false,
             target,
         )?,
@@ -981,7 +981,6 @@ pub(super) fn run<'a, W: Write>(
     search.finish(host)
 }
 
-
 fn weight(handoff: &Handoff) -> u64 {
     match handoff {
         Handoff::Complete(_, Observed::Ready(group)) => group.output.memory_bytes() as u64,
@@ -1001,13 +1000,14 @@ struct Search<'s> {
     quiet_stats: Mutex<json::Stats>,
     fatal: Mutex<Option<io::Error>>,
     publication: Mutex<()>,
-    descriptors: &'static line_grep::IoBudget,
+    descriptors: Arc<line_grep::IoBudget>,
     tty: bool,
+    runtime: Option<&'s Runtime<'s>>,
     capture: Arc<capture::Budget>,
 }
 
 impl<'s> Search<'s> {
-    fn new<W>(host: &Host<'s, W>, cancelled: &'s AtomicBool, threads: usize) -> Self {
+    fn new<W: Write>(host: &Host<'s, W>, cancelled: &'s AtomicBool, threads: usize) -> Self {
         Self {
             plan: host.plan,
             filename: host.filename,
@@ -1017,12 +1017,12 @@ impl<'s> Search<'s> {
             quiet_stats: Mutex::new(json::Stats::default()),
             fatal: Mutex::new(None),
             publication: Mutex::new(()),
-            // Descriptor limits and retained-directory caches are process-wide.
-            descriptors: {
-                static BUDGET: OnceLock<line_grep::IoBudget> = OnceLock::new();
-                BUDGET.get_or_init(|| line_grep::IoBudget::new(usize::MAX))
-            },
+            descriptors: host
+                .runtime
+                .and_then(|runtime| runtime.descriptors.as_ref())
+                .map_or_else(|| Arc::new(line_grep::IoBudget::new(threads)), Arc::clone),
             tty: host.tty(),
+            runtime: host.runtime,
             capture: capture::Budget::new(threads),
         }
     }
@@ -1172,7 +1172,7 @@ pub(super) fn walk<W: Write>(
             // Keep live-policy warning order unchanged; only buffered path
             // output defers this publisher-owned diagnostic.
             let _publication = lock(&search.publication);
-            *lock(&refused) = Some(shortfall);
+            let _ = report_shortfall(search.runtime, &shortfall);
         }
     };
     let started = ferret_query::lane_groups(
@@ -1198,7 +1198,9 @@ pub(super) fn walk<W: Write>(
                     break;
                 }
                 let go = match input {
-                    Input::File(path, size) => first.search(size, Job::Direct(path)),
+                    Input::File(path, size) => {
+                        first.search(size, Job::Direct(path.clone(), filter.cwd.join(path)))
+                    }
                     Input::Failed(path, error) => {
                         first.search(0, Job::Failed(path, error.to_string()))
                     }
@@ -1531,7 +1533,10 @@ impl Filter<'_> {
                 ));
             }
         };
-        Some((0, Job::Listed(entry.path().to_owned(), parent)))
+        Some((
+            0,
+            Job::Listed(entry.path().to_owned(), self.cwd.join(entry.path()), parent),
+        ))
     }
 }
 
@@ -1668,7 +1673,9 @@ impl<'a> Source<'a> {
                 self.source = None;
             }
             match self.inputs.next()? {
-                Input::File(path, size) => return Some((size, Job::Direct(path))),
+                Input::File(path, size) => {
+                    return Some((size, Job::Direct(path.clone(), self.filter.cwd.join(path))));
+                }
                 Input::Failed(path, error) => {
                     return Some((0, Job::Failed(path, error.to_string())));
                 }
@@ -1718,6 +1725,39 @@ mod tests {
             errors: false,
             cancelled: None,
         }
+    }
+
+    // D111: a spilled fallback parent must reopen under the client cwd,
+    // while output keeps the original operand spelling.
+    #[test]
+    fn a_closed_listed_parent_uses_the_lookup_path_not_the_display_path() {
+        use std::os::unix::fs::MetadataExt;
+        let directory =
+            std::env::temp_dir().join(format!("ferret-grep-listed-cwd-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let actual = directory.join("file");
+        fs::write(&actual, b"red\n").unwrap();
+        let stat = directory.metadata().unwrap();
+        let plan = plan(&["red"]);
+        let mut host = host(&plan, Vec::new());
+        let mut job = Some(Job::Listed(
+            "display/file".into(),
+            actual,
+            engine::reader::Parent::Closed(stat.dev(), stat.ino()),
+        ));
+        let fork = || -> Option<Box<CheckedReader<'_>>> { None };
+        run(
+            &mut host,
+            |_| job.take().map(|job| (4, job)),
+            &fork,
+            None,
+            1,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(host.writer, b"display/file:red\n");
+        assert!(!host.errors);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     // Drive the real handoff with groups just over the capture threshold.
@@ -2491,6 +2531,7 @@ mod tests {
                 }))
             };
             let mut host = Host {
+                runtime: None,
                 plan: &plan,
                 filename: true,
                 writer: Vec::new(),
@@ -2674,6 +2715,7 @@ mod tests {
         };
         let plan = plan(&["-q", "red"]);
         let mut host = Host {
+            runtime: None,
             plan: &plan,
             filename: true,
             writer: Vec::new(),
@@ -2795,6 +2837,7 @@ mod tests {
         };
         let plan = plan(&["-q", "red"]);
         let mut host = Host {
+            runtime: None,
             plan: &plan,
             filename: true,
             writer: Vec::new(),

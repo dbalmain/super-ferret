@@ -17,6 +17,14 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
 | `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
 
+Indexed directory content searches use the resident daemon (D111 A), falling
+back to the shared in-process host when it is unavailable or refuses the hello.
+The client resolves presentation, terminal defaults, search threads, cwd and
+pattern files. Mixed explicit files travel with a directory request; requests
+including search stdin remain local. `--files`, explicit-file-only searches,
+`-u`/`-uu` and `--live` stay local; `--live` loads only catalog roots, not the
+resident engine. Debug `FERRET_TEST_*` injections also stay local.
+
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
 data. Missing/incompatible indexes or unindexed directory starts exit 2 with
 index/live advice. Mixed operands use their respective sources. Help/version
@@ -180,7 +188,7 @@ which was quadratic on long lines and ran the engine's slow Unicode-`\b`
 fallback over non-ASCII text. Captures and replacement still use the whole
 source line. Uncoloured, unnumbered plain records combine path,
 separator, data and LF through the capture's vectored writer. Grep shares one
-capture allocation budget of (2T+1) × 4 MiB for configured concurrency T (D93,
+capture allocation budget per request of (2T+1) × 4 MiB for configured concurrency T (D93,
 D109 B), covering workers, queued groups and the publisher's current capture.
 Above 4 MiB, a file takes the streaming slot when available, sends its captured
 prefix, and streams the rest in 64 KiB chunks (D103 A). While another file
@@ -355,8 +363,10 @@ caches, sixteen host descriptors and six descriptors per active operation,
 including reopened parents, input files and simultaneous context spools during
 compaction. It always permits one operation; additional workers wait when the
 limit is tight, without changing the thread count or warning. At limit 1,024
-with sixteen workers, every worker and the producer fit and admission takes no
-mutex. Each read reserves its whole allowance through the closing check, so a
+with sixteen workers, every worker and the producer fit and local admission
+takes no mutex. Concurrent daemon greps share one process-wide admission mutex;
+their independent capture pools are bounded in aggregate by the daemon's
+four-query admission limit. Each read reserves its whole allowance through the closing check, so a
 stream holding the publisher never needs a descriptor permit held by another
 reader. Capture-byte waits preserve this order: descriptor admission
 before reading or capturing, and no further admission until that read closes;
