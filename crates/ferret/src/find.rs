@@ -20,31 +20,20 @@ use crate::xdg::Dirs;
 pub(crate) const PERMISSION_WARNING: &str =
     "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form";
 
+/// The catalog a find plan walks: the full engine, whose name index serves
+/// a plain `-name` listing, or for an action plan, which never reads that
+/// index, the bare catalog with only the sections the plan reads (D56 A
+/// still runs actions here; D78's resident open is skipped for them).
+enum FindCatalog {
+    Engine(Box<Engine>),
+    Sections(Box<Catalog>),
+}
+
 /// Resolves the catalog a find plan should walk through: `None` for a live,
 /// unindexed walk (`-I`, a configured `find_no_ignore`, or an information
 /// plan), `Some` for a catalog-backed walk, or an error message (without a
 /// `find: ` prefix) describing why neither is available.
-enum CatalogView {
-    Engine(Box<Engine>),
-    Lightweight(Box<Catalog>),
-}
-
-fn open_action_catalog(index: &Path, plan: &Plan) -> Result<Catalog, String> {
-    let catalog = Catalog::open(index)
-        .map_err(|error| format!("{}: {error}; re-index or use -I", index.display()))?
-        .ok_or_else(|| {
-            format!(
-                "no index in {}; run ferret index DIR or use -I",
-                index.display()
-            )
-        })?;
-    catalog
-        .load(&plan.catalog_sections())
-        .map_err(|error| format!("{}: {error}; re-index or use -I", index.display()))?;
-    Ok(catalog)
-}
-
-fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<CatalogView>, String> {
+fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<FindCatalog>, String> {
     if plan.no_ignore() || plan.is_information() {
         return Ok(None);
     }
@@ -72,18 +61,25 @@ fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<CatalogVi
     let Some(index) = index else {
         return Err("cannot locate index; set --index or FERRET_INDEX, or use -I".to_owned());
     };
-    if plan.has_side_effects() {
-        return open_action_catalog(&index, plan)
-            .map(Box::new)
-            .map(CatalogView::Lightweight)
-            .map(Some);
-    }
-    match Engine::open(&index) {
-        Ok(Some(engine)) => Ok(Some(CatalogView::Engine(Box::new(engine)))),
-        Ok(None) => Err(format!(
+    open_catalog(plan, &index).map(Some)
+}
+
+fn open_catalog(plan: &Plan, index: &Path) -> Result<FindCatalog, String> {
+    let missing = || {
+        format!(
             "no index in {}; run ferret index DIR or use -I",
             index.display()
-        )),
+        )
+    };
+    if plan.has_side_effects() {
+        let failed = |error| format!("{}: {error}; re-index or use -I", index.display());
+        let catalog = Catalog::open(index).map_err(failed)?.ok_or_else(missing)?;
+        catalog.load(&plan.catalog_sections()).map_err(failed)?;
+        return Ok(FindCatalog::Sections(Box::new(catalog)));
+    }
+    match Engine::open(index) {
+        Ok(Some(engine)) => Ok(FindCatalog::Engine(Box::new(engine))),
+        Ok(None) => Err(missing()),
         Err(error) => Err(format!(
             "cannot open index in {}: {error}; re-index or use -I",
             index.display()
@@ -153,8 +149,8 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     let mut effects = Output::Stdout;
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
-        Some(CatalogView::Engine(engine)) => engine.pin().find(&plan, effects.clone(), workers),
-        Some(CatalogView::Lightweight(catalog)) => plan.run_parallel(
+        Some(FindCatalog::Engine(engine)) => engine.pin().find(&plan, effects.clone(), workers),
+        Some(FindCatalog::Sections(catalog)) => plan.run_parallel(
             plan.parallel_catalog_source(*catalog),
             effects.clone(),
             workers,
@@ -267,8 +263,8 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     let host = FrameOutput::new(ID, ChildStdin::Inherit).with_warning_stderr();
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
-        Some(CatalogView::Engine(engine)) => engine.pin().find(&plan, host.clone(), workers),
-        Some(CatalogView::Lightweight(catalog)) => plan.run_parallel(
+        Some(FindCatalog::Engine(engine)) => engine.pin().find(&plan, host.clone(), workers),
+        Some(FindCatalog::Sections(catalog)) => plan.run_parallel(
             plan.parallel_catalog_source(*catalog),
             host.clone(),
             workers,
@@ -402,8 +398,11 @@ mod tests {
 
     use super::*;
 
+    /// An action plan opens only the sections it reads, never the resident
+    /// names a `-name` listing's index is built from; a plain listing still
+    /// gets the engine.
     #[test]
-    fn action_catalog_open_does_not_build_resident_names() {
+    fn action_plans_open_the_catalog_without_resident_names() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
             "ferret-find-light-open-{}-{}",
@@ -421,19 +420,20 @@ mod tests {
             &ferret_crawl::IndexOptions::default(),
         )
         .unwrap();
-        let plan = Plan::parse(&[
-            root.into_os_string(),
-            "-exec".into(),
-            "true".into(),
-            "{}".into(),
-            "+".into(),
-        ])
-        .unwrap();
+        let plan = |args: &[&str]| {
+            let mut argv = vec![root.clone().into_os_string()];
+            argv.extend(args.iter().map(OsString::from));
+            Plan::parse(&argv).unwrap()
+        };
 
-        let catalog = open_action_catalog(&index, &plan).unwrap();
-
-        assert!(plan.has_side_effects());
-        assert!(catalog.resident_names().is_none());
+        match open_catalog(&plan(&["-exec", "true", "{}", "+"]), &index) {
+            Ok(FindCatalog::Sections(catalog)) => assert!(catalog.resident_names().is_none()),
+            _ => panic!("an action plan opened the engine"),
+        }
+        assert!(matches!(
+            open_catalog(&plan(&["-name", "one"]), &index),
+            Ok(FindCatalog::Engine(_))
+        ));
         let _ = std::fs::remove_dir_all(directory);
     }
 
