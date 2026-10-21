@@ -24,7 +24,8 @@ const CONTENT: [&str; 14] = [
     "NOT text:original",
     "text:absent OR text:modified",
     "text:needle",
-    "text:unique7777",
+    // Last file `unfollowed_burst` writes (`BURST_FILES - 1`).
+    "text:unique23",
     "text:word",
     "text:word17part3",
     "text:word500part3",
@@ -1356,8 +1357,19 @@ fn gate(tree: &Tree, phase: &str) -> PathBuf {
     fs::write(path.join(phase), b"hold").unwrap_or_else(|e| panic!("gate: {e}"));
     path
 }
+/// Burst files an uncovered follow must still be short of finishing.
+///
+/// The background gate parks on the 10th cancellation check of one turn: one
+/// check before `follow`, then one per document. Releasing it publishes those
+/// documents, about eight (a stubbed command follow left 9,995 of 10,002
+/// uncovered). The explicit-follow gate parks on its own 10th per-document
+/// check, so at least ten documents have to remain ahead of that frontier.
+/// 24 burst files plus `original.txt` is 25 live documents: past that floor
+/// of 18, and still uncovered if the command replies before following. The
+/// daemon's startup walk of this tree stays inside the suite's 8s bound.
+const BURST_FILES: usize = 24;
 fn unfollowed_burst(tree: &Tree) {
-    for i in 0..10_001 {
+    for i in 0..BURST_FILES {
         write(
             tree.path(&format!("src/burst-{i}.txt")),
             &format!("needle unique{i} words"),
@@ -1390,31 +1402,176 @@ fn manifest_equals_clean(tree: &Tree) {
     let actual = content_answers(|q| tree.local(&["search", "--scan-uncovered", q]));
     assert_eq!(actual, expected);
 }
+/// Threads exit between `readdir` and the `stat` read. A missing row is a
+/// thread that is already gone, so the sample skips it.
+fn task_rows(pid: u32) -> Vec<(String, String, i32)> {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|entry| {
+            let tid = entry.file_name().to_string_lossy().into_owned();
+            let comm = fs::read_to_string(entry.path().join("comm")).ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let nice = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(16))
+                .and_then(|field| field.parse().ok())?;
+            Some((tid, comm.trim().to_owned(), nice))
+        })
+        .collect()
+}
+
 #[test]
-fn queued_command_interrupts_a_ten_thousand_document_follow() {
+fn queued_command_covers_content_while_background_follow_is_held() {
     let mut tree = Tree::new();
     unfollowed_burst(&tree);
     let gate = gate(&tree, "follow");
     let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
-    tree.spawn(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    tree.spawn(&[
+        ("FERRET_CONTENT_TEST_GATE", gate_text),
+        ("FERRET_INDEX_WORKERS", "4"),
+    ]);
     wait(|| gate.join("follow.reached").exists());
     write(tree.path("src/urgent.txt"), "urgent");
-    let started = Instant::now();
-    tree.success(tree.run(&["index", "src"]));
+    let pid = tree
+        .daemon
+        .as_ref()
+        .unwrap_or_else(|| panic!("daemon"))
+        .id();
+    let before = task_rows(pid);
+    let before_tids: std::collections::HashSet<_> =
+        before.iter().map(|(tid, _, _)| tid.clone()).collect();
+    let command_nice = before
+        .iter()
+        .find(|(_, comm, _)| comm == "ferret-command")
+        .map(|(_, _, nice)| *nice)
+        .unwrap_or_else(|| panic!("command thread missing: {before:?}"));
+    let lowered: Vec<_> = before
+        .iter()
+        .filter(|(_, _, nice)| *nice == 19)
+        .map(|(tid, _, _)| tid.clone())
+        .collect();
     assert!(
-        started.elapsed() < BOUND,
-        "writer command exceeded budget bound"
+        !lowered.is_empty(),
+        "writer was not at nice 19 before the command: {before:?}"
     );
+    let mut seen = std::collections::HashMap::<String, (String, i32)>::new();
+    let output = std::thread::scope(|scope| {
+        let index = scope.spawn(|| tree.run(&["index", "src"]));
+        while !index.is_finished() {
+            for (tid, comm, nice) in task_rows(pid) {
+                // The merge worker is spawned from the nice-19 writer once
+                // follow finishes, and it can appear before the client has
+                // observed the reply. It is background work.
+                if !before_tids.contains(&tid) && comm != "ferret-merge" {
+                    seen.entry(tid).or_insert((comm, nice));
+                }
+            }
+            // The crawl is short on this tree. A 1ms sleep can miss every
+            // worker between two samples; yielding still lets them run.
+            std::thread::yield_now();
+        }
+        index
+            .join()
+            .unwrap_or_else(|_| panic!("index thread panicked"))
+    });
+    tree.success(output);
     assert!(
         gate.join("follow").exists(),
-        "command must complete while first build is held"
+        "command follow waited in the background content gate"
+    );
+    assert_eq!(
+        number(&tree.status(), "uncovered"),
+        0,
+        "index returned with content still uncovered: {}",
+        tree.status()
+    );
+    let last = BURST_FILES - 1;
+    let search = tree.success(tree.run(&["search", &format!("text:unique{last}")]));
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(
+        stdout.contains(&format!("burst-{last}.txt")),
+        "indexed content missing from search: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&search.stderr);
+    assert!(
+        !stderr.contains("does not yet cover"),
+        "search scanned or refused: {stderr}"
     );
     assert!(
-        number(&tree.status(), "uncovered") > 0,
-        "whole first build completed before command"
+        !seen.is_empty(),
+        "command crawl spawned no worker; nice inheritance was not observed"
     );
+    for (tid, (comm, nice)) in &seen {
+        assert_eq!(
+            *nice, command_nice,
+            "worker {tid} ({comm}) nice {nice}, command thread {command_nice}"
+        );
+        assert_ne!(*nice, 19, "worker {tid} ({comm}) ran at background nice");
+    }
+    let after = task_rows(pid);
+    for tid in &lowered {
+        if let Some((_, comm, nice)) = after.iter().find(|(id, _, _)| id == tid) {
+            assert_eq!(*nice, 19, "background thread {tid} ({comm}) left nice 19");
+        }
+    }
     fs::remove_file(gate.join("follow")).unwrap_or_else(|e| panic!("release: {e}"));
     tree.converges();
+}
+#[test]
+fn drain_during_explicit_follow_exits_incomplete() {
+    let mut tree = Tree::new();
+    unfollowed_burst(&tree);
+    // The background gate keeps documents uncovered until the command is
+    // queued. The explicit gate then holds that command's own follow, so
+    // drain overlaps it instead of landing after it has already finished.
+    let gate = gate(&tree, "follow");
+    fs::write(gate.join("explicit"), b"hold").unwrap_or_else(|e| panic!("gate: {e}"));
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.spawn(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    wait(|| gate.join("follow.reached").exists());
+    let output = std::thread::scope(|scope| {
+        let index = scope.spawn(|| tree.run(&["index", "src"]));
+        wait(|| gate.join("explicit.reached").exists());
+        let _ = tree.event("{\"op\":\"drain\"}\n");
+        index
+            .join()
+            .unwrap_or_else(|_| panic!("index thread panicked"))
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout {:?}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "content error printed a report: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "ferret: content index: interrupted (daemon stopping); run ferret index again\n"
+    );
+    let until = Instant::now() + BOUND;
+    loop {
+        let done = tree
+            .daemon
+            .as_mut()
+            .unwrap_or_else(|| panic!("daemon"))
+            .try_wait()
+            .unwrap_or_else(|e| panic!("wait: {e}"));
+        if let Some(status) = done {
+            assert!(status.success(), "drain: {status}");
+            break;
+        }
+        assert!(Instant::now() < until, "drain exceeded bound");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    tree.daemon.take();
 }
 #[test]
 fn drain_during_follow_keeps_a_queryable_manifest_and_restart_finishes_it() {

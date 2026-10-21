@@ -1583,3 +1583,79 @@ fn index_workers_lower_their_own_nice_without_lowering_query_threads() {
     }
     assert_eq!(priority(), query, "caller/query priority must not change");
 }
+
+#[derive(Debug)]
+struct Unpaced {
+    workers: usize,
+    limiter: Arc<ferret_catalog::bulk::Limiter>,
+}
+impl ferret_catalog::bulk::Control for Unpaced {
+    fn admit(
+        &self,
+        _kind: ferret_catalog::bulk::Kind,
+        _view: &Catalog,
+    ) -> Result<(), ferret_catalog::bulk::Blocked> {
+        Ok(())
+    }
+    fn limiter(&self) -> Arc<ferret_catalog::bulk::Limiter> {
+        self.limiter.clone()
+    }
+    fn paced(&self) -> bool {
+        false
+    }
+    fn workers(&self) -> usize {
+        self.workers
+    }
+}
+
+#[test]
+fn unpaced_command_workers_keep_the_caller_nice() {
+    fn priority() -> (i32, u32) {
+        let tid = rustix::thread::gettid().as_raw_nonzero().get();
+        let stat = fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        (fields[16].parse().unwrap(), fields[38].parse().unwrap())
+    }
+    let caller = priority();
+    let caller_tid = rustix::thread::gettid().as_raw_nonzero().get();
+    assert_ne!(
+        caller.0, 19,
+        "the caller is already nice 19, so a skipped lower is invisible"
+    );
+    let tmp = Tmp::new("unpaced-nice");
+    tmp.write("a.txt", b"alpha");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let _hook = Hook::set(&tmp.tree(), move |probe| {
+        if matches!(probe, Probe::Hashed(_)) {
+            let tid = rustix::thread::gettid().as_raw_nonzero().get();
+            recorded.lock().unwrap().push((tid, priority()));
+        }
+    });
+    let options = IndexOptions {
+        workers: 2,
+        bulk: Some(Arc::new(Unpaced {
+            workers: 2,
+            limiter: Arc::new(ferret_catalog::bulk::Limiter::new(
+                0,
+                Arc::new(ferret_catalog::bulk::Monotonic::default()),
+            )),
+        })),
+        ..IndexOptions::default()
+    };
+    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options).unwrap();
+    let worker = seen.lock().unwrap();
+    assert!(!worker.is_empty(), "the crawl hashed on no worker");
+    for &(tid, (nice, policy)) in worker.iter() {
+        assert_ne!(tid, caller_tid, "the hash ran on the calling thread");
+        assert_eq!(nice, caller.0);
+        assert_ne!(nice, 19);
+        assert_eq!(policy, caller.1, "scheduling policy stays unchanged");
+    }
+    assert_eq!(priority(), caller, "caller priority must not change");
+}

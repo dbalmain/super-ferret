@@ -1,6 +1,7 @@
 //! The daemon's one writer queue. Explicit root/policy commands are serial
-//! barriers; inotify drains on another thread while the producer publishes.
-//! Queries use Engine's immutable pins and never enter this queue.
+//! barriers on a thread that keeps the process's starting nice; inotify drains
+//! on another thread while the producer publishes. Queries use Engine's
+//! immutable pins and never enter this queue.
 
 use std::ffi::OsStr;
 use std::io;
@@ -24,7 +25,34 @@ mod content;
 
 pub(super) struct Command {
     request: Request,
-    reply: mpsc::SyncSender<Result<ferret_crawl::Report, ferret_crawl::IndexError>>,
+    reply: mpsc::SyncSender<CommandReply>,
+}
+struct CommandJob {
+    request: Request,
+    options: IndexOptions,
+    done: mpsc::SyncSender<std::thread::Result<CommandReply>>,
+}
+pub(super) struct CommandReply {
+    result: Result<ferret_crawl::Report, ferret_crawl::IndexError>,
+    /// `Ok` when the catalog change failed or content follow covered every
+    /// document. Drain and shutdown leave `Err` while documents remain.
+    content: Result<(), String>,
+    /// A deferred command with no watch must arm the fallback backstop again.
+    arm_fallback: bool,
+}
+/// Drops the job sender before joining, so teardown cannot detach the thread
+/// or wait on a recv that still has a live sender.
+struct CommandLane {
+    jobs: Option<mpsc::Sender<CommandJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for CommandLane {
+    fn drop(&mut self) {
+        self.jobs.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 pub(super) enum Message {
     Command(Box<Command>),
@@ -181,8 +209,32 @@ fn serve(
         index: host.index.clone(),
         dirs: crate::xdg::Dirs::from_env().ok(),
     };
-    // Intake and sampler were spawned at normal priority; only this retained
-    // index owner and its subsequently created index workers are lowered.
+    // Intake and the sampler were spawned at the process's starting nice.
+    // This thread is too. An unprivileged process cannot raise a thread's
+    // nice later (RLIMIT_NICE is a hard ceiling), so an explicit command
+    // runs here and its crawl workers inherit this nice. The writer then
+    // lowers itself to nice 19 for background refresh and follow, and blocks
+    // here until the command finishes, which keeps a watch refresh queued.
+    let (job_send, job_recv) = mpsc::channel();
+    let command_host = host.clone();
+    let command_engine = engine.clone();
+    let command_scheduler = scheduler.clone();
+    let command_watch = watch.clone();
+    let command_thread = std::thread::Builder::new()
+        .name("ferret-command".into())
+        .spawn(move || {
+            command_loop(
+                command_host,
+                command_engine,
+                command_scheduler,
+                command_watch,
+                job_recv,
+            )
+        })?;
+    let lane = CommandLane {
+        jobs: Some(job_send),
+        thread: Some(command_thread),
+    };
     ferret_crawl::lower_index_priority()?;
     let mut options = IndexOptions {
         watch: watch.clone(),
@@ -248,117 +300,34 @@ fn serve(
                         "roots-remove"
                     },
                 );
+                // The test delay stays on this thread, before the crawl, so a
+                // queued command is already `writer_running`.
                 #[cfg(debug_assertions)]
                 std::thread::sleep(duration("FERRET_WRITER_TEST_COMMAND_DELAY_MS", 0));
-                // The first argv item is the originating client's rules. Paths
-                // are absolute bytes, checked again by the real producer.
-                let global = command
-                    .request
-                    .args
-                    .first()
-                    .map(|s| String::from_utf8_lossy(s).into_owned());
-                let paths: Vec<_> = command
-                    .request
-                    .args
-                    .iter()
-                    .skip(1)
-                    .map(|s| PathBuf::from(OsStr::from_bytes(s)))
-                    .collect();
-                let result = if global.is_none() {
-                    Err(ferret_crawl::IndexError::BadRoot(PathBuf::new()))
-                } else {
-                    command_options.global = global;
-                    let (change, refresh) = match command.request.op {
-                        Op::Index => (
-                            RootChange {
-                                add: &paths,
-                                remove: &[],
-                            },
-                            if paths.is_empty() {
-                                Refresh::All
-                            } else {
-                                Refresh::Only(&paths)
-                            },
-                        ),
-                        _ => (
-                            RootChange {
-                                add: &[],
-                                remove: &paths,
-                            },
-                            Refresh::Only(&[]),
-                        ),
-                    };
-                    engine
-                        .index_change(change, refresh, &command_options)
-                        .map_err(|error| match error {
-                            ferret_crawl::IndexError::DeferredBulk(
-                                ferret_catalog::bulk::Blocked::Memory,
-                            ) => {
-                                let status = scheduler.status();
-                                ferret_crawl::IndexError::DeferredMemory {
-                                    required: status.required_memory,
-                                    available: status.sample.memory.unwrap_or(0),
-                                }
-                            }
-                            other => other,
-                        })
+                let (done, outcome) = mpsc::sync_channel(1);
+                lane.jobs
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("command thread stopped"))?
+                    .send(CommandJob {
+                        request: command.request,
+                        options: command_options,
+                        done,
+                    })
+                    .map_err(|_| io::Error::other("command thread stopped"))?;
+                let reply = match outcome
+                    .recv()
+                    .map_err(|_| io::Error::other("command thread stopped"))?
+                {
+                    Ok(reply) => reply,
+                    Err(payload) => std::panic::resume_unwind(payload),
                 };
-                if let Ok(report) = &result {
-                    global_inputs(watch.as_ref(), &engine, &context);
-                    successful(host, report, false);
-                    host.writer_status
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .retained_roots = report
-                        .coverage_faults
-                        .iter()
-                        .map(|fault| fault.root.clone())
-                        .collect();
-                    if let Some(w) = &watch {
-                        w.adopt_aliases(engine.pin().catalog());
-                        w.reconcile(engine.pin().catalog());
-                    }
-                } else if let Err(error) = &result {
-                    let deferred = match error {
-                        ferret_crawl::IndexError::DeferredBulk(reason) => Some(*reason),
-                        ferret_crawl::IndexError::DeferredMemory { .. } => {
-                            Some(ferret_catalog::bulk::Blocked::Memory)
-                        }
-                        _ => None,
-                    };
-                    if let Some(reason) = deferred {
-                        host.writer_status
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .blocked = Some(reason);
-                        if let Some(w) = &watch {
-                            w.backstop(RefreshReason::Backstop);
-                        } else {
-                            initial = true;
-                            host.writer_status
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .fallback_backstop = true;
-                        }
-                    }
-                    if let Some(w) = &watch {
-                        w.abort_policy_roots();
-                    }
-                    host.writer_status
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .error = Some(error.to_string());
-                    if matches!(
-                        error,
-                        ferret_crawl::IndexError::Update(_) | ferret_crawl::IndexError::Commit(_)
-                    ) && let Some(w) = &watch
-                    {
-                        w.backstop(RefreshReason::Backstop);
-                    }
+                if reply.arm_fallback {
+                    initial = true;
                 }
-                // The reply is detached from socket backpressure. Publication
-                // and watch adoption finish before the next command begins.
-                let _ = command.reply.send(result);
+                // The reply is detached from socket backpressure. Publication,
+                // watch adoption and the unpaced content follow finish before
+                // the next command begins.
+                let _ = command.reply.send(reply);
                 host.writer_pending.fetch_sub(1, Ordering::AcqRel);
                 content_due = Instant::now();
                 continue;
@@ -566,6 +535,162 @@ fn serve(
     }
     Ok(())
 }
+fn command_loop(
+    host: Arc<Host>,
+    engine: Arc<Engine>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+    watch: Option<Arc<Watch>>,
+    jobs: mpsc::Receiver<CommandJob>,
+) {
+    let context = crate::cli::Context {
+        index: host.index.clone(),
+        dirs: crate::xdg::Dirs::from_env().ok(),
+    };
+    while let Ok(job) = jobs.recv() {
+        let CommandJob {
+            request,
+            mut options,
+            done,
+        } = job;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_explicit(
+                &host,
+                &engine,
+                &scheduler,
+                watch.as_ref(),
+                &context,
+                &request,
+                &mut options,
+            )
+        }));
+        if done.send(outcome).is_err() {
+            break;
+        }
+    }
+}
+fn run_explicit(
+    host: &Host,
+    engine: &Engine,
+    scheduler: &crate::scheduler::Scheduler,
+    watch: Option<&Arc<Watch>>,
+    context: &crate::cli::Context,
+    request: &Request,
+    options: &mut IndexOptions,
+) -> CommandReply {
+    // The first argv item is the originating client's rules. Paths are
+    // absolute bytes, checked again by the real producer.
+    let global = request
+        .args
+        .first()
+        .map(|s| String::from_utf8_lossy(s).into_owned());
+    let paths: Vec<_> = request
+        .args
+        .iter()
+        .skip(1)
+        .map(|s| PathBuf::from(OsStr::from_bytes(s)))
+        .collect();
+    let result = if global.is_none() {
+        Err(ferret_crawl::IndexError::BadRoot(PathBuf::new()))
+    } else {
+        options.global = global;
+        let (change, refresh) = match request.op {
+            Op::Index => (
+                RootChange {
+                    add: &paths,
+                    remove: &[],
+                },
+                if paths.is_empty() {
+                    Refresh::All
+                } else {
+                    Refresh::Only(&paths)
+                },
+            ),
+            _ => (
+                RootChange {
+                    add: &[],
+                    remove: &paths,
+                },
+                Refresh::Only(&[]),
+            ),
+        };
+        engine
+            .index_change(change, refresh, options)
+            .map_err(|error| match error {
+                ferret_crawl::IndexError::DeferredBulk(ferret_catalog::bulk::Blocked::Memory) => {
+                    let status = scheduler.status();
+                    ferret_crawl::IndexError::DeferredMemory {
+                        required: status.required_memory,
+                        available: status.sample.memory.unwrap_or(0),
+                    }
+                }
+                other => other,
+            })
+    };
+    let mut arm_fallback = false;
+    if let Ok(report) = &result {
+        global_inputs(watch, engine, context);
+        successful(host, report, false);
+        host.writer_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_roots = report
+            .coverage_faults
+            .iter()
+            .map(|fault| fault.root.clone())
+            .collect();
+        if let Some(w) = watch {
+            w.adopt_aliases(engine.pin().catalog());
+            w.reconcile(engine.pin().catalog());
+        }
+    } else if let Err(error) = &result {
+        let deferred = match error {
+            ferret_crawl::IndexError::DeferredBulk(reason) => Some(*reason),
+            ferret_crawl::IndexError::DeferredMemory { .. } => {
+                Some(ferret_catalog::bulk::Blocked::Memory)
+            }
+            _ => None,
+        };
+        if let Some(reason) = deferred {
+            host.writer_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .blocked = Some(reason);
+            if let Some(w) = watch {
+                w.backstop(RefreshReason::Backstop);
+            } else {
+                arm_fallback = true;
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fallback_backstop = true;
+            }
+        }
+        if let Some(w) = watch {
+            w.abort_policy_roots();
+        }
+        host.writer_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .error = Some(error.to_string());
+        if matches!(
+            error,
+            ferret_crawl::IndexError::Update(_) | ferret_crawl::IndexError::Commit(_)
+        ) && let Some(w) = watch
+        {
+            w.backstop(RefreshReason::Backstop);
+        }
+    }
+    let content = if result.is_ok() {
+        content::follow_explicit(host, engine)
+    } else {
+        Ok(())
+    };
+    CommandReply {
+        result,
+        content,
+        arm_fallback,
+    }
+}
 fn global_inputs(watch: Option<&Arc<Watch>>, engine: &Engine, context: &crate::cli::Context) {
     if let (Some(w), Some(dirs)) = (watch, &context.dirs) {
         let pin = engine.pin();
@@ -624,8 +749,8 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
         });
     }
     let started = Instant::now();
-    let result = match receive.recv() {
-        Ok(result) => result,
+    let reply = match receive.recv() {
+        Ok(reply) => reply,
         Err(_) => {
             emit_to(destination, &request.id, "begin", |o| {
                 o.null("generation");
@@ -638,15 +763,30 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
             });
         }
     };
-    let rendered = crate::index::render(&result);
+    let rendered = crate::index::render(&reply.result);
+    // Daemon stderr frames are written raw, so the prefix matches `cli::error`.
+    let content_failed = reply.content.is_err();
+    let exit = if content_failed {
+        crate::cli::Exit::Error as u8
+    } else {
+        rendered.exit as u8
+    };
+    let mut stderr = rendered.diagnostics;
+    if let Err(error) = &reply.content {
+        stderr.push_str("ferret: content index: ");
+        stderr.push_str(error);
+        stderr.push('\n');
+    }
+    let stdout = if content_failed {
+        String::new()
+    } else {
+        rendered.stdout
+    };
     let session = super::pin(host)?;
     emit_to(destination, &request.id, "begin", |o| {
         generation(o, Some(session.generation()));
     })?;
-    for (event, text) in [
-        ("stdout", &rendered.stdout),
-        ("stderr", &rendered.diagnostics),
-    ] {
+    for (event, text) in [("stdout", &stdout), ("stderr", &stderr)] {
         for bytes in text.as_bytes().chunks(64 << 10) {
             emit_to(destination, &request.id, event, |o| {
                 o.bytes("bytes", bytes);
@@ -665,9 +805,9 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
     );
     object
         .str("outcome", rendered.outcome)
-        .int("exit", rendered.exit as u8)
+        .int("exit", exit)
         .int("total_us", started.elapsed().as_micros() as i128);
-    if let Ok(report) = &result {
+    if let Ok(report) = &reply.result {
         crate::index::log_report(&mut object, report);
     }
     object.end();
@@ -675,8 +815,7 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
         o.bytes("bytes", &log);
     })?;
     emit_to(destination, &request.id, "end", |o| {
-        o.int("exit", rendered.exit as u8)
-            .str("outcome", rendered.outcome);
+        o.int("exit", exit).str("outcome", rendered.outcome);
     })
 }
 pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {

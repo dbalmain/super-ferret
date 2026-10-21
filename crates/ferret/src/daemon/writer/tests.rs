@@ -78,9 +78,11 @@ fn command(host: &Host, root: &std::path::Path) -> Result<ferret_crawl::Report, 
             reply,
         })))
         .unwrap_or_else(|_| panic!("writer channel"));
-    receive
+    let reply = receive
         .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("writer reply: {e}"))
+        .unwrap_or_else(|e| panic!("writer reply: {e}"));
+    assert!(reply.content.is_ok(), "content follow: {:?}", reply.content);
+    reply.result
 }
 fn deferred_writer(reason: Blocked) {
     let tree = tree();
