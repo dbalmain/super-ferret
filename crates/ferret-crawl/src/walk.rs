@@ -386,9 +386,12 @@ pub fn load_policy(
 
 /// Loads rg's git, `.ignore` and `.rgignore` inputs with the crawler's scoped
 /// reads. Ferret ignore files are not consulted; content has no size cap.
-/// As in rg, a symlinked `.git` is followed (one that does not resolve
-/// starts no work tree), and a `.git` file contributes `info/exclude` only
-/// through a `commondir`. Diagnostics and directory-open failures follow
+/// As in rg, a symlinked `.git` is followed. A target that does not resolve
+/// — a loop, a dangling link, or a component that cannot be traversed —
+/// starts no work tree. An execute-only directory still does: it is opened
+/// `O_PATH` and `info/exclude` is read by name. A `.git` file contributes
+/// `info/exclude` only through a `commondir`, including when that directory
+/// is execute-only. Diagnostics and directory-open failures follow
 /// [`load_policy`].
 pub fn load_grep_policy(
     path: &Path,
@@ -840,6 +843,15 @@ fn root_dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC
 }
 
+/// A directory location, with no read of the directory itself. Opening needs
+/// no permission on the final directory, so an execute-only `.git` or gitdir
+/// still yields a handle; named reads then need search permission. Grep uses
+/// this so `info/exclude` can be read by name. The crawl uses
+/// [`root_dir_flags`], which requires the directory to be readable.
+fn path_dir_flags() -> OFlags {
+    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC
+}
+
 fn child_dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
@@ -882,11 +894,13 @@ struct Walker<'b, F> {
     /// [`DENTS_BYTES`].
     dents: Vec<u8>,
     visit: F,
-    /// Rg's reading of `.git`, for grep's policy loads: a symlinked `.git`
-    /// is followed, so one that does not resolve (dangling, or a loop)
-    /// starts no work tree; and a `.git` file's `info/exclude` applies only
-    /// through a `commondir`. D13 opens nothing through a symlinked `.git`,
-    /// counts any `.git` entry, and reads a gitdir's own exclude.
+    /// Rg's reading of `.git`, for grep's policy loads. A symlinked `.git`
+    /// is followed: one that does not resolve (a loop, a dangling link, or
+    /// a component that cannot be traversed) starts no work tree, while an
+    /// execute-only directory is opened `O_PATH` so `info/exclude` can be
+    /// read by name. A `.git` file's `info/exclude` applies only through a
+    /// `commondir`. D13 opens nothing through a symlinked `.git`, counts
+    /// any `.git` entry, and reads a gitdir's own exclude.
     rg_git: bool,
 }
 
@@ -1071,16 +1085,21 @@ fn after_open(rel: &[u8]) {
 /// A parent's continuation, and the child directory to walk next.
 type Descent<D> = (Job<D>, Job<D>);
 
-/// What `.git` is. A symlink is [`GitProbe::Present`]: nothing is opened
-/// through it. A real directory keeps the descriptor from the probe so
-/// `info/exclude` cannot be redirected by a later swap of the name.
+/// What `.git` is. The crawl leaves a symlink as [`GitProbe::Present`] and
+/// opens nothing through it. Grep follows one: a resolved directory is
+/// [`GitProbe::Directory`] (an `O_PATH` handle, so missing read permission
+/// does not hide `info/exclude`), a resolved file is [`GitProbe::File`],
+/// and a target that does not resolve is [`GitProbe::Missing`]. A held
+/// directory descriptor is what `info/exclude` is read from, so a later
+/// swap of the name cannot redirect it.
 enum GitProbe {
     Missing,
     Directory(OwnedFd),
     /// Bytes of a regular `.git` file, already read from the opened inode.
     File(Vec<u8>),
-    /// A symlink or other non-regular entry. Still starts a work tree
-    /// (so `.gitignore` applies) but contributes no exclude.
+    /// Starts a work tree, so `.gitignore` applies, but contributes no
+    /// exclude. The crawl uses this for a symlink. Grep uses it when the
+    /// target resolved and is not a directory or a readable gitfile.
     Present,
 }
 
@@ -1810,7 +1829,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
 
     fn probe_git(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
         let flags = if self.rg_git {
-            root_dir_flags()
+            // Follow, and do not require read permission on the directory.
+            path_dir_flags()
         } else {
             child_dir_flags()
         };
@@ -1825,8 +1845,10 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     }
 
     /// The directory open failed for a reason other than "not a directory"
-    /// or "a symlink". A directory we cannot search still starts a work
-    /// tree; a regular file is read below.
+    /// or a symlink loop. A directory we cannot search still starts a work
+    /// tree; a regular file is read below. Grep has already tried `O_PATH`,
+    /// so a directory that merely lacks read permission does not arrive
+    /// here. A symlink that does is one whose target did not resolve.
     fn probe_git_failed(&mut self, dir: BorrowedFd<'_>, error: Errno, token: V::Dir) -> GitProbe {
         match statat(dir, DOT_GIT, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) if file_type(&stat) == FileType::RegularFile => {
@@ -1836,12 +1858,28 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 self.fail_at_git(io::Error::from(error), token);
                 GitProbe::Present
             }
+            Ok(stat) if self.rg_git && file_type(&stat) == FileType::Symlink => {
+                self.symlink_follow_failed(dir)
+            }
             Ok(_) => GitProbe::Present,
             Err(Errno::NOENT) => GitProbe::Missing,
             Err(stat_err) => {
                 self.fail_at_git(io::Error::from(stat_err), token);
                 GitProbe::Missing
             }
+        }
+    }
+
+    /// Following a symlinked `.git` failed. `stat` follows, and needs only
+    /// search permission, so it distinguishes a target that resolved (an
+    /// unreadable file still starts a work tree) from one that did not
+    /// (search denied, or a non-directory component). The latter is
+    /// absence, as a dangling link is, and is not a fault.
+    fn symlink_follow_failed(&self, dir: BorrowedFd<'_>) -> GitProbe {
+        if statat(dir, DOT_GIT, AtFlags::empty()).is_ok() {
+            GitProbe::Present
+        } else {
+            GitProbe::Missing
         }
     }
 
@@ -1863,11 +1901,15 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 }
             },
             Err(Errno::NOENT) => GitProbe::Missing,
+            Err(Errno::LOOP) if self.rg_git => GitProbe::Missing,
             Err(Errno::LOOP) => GitProbe::Present,
             Err(error) => match statat(dir, DOT_GIT, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) if file_type(&stat) == FileType::RegularFile => {
                     self.fail_at_git(io::Error::from(error), token);
                     GitProbe::Present
+                }
+                Ok(stat) if self.rg_git && file_type(&stat) == FileType::Symlink => {
+                    self.symlink_follow_failed(dir)
                 }
                 Ok(_) => GitProbe::Present,
                 Err(Errno::NOENT) => GitProbe::Missing,
@@ -1959,6 +2001,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// Symlinks are followed, as git follows them: the gitdir's text can
     /// already name any directory, so `O_NOFOLLOW` here would protect nothing.
     /// What the handle protects is `base`, which a rename cannot redirect.
+    /// Grep opens `O_PATH`, so an execute-only directory still yields a
+    /// handle `info/exclude` can be read from by name. The crawl opens
+    /// `O_RDONLY` and faults when that directory is not readable.
     fn open_git_directory(
         &mut self,
         base: BorrowedFd<'_>,
@@ -1977,10 +2022,15 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             .join(path)
         };
         self.visit.policy_path(&dependency);
-        let opened = if path.is_absolute() {
-            open_path(path, root_dir_flags(), Mode::empty())
+        let flags = if self.rg_git {
+            path_dir_flags()
         } else {
-            openat(base, path, root_dir_flags(), Mode::empty())
+            root_dir_flags()
+        };
+        let opened = if path.is_absolute() {
+            open_path(path, flags, Mode::empty())
+        } else {
+            openat(base, path, flags, Mode::empty())
         };
         // A missing gitdir or common directory is a fault like any other: the
         // `.git` file says a work tree starts here, and its exclude rules and

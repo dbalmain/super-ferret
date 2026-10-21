@@ -5,7 +5,8 @@ mod fixture;
 
 use fixture::{Fixture, sorted};
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn nested_gitignore_negation_directory_anchor_and_double_star() {
@@ -584,4 +585,177 @@ fn symlinked_git_counts_only_when_it_resolves() {
         sorted(&lone.stdout),
         ["./excluded", "./global", "./keep", "./local"]
     );
+}
+
+// Mode 0111 is execute-only: the directory cannot be listed, but a name
+// inside it can be opened. rg still reads `info/exclude`. A real `.git`, a
+// symlink to one, and a chain of symlinks are the same open.
+#[test]
+fn execute_only_git_directory_exclude_is_read_by_name() {
+    use std::os::unix::fs::symlink;
+
+    if running_as_root() {
+        return;
+    }
+    let f = Fixture::new("git-mode-0111");
+    write_global(&f);
+    for case in ["real", "link", "double"] {
+        work_tree(&f, case, HITS);
+    }
+    f.write("real/.git/info/exclude", b"excluded\n");
+    f.write("target-0111/info/exclude", b"excluded\n");
+    let _real = ListingDenied::at(&f.tree.join("real/.git"), 0o111);
+    let _target = ListingDenied::at(&f.tree.join("target-0111"), 0o111);
+    symlink("../target-0111", f.tree.join("link/.git")).unwrap();
+    symlink("target-0111", f.tree.join("mid")).unwrap();
+    symlink("../mid", f.tree.join("double/.git")).unwrap();
+    for case in ["real", "link", "double"] {
+        compare_quiet(&f, &f.tree.join(case));
+    }
+}
+
+// A symlinked `.git` whose target cannot be traversed is not a repository,
+// so neither `.gitignore` nor the global excludes apply. A symlink to a
+// mode 000 directory does resolve: it is a repository, and `info/exclude`
+// cannot be read.
+#[test]
+fn unresolved_git_symlink_starts_no_work_tree() {
+    use std::os::unix::fs::symlink;
+
+    if running_as_root() {
+        return;
+    }
+    let f = Fixture::new("git-unresolved");
+    write_global(&f);
+    f.write("locked/meta/info/exclude", b"excluded\n");
+    f.write("notdir", b"file\n");
+    f.write("mode0/info/exclude", b"excluded\n");
+    for case in ["through-dir", "through-file", "symlink-000"] {
+        work_tree(&f, case, HITS);
+    }
+    let _locked = ListingDenied::at(&f.tree.join("locked"), 0o000);
+    let _mode0 = ListingDenied::at(&f.tree.join("mode0"), 0o000);
+    symlink("../locked/meta", f.tree.join("through-dir/.git")).unwrap();
+    symlink("../notdir/meta", f.tree.join("through-file/.git")).unwrap();
+    symlink("../mode0", f.tree.join("symlink-000/.git")).unwrap();
+    for case in ["through-dir", "through-file", "symlink-000"] {
+        compare_quiet(&f, &f.tree.join(case));
+    }
+}
+
+// A gitfile's exclude comes from the `commondir` directory. That directory,
+// and the gitdir that names it, may be execute-only; rg still reads the
+// common `info/exclude` by name and does not apply the gitdir's own. A
+// gitdir path that cannot be traversed still leaves a repository — the
+// gitfile was read — and contributes no exclude.
+#[test]
+fn execute_only_commondir_exclude_is_read_by_name() {
+    if running_as_root() {
+        return;
+    }
+    let f = Fixture::new("gitfile-mode-0111");
+    write_global(&f);
+    let hits = ["keep", "local", "global", "excluded", "own"];
+    f.write("common-x/info/exclude", b"excluded\n");
+    f.write("gitdir-a/commondir", b"../common-x\n");
+    f.write("gitdir-a/info/exclude", b"own\n");
+    f.write("common-y/info/exclude", b"excluded\n");
+    f.write("gitdir-b/commondir", b"../common-y\n");
+    f.write("gitdir-b/info/exclude", b"own\n");
+    f.write("reachable/info/exclude", b"excluded\n");
+    f.write("locked/gitdir/commondir", b"../../reachable\n");
+    f.write("locked/gitdir/info/exclude", b"own\n");
+    let _common = ListingDenied::at(&f.tree.join("common-x"), 0o111);
+    let _gitdir = ListingDenied::at(&f.tree.join("gitdir-b"), 0o111);
+    let _locked = ListingDenied::at(&f.tree.join("locked"), 0o000);
+    for (case, gitdir) in [
+        ("common-link", "../gitdir-a\n"),
+        ("gitdir-link", "../gitdir-b\n"),
+        ("unresolved-gitdir", "../locked/gitdir\n"),
+    ] {
+        work_tree(&f, case, &hits);
+        f.write(
+            &format!("{case}/.git"),
+            format!("gitdir: {gitdir}").as_bytes(),
+        );
+    }
+    for case in ["common-link", "gitdir-link", "unresolved-gitdir"] {
+        compare_quiet(&f, &f.tree.join(case));
+    }
+}
+
+const HITS: &[&str] = &["keep", "local", "global", "excluded"];
+
+// Clippy allows `unwrap` inside `#[test]` and not in the helpers those tests
+// call. Fixture setup panics if it cannot write, same as the tests above.
+#[allow(clippy::unwrap_used)]
+fn write_global(f: &Fixture) {
+    let global = f.base.join("home/config/git/ignore");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(&global, b"global\n").unwrap();
+}
+
+fn work_tree(f: &Fixture, case: &str, names: &[&str]) {
+    f.write(&format!("{case}/.gitignore"), b"local\n");
+    for name in names {
+        f.write(&format!("{case}/{name}"), b"hit\n");
+    }
+}
+
+fn compare_quiet(f: &Fixture, cwd: &Path) {
+    f.compare(cwd, &["-l", "hit", "."], true);
+    for args in [&["-l", "hit", "."][..], &["--files"][..]] {
+        let rg = f.oracle(cwd, args);
+        let ferret = f.ferret(cwd, args);
+        assert!(
+            rg.stderr.is_empty() && ferret.stderr.is_empty(),
+            "{args:?}\nrg: {rg:?}\nferret: {ferret:?}"
+        );
+    }
+}
+
+/// Restores mode 0755 so the fixture can be removed. Mode 000 and 0111
+/// directories cannot be listed or unlinked from by an unprivileged user.
+struct ListingDenied {
+    path: PathBuf,
+}
+
+impl ListingDenied {
+    // Clippy allows `unwrap` inside `#[test]` and not in the helpers those
+    // tests call.
+    #[allow(clippy::unwrap_used)]
+    fn at(path: &Path, mode: u32) -> Self {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        let denied = fs::read_dir(path).is_err();
+        let guard = Self {
+            path: path.to_path_buf(),
+        };
+        assert!(
+            denied,
+            "{} mode {mode:04o} is still listable; run the tests as an unprivileged user",
+            path.display()
+        );
+        guard
+    }
+}
+
+impl Drop for ListingDenied {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755));
+    }
+}
+
+// Clippy allows `unwrap` inside `#[test]` and not in the helpers those tests
+// call.
+#[allow(clippy::unwrap_used)]
+fn running_as_root() -> bool {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let root = status.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("Uid:") && fields.nth(1) == Some("0")
+    });
+    if root {
+        eprintln!("skipping: running as root, so chmod 000 does not deny access");
+    }
+    root
 }
