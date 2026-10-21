@@ -2140,7 +2140,7 @@ fn buffered_stdout_needs_no_extra_descriptor() {
         let path = fixture.base.join("out");
         let out = fs::File::create(&path).unwrap();
         let script = match limit {
-            Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+            Some(limit) => format!("exec 3>&- && ulimit -n {limit} && exec \"$0\" \"$@\""),
             None => "exec \"$0\" \"$@\"".to_owned(),
         };
         let mut command = fixture.command(OsStr::new("sh"));
@@ -5531,7 +5531,7 @@ fn swap_after_listing(fixture: &Fixture, dir: &str, limit: Option<u32>) -> Vec<S
         command
             .arg("-c")
             .arg(match limit {
-                Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+                Some(limit) => format!("exec 3>&- && ulimit -n {limit} && exec \"$0\" \"$@\""),
                 None => "exec \"$0\" \"$@\"".to_owned(),
             })
             .arg(env!("CARGO_BIN_EXE_ferret"))
@@ -5593,7 +5593,7 @@ fn deep_walk_under_a_low_open_file_limit_searches_every_level() {
         command
             .arg("-c")
             .arg(match limit {
-                Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+                Some(limit) => format!("exec 3>&- && ulimit -n {limit} && exec \"$0\" \"$@\""),
                 None => "exec \"$0\" \"$@\"".to_owned(),
             })
             .arg(env!("CARGO_BIN_EXE_ferret"))
@@ -5663,7 +5663,9 @@ fn many_readers_under_a_low_descriptor_limit_match_one_worker() {
         let mut command = fixture.command(OsStr::new("sh"));
         command
             .arg("-c")
-            .arg(format!("ulimit -n {limit} && exec \"$0\" \"$@\""))
+            .arg(format!(
+                "exec 3>&- && ulimit -n {limit} && exec \"$0\" \"$@\""
+            ))
             .arg(env!("CARGO_BIN_EXE_ferret"))
             .arg("--index")
             .arg(fixture.base.join("index"))
