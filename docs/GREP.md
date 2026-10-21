@@ -13,7 +13,7 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 | Input | Source |
 | --- | --- |
 | Recursive directory, default `.` | Pinned catalog and S3 trigram postings; current bytes for candidates |
-| Uncovered directory (D112 B) | Live rg visibility, anchored at the nearest enclosing `.git`, or the operand outside git |
+| Uncovered directory (D112 B) | Live rg visibility: git rules from the nearest enclosing `.git`, `.ignore`/`.rgignore` from every ancestor |
 | Explicit file, file symlink, or `-` | Direct current-byte search, without opening an index |
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
 | `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
@@ -42,7 +42,10 @@ owner still causes query fallback; D110's behavior is unchanged.
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
 data. Incompatible indexes exit 2 with reindexing advice. An absent index or
 uncovered directory selects an in-process live search, without opening the
-content index or contacting the daemon. Mixed covered/uncovered requests stay
+content index or contacting the daemon. An operand is covered only when both
+its canonical path and its spelling, with `.` and `..` folded, lie under a
+configured root: the catalog resolves the spelling, so an alias into a root
+(`alias -> root`) is searched live. Mixed covered/uncovered requests stay
 local: each covered operand uses the snapshot, each uncovered operand walks
 live, in operand order. Covered-only requests retain daemon routing.
 
@@ -50,8 +53,16 @@ The D112 fallback reads `.gitignore` from the work-tree top down,
 `.git/info/exclude`, `$XDG_CONFIG_HOME/git/ignore` (or `~/.config/git/ignore`),
 `.ignore`, and `.rgignore`, in increasing precedence. It applies no ferret
 ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
-read `core.excludesFile`. Slash-anchored global patterns are relative to the
-command's cwd, including when an operand starts a nested work tree. Hidden entries are skipped unless requested or whitelisted by ignore rules. Named
+read `core.excludesFile`. As in rg 15.2.0, the three git sources apply only
+in directories inside a work tree: any ancestor holding a `.git` entry counts,
+so a stray `.git` above a scratch directory makes it a work tree. Ancestor
+`.gitignore` rules stop at a nested work tree's top; ancestor `.ignore` and
+`.rgignore` rules, up to `/`, do not, so naming a subdirectory or a nested
+repository keeps them. A `.git` file whose gitdir has no `commondir` (`git
+init --separate-git-dir`) contributes no `info/exclude`; through a `commondir`
+the common directory's applies. D13 indexing reads both. Slash-anchored global
+patterns are relative to the command's cwd, including when an operand starts a
+nested work tree. Hidden entries are skipped unless requested or whitelisted by ignore rules. Named
 ignored operands are searched, while ancestor rules still apply inside them.
 `-L`/`--follow` follows links in uncovered and unrestricted walks; indexed
 `-L` remains unsupported (use `-u`). `--live` retains D13 and requires covering

@@ -13,7 +13,7 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new(name: &str) -> Self {
-        let base = std::env::temp_dir().join(format!(
+        let base = scratch().join(format!(
             "ferret-grep-uncovered-{}-{name}",
             std::process::id()
         ));
@@ -139,6 +139,25 @@ fn assert_equal(rg: &Output, ferret: &Output, names: bool) {
     assert!(equal(rg, ferret, names), "rg: {rg:?}\nferret: {ferret:?}");
 }
 
+/// A scratch directory with no `.git` in any ancestor. Rg treats any `.git`
+/// above a path as a work tree, so a stray `/tmp/.git` would silently turn
+/// every outside-git case into an inside-git one on that machine alone.
+fn scratch() -> PathBuf {
+    let candidates = [
+        std::env::temp_dir(),
+        PathBuf::from("/dev/shm"),
+        PathBuf::from("/var/tmp"),
+    ];
+    candidates
+        .iter()
+        .filter_map(|dir| fs::canonicalize(dir).ok())
+        .find(|dir| {
+            dir.ancestors()
+                .all(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_err())
+        })
+        .unwrap_or_else(|| panic!("every scratch candidate has a .git ancestor: {candidates:?}"))
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.base);
@@ -150,6 +169,13 @@ fn sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
         .split(|&byte| byte == b'\n')
         .filter(|line| !line.is_empty())
         .collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// Output lines as text, sorted, for pinning a file set.
+pub fn sorted(bytes: &[u8]) -> Vec<&str> {
+    let mut lines: Vec<_> = std::str::from_utf8(bytes).unwrap().lines().collect();
     lines.sort_unstable();
     lines
 }

@@ -90,13 +90,23 @@ impl Anchors {
             .transpose()
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
+        // The catalog resolves an operand by its spelling, so a canonical
+        // match alone would claim an alias (`alias -> root`) the catalog
+        // cannot name. Covered needs both, as resolution does.
+        let spellings: Vec<PathBuf> = paths
+            .iter()
+            .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+            .collect();
         let mut anchors = Self::from_paths(&index, "".into(), paths)?;
         anchors.fallback = true;
         let mut uncovered = Vec::new();
         for input in inputs {
             if let Input::Directory(path) = input {
                 let real = fs::canonicalize(path).map_err(|e| e.to_string())?;
-                if !anchors.roots.iter().any(|root| real.starts_with(root)) {
+                let spelled = lexical(path).map_err(|e| e.to_string())?;
+                if !anchors.roots.iter().any(|root| real.starts_with(root))
+                    || !spellings.iter().any(|root| spelled.starts_with(root))
+                {
                     uncovered.push(path.clone());
                 }
             }
@@ -216,10 +226,11 @@ impl Anchors {
         real: PathBuf,
         stopped: &dyn Fn() -> bool,
     ) -> io::Result<Policy> {
-        let root = real
-            .ancestors()
-            .find(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
-            .unwrap_or(&real);
+        // Rg reads `.ignore` and `.rgignore` in every ancestor, but git rules
+        // only from the nearest work-tree top down. Loading from `/` gives
+        // both: entering a directory holding `.git` starts a work tree, which
+        // drops the enclosing gitignore rules and keeps the others.
+        let root = Path::new("/");
         let mut rules = load_rg(root, None, None, None, stopped)?;
         let mut at = root.to_owned();
         for component in real
@@ -256,6 +267,22 @@ impl Anchors {
             rules,
         })
     }
+}
+
+// The absolute spelling with `.` and `..` folded lexically, as the catalog
+// resolves an operand: a symlink's target is not consulted.
+fn lexical(path: &Path) -> io::Result<PathBuf> {
+    let mut folded = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                folded.pop();
+            }
+            other => folded.push(other),
+        }
+    }
+    Ok(folded)
 }
 
 // read_link expands aliases even when their targets have disappeared.
@@ -444,8 +471,10 @@ impl Policy {
             }
             State::Bypass => None,
         };
+        // Rg applies the global git excludes only inside a work tree.
+        let in_work_tree = matches!(state, State::Rules { rules, .. } if rules.in_work_tree());
         let ignore_rule = local_rule.or_else(|| {
-            let (_, cwd) = selection?;
+            let (_, cwd) = selection.filter(|_| in_work_tree)?;
             let absolute = cwd.join(entry.path());
             self.anchors.git_global.decision(
                 absolute

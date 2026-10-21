@@ -3,7 +3,7 @@
 #[path = "support/grep_uncovered.rs"]
 mod fixture;
 
-use fixture::Fixture;
+use fixture::{Fixture, sorted};
 use std::fs;
 
 #[test]
@@ -285,18 +285,153 @@ fn overrides_and_ignore_whitelists_reveal_ignored_and_hidden_entries() {
     f.compare(&f.tree, &["-g", "!.hidden.txt", "-l", "hit", "."], true);
 }
 
+// Rg applies the global git excludes only in directories inside a work tree,
+// whichever ancestor starts it; slash-anchored global patterns stay relative
+// to the command's cwd.
 #[test]
-fn default_global_excludes_apply_outside_git_and_keep_the_operand_anchor() {
+fn default_global_excludes_apply_only_inside_git_and_keep_the_operand_anchor() {
     let f = Fixture::new("nested-global");
     let global = f.base.join("home/config/git/ignore");
     fs::create_dir_all(global.parent().unwrap()).unwrap();
     fs::write(&global, b"/global.txt\n").unwrap();
-    f.write("global.txt", b"hit\n");
+    for path in [
+        "global.txt",
+        "keep.txt",
+        "plain/global.txt",
+        "nested/global.txt",
+        "nested/keep.txt",
+    ] {
+        f.write(path, b"hit\n");
+    }
     f.write("nested/.git/HEAD", b"ref: refs/heads/main\n");
-    f.write("nested/global.txt", b"hit\n");
-    f.write("nested/keep.txt", b"hit\n");
     f.compare(&f.tree, &["-l", "hit", "."], true);
     f.compare(&f.tree, &["-l", "hit", "nested"], true);
     fs::write(&global, b"global.txt\n").unwrap();
     f.compare(&f.tree, &["-l", "hit", "."], true);
+    f.compare(&f.tree, &["-l", "hit", "plain"], true);
+    f.compare(&f.tree.join("nested"), &["-l", "hit", "."], true);
+    // Pinned, so the cases above cannot all agree vacuously: outside the
+    // nested repository nothing is excluded.
+    let outside = f.ferret(&f.tree, &["-l", "hit", "."]);
+    assert_eq!(
+        sorted(&outside.stdout),
+        [
+            "./global.txt",
+            "./keep.txt",
+            "./nested/keep.txt",
+            "./plain/global.txt"
+        ]
+    );
+    // A `.git` above the operand puts it inside a work tree.
+    f.repo();
+    f.compare(&f.tree.join("plain"), &["-l", "hit", "."], true);
+    f.compare(&f.tree, &["-l", "hit", "plain"], true);
+}
+
+// Ancestor `.ignore` and `.rgignore` files apply to a named subdirectory,
+// anchored at their own directories, whatever the cwd.
+#[test]
+fn ancestor_ignore_and_rgignore_apply_to_a_named_subdirectory() {
+    let f = Fixture::new("ancestor-ignore");
+    f.write(".ignore", b"x\n/a/sub/y\nsub/unanchored-miss\n");
+    f.write("a/.rgignore", b"z\n");
+    for path in ["x", "y", "z", "unanchored-miss", "keep"] {
+        f.write(&format!("a/sub/{path}"), b"hit\n");
+    }
+    f.compare(&f.tree, &["-l", "hit", "a/sub"], true);
+    f.compare(&f.tree.join("a"), &["-l", "hit", "sub"], true);
+    f.compare(&f.tree.join("a/sub"), &["-l", "hit", "."], true);
+    let named = f.ferret(&f.tree, &["-l", "hit", "a/sub"]);
+    assert_eq!(
+        sorted(&named.stdout),
+        ["a/sub/keep", "a/sub/unanchored-miss"]
+    );
+}
+
+// An operand that starts a nested repository drops the outer `.gitignore`
+// rules and keeps the outer `.ignore` and `.rgignore` rules.
+#[test]
+fn named_nested_repository_keeps_outer_ignore_and_rgignore() {
+    let f = Fixture::new("nested-operand");
+    f.repo();
+    f.write(".gitignore", b"from-gitignore\n");
+    f.write(".ignore", b"from-ignore\n");
+    f.write(".rgignore", b"from-rgignore\n");
+    f.write("nested/.git/HEAD", b"ref: refs/heads/main\n");
+    for path in ["from-gitignore", "from-ignore", "from-rgignore", "keep"] {
+        f.write(&format!("nested/{path}"), b"hit\n");
+    }
+    f.compare(&f.tree, &["-l", "hit", "."], true);
+    f.compare(&f.tree, &["-l", "hit", "nested"], true);
+    f.compare(&f.tree.join("nested"), &["-l", "hit", "."], true);
+    let named = f.ferret(&f.tree, &["-l", "hit", "nested"]);
+    assert_eq!(
+        sorted(&named.stdout),
+        ["nested/from-gitignore", "nested/keep"]
+    );
+}
+
+// A `.git` file without `commondir` (`git init --separate-git-dir`): rg does
+// not read that gitdir's `info/exclude`. With a `commondir` (a linked work
+// tree) it reads the common directory's.
+#[test]
+fn git_file_exclude_applies_only_through_commondir() {
+    let f = Fixture::new("gitfile-exclude");
+    let separate = f.base.join("separate");
+    fs::create_dir_all(separate.join("info")).unwrap();
+    fs::write(separate.join("info/exclude"), b"excluded\n").unwrap();
+    let linked = f.base.join("linked");
+    fs::create_dir_all(linked.join("info")).unwrap();
+    fs::write(linked.join("commondir"), b"../common\n").unwrap();
+    fs::write(linked.join("info/exclude"), b"own\n").unwrap();
+    fs::create_dir_all(f.base.join("common/info")).unwrap();
+    fs::write(f.base.join("common/info/exclude"), b"excluded\n").unwrap();
+    for (tree, gitdir) in [("separate-tree", "separate"), ("linked-tree", "linked")] {
+        f.write(
+            &format!("{tree}/.git"),
+            format!("gitdir: ../../{gitdir}\n").as_bytes(),
+        );
+        for path in ["excluded", "own", "keep"] {
+            f.write(&format!("{tree}/{path}"), b"hit\n");
+        }
+        f.compare(&f.tree.join(tree), &["-l", "hit", "."], true);
+    }
+    let separate = f.ferret(&f.tree.join("separate-tree"), &["-l", "hit", "."]);
+    assert_eq!(sorted(&separate.stdout), ["./excluded", "./keep", "./own"]);
+}
+
+// The catalog resolves an operand by its spelling: an alias into an indexed
+// root has none, so it is searched live rather than failing, while the root's
+// own spelling keeps snapshot membership.
+#[test]
+fn symlink_alias_into_an_indexed_root_is_searched_live() {
+    let f = Fixture::new("alias-root");
+    f.write("real/old", b"hit\n");
+    std::os::unix::fs::symlink("real", f.tree.join("alias")).unwrap();
+    f.index(&f.tree.join("real"));
+    f.write("real/new", b"hit\n");
+    f.compare(&f.tree, &["-l", "hit", "alias"], true);
+    let snapshot = f.ferret(&f.tree, &["-l", "hit", "real"]);
+    assert_eq!(snapshot.status.code(), Some(0), "{snapshot:?}");
+    assert_eq!(snapshot.stdout, b"real/old\n");
+}
+
+// A directory created under a root after its crawl is covered but has no
+// snapshot. The advice must name what works: --live is not in play.
+#[test]
+fn new_directory_under_a_root_names_working_remedies() {
+    let f = Fixture::new("new-under-root");
+    f.write("root/old", b"hit\n");
+    f.index(&f.tree.join("root"));
+    f.write("root/fresh/new", b"hit\n");
+    for args in [&["-l", "hit", "root/fresh"][..], &["--files", "root/fresh"]] {
+        let output = f.ferret(&f.tree, args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(!stderr.contains("--live"), "{stderr}");
+        assert!(
+            stderr.contains("ferret index DIR") && stderr.contains("-u"),
+            "{stderr}"
+        );
+    }
 }

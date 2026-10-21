@@ -386,7 +386,9 @@ pub fn load_policy(
 
 /// Loads rg's git, `.ignore` and `.rgignore` inputs with the crawler's scoped
 /// reads. Ferret ignore files are not consulted; content has no size cap.
-/// Diagnostics and directory-open failures follow [`load_policy`].
+/// As in rg, a `.git` file contributes `info/exclude` only through a
+/// `commondir`. Diagnostics and directory-open failures follow
+/// [`load_policy`].
 pub fn load_grep_policy(
     path: &Path,
     parent: Option<&DirRules>,
@@ -411,10 +413,12 @@ fn load_query_policy(
     grep: bool,
     visit: impl FnMut(Event<'_, ()>),
 ) -> io::Result<DirRules> {
+    // Policy inputs are probed by name, never listed, so grep can load an
+    // ancestor it may search but not read, as rg does.
     let fd = open_path(
         path,
         if grep {
-            root_dir_flags()
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC
         } else {
             child_dir_flags()
         },
@@ -422,6 +426,7 @@ fn load_query_policy(
     )?;
     let boundaries = BoundaryIndex::default();
     let mut walker = Walker::new(path, &boundaries, visit);
+    walker.common_exclude_only = grep;
     let loaded = walker.load_ignores(
         fd.as_fd(),
         |name| {
@@ -876,6 +881,9 @@ struct Walker<'b, F> {
     /// [`DENTS_BYTES`].
     dents: Vec<u8>,
     visit: F,
+    /// Rg's reading of a `.git` file: `info/exclude` applies only through a
+    /// `commondir`, never from a gitdir without one. D13 reads both.
+    common_exclude_only: bool,
 }
 
 /// A worker's `getdents` buffer. 32 KiB holds several hundred entries of
@@ -1120,6 +1128,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             rel: Vec::with_capacity(256),
             dents: Vec::with_capacity(DENTS_BYTES),
             visit,
+            common_exclude_only: false,
         }
     }
 
@@ -1890,6 +1899,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let Some((common, commondir)) = self.common_dir(gitdir, token) else {
             return (None, None);
         };
+        let excluded = commondir.is_some() || !self.common_exclude_only;
         let (kind, common_path) = match commondir {
             Some(text) => (WorkTreeKind::Linked, gitdir_path.join(text)),
             None if in_work_tree => (WorkTreeKind::Submodule, gitdir_path),
@@ -1902,7 +1912,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 common_dir: normalize(&common_path),
                 common_id,
             });
-        (work_tree, self.read_exclude(common, token))
+        let exclude = if excluded {
+            self.read_exclude(common, token)
+        } else {
+            None
+        };
+        (work_tree, exclude)
     }
 
     /// The directory being loaded, as a path: the root the caller gave, made

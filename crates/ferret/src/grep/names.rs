@@ -233,7 +233,7 @@ impl Listing<'_> {
                             .next(true)
                 {
                     return Err(format!(
-                        "{}: {}; index this directory, use -u, or omit --live to search uncovered paths",
+                        "{}: {}; refresh the index with ferret index DIR, or use -u to search current files",
                         error.path.display(),
                         error.error
                     ));
