@@ -165,6 +165,15 @@ impl ContentReport {
     }
 }
 
+/// Names [`DocNames::adopt`] may place for each overlay inode or name row
+/// before it leaves the set to the full build. Rows of hard links and small
+/// groups of copies fit; a document shared by many copies does not.
+const ADOPT_FANOUT: usize = 4;
+
+/// Names [`DocNames::adopt`] may place regardless of the overlay's size, so
+/// a small overlay touching a few multi-name rows still adopts.
+const ADOPT_FLOOR: usize = 64;
+
 /// The rows one full build placed, shared by the views that adopt it.
 #[derive(Debug)]
 struct DocNameBase {
@@ -277,13 +286,20 @@ impl DocNames {
     /// `catalog`, a later view of the same checkpoint epoch: only the rows
     /// of documents the overlay touched are rebuilt, from their previous
     /// names and the overlay's. The work is bounded by the overlay's inode
-    /// and name rows and those documents' names, not by the catalog; the
-    /// default compaction limits keep an overlay near 1% of its checkpoint.
+    /// and name rows: at most `ADOPT_FANOUT` names placed for each, plus
+    /// `ADOPT_FLOOR`; the default compaction limits keep an overlay near
+    /// 1% of its checkpoint.
     ///
-    /// `Ok(None)` when an inode that had no document in `previous_catalog`
-    /// gained one while keeping a name the overlay never rewrote: no
-    /// previous row holds that name, and finding it means a pass over every
-    /// name, which is the full build's job.
+    /// `Ok(None)`, leaving the set for the full build:
+    ///
+    /// - when an inode that had no document in `previous_catalog` gained one
+    ///   while keeping a name the overlay never rewrote: no previous row holds
+    ///   that name, and finding it means a pass over every name;
+    /// - when the touched rows exceed that bound. Distinct inodes with
+    ///   identical content share a document, so one renamed copy touches a row
+    ///   as long as all its copies, and the cumulative overlay would touch it
+    ///   again on every later refresh of the epoch. A count per document would
+    ///   not do: rows emit every name.
     pub fn adopt(
         catalog: &Catalog,
         previous_catalog: &Catalog,
@@ -308,7 +324,9 @@ impl DocNames {
         // every row to rebuild.
         let mut affected = HashSet::new();
         let mut rewritten = Vec::new();
+        let mut overlay_rows = 0usize;
         for (name, live) in catalog.changed_names() {
+            overlay_rows += 1;
             affected.extend(owner(previous_catalog, name));
             if live {
                 affected.extend(owner(catalog, name));
@@ -317,6 +335,7 @@ impl DocNames {
         }
         let mut gained = Vec::new();
         for inode in catalog.changed_inodes() {
+            overlay_rows += 1;
             let before = previous_catalog
                 .is_live_inode(inode)
                 .then(|| previous_catalog.doc(inode))
@@ -344,6 +363,18 @@ impl DocNames {
             }) {
                 return Ok(None);
             }
+        }
+
+        // Placing the candidates and carrying the replaced rows is the rest
+        // of the work; refuse it before doing it.
+        let work = affected
+            .iter()
+            .map(|&doc| previous.names(doc).len())
+            .sum::<usize>()
+            + rewritten.len()
+            + previous.overrides.len();
+        if work > overlay_rows.saturating_mul(ADOPT_FANOUT) + ADOPT_FLOOR {
+            return Ok(None);
         }
 
         let mut rows: HashMap<u32, Vec<NameId>> =

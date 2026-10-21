@@ -405,15 +405,20 @@ impl Engine {
         ));
         drop(retired);
         let incarnation = view.generation().incarnation;
-        *self
+        let mut current = self
             .current
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The content view is read under the lock, not from `previous`: a
+        // content publication since the pin is newer and must survive.
+        let content = current
+            .content
+            .take()
+            .filter(|content| content.manifest().incarnation == incarnation);
+        *current = QuerySession {
             catalog: view,
             names,
-            content: previous
-                .content
-                .filter(|content| content.manifest().incarnation == incarnation),
+            content,
             derived: Arc::new(derived),
             threads: previous.threads,
         };

@@ -234,6 +234,112 @@ fn a_kept_name_gaining_a_document_leaves_doc_names_to_the_full_build() {
     assert_eq!(next.doc_names().unwrap().names(doc.0).len(), 1);
 }
 
+/// Distinct inodes with identical content share one document, so renaming
+/// one of many copies touches a row as long as the catalog's copies. The
+/// overlay holds one changed name; rebuilding that row would cost every
+/// copy's name before publication, and the cumulative overlay would
+/// re-seed it on every later refresh of the epoch. DocNames is left for
+/// the first query to build instead, which builds it correctly; the live
+/// set is still carried.
+#[test]
+fn renaming_one_of_many_identical_files_leaves_doc_names_to_the_full_build() {
+    let tree = Tree::with_files(0);
+    for i in 0..300 {
+        let dir = tree.0.join("root").join(format!("d{}", i / 100));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{i}.txt")), b"alpha identical").unwrap();
+    }
+    let engine = tree.compacted_engine();
+    let previous = engine.pin();
+    warm(&previous);
+    let shared = document_named(previous.catalog(), b"0.txt");
+    assert_eq!(previous.doc_names().unwrap().names(shared.0).len(), 300);
+
+    fs::rename(
+        tree.0.join("root/d0/0.txt"),
+        tree.0.join("root/d2/moved.txt"),
+    )
+    .unwrap();
+    tree.refresh(&engine);
+
+    let next = engine.pin();
+    assert_eq!(
+        previous.generation().checkpoint,
+        next.generation().checkpoint
+    );
+    assert!(next.derived.live.get().is_some(), "live set not adopted");
+    assert!(
+        next.derived.docs.get().is_none(),
+        "adoption expanded the shared 300-name row"
+    );
+    assert_eq!(next.live(), &live_documents(next.catalog()));
+    let fresh = DocNames::new(next.catalog()).unwrap();
+    let built = next.doc_names().unwrap();
+    for doc in 0..next.catalog().next_doc().0 {
+        assert_eq!(built.names(doc), fresh.names(doc), "document {doc}");
+    }
+    assert_eq!(built.names(shared.0).len(), 300);
+}
+
+/// A catalog publication that pinned the old content view before a content
+/// publication landed keeps the newer content view rather than restoring
+/// the one it pinned. Production callers both hold `Engine.writer` today;
+/// this drives the two publishers concurrently, as moving merges off the
+/// writer thread will. `select` is held on the retired list after its pin,
+/// the window in which the content view changes.
+#[test]
+fn a_catalog_publication_keeps_a_content_view_published_after_its_pin() {
+    let tree = Tree::with_files(4);
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let pinned = engine.pin();
+    let newer = Arc::new(
+        ferret_index::View::open_with_threads(
+            &tree.0.join("index").join(CONTENT_DIR),
+            &catalog_view(pinned.catalog(), pinned.live()),
+            1,
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(!Arc::ptr_eq(pinned.content.as_ref().unwrap(), &newer));
+    // The next catalog view, committed but not yet published.
+    fs::write(tree.0.join("root/new.txt"), b"new publication").unwrap();
+    let view = ferret_crawl::refresh(
+        engine.writer.lock().unwrap().as_mut().unwrap(),
+        RefreshRequest {
+            expected_generation: pinned.generation(),
+            scopes: vec![RefreshScope::Root(tree.0.join("root"))],
+            rename_hints: Vec::new(),
+            reason: RefreshReason::Burst,
+        },
+        &IndexOptions::default(),
+    )
+    .unwrap()
+    .view;
+    let pins = || Arc::strong_count(&engine.current.read().unwrap().names);
+    let before = pins();
+
+    let retired = engine.retired.lock().unwrap();
+    std::thread::scope(|scope| {
+        let select = scope.spawn(|| engine.select(view));
+        while pins() == before {
+            std::thread::yield_now();
+        }
+        engine.select_content(newer.clone());
+        drop(retired);
+        select.join().unwrap();
+    });
+
+    let current = engine.pin();
+    assert_ne!(current.generation(), pinned.generation());
+    assert!(
+        Arc::ptr_eq(current.content.as_ref().unwrap(), &newer),
+        "select restored the content view it pinned"
+    );
+}
+
 /// A compaction starts a new checkpoint epoch, whose ids the previous sets
 /// do not describe: the new view is cold until a query builds it.
 #[test]
