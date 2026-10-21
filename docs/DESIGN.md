@@ -759,8 +759,9 @@ row postings do not change the content-index boundary. D55 remains open.
 
 Indexed directory grep (D111 A) uses the same host with an explicit pinned
 session, cwd, stdout writer and stderr sink. Its client sends resolved terminal,
-colour, heading, numbering and thread settings plus pattern-file bytes; the
-server never resolves those against its own environment. Stdout/stderr frames
+colour, heading, numbering and thread settings, pattern-file bytes and its
+absolute temporary directory, where before-context spools spill; the server
+never resolves those against its own environment. Stdout/stderr frames
 preserve host flush boundaries and grep's native 0/1/2 exits. Connection hangup
 or cancel stops grep through the scheduler's existing cancellation flag.
 The server caps requested grep threads at its resident search-verification

@@ -49,6 +49,8 @@ pub(crate) struct Request {
 
 /// Client-resolved grep environment. Pattern-file bytes travel with the
 /// request so the socket host never opens client-relative files or stdin.
+/// `temp_dir` is the client's absolute temporary directory, where
+/// before-context windows spill instead of the server's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrepOptions {
     pub color: bool,
@@ -57,6 +59,7 @@ pub(crate) struct GrepOptions {
     pub tty: bool,
     pub threads: usize,
     pub pattern_files: Vec<Vec<u8>>,
+    pub temp_dir: Vec<u8>,
 }
 
 impl GrepOptions {
@@ -70,7 +73,8 @@ impl GrepOptions {
                 .byte_strings(
                     "pattern_files",
                     self.pattern_files.iter().map(Vec::as_slice),
-                );
+                )
+                .opt_byte_value("temp_dir", Some(&self.temp_dir));
         });
     }
     fn parse(value: &Value) -> Option<Self> {
@@ -88,13 +92,15 @@ impl GrepOptions {
             .checked_mul(2)?
             .checked_add(1)?
             .checked_mul(4 << 20)?;
-        (threads > 0).then_some(Self {
+        let temp_dir = byte_value(value.field("temp_dir")?)?;
+        (threads > 0 && temp_dir.first() == Some(&b'/')).then_some(Self {
             color: boolean("color")?,
             heading: boolean("heading")?,
             numbers: boolean("numbers")?,
             tty: boolean("tty")?,
             threads,
             pattern_files: files.iter().map(byte_value).collect::<Option<_>>()?,
+            temp_dir,
         })
     }
 }
@@ -1074,6 +1080,25 @@ mod tests {
         assert_eq!(r.limit, Some(20));
     }
 
+    // The server spills context into the client's directory, so it must not
+    // resolve a missing or relative one against its own environment or cwd.
+    #[test]
+    fn grep_temp_dir_is_required_and_absolute() {
+        let grep = |temp: &str| {
+            format!(
+                r#"{{"id":"g","op":"grep","args":[],"grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[]{temp}}}}}"#
+            )
+        };
+        let r = ok(grep(r#","temp_dir":"/client/tmp""#).as_bytes());
+        assert_eq!(r.grep.unwrap().temp_dir, b"/client/tmp".to_vec());
+        for temp in ["", r#","temp_dir":"tmp""#, r#","temp_dir":"""#] {
+            assert_eq!(
+                err_kind(grep(temp).as_bytes()),
+                RequestErrorKind::InvalidField("grep")
+            );
+        }
+    }
+
     #[test]
     fn negative_limit_is_rejected() {
         let line = br#"{"id":"a","op":"search","args":[],"limit":-1}"#;
@@ -1144,6 +1169,7 @@ mod tests {
                     tty: self.bool(),
                     threads: self.below(32) + 1,
                     pattern_files: vec![self.bytes(24)],
+                    temp_dir: [b"/".as_slice(), &self.bytes(23)].concat(),
                 }),
                 args,
                 cwd: self.bool().then(|| self.bytes(24)),

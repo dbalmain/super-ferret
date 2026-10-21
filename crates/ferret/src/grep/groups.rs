@@ -2282,7 +2282,7 @@ mod tests {
         else {
             panic!("search")
         };
-        plan
+        *plan
     }
 
     // M2: a copy may reuse catalogue bytes only after its own full-key stat.

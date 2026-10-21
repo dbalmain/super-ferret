@@ -3,6 +3,8 @@
 //! index. Compaction bounds retained disk to twice the live window plus 64 KiB.
 
 use std::io::{self, Write};
+use std::path::Path;
+use std::sync::Arc;
 
 use super::{Line, LineKind};
 use crate::find::OutputBuffer;
@@ -42,16 +44,28 @@ pub(super) struct Before<'a> {
     count: u64,
     limit: u64,
     stopped: &'a dyn Fn() -> bool,
+    spill_dir: Option<Arc<Path>>,
 }
 
 impl<'a> Before<'a> {
-    pub fn new(limit: u64, stopped: &'a dyn Fn() -> bool) -> Self {
-        Self {
+    /// `spill_dir` is [`super::Plan::spill_dir`]: `None` spills into the
+    /// process's temporary directory.
+    pub fn new(limit: u64, stopped: &'a dyn Fn() -> bool, spill_dir: Option<Arc<Path>>) -> Self {
+        let mut window = Self {
             store: OutputBuffer::default(),
             head: 0,
             count: 0,
             limit,
             stopped,
+            spill_dir,
+        };
+        window.store = window.spool();
+        window
+    }
+    fn spool(&self) -> OutputBuffer {
+        match &self.spill_dir {
+            Some(dir) => OutputBuffer::default().with_spill_dir(dir.clone()),
+            None => OutputBuffer::default(),
         }
     }
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -107,7 +121,7 @@ impl<'a> Before<'a> {
         Ok(())
     }
     fn compact(&mut self) -> io::Result<()> {
-        let mut compact = OutputBuffer::default();
+        let mut compact = self.spool();
         self.store.read_range(
             self.head,
             self.store.len() - self.head,
@@ -141,7 +155,11 @@ impl<'a> Before<'a> {
             })?;
             offset += 24 + len as u64;
         }
-        self.store = OutputBuffer::default();
+        // Emit runs before every selected line, usually with nothing held;
+        // replacing an empty spool would clone the spill directory per line.
+        if !self.store.is_empty() {
+            self.store = self.spool();
+        }
         self.head = 0;
         self.count = 0;
         Ok(())
@@ -156,7 +174,7 @@ mod tests {
     fn spilled_window_repeatedly_evicts_compacts_and_replays_exact_bytes() {
         use std::collections::VecDeque;
 
-        let mut window = Before::new(5, &|| false);
+        let mut window = Before::new(5, &|| false, None);
         let mut reference = VecDeque::new();
         let mut compactions = 0;
         let mut spilled = false;
@@ -205,7 +223,7 @@ mod tests {
     #[test]
     fn large_context_counts_spill_headers_and_rolling_windows_compact() {
         for limit in [2, 20_000] {
-            let mut window = Before::new(limit, &|| false);
+            let mut window = Before::new(limit, &|| false, None);
             for number in 0..2000 {
                 window.push(number, &[b'x'; 128]).unwrap();
                 assert!(window.store.memory_bytes() <= 128 << 10);

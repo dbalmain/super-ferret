@@ -7,6 +7,7 @@ use std::io::{self, Read};
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ferret_verify::{Grep, GrepFlags, LineFlags};
 
@@ -23,7 +24,7 @@ pub use descriptors::{IoBudget, IoPermit};
 pub enum Command {
     Help,
     Version,
-    Search(Plan),
+    Search(Box<Plan>),
     Files(Names),
 }
 
@@ -104,6 +105,10 @@ pub struct Plan {
     pub multiline: bool,
     pub json: bool,
     pub replacement: Option<Box<ferret_verify::Replacement>>,
+    /// Where before-context windows spill. `None`, as parsed, reads the
+    /// process's temporary directory when a spool is created; a resident host
+    /// serving another process sets that caller's absolute directory.
+    pub spill_dir: Option<Arc<Path>>,
     #[cfg(test)]
     force_per_line: bool,
 }
@@ -593,7 +598,7 @@ pub fn parse_with(
             None,
         )
     };
-    Ok(Command::Search(Plan {
+    Ok(Command::Search(Box::new(Plan {
         #[cfg(test)]
         force_per_line: false,
         grep,
@@ -616,7 +621,8 @@ pub fn parse_with(
         text: text_mode,
         multiline,
         json,
-    }))
+        spill_dir: None,
+    })))
 }
 
 // Each -u occurrence applies its next widening step at that argv position.
@@ -850,7 +856,7 @@ fn scan_records(
     let rendering = plan.output == Output::Lines && (!plan.quiet || plan.json);
     let after = if rendering { plan.after } else { 0 };
     let before_lines = if rendering { plan.before } else { 0 };
-    let mut before = context::Before::new(before_lines, stopped);
+    let mut before = context::Before::new(before_lines, stopped, plan.spill_dir.clone());
     let mut trailing = 0;
     let mut limited = false;
     let mut emit = |line: Line<'_>| {

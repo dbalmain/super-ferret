@@ -273,8 +273,10 @@ serial listing without cancelling the connection, which remains reusable.
 D111 adds `op: "grep"` with ordinary content or `--files` argv and an absolute `cwd`.
 The required `grep` object carries explicit boolean `color`, `heading`,
 `numbers` and `tty`, a positive `threads` count, and `pattern_files`: byte
-strings in parser read order, including pattern stdin. The client resolves
-these before connecting. Oversized requests use the same in-process fallback
+strings in parser read order, including pattern stdin, and `temp_dir`, the
+absolute directory where before-context windows spill (the client's `TMPDIR`
+made absolute; a batch caller names its own). The client resolves these before
+connecting. Oversized requests use the same in-process fallback
 as find. Grep's stdout and stderr use find's byte frames; an empty stdout
 frame with `flush: true` asks the client to publish the accepted prefix at a
 host flush boundary. The end exit is grep's native 0/1/2. `grep --json` remains

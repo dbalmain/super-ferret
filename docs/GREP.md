@@ -888,7 +888,9 @@ diagnostic, after any walk error it reported (D99). A file selected but
 skipped by the index, or failing to open, still counts as searched. An
 explicit path (`.` included) or stdin keeps exit 1, silent. A context-spool
 fault names the input and temporary file in `TMPDIR`, never stdout; it fails
-only that file, preserving any prefix already streamed.
+only that file, preserving any prefix already streamed. Through the daemon the
+spool goes to the client's `TMPDIR`, made absolute against the client's cwd,
+never ferretd's.
 Error wording differs from rg; diagnostic presence and exit status are tested.
 
 ## Shared engine and crate seams

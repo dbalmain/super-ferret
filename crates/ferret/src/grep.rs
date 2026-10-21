@@ -113,7 +113,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             let tty = presentation::resolve(&mut plan.presentation);
             return names::run(&plan, index, args, tty);
         }
-        line_grep::Command::Search(plan) => plan,
+        line_grep::Command::Search(plan) => *plan,
     };
     if let Some(exit) = context_error(global_json) {
         return exit;

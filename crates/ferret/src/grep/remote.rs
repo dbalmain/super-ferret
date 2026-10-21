@@ -26,6 +26,7 @@ pub(super) fn run(
             tty,
             threads: engine::search_threads_for(index),
             pattern_files: pattern_files.to_vec(),
+            temp_dir: temp_dir()?,
         },
     )
 }
@@ -46,8 +47,18 @@ pub(super) fn names(
             tty,
             threads: 1,
             pattern_files: Vec::new(),
+            temp_dir: temp_dir()?,
         },
     )
+}
+
+/// The temporary directory a local run would spill into, made absolute
+/// against this process's cwd. `None` keeps the search in process.
+fn temp_dir() -> Option<Vec<u8>> {
+    std::path::absolute(std::env::temp_dir())
+        .ok()
+        .map(PathBuf::into_os_string)
+        .map(OsString::into_vec)
 }
 
 pub(crate) fn serve(
@@ -117,7 +128,7 @@ pub(crate) fn serve(
         flush: &flush,
     };
     let mut plan = match parsed {
-        Ok(line_grep::Command::Search(plan)) => plan,
+        Ok(line_grep::Command::Search(plan)) => *plan,
         Ok(line_grep::Command::Files(mut plan)) => {
             plan.presentation.color = if options.color {
                 line_grep::Color::Always
@@ -149,6 +160,9 @@ pub(crate) fn serve(
     };
     plan.presentation.heading = Some(options.heading);
     plan.line_number = options.numbers;
+    plan.spill_dir = Some(Arc::from(Path::new(std::ffi::OsStr::from_bytes(
+        &options.temp_dir,
+    ))));
     let paths = if plan.paths.is_empty() {
         vec![PathBuf::from(".")]
     } else {

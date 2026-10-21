@@ -1804,7 +1804,7 @@ fn grep_pipe_close_and_disconnect_release_workers_and_all_query_slots() {
     for _ in 0..4 {
         let (mut peer, _) = tree.connect();
         let request = format!(
-            r#"{{"id":"g","op":"grep","args":["red","dense","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":2,"pattern_files":[]}}}}"#,
+            r#"{{"id":"g","op":"grep","args":["red","dense","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":2,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
             tree.base.display()
         );
         peer.get_mut()
@@ -1957,7 +1957,7 @@ fn raw_output_negotiation_is_per_request_and_preserves_legacy_peers() {
     for raw in [false, true, false] {
         let capabilities = if raw { r#"["raw-output-v1"]"# } else { "[]" };
         let request = format!(
-            r#"{{"id":"g","op":"grep","args":["main","src"],"cwd":"{}","capabilities":{},"grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[]}}}}"#,
+            r#"{{"id":"g","op":"grep","args":["main","src"],"cwd":"{}","capabilities":{},"grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
             tree.base.display(),
             capabilities
         );
@@ -2084,7 +2084,7 @@ fn daemon_grep_bounds_client_threads_before_allocating_and_survives_bad_counts()
     let (mut peer, _) = tree.connect();
     for threads in [100_000_000_u64, 0, u64::MAX, 1] {
         let request = format!(
-            r#"{{"id":"g","op":"grep","args":["main","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":{},"pattern_files":[]}}}}"#,
+            r#"{{"id":"g","op":"grep","args":["main","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":{},"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
             tree.base.display(),
             threads
         );
@@ -2122,7 +2122,7 @@ fn stopped_grep_consumer_leaves_a_descriptor_share_for_another_request() {
     tree.start_limited("ulimit -n 64");
     let (mut slow, _) = tree.connect();
     let request = format!(
-        r#"{{"id":"slow","op":"grep","args":["red","dense","dense","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":2,"pattern_files":[]}}}}"#,
+        r#"{{"id":"slow","op":"grep","args":["red","dense","dense","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":2,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
         tree.base.display()
     );
     slow.get_mut()
@@ -2146,4 +2146,57 @@ fn stopped_grep_consumer_leaves_a_descriptor_share_for_another_request() {
     assert_eq!(number(&response, "exit"), Some(0), "{response}");
     drop(slow);
     assert!(tree.run(&["grep", "-q", "red", "src"]).status.success());
+}
+
+// A before-context window over long lines spills to disk. The daemon must
+// spill where the client's own run would, never into its startup TMPDIR,
+// which here no longer exists.
+#[test]
+fn daemon_grep_spills_context_into_the_clients_temporary_directory() {
+    let tree = Tree::new();
+    fs::write(tree.base.join("src/a"), b"red\n").unwrap();
+    assert!(tree.local(&["index", "src"]).status.success());
+    let mut context = Vec::new();
+    for _ in 0..100 {
+        context.extend_from_slice(&[b'x'; 1024]);
+        context.push(b'\n');
+    }
+    context.extend_from_slice(b"red\n");
+    fs::write(tree.base.join("context"), context).unwrap();
+    fs::create_dir(tree.base.join("client-tmp")).unwrap();
+    let missing = tree.base.join("missing-tmp");
+    tree.start_at(
+        &[("TMPDIR", missing.to_str().unwrap())],
+        std::path::Path::new("/"),
+    );
+    let client = tree.base.join("client-tmp");
+    let gone = tree.base.join("client-gone");
+    for temp in [client.as_os_str(), "client-tmp".as_ref(), gone.as_os_str()] {
+        let grep = |local: bool| {
+            let mut command = tree.command(&["grep", "-B100", "red", "context", "src"]);
+            command.env("TMPDIR", temp);
+            if local {
+                command.env("FERRET_NO_DAEMON", "1");
+            }
+            command.output().unwrap()
+        };
+        let (local, daemon) = (grep(true), grep(false));
+        assert_eq!(
+            daemon.status.code(),
+            local.status.code(),
+            "{temp:?} {daemon:?}"
+        );
+        assert_eq!(daemon.stdout, local.stdout, "{temp:?}");
+        let stderr = String::from_utf8_lossy(&daemon.stderr);
+        if temp == gone.as_os_str() {
+            assert_eq!(daemon.status.code(), Some(2));
+            assert!(
+                stderr.contains(&format!("create output spill {}/", gone.display())),
+                "{stderr}"
+            );
+        } else {
+            assert_eq!(daemon.status.code(), Some(0), "{stderr}");
+            assert!(stderr.is_empty(), "{stderr}");
+        }
+    }
 }
