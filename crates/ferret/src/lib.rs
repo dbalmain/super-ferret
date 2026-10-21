@@ -5,8 +5,8 @@
 //!
 //! - [`cli`]: the entry point, exit statuses, where the index is, usage.
 //! - [`batch`]: resident query executor and the sequential S1B JSON-lines host.
-//! - [`daemon`]: query-only socket host, endpoint lifecycle and ordinary
-//!   clients.
+//! - [`daemon`]: socket host. It retains the writer (watches, catalog refresh,
+//!   content follow and merge), the endpoint lifecycle and ordinary clients.
 //! - `transport`: shared event destinations; no parallel socket encoder.
 //! - [`args`]: the command line, parsed; pure.
 //! - [`find`], [`search`], [`index`] (with `roots`), [`stats`]: one module per

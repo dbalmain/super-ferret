@@ -31,12 +31,12 @@ only the source of names and metadata differs.
 ## Freshness (default mode)
 
 Default mode is an index query, like `locate`. Names, kinds, visibility and
-stored metadata describe the last `ferret index` run:
-
-- a name created since then is absent, including one created by the command's
-  own actions;
-- a name deleted since then is still listed, and changed metadata still answers
-  with its old value, until the next index run.
+stored metadata describe the catalog's last publication. While ferretd is
+running, watches keep that publication current: an ordinary change lands
+within about a second. A one-shot `ferret index` does not stay running, so
+until the next publication a name created since then is absent (including one
+created by the command's own actions), a deleted name is still listed, and
+changed metadata still answers with its old value.
 
 An expression with an effect on the tree or on files checks that names still
 exist. The effects are every form of `-exec`, `-execdir`, `-ok` and `-okdir`,
@@ -48,9 +48,10 @@ externally removed directories still report ENOENT. A later sibling's
 removal does not hide a name already observed. Stored predicates such as
 `-mtime` and `-size` still answer from the index.
 
-Re-index after changing ignore rules: the index does not watch policy files, or
-anything inside an ignored tree. The daemon (S1b) will keep the index current;
-until then, `-I` asks about the disk as it is now.
+A one-shot index does not watch policy files, or anything inside an ignored
+tree. While ferretd is running it watches the policy files the crawl read
+(saves, creation, replacement and ancestor symlink changes) and refreshes.
+`-I` asks about the disk as it is now.
 
 ## Ignore rules (default mode)
 

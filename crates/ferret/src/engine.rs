@@ -4,7 +4,9 @@
 //! A writer engine may also own the content index (docs/S2.md § Manifest
 //! and commit): [`Engine::attach_content`] opens it under the catalog's
 //! writer lock, and a [`QuerySession`] then pins the index view published
-//! with its catalog view. A query-only engine does not open it in S2 M3.
+//! with its catalog view. A query-only engine opens that index read-only
+//! through [`Engine::open_content`]: no writer lock, and nothing is repaired
+//! or removed.
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
