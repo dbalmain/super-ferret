@@ -66,6 +66,7 @@ pub(crate) fn serve(
     pin: Option<&engine::QuerySession>,
     destination: &Destination,
     requests: usize,
+    granted: Option<usize>,
 ) -> io::Result<Exit> {
     let start = std::time::Instant::now();
     let record = AtomicU64::new(0);
@@ -178,9 +179,11 @@ pub(crate) fn serve(
     let Some(pin) = pin else {
         return Ok(runtime.failure("no index available"));
     };
-    // The resident engine owns the verification grant; client options must
-    // never size pools before being bounded by that grant.
-    let threads = options.threads.min(pin.search_threads());
+    // The daemon's shared pool grants `granted` before any pool is sized.
+    // Client `options.threads` is only an upper bound, and so is the resident
+    // search-thread cap. A batch host has no pool and passes `None`.
+    let cap = options.threads.min(pin.search_threads());
+    let threads = granted.unwrap_or(cap).min(cap).max(1);
     runtime.descriptors = Some(Arc::new(line_grep::IoBudget::for_request(
         threads, requests,
     )));

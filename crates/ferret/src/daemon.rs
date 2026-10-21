@@ -23,7 +23,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::engine::{Engine, QuerySession};
@@ -62,7 +62,7 @@ struct Host {
     context: String,
     build: String,
     query_limit: usize,
-    workers: usize,
+    permits: Permits,
     format: u64,
     writer_send: mpsc::SyncSender<writer::Message>,
     writer_status: Mutex<writer::Status>,
@@ -268,8 +268,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         writer_running: AtomicBool::new(false),
         writer_pending: AtomicUsize::new(0),
         stop: AtomicBool::new(false),
-        workers: ferret_crawl::default_workers().min(16)
-            / QUERIES.min(ferret_crawl::default_workers()),
+        permits: Permits::new(ferret_crawl::default_workers()),
     });
     let writer = writer::start(host.clone(), writer_receive);
     let mut idle_since = Instant::now();
@@ -458,7 +457,7 @@ fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
                     .int("argv", protocol::MAX_ARGV_ELEMENTS as u64)
                     .int("part", 64 * 1024)
                     .int("queries", host.query_limit as u64)
-                    .int("workers", host.workers as u64);
+                    .int("workers", host.permits.budget as u64);
             });
         o.str("state", state);
         generation(o, selected);
@@ -507,6 +506,90 @@ impl Drop for QueryPermit<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queries -= 1;
         self.0.lifecycle_changed.notify_one();
+    }
+}
+
+/// One pool of query-worker permits, `min(16, CPUs)` via
+/// [`ferret_crawl::default_workers`]. Find, search and grep all draw from it.
+/// Admission ([`QUERIES`]) is a separate limit.
+struct Permits {
+    budget: usize,
+    state: Mutex<PermitState>,
+}
+struct PermitState {
+    free: usize,
+    /// Parallelism of each in-flight grant, in the order it was taken.
+    running: Vec<usize>,
+}
+/// One query's permits. Drop returns them after that query's workers join.
+struct Grant<'a> {
+    permits: &'a Permits,
+    /// Returned to the pool. Zero when the pool was empty and the query kept
+    /// its connection thread without charging past the budget.
+    charged: usize,
+    workers: usize,
+}
+impl Permits {
+    fn new(budget: usize) -> Self {
+        let budget = budget.max(1);
+        Self {
+            budget,
+            state: Mutex::new(PermitState {
+                free: budget,
+                running: Vec::new(),
+            }),
+        }
+    }
+
+    /// Grants `min(asked, free)` workers, and never fewer than one. Does not
+    /// wait. An empty pool still grants the connection thread; that worker is
+    /// not charged, so the charged total stays inside the budget. Waiting
+    /// could deadlock: an admitted query blocked on a permit another query
+    /// holds, while that query is blocked on this connection.
+    fn take(&self, asked: usize) -> Grant<'_> {
+        let asked = asked.max(1);
+        let mut state = self.lock();
+        let charged = asked.min(state.free);
+        let workers = charged.max(1);
+        state.free -= charged;
+        state.running.push(workers);
+        Grant {
+            permits: self,
+            charged,
+            workers,
+        }
+    }
+
+    /// Charged permits, and the parallelism of each in-flight grant.
+    fn snapshot(&self) -> (usize, Vec<usize>) {
+        let state = self.lock();
+        (self.budget - state.free, state.running.clone())
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PermitState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+impl Grant<'_> {
+    fn workers(&self) -> usize {
+        self.workers
+    }
+}
+impl Drop for Grant<'_> {
+    fn drop(&mut self) {
+        let mut state = self.permits.lock();
+        state.free += self.charged;
+        if let Some(index) = state
+            .running
+            .iter()
+            .position(|&workers| workers == self.workers)
+        {
+            state.running.swap_remove(index);
+        }
+        self.charged = 0;
+        debug_assert!(state.free <= self.permits.budget);
     }
 }
 fn admit<'a>(host: &'a Host, cancelled: &AtomicBool) -> Option<QueryPermit<'a>> {
@@ -848,25 +931,62 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
         Op::Index | Op::RootsRemove => {
             unreachable!("writer requests routed before query selection")
         }
-        Op::Search => crate::batch::search_request(request, Some(session), None, destination),
+        Op::Search => {
+            // Dropped when this arm returns. `search_request` joins its
+            // verification workers before then, including cancellation, client
+            // disconnect and a broken socket write.
+            let grant = host.permits.take(session.search_threads());
+            let result = crate::batch::search_request(
+                request,
+                Some(session),
+                None,
+                destination,
+                Some(grant.workers()),
+            );
+            drop(grant);
+            result
+        }
         Op::Grep => {
-            crate::batch::grep_request(request, Some(session), destination, host.query_limit)
+            // The client's thread count is only an upper bound. The resident
+            // search-thread cap still applies, then the shared pool. `serve`
+            // sizes every pool from the grant and joins those workers before
+            // `grep_request` returns, including a broken stdout pipe.
+            let asked = request
+                .grep
+                .as_ref()
+                .map_or(1, |options| options.threads.min(session.search_threads()));
+            let grant = host.permits.take(asked);
+            let result = crate::batch::grep_request(
+                request,
+                Some(session),
+                destination,
+                host.query_limit,
+                Some(grant.workers()),
+            );
+            drop(grant);
+            result
         }
         Op::Find => {
             // Clear all action grants. Even a direct socket caller cannot ask
             // the daemon to execute, prompt, delete or open an output file.
+            // Find has no job-count flag; the ask is the in-process default.
+            // `find_request` joins the walk before it returns. A transport
+            // error counts as cancellation and stops that walk first.
             let mut request = request.clone();
             request
                 .capabilities
                 .retain(|capability| capability == "test-find-panic");
-            crate::batch::find_request(
+            let grant = host.permits.take(ferret_crawl::default_workers());
+            let result = crate::batch::find_request(
                 &request,
                 Path::new("/"),
                 Some(session),
                 true,
                 destination,
-                host.workers,
-            )
+                grant.workers(),
+            );
+            drop(grant);
+            result
         }
         Op::Status | Op::Reload => {
             let report = if request.op == Op::Status {
@@ -887,6 +1007,10 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
                     o.int("engine_opens", Engine::open_count())
                         .int("bytes", session.resident_bytes());
                     writer::fields(host, o);
+                    let (held, running) = host.permits.snapshot();
+                    o.int("worker_budget", host.permits.budget as u64)
+                        .int("worker_permits", held as u64)
+                        .integers("worker_grants", running.into_iter().map(|n| n as u64));
                     crate::status::resources(o);
                     crate::status::catalog_fields(o, &session);
                     let engine = host

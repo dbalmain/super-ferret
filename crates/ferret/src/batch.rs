@@ -189,12 +189,14 @@ fn handle(
             engine.as_ref().map(Engine::pin),
             dirs,
             &Destination::Stdout,
+            None,
         ),
         Op::Grep => grep_request(
             request,
             engine.as_ref().map(Engine::pin),
             &Destination::Stdout,
             1,
+            None,
         ),
         Op::Find => find_request(
             request,
@@ -212,6 +214,7 @@ pub(crate) fn search_request(
     session: Option<QuerySession>,
     dirs: Option<&Dirs>,
     destination: &Destination,
+    workers: Option<usize>,
 ) -> io::Result<()> {
     let started = Instant::now();
     let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| {
@@ -246,13 +249,16 @@ pub(crate) fn search_request(
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
-                session.search_content(
+                let bound = (!request
+                    .capabilities
+                    .iter()
+                    .any(|c| c == "scan" || c == "scan-uncovered"))
+                .then_some(ferret_query::UNCOVERED_BOUND);
+                let threads = workers.unwrap_or_else(|| session.search_threads());
+                session.search_content_threads(
                     &query,
-                    (!request
-                        .capabilities
-                        .iter()
-                        .any(|c| c == "scan" || c == "scan-uncovered"))
-                    .then_some(ferret_query::UNCOVERED_BOUND),
+                    bound,
+                    threads,
                     destination.cancellation(),
                     |row: &Row<'_>| {
                         if destination.cancelled() {
@@ -363,6 +369,9 @@ pub(crate) fn search_request(
         if let Some(error) = query_error.as_deref() {
             o.str("error", error);
         }
+        if let Some(workers) = workers {
+            o.int("workers", workers as u64);
+        }
     })
 }
 
@@ -414,7 +423,8 @@ pub(crate) fn find_request(
                     o.int("exit", 1)
                         .bool("cancelled", destination.cancelled())
                         .str("error", error.code())
-                        .int("elapsed_us", started.elapsed().as_micros() as i128);
+                        .int("elapsed_us", started.elapsed().as_micros() as i128)
+                        .int("workers", workers as u64);
                 })?;
                 return Ok(());
             }
@@ -433,7 +443,8 @@ pub(crate) fn find_request(
                     o.int("exit", 1)
                         .bool("cancelled", destination.cancelled())
                         .str("error", &feature.to_string_lossy())
-                        .int("elapsed_us", started.elapsed().as_micros() as i128);
+                        .int("elapsed_us", started.elapsed().as_micros() as i128)
+                        .int("workers", workers as u64);
                 })?;
                 return Ok(());
             }
@@ -459,7 +470,8 @@ pub(crate) fn find_request(
     event_to(destination, request, "end", |o| {
         o.int("exit", status)
             .bool("cancelled", destination.cancelled())
-            .int("elapsed_us", started.elapsed().as_micros() as i128);
+            .int("elapsed_us", started.elapsed().as_micros() as i128)
+            .int("workers", workers as u64);
         if let Some(error) = query_error.as_deref() {
             o.str("error", error);
         }
@@ -562,13 +574,18 @@ pub(crate) fn grep_request(
     session: Option<QuerySession>,
     destination: &Destination,
     requests: usize,
+    workers: Option<usize>,
 ) -> io::Result<()> {
     event_to(destination, request, "begin", |o| {
         generation(o, session.as_ref().map(QuerySession::generation))
     })?;
-    let exit = crate::grep::remote::serve(request, session.as_ref(), destination, requests)?;
+    let exit =
+        crate::grep::remote::serve(request, session.as_ref(), destination, requests, workers)?;
     event_to(destination, request, "end", |o| {
         o.int("exit", exit as u8)
             .bool("cancelled", destination.cancelled());
+        if let Some(workers) = workers {
+            o.int("workers", workers as u64);
+        }
     })
 }

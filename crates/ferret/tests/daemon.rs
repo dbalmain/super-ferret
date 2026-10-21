@@ -248,6 +248,23 @@ fn number(line: &str, key: &str) -> Option<u32> {
         .parse()
         .ok()
 }
+fn integer_list(line: &str, key: &str) -> Vec<u32> {
+    let (_, rest) = line
+        .split_once(&format!("\"{key}\":["))
+        .unwrap_or_else(|| panic!("no {key} in {line}"));
+    let array = rest.split_once(']').unwrap().0;
+    if array.is_empty() {
+        Vec::new()
+    } else {
+        array
+            .split(',')
+            .map(|part| part.trim().parse().unwrap())
+            .collect()
+    }
+}
+fn status_line(peer: &mut BufReader<UnixStream>) -> String {
+    block(peer, b"{\"id\":\"s\",\"op\":\"status\"}\n")
+}
 fn ready(stream: UnixStream) -> (BufReader<UnixStream>, String) {
     stream.set_read_timeout(Some(BOUND)).unwrap();
     stream.set_write_timeout(Some(BOUND)).unwrap();
@@ -3011,4 +3028,153 @@ fn transient_accept_errors_do_not_stop_the_daemon() {
         );
         assert_eq!(tree.sockets().len(), 1, "{name}");
     }
+}
+
+/// `wmem_max` on this machine is 4 MiB. An unread grep of a larger file stays
+/// inside `grep_request`, so its grant is still held when status is read.
+const DENSE_LINES: usize = 1_000_000;
+
+fn start_without_search_thread_override(tree: &Tree) {
+    let mut command = fixture::command(DAEMON, &tree.base);
+    command.env_remove("FERRET_SEARCH_THREADS");
+    tree.start_command(&[], &tree.base, command);
+}
+
+fn write_dense(tree: &Tree) {
+    fs::write(
+        tree.base.join("dense"),
+        b"red red red red\n".repeat(DENSE_LINES),
+    )
+    .unwrap();
+}
+
+fn patient(peer: &mut BufReader<UnixStream>) {
+    peer.get_mut()
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    peer.get_mut()
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+}
+
+fn hold_grep(tree: &Tree, id: &str) -> BufReader<UnixStream> {
+    let (mut peer, _) = tree.connect();
+    patient(&mut peer);
+    let request = format!(
+        r#"{{"id":"{id}","op":"grep","args":["red","dense","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":64,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
+        tree.base.display()
+    );
+    peer.get_mut()
+        .write_all(format!("{request}\n").as_bytes())
+        .unwrap();
+    let begin = line(&mut peer);
+    assert!(begin.contains("\"event\":\"begin\""), "{begin}");
+    let stdout = line(&mut peer);
+    assert!(stdout.contains("\"event\":\"stdout\""), "{stdout}");
+    peer
+}
+
+fn wait_status(peer: &mut BufReader<UnixStream>, mut ready: impl FnMut(&str) -> bool) -> String {
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    while Instant::now() < until {
+        last = status_line(peer);
+        if ready(&last) {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("deadline exceeded: {last}");
+}
+
+fn find_end(tree: &Tree) -> String {
+    let (mut peer, _) = tree.connect();
+    patient(&mut peer);
+    let request = format!(
+        r#"{{"id":"f","op":"find","cwd":"{}","args":["src","-print"]}}"#,
+        tree.base.display()
+    );
+    let output = block(&mut peer, format!("{request}\n").as_bytes());
+    output
+        .lines()
+        .find(|line| line.contains("\"event\":\"end\""))
+        .unwrap_or_else(|| panic!("no end in {output}"))
+        .to_owned()
+}
+
+fn advertised_budget(hello: &str, status: &str) -> u32 {
+    let hello_workers = number(hello, "workers").unwrap_or_else(|| panic!("no workers in {hello}"));
+    assert_eq!(
+        number(status, "worker_budget"),
+        Some(hello_workers),
+        "{status}"
+    );
+    hello_workers
+}
+
+#[test]
+fn worker_pool_lone_find_is_granted_the_full_budget() {
+    let tree = Tree::new();
+    start_without_search_thread_override(&tree);
+    let (mut status, hello) = tree.connect();
+    patient(&mut status);
+    let budget = advertised_budget(&hello, &status_line(&mut status));
+    let end = find_end(&tree);
+    assert_eq!(number(&end, "exit"), Some(0), "{end}");
+    assert_eq!(number(&end, "workers"), Some(budget), "{end}");
+    let after = status_line(&mut status);
+    assert_eq!(number(&after, "worker_permits"), Some(0), "{after}");
+    assert!(integer_list(&after, "worker_grants").is_empty(), "{after}");
+}
+
+#[test]
+fn worker_pool_concurrent_queries_stay_inside_it() {
+    let tree = Tree::new();
+    write_dense(&tree);
+    start_without_search_thread_override(&tree);
+    let (mut status, hello) = tree.connect();
+    patient(&mut status);
+    let budget = advertised_budget(&hello, &status_line(&mut status));
+    let _first = hold_grep(&tree, "g1");
+    let held = wait_status(&mut status, |line| {
+        integer_list(line, "worker_grants").len() == 1
+            && number(line, "worker_permits") == Some(budget)
+    });
+    assert_eq!(integer_list(&held, "worker_grants"), vec![budget], "{held}");
+    let _second = hold_grep(&tree, "g2");
+    let shared = wait_status(&mut status, |line| {
+        integer_list(line, "worker_grants").len() == 2
+    });
+    let grants = integer_list(&shared, "worker_grants");
+    let permits = number(&shared, "worker_permits").unwrap_or_else(|| panic!("{shared}"));
+    assert!(permits <= budget, "{shared}");
+    assert!(grants.iter().all(|grant| *grant >= 1), "{shared}");
+    // An empty pool still grants the connection thread and does not charge
+    // it, so in-flight grants may add to `budget + in_flight - 1`.
+    let sum: u32 = grants.iter().sum();
+    assert!(
+        sum < budget + grants.len() as u32,
+        "grants {grants:?} budget {budget}: {shared}"
+    );
+}
+
+#[test]
+fn worker_pool_cancelled_query_returns_its_permits() {
+    let tree = Tree::new();
+    write_dense(&tree);
+    start_without_search_thread_override(&tree);
+    let (mut status, hello) = tree.connect();
+    patient(&mut status);
+    let budget = advertised_budget(&hello, &status_line(&mut status));
+    let mut grep = hold_grep(&tree, "g");
+    wait_status(&mut status, |line| {
+        number(line, "worker_permits") == Some(budget)
+    });
+    grep.get_mut().write_all(b"{\"op\":\"cancel\"}\n").unwrap();
+    let released = wait_status(&mut status, |line| {
+        number(line, "worker_permits") == Some(0) && integer_list(line, "worker_grants").is_empty()
+    });
+    assert_eq!(number(&released, "worker_permits"), Some(0), "{released}");
+    let end = find_end(&tree);
+    assert_eq!(number(&end, "workers"), Some(budget), "{end}");
 }

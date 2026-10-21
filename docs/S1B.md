@@ -136,7 +136,9 @@ view with an explicit failed-refresh status.
 
 Use bounded query admission and output buffers. Initially allow up to four
 active queries and at most `min(16, CPUs)` total query worker permits; tune from
-measurements. Reuse the existing find executor, passing available worker counts,
+measurements. A query takes the permits free at its start, at least one and at
+most what it asked for, and does not wait. Reuse the existing find executor,
+passing available worker counts,
 rather than copying its per-entry loop. Waiting clients do not pin a generation
 until admitted. Slow output holds that query's pin, not the writer;
 disconnect/cancellation releases it after workers and already-started actions
@@ -500,7 +502,10 @@ execution catches unwinding panics (find workers wake their siblings on unwind) 
 and development profiles retain unwinding, enforced by a compile-time guard. Engine pins and event writes happen
 outside the selection lock, and poisoned locks recover checked immutable state.
 There are at most 32 connections and `min(4, CPUs)` admitted queries, with at
-most `min(16, CPUs)` total query worker permits.
+most `min(16, CPUs)` total query worker permits. A query takes the permits free
+at its start, at least one and at most what it asked for, and does not wait; an
+empty pool still runs it on its connection thread and does not charge that one
+past the budget.
 
 `FERRET_DAEMON_STARTUP_MS` bounds singleton lock acquisition and draining an
 incompatible daemon (default 10000). It also bounds a writer command waiting

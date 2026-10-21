@@ -127,7 +127,7 @@ fn deferred_writer(reason: Blocked) {
         context: "fixture".into(),
         build: "fixture".into(),
         query_limit: 4,
-        workers: 1,
+        permits: crate::daemon::Permits::new(1),
         format: ferret_catalog::FORMAT_VERSION as u64,
         writer_send: send,
         writer_status: Mutex::new(Status {
