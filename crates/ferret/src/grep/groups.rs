@@ -976,23 +976,11 @@ pub(super) fn run<'a, W: Write>(
     );
     if let Some(shortfall) = shortfall {
         host.writer.flush()?;
-        report_shortfall(&shortfall);
+        host.report_shortfall(&shortfall)?;
     }
     search.finish(host)
 }
 
-/// Warns, once per process, that the system refused search threads (D108
-/// B). The search goes on with fewer, so the exit status still describes the
-/// search alone.
-pub(super) fn report_shortfall(shortfall: &Shortfall) {
-    static REPORTED: AtomicBool = AtomicBool::new(false);
-    if !REPORTED.swap(true, Ordering::AcqRel) {
-        cli::error(&format!(
-            "grep: searching with {} of {} threads: {}",
-            shortfall.running, shortfall.asked, shortfall.cause
-        ));
-    }
-}
 
 fn weight(handoff: &Handoff) -> u64 {
     match handoff {
@@ -1013,7 +1001,8 @@ struct Search<'s> {
     quiet_stats: Mutex<json::Stats>,
     fatal: Mutex<Option<io::Error>>,
     publication: Mutex<()>,
-    descriptors: line_grep::IoBudget,
+    descriptors: &'static line_grep::IoBudget,
+    tty: bool,
     capture: Arc<capture::Budget>,
 }
 
@@ -1028,7 +1017,12 @@ impl<'s> Search<'s> {
             quiet_stats: Mutex::new(json::Stats::default()),
             fatal: Mutex::new(None),
             publication: Mutex::new(()),
-            descriptors: line_grep::IoBudget::new(threads),
+            // Descriptor limits and retained-directory caches are process-wide.
+            descriptors: {
+                static BUDGET: OnceLock<line_grep::IoBudget> = OnceLock::new();
+                BUDGET.get_or_init(|| line_grep::IoBudget::new(usize::MAX))
+            },
+            tty: host.tty(),
             capture: capture::Budget::new(threads),
         }
     }
@@ -1172,13 +1166,13 @@ pub(super) fn walk<W: Write>(
     let live = source.live;
     let refused = Mutex::new(None);
     let on_refused = |shortfall: Shortfall| {
-        if buffered_path_output(search.plan) {
+        if buffered_path_output(search.plan, search.tty) {
             *lock(&refused) = Some(shortfall);
         } else {
             // Keep live-policy warning order unchanged; only buffered path
             // output defers this publisher-owned diagnostic.
             let _publication = lock(&search.publication);
-            report_shortfall(&shortfall);
+            *lock(&refused) = Some(shortfall);
         }
     };
     let started = ferret_query::lane_groups(
@@ -1258,7 +1252,7 @@ pub(super) fn walk<W: Write>(
     );
     if let Some(shortfall) = lock(&refused).take() {
         host.writer.flush()?;
-        report_shortfall(&shortfall);
+        host.report_shortfall(&shortfall)?;
     }
     if let Err(cause) = started {
         return Ok(Walk::Refused(cause));
@@ -1714,6 +1708,7 @@ mod tests {
     fn host<W: Write>(plan: &Plan, writer: W) -> Host<'_, W> {
         Host {
             plan,
+            runtime: None,
             filename: true,
             writer,
             buffer: Vec::new(),

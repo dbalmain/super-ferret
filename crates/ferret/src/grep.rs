@@ -1,4 +1,4 @@
-//! Local grep host: resolve operands before opening a generation, adapt policy
+//! Shared grep host: resolve operands before opening a generation, adapt policy
 //! and checked reads, and commit each file's bounded plain output as a group.
 
 use std::ffi::OsString;
@@ -16,6 +16,7 @@ mod live;
 mod names;
 mod output;
 mod presentation;
+mod remote;
 mod sources;
 
 use ferret_catalog::NameId;
@@ -85,7 +86,16 @@ enum Input {
 /// output failures.
 pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let start = std::time::Instant::now();
-    let command = match line_grep::parse(args) {
+    let mut pattern_files = Vec::new();
+    let command = match line_grep::parse_with(args, &mut |path| {
+        let bytes = if path == Path::new("-") {
+            let mut bytes = Vec::new();
+            io::stdin().lock().read_to_end(&mut bytes)?;
+            bytes
+        } else { fs::read(path)? };
+        pattern_files.push(bytes.clone());
+        Ok(bytes)
+    }) {
         Ok(command) => command,
         Err(error) => return failure(&error.to_string()),
     };
@@ -117,8 +127,6 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     if plan.max_count == Some(0) {
         return Exit::NoMatch;
     }
-    let cancelled = AtomicBool::new(false);
-    let stopped = || cancelled.load(Ordering::Acquire);
     let inputs = if plan.stdin_patterns && plan.paths.is_empty() {
         resolve_inputs(&[PathBuf::from(".")], false)
     } else {
@@ -127,6 +135,18 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let recursive = inputs
         .iter()
         .any(|input| matches!(input, Input::Directory(_)));
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => return failure(&error.to_string()),
+    };
+    if recursive && !plan.traversal.unrestricted && !plan.traversal.live
+        && !inputs.iter().any(|input| matches!(input, Input::Stdin))
+        && !std::env::vars_os().any(|(key, _)| key.as_bytes().starts_with(b"FERRET_TEST_"))
+        && let Ok(index) = index_path(index)
+        && let Some(exit) = remote::run(args, &pattern_files, &plan, tty, &index)
+    {
+        return exit;
+    }
     let live = if recursive && plan.traversal.live && !plan.traversal.unrestricted {
         match live::Anchors::open(index) {
             Ok(anchors) => Some(anchors),
@@ -144,52 +164,86 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         None
     };
     let pin = engine.as_ref().map(Engine::pin);
+    let threads = pin.as_ref().map_or_else(
+        || live.as_ref().map_or_else(|| {
+            let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+            engine::search_threads(engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()), None, available)
+        }, live::Anchors::search_threads),
+        engine::QuerySession::search_threads,
+    );
+    let cancelled = AtomicBool::new(false);
+    let stderr = |message: &str| { cli::error(message); Ok(()) };
+    let runtime = Runtime { cancelled: &cancelled, stderr: &stderr, tty, warned: AtomicBool::new(false) };
+    let stdout = io::stdout();
+    execute(&plan, inputs, &selection, pin.as_ref(), live.as_ref(), &cwd, threads,
+        output::Writer::new(&stdout, block_stdout(&plan)), &runtime, start)
+}
+
+struct Runtime<'a> {
+    cancelled: &'a AtomicBool,
+    stderr: &'a (dyn Fn(&str) -> io::Result<()> + Sync),
+    tty: bool,
+    warned: AtomicBool,
+}
+
+impl Runtime<'_> {
+    fn failure(&self, message: &str) -> Exit {
+        let _ = (self.stderr)(&format!("grep: {message}"));
+        Exit::Usage
+    }
+    fn output_failure(&self, error: &io::Error) -> Exit {
+        if error.kind() == io::ErrorKind::BrokenPipe { Exit::Ok }
+        else { self.failure(&format!("writing stdout: {error}")) }
+    }
+}
+
+// Both hosts supply the same resolved environment and pinned generation.
+#[allow(clippy::too_many_arguments)] // Explicit host dependencies, shared by the local and socket adapters.
+fn execute<W: Write>(plan: &Plan, inputs: Vec<Input>, selection: &GrepSelection,
+    pin: Option<&engine::QuerySession>, live: Option<&live::Anchors>, cwd: &Path,
+    threads: usize, writer: W, runtime: &Runtime<'_>, start: std::time::Instant) -> Exit {
+    let cancelled = runtime.cancelled;
+    let stopped = || cancelled.load(Ordering::Acquire);
+    let recursive = inputs.iter().any(|input| matches!(input, Input::Directory(_)));
     let candidates = if !plan.invert {
         match pin
-            .as_ref()
             .map(|pin| pin.grep_candidates(&plan.grep, &stopped))
             .transpose()
         {
             Ok(candidates) => candidates,
-            Err(error) => return failure(&error.to_string()),
+            Err(error) => return runtime.failure(&error.to_string()),
         }
     } else {
         None
     };
     let names = match pin
-        .as_ref()
         .map(|pin| pin.doc_names_until(stopped))
         .transpose()
     {
         Ok(names) => names.flatten(),
-        Err(error) => return failure(&error.to_string()),
+        Err(error) => return runtime.failure(&error.to_string()),
     };
     let documents = match pin
-        .as_ref()
         .map(|pin| ferret_crawl::Documents::by_name(pin.catalog()))
         .transpose()
     {
         Ok(documents) => documents,
-        Err(error) => return failure(&error.to_string()),
-    };
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(error) => return failure(&error.to_string()),
+        Err(error) => return runtime.failure(&error.to_string()),
     };
     for input in &inputs {
         if let Input::Directory(path) = input {
             if let Some(anchors) = &live {
                 if let Err(error) = anchors.validate(path) {
-                    return failure(&format!("{}: {error}", path.display()));
+                    return runtime.failure(&format!("{}: {error}", path.display()));
                 }
             } else if let Some(pin) = &pin {
                 let mut source =
                     match sources::Directory::new(path, Some(pin.catalog()), &cwd, false) {
                         Ok(source) => source,
-                        Err(error) => return failure(&error.to_string()),
+                        Err(error) => return runtime.failure(&error.to_string()),
                     };
                 if let Some(Err(error)) = source.next(true) {
-                    return failure(&format!(
+                    return runtime.failure(&format!(
                         "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
                         error.path.display(),
                         error.error
@@ -198,14 +252,14 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             }
         }
     }
-    let stdout = io::stdout();
     let mut host = Host {
         plan: &plan,
         filename: plan
             .presentation
             .filename
             .unwrap_or(recursive || inputs.len() > 1),
-        writer: output::Writer::new(&stdout, block_stdout(&plan)),
+        writer,
+        runtime: Some(runtime),
         buffer: Vec::new(),
         matched: false,
         emitted_group: false,
@@ -219,29 +273,15 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     for input in inputs {
         if let Input::Failed(path, error) = input {
             if let Err(error) = host.error(&path, &error) {
-                return output_failure(&error);
+                return runtime.output_failure(&error);
             }
         } else {
             resolved.push(input);
         }
     }
     let inputs = resolved;
-    let threads = pin.as_ref().map_or_else(
-        || {
-            if let Some(anchors) = &live {
-                return anchors.search_threads();
-            }
-            let available = std::thread::available_parallelism().map_or(1, |n| n.get());
-            engine::search_threads(
-                engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()),
-                None,
-                available,
-            )
-        },
-        |pin| pin.search_threads(),
-    );
     let fork = || {
-        pin.as_ref()
+        pin
             .zip(documents.as_ref())
             .map(|(pin, documents)| engine::reader::checked(pin.catalog(), documents))
     };
@@ -252,7 +292,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     'inputs: while inputs.peek().is_some() {
         let mut segment = Vec::new();
         while inputs.peek().is_some_and(|input| {
-            !matches!(input, Input::Stdin) && (!buffered_path_output(&plan) || segment.is_empty())
+            !matches!(input, Input::Stdin) && (!buffered_path_output(plan, runtime.tty) || segment.is_empty())
         }) {
             if let Some(input) = inputs.next() {
                 segment.push(input);
@@ -269,10 +309,10 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             };
             let mut source = groups::Source::new(
                 segment,
-                pin.as_ref().map(|p| p.catalog()),
+                pin.map(|p| p.catalog()),
                 candidates.as_ref(),
                 &selection,
-                cwd.clone(),
+                cwd.to_owned(),
             )
             .with_traversal(plan.traversal, plan.text)
             .with_live(live.as_ref())
@@ -284,14 +324,14 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 Some(Ok(groups::Walk::Done)) => None,
                 // D108 B: the calling thread searches the operands alone.
                 Some(Ok(groups::Walk::Refused(cause))) => {
-                    groups::report_shortfall(&ferret_query::Shortfall {
+                    if let Err(error) = host.report_shortfall(&ferret_query::Shortfall {
                         running: 1,
                         asked: threads,
                         cause,
-                    });
+                    }) { return runtime.output_failure(&error); }
                     Some(1)
                 }
-                Some(Err(error)) => return output_failure(&error),
+                Some(Err(error)) => return runtime.output_failure(&error),
             };
             if let Some(threads) = serial {
                 let result = groups::run(
@@ -304,7 +344,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 );
                 searched |= source.searched();
                 if let Err(error) = result {
-                    return output_failure(&error);
+                    return runtime.output_failure(&error);
                 }
             }
             if plan.quiet && host.matched {
@@ -313,17 +353,17 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 }
                 break 'inputs;
             }
-            if buffered_path_output(&plan)
+            if buffered_path_output(plan, runtime.tty)
                 && let Err(error) = host.writer.flush()
             {
-                return output_failure(&error);
+                return runtime.output_failure(&error);
             }
         }
         if matches!(inputs.peek(), Some(Input::Stdin)) {
             inputs.next();
             searched = true;
             if let Err(error) = host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX) {
-                return output_failure(&error);
+                return runtime.output_failure(&error);
             }
             if plan.quiet && host.matched {
                 if !plan.json {
@@ -336,15 +376,15 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     if plan.json
         && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start)
     {
-        return output_failure(&error);
+        return runtime.output_failure(&error);
     }
     if let Err(error) = host.writer.flush() {
-        return output_failure(&error);
+        return runtime.output_failure(&error);
     }
     if plan.quiet && host.matched {
         Exit::Ok
     } else if plan.paths.is_empty() && !searched {
-        cli::error(
+        let _ = (runtime.stderr)(
             "grep: no files were searched; a glob, depth, hidden or ignore filter probably \
              excluded every file under the current directory",
         );
@@ -470,6 +510,7 @@ fn readable_stdin() -> bool {
 
 struct Host<'a, W> {
     plan: &'a Plan,
+    runtime: Option<&'a Runtime<'a>>,
     filename: bool,
     writer: W,
     buffer: Vec<u8>,
@@ -489,8 +530,8 @@ fn block_stdout(plan: &Plan) -> bool {
 
 /// Redirected path/count records may share the block buffer until an operand
 /// or diagnostic boundary. Ttys, NUL names and live policy keep line output.
-fn buffered_path_output(plan: &Plan) -> bool {
-    !stdout_is_terminal()
+fn buffered_path_output(plan: &Plan, tty: bool) -> bool {
+    !tty
         && !plan.traversal.live
         && !nul_names(plan)
         && !plan.json
@@ -507,11 +548,24 @@ fn nul_names(plan: &Plan) -> bool {
 }
 
 impl<W: Write> Host<'_, W> {
+    fn tty(&self) -> bool {
+        self.runtime.map_or_else(stdout_is_terminal, |runtime| runtime.tty)
+    }
+    fn diagnostic(&self, message: &str) -> io::Result<()> {
+        if let Some(runtime) = self.runtime { (runtime.stderr)(message) }
+        else { cli::error(message); Ok(()) }
+    }
+    fn report_shortfall(&self, shortfall: &ferret_query::Shortfall) -> io::Result<()> {
+        if self.runtime.is_none_or(|runtime| !runtime.warned.swap(true, Ordering::AcqRel)) {
+            self.diagnostic(&format!("grep: searching with {} of {} threads: {}", shortfall.running, shortfall.asked, shortfall.cause))?;
+        }
+        Ok(())
+    }
     fn error(&mut self, path: &Path, error: &dyn std::fmt::Display) -> io::Result<()> {
         if !nul_names(self.plan) {
             self.writer.flush()?;
         }
-        cli::error(&format!("grep: {}: {error}", path.display()));
+        self.diagnostic(&format!("grep: {}: {error}", path.display()))?;
         self.errors = true;
         Ok(())
     }
@@ -659,7 +713,7 @@ impl<W: Write> Host<'_, W> {
         let published = self.publish(path, result, output);
         // NUL names retain std's existing line buffering and diagnostic
         // ordering, including a pending name when the next operand fails.
-        if nul_names(self.plan) || buffered_path_output(self.plan) {
+        if nul_names(self.plan) || buffered_path_output(self.plan, self.tty()) {
             return published;
         }
         // Surface even a short final group's write error before another
@@ -831,6 +885,7 @@ mod tests {
             };
             let mut host = Host {
                 plan: &plan,
+            runtime: None,
                 filename: false,
                 writer: Vec::new(),
                 buffer: Vec::new(),
@@ -898,6 +953,7 @@ mod tests {
             };
             let mut host = Host {
                 plan: &plan,
+            runtime: None,
                 filename: false,
                 writer: Vec::new(),
                 buffer: Vec::new(),
@@ -975,6 +1031,7 @@ mod tests {
                 };
                 let mut host = Host {
                     plan: &plan,
+            runtime: None,
                     filename: false,
                     writer: Vec::new(),
                     buffer: Vec::new(),
@@ -1016,6 +1073,7 @@ mod tests {
         };
         let mut host = Host {
             plan: &plan,
+            runtime: None,
             filename: false,
             writer: Vec::new(),
             buffer: Vec::new(),
@@ -1058,6 +1116,7 @@ mod tests {
         for mode in 0..4 {
             let mut host = Host {
                 plan: &plan,
+            runtime: None,
                 filename: false,
                 writer: Vec::new(),
                 buffer: Vec::new(),
@@ -1108,6 +1167,7 @@ mod tests {
         };
         let mut host = Host {
             plan: &plan,
+            runtime: None,
             filename: false,
             writer: Broken,
             buffer: Vec::new(),
@@ -1143,6 +1203,7 @@ mod tests {
         };
         let mut host = Host {
             plan: &plan,
+            runtime: None,
             filename: false,
             writer: io::BufWriter::new(Broken),
             buffer: Vec::new(),
@@ -1191,6 +1252,7 @@ mod tests {
         };
         let mut host = Host {
             plan: &plan,
+            runtime: None,
             filename: false,
             writer: FailSecond::default(),
             buffer: Vec::new(),
@@ -1225,6 +1287,7 @@ mod tests {
             for failure in [false, true] {
                 let mut host = Host {
                     plan: &plan,
+            runtime: None,
                     filename: false,
                     writer: Vec::new(),
                     buffer: Vec::new(),
