@@ -6297,3 +6297,39 @@ an indexed answer (then A, with the corrected messages), or agents mostly
 calling grep in trees whose committed sources sit under `vendor/`, `build/` or
 `dist/`, where B's default ignores would hide real matches (then B with
 `DEFAULT_IGNORE` limited to what git ignores when a work tree is found).
+
+## D113 — Indexed grep and files over the size cap
+
+**Status: answered, yes, 2026-10-21.**
+
+Question: should indexed `ferret grep` search catalogued files that are over
+the 8 MiB content-index cap, reading them live, rather than leaving them out?
+
+Evidence. The cap (`ferret-policy` `DEFAULT_SIZE_CAP`, "a judgement, not a
+measurement") exists to keep big files out of the content index; grep
+inherited it only so its answers agree with the index. Today indexed grep
+skips over-cap files, and a changed candidate that has grown past the cap
+reports an error (GREP.md, "Indexed recursive content"). rg has no cap.
+**Measured** on Dave's `~/w` (2026-10-21, `rg --files` plus `stat`): 67,584
+files rg would search, 4.8 GB; 90 over 8 MiB, 1.97 GB, nearly all build
+output under one repo's unignored `target/debug` (binary; ferret's index
+leaves `target/` out anyway). Over-cap files with no NUL in their first
+8 KiB: 6 files, 110 MB, all JSONL corpora (`grep-compat`, `find-compat`),
+which are the files an agent would grep. At U3's 65 ms per warm GB, reading
+all six costs about 7 ms, paid only by searches whose operands reach them.
+
+Options:
+
+- **Yes — search them live.** The catalog already lists over-cap files with
+  their sizes; grep reads them directly beside the index's candidates, with
+  rg's binary handling, and the grown-past-the-cap error goes. Matches rg.
+  Costs the bytes read per call in trees that hold such files.
+- **No — keep the cap.** No change; ferret silently misses matches in large
+  text files that rg finds.
+
+> Dave: Should we be live grepping those files even when they don't show up
+> in the index? I think yes.
+
+Fact that would change it: trees where over-cap text files are common and
+large enough that every grep reads gigabytes; then a cap configurable per
+root, not a fixed exclusion.
