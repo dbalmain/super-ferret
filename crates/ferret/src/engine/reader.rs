@@ -63,9 +63,11 @@ pub(crate) fn direct(
     }
 }
 
-/// The directory a walked file was listed in.
+/// How a walked file is opened.
 #[derive(Debug)]
 pub(crate) enum Parent {
+    /// A walk explicitly requested symlink following (grep -L).
+    Followed,
     /// Still open, as the walk retained it.
     Open(DirectoryHandle),
     /// Closed by a walk past its descriptor budget: its `(dev, ino)`, which
@@ -93,6 +95,7 @@ pub(crate) fn listed(
     };
     let reopened;
     let directory = match parent {
+        Parent::Followed => return direct(path, cap, each, cancelled),
         Parent::Open(directory) => directory.as_fd(),
         &Parent::Closed(dev, ino) => {
             let spelled = path

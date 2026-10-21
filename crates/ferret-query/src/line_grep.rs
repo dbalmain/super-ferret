@@ -44,6 +44,7 @@ pub struct Names {
 pub struct Traversal {
     pub unrestricted: bool,
     pub live: bool,
+    pub follow: bool,
     pub max_depth: Option<usize>,
 }
 
@@ -320,6 +321,8 @@ pub fn parse_with(
                 "--json" if value.is_none() => json = true,
                 "--no-json" if value.is_none() => json = false,
                 "--live" if value.is_none() => traversal.live = true,
+                "--follow" if value.is_none() => traversal.follow = true,
+                "--no-follow" if value.is_none() => traversal.follow = false,
                 "--no-ignore" if value.is_none() => traversal.unrestricted = true,
                 "--ignore" if value.is_none() => traversal.unrestricted = false,
                 "--unrestricted" if value.is_none() => {
@@ -433,6 +436,7 @@ pub fn parse_with(
                         presentation.pretty();
                         line_number = true;
                     }
+                    b'L' => traversal.follow = true,
                     b'q' => quiet = true,
                     b'u' => unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?,
                     b'a' => text_mode = true,

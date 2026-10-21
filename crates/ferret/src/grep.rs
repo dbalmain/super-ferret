@@ -69,7 +69,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   --max-depth N      limit directory traversal depth\n\
   --scan             accepted; broad patterns always scan\n\n\
 Directories use snapshot names/postings and current candidate bytes.\n\
-An index covering each directory is required; trigrams are optional.\n\
+Uncovered directories search live with rg ignore rules; trigrams are optional.\n\
 Explicit files and stdin search directly. UTF-8 BOMs are stripped; UTF-16\n\
 decoding is deferred. Excluded paths are absent. Exit: 0 match, 1 none, 2 error.\n";
 
@@ -141,7 +141,28 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(cwd) => cwd,
         Err(error) => return failure(&error.to_string()),
     };
-    if daemon_operands(&inputs)
+    let routing = if recursive && !plan.traversal.unrestricted && !plan.traversal.live {
+        match live::Anchors::routing(index, &inputs) {
+            Ok(anchors) => Some(anchors),
+            Err(error) => return failure(&error),
+        }
+    } else {
+        None
+    };
+    let covered = routing.as_ref().is_none_or(live::Anchors::all_covered);
+    if recursive
+        && plan.traversal.follow
+        && !plan.traversal.unrestricted
+        && routing
+            .as_ref()
+            .is_none_or(|anchors| anchors.any_covered(&inputs))
+    {
+        return failure(
+            "-L is supported for uncovered directories and -u; use -u to follow links in an indexed tree",
+        );
+    }
+    if covered
+        && daemon_operands(&inputs)
         && !plan.traversal.unrestricted
         && !plan.traversal.live
         && !test_injections()
@@ -156,9 +177,15 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             Err(error) => return failure(&error),
         }
     } else {
-        None
+        routing
     };
-    let engine = if recursive && !plan.traversal.unrestricted && !plan.traversal.live {
+    let engine = if recursive
+        && !plan.traversal.unrestricted
+        && !plan.traversal.live
+        && live
+            .as_ref()
+            .is_none_or(|anchors| anchors.any_covered(&inputs))
+    {
         match open_index(index) {
             Ok(engine) => Some(engine),
             Err(error) => return failure(&error),
@@ -276,7 +303,11 @@ impl Execution<'_> {
             Err(error) => return runtime.failure(&error.to_string()),
         };
         let documents = match pin
-            .map(|pin| ferret_crawl::Documents::by_name(pin.catalog()))
+            .map(|pin| {
+                ferret_crawl::Documents::by_name(pin.catalog()).map(|documents| {
+                    documents.with_config(ferret_policy::Config { size_cap: u64::MAX })
+                })
+            })
             .transpose()
         {
             Ok(documents) => documents,
@@ -284,7 +315,7 @@ impl Execution<'_> {
         };
         for input in &inputs {
             if let Input::Directory(path) = input {
-                if let Some(anchors) = live {
+                if let Some(anchors) = live.filter(|anchors| anchors.walks(path)) {
                     if let Err(error) = anchors.validate(path) {
                         return runtime.failure(&format!("{}: {error}", path.display()));
                     }
@@ -296,7 +327,7 @@ impl Execution<'_> {
                         };
                     if let Some(Err(error)) = source.next(true) {
                         return runtime.failure(&format!(
-                        "{}: {}; index this directory, use -u, or use --live with a covering catalog root",
+                        "{}: {}; refresh the index with ferret index DIR, or use -u to search current files",
                         error.path.display(),
                         error.error
                     ));
@@ -344,7 +375,8 @@ impl Execution<'_> {
             let mut segment = Vec::new();
             while inputs.peek().is_some_and(|input| {
                 !matches!(input, Input::Stdin)
-                    && (!buffered_path_output(plan, runtime.tty) || segment.is_empty())
+                    && (segment.is_empty()
+                        || !buffered_path_output(plan, runtime.tty) && covered_inputs(live))
             }) {
                 if let Some(input) = inputs.next() {
                     segment.push(input);
@@ -454,6 +486,10 @@ impl Execution<'_> {
     }
 }
 
+fn covered_inputs(live: Option<&live::Anchors>) -> bool {
+    live.is_none_or(live::Anchors::all_covered)
+}
+
 fn test_injections() -> bool {
     std::env::vars_os().any(|(key, _)| key.as_bytes().starts_with(b"FERRET_TEST_"))
 }
@@ -505,7 +541,7 @@ fn open_index(index: Option<&Path>) -> Result<Engine, String> {
         })?
         .ok_or_else(|| {
             format!(
-                "no index in {}; run ferret index DIR, use -u, or use --live with a covering catalog root",
+                "no index in {}; run ferret index DIR, use -u, or omit --live to search uncovered paths",
                 index.display()
             )
         })?;

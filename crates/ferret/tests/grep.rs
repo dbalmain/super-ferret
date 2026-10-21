@@ -545,18 +545,17 @@ fn direct_inputs_help_and_version_do_not_need_an_index_or_config() {
             "{output:?}"
         );
     }
-    let output = fixture.ferret(&["grep", "red", "."], None);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+    // D112: recursive operands no longer need a pre-existing index either.
+    fixture.compare(&["red", "."], None);
 }
 
 #[test]
-fn changed_candidates_over_the_cap_report_errors() {
+fn changed_candidates_over_the_cap_are_searched() {
     let fixture = Fixture::new("changed-size");
-    fixture.write("one.rs", &vec![b'r'; 8 * 1024 * 1024 + 1]);
-    let output = fixture.ferret(&["grep", "lantern", "."], None);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(!output.stderr.is_empty());
+    let mut bytes = vec![b'r'; 8 * 1024 * 1024 + 1];
+    bytes.extend_from_slice(b"\nlantern grown\n");
+    fixture.write("one.rs", &bytes);
+    fixture.compare(&["lantern", "."], None);
 }
 
 #[test]
@@ -594,7 +593,7 @@ fn binary_message_is_the_documented_difference_and_quiet_agrees() {
 }
 
 #[test]
-fn unindexed_directory_is_a_fatal_presearch_error_even_in_quiet_mode() {
+fn unindexed_directory_is_searched_beside_an_explicit_file() {
     let fixture = Fixture::new("unindexed");
     let outside = fixture.base.join("outside");
     fs::create_dir_all(&outside).unwrap();
@@ -603,11 +602,8 @@ fn unindexed_directory_is_a_fatal_presearch_error_even_in_quiet_mode() {
         vec!["grep", "-q", "red", "one.rs", outside.to_str().unwrap()],
     ] {
         let output = fixture.ferret(&args, None);
-        assert_eq!(output.status.code(), Some(2));
-        assert!(
-            output.stdout.is_empty() && !output.stderr.is_empty(),
-            "{output:?}"
-        );
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 }
 
@@ -1602,7 +1598,7 @@ fn files_explicit_operands_need_no_index_and_never_open_streams() {
 }
 
 #[test]
-fn files_requires_directory_coverage_before_any_output_including_quiet() {
+fn files_lists_an_uncovered_directory_beside_an_explicit_file() {
     let fixture = Fixture::new("files-coverage");
     let outside = fixture.base.join("outside");
     fs::create_dir_all(&outside).unwrap();
@@ -1613,8 +1609,8 @@ fn files_requires_directory_coverage_before_any_output_including_quiet() {
         }
         args.extend(["one.rs", outside.to_str().unwrap()]);
         let output = fixture.ferret(&args, None);
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
-        assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty());
     }
 }
 
@@ -2530,12 +2526,8 @@ fn m6_unrestricted_needs_no_index_and_preserves_override_order() {
     ] {
         fixture.compare(&args, None);
     }
-    assert!(
-        fixture
-            .ferret(&["grep", "red", "."], None)
-            .stdout
-            .is_empty()
-    );
+    // D112's default fallback respects ignore rules without an index.
+    fixture.compare(&["red", "."], None);
 }
 
 #[test]
@@ -2969,7 +2961,7 @@ fn m6_live_binary_depth_and_operand_matrix() {
 }
 
 #[test]
-fn m6_recursive_cap_is_independent_of_text_and_freshness() {
+fn m6_live_cap_does_not_limit_indexed_grep() {
     let fixture = Fixture::new("live-cap");
     fs::create_dir(fixture.tree().join("large")).unwrap();
     fixture.write("large/big", b"red\n");
@@ -2979,12 +2971,13 @@ fn m6_recursive_cap_is_independent_of_text_and_freshness() {
         .unwrap();
     file.set_len(9 << 20).unwrap();
     assert!(fixture.ferret(&["index", "."], None).status.success());
-    for flags in [vec!["-a"], vec!["--live", "-a"]] {
+    // D113 removes the indexed cap; explicit D13 --live retains it.
+    for (flags, exit) in [(vec!["-a"], 0), (vec!["--live", "-a"], 1)] {
         let mut args = vec!["grep"];
         args.extend(flags);
         args.extend(["-q", "red", "large"]);
         let result = fixture.ferret(&args, None);
-        assert_eq!(result.status.code(), Some(1), "{result:?}");
+        assert_eq!(result.status.code(), Some(exit), "{result:?}");
     }
     for args in [
         vec!["--live", "-auq", "red", "large"],

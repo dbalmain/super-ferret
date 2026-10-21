@@ -1766,7 +1766,8 @@ impl EventVisitor for Hasher<'_> {
                 let path_bytes = match file {
                     ferret_policy::IgnoreFile::Ferret(path)
                     | ferret_policy::IgnoreFile::Git(path)
-                    | ferret_policy::IgnoreFile::GitExclude(path) => path.as_os_str().len(),
+                    | ferret_policy::IgnoreFile::GitExclude(path)
+                    | ferret_policy::IgnoreFile::Grep(path) => path.as_os_str().len(),
                     ferret_policy::IgnoreFile::Global => 0,
                 };
                 // Lossy path display can expand each invalid byte to three;

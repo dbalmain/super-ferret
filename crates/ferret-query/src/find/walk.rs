@@ -533,6 +533,26 @@ pub struct WalkError {
     pub error: io::Error,
 }
 
+#[derive(Debug)]
+struct OutsideCatalog;
+impl std::fmt::Display for OutsideCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "start is outside the catalog or the index is stale; run ferret index DIR or use -I",
+        )
+    }
+}
+impl std::error::Error for OutsideCatalog {}
+impl WalkError {
+    /// The explicit start has no catalog resolution. Hosts can supply their
+    /// own live-mode advice without interpreting the find diagnostic text.
+    pub fn is_outside_catalog(&self) -> bool {
+        self.error
+            .get_ref()
+            .is_some_and(|error| error.is::<OutsideCatalog>())
+    }
+}
+
 /// Ordered entries with a feedback channel for prune. A source is configured
 /// with the plan's global traversal options before execution. After yielding an
 /// entry, `next(false)` prevents descent; post-order sources already descended.
@@ -708,6 +728,14 @@ impl LiveWalk {
     /// An unrestricted physical walk, retaining each operand's spelling.
     pub fn paths(paths: Vec<PathBuf>, cwd: PathBuf) -> Self {
         Self::new(paths, Options::at(cwd))
+    }
+
+    /// Follows descendant symlinks, diagnosing ancestor cycles.
+    pub fn following_links(mut self, follow: bool) -> Self {
+        if follow {
+            self.options.follow = Follow::All;
+        }
+        self
     }
 
     /// Keeps each listed directory open while its entries are visited, so
@@ -1219,11 +1247,15 @@ impl LiveWalk {
                                     _ => None,
                                 });
                     }
-                    let resolved = match resolve(catalog, self.entry.lookup_path().as_ref(), follow || self.entry.path.ends_with(b"/")) {
+                    let resolved = match resolve(
+                        catalog,
+                        self.entry.lookup_path().as_ref(),
+                        follow || self.entry.path.ends_with(b"/"),
+                    ) {
                         Ok(Some(resolved)) => resolved,
-                        Ok(None) => return Some(Err(self.entry.error(io::Error::other(
-                            "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
-                        )))),
+                        Ok(None) => {
+                            return Some(Err(self.entry.error(io::Error::other(OutsideCatalog))));
+                        }
                         Err(error) => return Some(Err(self.entry.error(error))),
                     };
                     if !resolved.1
@@ -1708,6 +1740,51 @@ fn resolve_catalog(
     path: &Path,
     follow: bool,
 ) -> io::Result<Option<(Target, bool)>> {
+    resolve_in(catalog, path, follow)
+}
+
+/// A namespace [`resolve_in`] walks: the catalog, or a host's view that must
+/// agree with it on which spellings resolve.
+pub trait Namespace {
+    /// What a resolved path names.
+    type Node;
+    /// The node at absolute `path`, and whether it lies below an opaque node
+    /// with an unresolved suffix; `None` when the namespace has no such path.
+    fn resolve(&self, path: &Path) -> Option<(Self::Node, bool)>;
+    /// The target of a symlink node; `None` for any other node.
+    fn link_target(&self, node: &Self::Node) -> Option<PathBuf>;
+    /// Whether the node is a directory `..` may be collapsed against.
+    fn is_directory(&self, node: &Self::Node) -> bool;
+}
+
+impl Namespace for Catalog {
+    type Node = Target;
+    fn resolve(&self, path: &Path) -> Option<(Target, bool)> {
+        Catalog::resolve(self, path.as_os_str().as_bytes())
+            .map(|resolved| (resolved.target, !resolved.remainder.is_empty()))
+    }
+    fn link_target(&self, node: &Target) -> Option<PathBuf> {
+        match *node {
+            Target::Inode(id) if self.kind(id) == Kind::Symlink => Some(PathBuf::from(
+                OsStr::from_bytes(Catalog::link_target(self, id).unwrap_or_default()),
+            )),
+            _ => None,
+        }
+    }
+    fn is_directory(&self, node: &Target) -> bool {
+        matches!(*node, Target::Inode(dir) if Catalog::is_directory(self, dir))
+    }
+}
+
+/// Resolves `path` the way a catalogued start is resolved: lexically outside
+/// the namespace, following its recorded symlinks inside it, and collapsing
+/// `..` only after exact directories. `Ok(None)` means the spelling is
+/// outside the namespace; `NotFound` is a missing child inside it.
+pub fn resolve_in<N: Namespace>(
+    namespace: &N,
+    path: &Path,
+    follow: bool,
+) -> io::Result<Option<(N::Node, bool)>> {
     let mut pending = std::path::absolute(path)?;
     for _ in 0..40 {
         let mut prefix = PathBuf::new();
@@ -1735,7 +1812,7 @@ fn resolve_catalog(
                 std::path::Component::CurDir => {}
                 part => prefix.push(part.as_os_str()),
             }
-            let Some(resolved) = catalog.resolve(prefix.as_os_str().as_bytes()) else {
+            let Some((target, below_opaque)) = namespace.resolve(&prefix) else {
                 if inside && !via_parent {
                     return Err(rustix::io::Errno::NOENT.into());
                 }
@@ -1743,34 +1820,28 @@ fn resolve_catalog(
                 continue;
             };
             inside = true;
-            if !resolved.remainder.is_empty() {
+            if below_opaque {
                 exact = false;
-                opaque = Some(resolved.target);
+                opaque = Some(target);
                 continue;
             }
-            if let Target::Inode(id) = resolved.target
-                && catalog.kind(id) == Kind::Symlink
+            if let Some(link) = namespace.link_target(&target)
                 && (follow || at + 1 < parts.len())
             {
-                let target = Path::new(OsStr::from_bytes(
-                    catalog.link_target(id).unwrap_or_default(),
-                ));
-                let mut next = prefix.parent().unwrap_or(Path::new("/")).join(target);
+                let mut next = prefix.parent().unwrap_or(Path::new("/")).join(link);
                 for part in &parts[at + 1..] {
                     next.push(part.as_os_str());
                 }
                 redirected = Some(std::path::absolute(next)?);
                 break;
             }
-            exact = matches!(resolved.target, Target::Inode(dir) if catalog.is_directory(dir));
-            opaque = Some(resolved.target);
+            exact = namespace.is_directory(&target);
+            opaque = Some(target);
         }
         match redirected {
             Some(next) => pending = next,
             None => {
-                return Ok(catalog
-                    .resolve(prefix.as_os_str().as_bytes())
-                    .map(|resolved| (resolved.target, !resolved.remainder.is_empty())));
+                return Ok(namespace.resolve(&prefix));
             }
         }
     }

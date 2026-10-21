@@ -13,6 +13,7 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 | Input | Source |
 | --- | --- |
 | Recursive directory, default `.` | Pinned catalog and S3 trigram postings; current bytes for candidates |
+| Uncovered directory (D112 B) | Live rg visibility: git rules from the nearest enclosing `.git`, `.ignore`/`.rgignore` from every ancestor |
 | Explicit file, file symlink, or `-` | Direct current-byte search, without opening an index |
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
 | `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
@@ -20,7 +21,7 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 Indexed directory content searches and `--files` use the resident daemon (D111 A), falling
 back to the shared in-process host when it is unavailable or refuses the hello.
 The client resolves presentation, terminal defaults, search threads, cwd and
-pattern files. Only requests whose every operand is a directory route; any
+pattern files. Only requests whose every operand is a covered directory route; any
 explicit file, missing operand or `-` keeps the whole request local, because
 ferretd would resolve its spelling again in its own process, where
 `/proc/self/fd/N`, `/dev/fd/N` or `/proc/self/cwd` name its descriptors and
@@ -39,8 +40,45 @@ build-mismatch drain/replacement path. A loading, refused or pre-hello-closed
 owner still causes query fallback; D110's behavior is unchanged.
 
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
-data. Missing/incompatible indexes or unindexed directory starts exit 2 with
-index/live advice. Mixed operands use their respective sources. Help/version
+data. Incompatible indexes exit 2 with reindexing advice. An absent index or
+uncovered directory selects an in-process live search, without opening the
+content index or contacting the daemon. An operand is covered only when its
+canonical path lies under a configured root and the catalog's resolver can
+resolve its spelling. Routing walks the stored root spellings over the live
+filesystem with the same resolver (`find::resolve_in`), without loading
+names; a spelling that crosses a symlink inside a root (which may sit in an
+opaque directory the catalog stops at, or have changed since the crawl) is
+resolved in the catalog itself, loading its name and link sections but never
+content. So an alias into a root (`alias -> root`) is searched live, while
+`root/link/../..` and a link inside an ignored `target/` stay snapshot
+requests. Mixed covered/uncovered requests stay
+local: each covered operand uses the snapshot, each uncovered operand walks
+live, in operand order. Covered-only requests retain daemon routing.
+
+The D112 fallback reads `.gitignore` from the work-tree top down,
+`.git/info/exclude`, `$XDG_CONFIG_HOME/git/ignore` (or `~/.config/git/ignore`),
+`.ignore`, and `.rgignore`, in increasing precedence. It applies no ferret
+ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
+read `core.excludesFile`. As in rg 15.2.0, the three git sources apply only
+in directories inside a work tree: any ancestor holding a `.git` that
+resolves counts (a stray `.git` above a scratch directory makes it a work
+tree); a symlinked `.git` is followed, and one that loops or dangles starts
+none. Ancestor
+`.gitignore` rules stop at a nested work tree's top; ancestor `.ignore` and
+`.rgignore` rules, up to `/`, do not, so naming a subdirectory or a nested
+repository keeps them. A `.git` file whose gitdir has no `commondir` (`git
+init --separate-git-dir`) contributes no `info/exclude`; through a `commondir`
+the common directory's applies. D13 indexing reads both. An ignore input that
+cannot be read (an unreadable `.ignore`, `.gitignore`, `info/exclude` or
+`.git`, or a gitfile naming no gitdir), in an ancestor or inside the tree, is
+skipped silently and the rules that loaded still apply, as in rg; `--live`
+keeps D13's error. Slash-anchored global
+patterns are relative to the command's cwd, including when an operand starts a
+nested work tree. Hidden entries are skipped unless requested or whitelisted by ignore rules. Named
+ignored operands are searched, while ancestor rules still apply inside them.
+`-L`/`--follow` follows links in uncovered and unrestricted walks; indexed
+`-L` remains unsupported (use `-u`). `--live` retains D13 and requires covering
+catalog roots. Help/version
 skip index/config; no query log or find config. Diagnose nonempty
 `RIPGREP_CONFIG_PATH`: pass flags explicitly. Refuse global `ferret --json`
 framing; `ferret grep --json` means rg output.
@@ -392,13 +430,17 @@ even a full budget cannot prevent that owner from replaying its prefix and
 finishing. Capture-space waiters poll cancellation at most every 20 ms, as
 descriptor waiters do; dropping captures or finishing a stream also wakes them.
 
-Indexed recursive content excludes policy's non-content files (binary-sniffed
-and over the default 8 MiB cap); name listing includes them. Changed candidates
-that exceed the cap report an error, rather than silently disappear. `-a`
-scans catalog-visible binary files but retains the recursive cap. Explicit
-files/stdin and unrestricted live mode stream without that indexing cap;
-multiline buffers whole input with fallible allocation and cancellation.
-Oversize/allocation failures are errors, never truncation or a no-match answer.
+Indexed recursive content skips catalogued binary files unless `-a` is set.
+**D113:** the default 8 MiB cap bounds content indexing only. Catalogued files
+above it are read live beside posting candidates, using rg's initial
+recursive binary probe and the existing first-NUL output policy below.
+Candidates that grow past the cap are also searched. These reads retain
+the checked catalog path and stat bracket and never enter the document cache
+as an old version. `-a` also removes binary suppression for oversized files.
+Explicit files/stdin, uncovered fallback and unrestricted walks have no size
+cap. D13 `--live` retains its indexing policy cap. Multiline buffers whole
+input with fallible allocation and cancellation; allocation failures are
+errors, never truncation or a no-match answer.
 
 ## Ignore rules and visibility
 
@@ -411,8 +453,8 @@ Cases where rg can search what indexed grep cannot: ferret-only global or
 `.ferretignore` exclusions; positive `-g` that overrides an index exclusion;
 `--hidden` when the hidden tree was ferret-excluded (notably `.git`);
 rg reinclusion that ferret's traversal did not retain (including different
-negation precedence); new names; and content omitted by the size/binary
-policy. Explicit starts/live mode are the exceptions above. `--hidden` alone
+negation precedence); new names; and catalogued binary content without `-a`.
+Explicit starts/live mode are the exceptions above. `--hidden` alone
 does not undo ferret ignore rules. **M3 clarification (2026-10-17):**
 `-.` aliases `--hidden`; `--no-hidden` reverses it in argv order. The hidden
 switch applies equally to content and name modes, without weakening negative
@@ -656,8 +698,8 @@ contract as line mode (D103 A).
 There is **no small peak-memory bound** for explicit files, stdin or unrestricted
 multiline input. The whole input buffer and line/span metadata grow with the
 input and match count; rendered-capture and host-cache budgets do not cap them.
-Indexed and policy-preserving input retain their existing size cap. No extra
-cap is imposed on explicit, stdin or unrestricted input.
+Only D13 `--live` retains its policy size cap. Indexed and uncovered grep,
+explicit files, stdin and unrestricted input have no content size cap.
 
 **Separators and headings follow printed records** (D98, fuzz B4). A file's
 heading, an inter-file separator and a `--` are each printed only before a
@@ -856,7 +898,8 @@ Detect NUL in each read chunk, without waiting for LF or EOF (review R1,
 2026-10-16). A producer that holds its stream open after NUL does not hold the
 query open. For non-binary input with no LF, line buffering grows with the line:
 explicit files and stdin have no invented cap and use fallible allocation;
-recursive input retains its existing file size cap. Capture buffering bounds rendered output
+indexed and uncovered recursive grep also have no size cap (D112/D113).
+D13 `--live` retains its policy cap. Capture buffering bounds rendered output
 memory, not this input-line buffer.
 If a selected line preceded it, plain line/span output prints
 `PATH: binary file matches` on stdout instead (stdin label: `(standard input)`).
@@ -1177,3 +1220,32 @@ ten warmups / 100 runs: before routing **2.66 / 6.30 ms** at 64k / 251k names;
 after routing **1.91 / 2.00 ms**. Local controls remain 2.74 / 6.22 ms. The
 resident path lists from its pinned catalog; unavailable-daemon fallback still
 uses the four-section lazy open, with identical names, ordering and exits.
+
+
+### D112 uncovered routing measurements (2026-10-21)
+
+Warm release binaries, an isolated 60-file / 26,409-byte tree, 16 configured
+search threads. Hyperfine `-N`, ten warmups and 100 runs, one benchmark at a
+time after checking `pgrep -x hyperfine`. Daemon runs require a bound socket
+and a private 0700 runtime directory. Mean times in milliseconds:
+
+| Call | Before D112 | After D112 | rg 15.2.0 |
+| --- | ---: | ---: | ---: |
+| Indexed `grep -q 'needle' DIR`, daemon | 1.874 | 1.926 | — |
+| Uncovered `grep -l 'x' DIR` | — | 2.448 | 3.497 |
+
+The daemon startup difference is 0.052 ms, within run variation (standard
+deviations 0.114 / 0.174 ms). Coverage reads checked root paths and strings,
+without loading the name tables or opening content. A regression test damages
+an unrelated content manifest and still requires uncovered content and names
+searches to succeed without contacting a daemon. Mixed requests stay local
+with an operand barrier between catalog and live sources.
+
+
+**D113 final startup check:** on the same frozen catalog and tree, fresh
+isolated runtime directories and daemon PID verified from hello before and
+after each run: original binary **1.880 ms**, final D112+D113 binary
+**1.958 ms** (standard deviations 0.130 / 0.139 ms; ten warmups / 100 runs,
+Hyperfine `-N`). The observed difference is **+0.078 ms**. Existing late-NUL
+count/diagnostic policy remains as documented above; D113 shares that policy
+rather than introducing a separate binary-output contract for large files.

@@ -30,6 +30,13 @@ impl Directory {
         })
     }
 
+    pub fn following_links(self, follow: bool) -> Self {
+        match self {
+            Self::Live(source) => Self::Live(source.following_links(follow)),
+            other => other,
+        }
+    }
+
     /// Keeps each listed directory open for the files listed in it, which
     /// content searches open beneath it (D21). Names-only listings open no
     /// file and leave it.
@@ -59,7 +66,7 @@ fn start(path: &Path) -> PathBuf {
 impl EntrySource for Directory {
     fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>> {
         match self {
-            Self::Catalog(source) => source.next(descend),
+            Self::Catalog(source) => source.next(descend).map(grep_error),
             Self::Live(source) => source.next(descend),
         }
     }
@@ -69,7 +76,7 @@ impl EntrySource for Directory {
         before_directory: &mut dyn FnMut() -> io::Result<()>,
     ) -> Option<Result<&Entry, WalkError>> {
         match self {
-            Self::Catalog(source) => source.next_with(descend, before_directory),
+            Self::Catalog(source) => source.next_with(descend, before_directory).map(grep_error),
             Self::Live(source) => source.next_with(descend, before_directory),
         }
     }
@@ -80,8 +87,20 @@ impl EntrySource for Directory {
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Option<Result<&Entry, WalkError>> {
         match self {
-            Self::Catalog(source) => source.next_with_cancel(descend, before_directory, cancelled),
+            Self::Catalog(source) => source
+                .next_with_cancel(descend, before_directory, cancelled)
+                .map(grep_error),
             Self::Live(source) => source.next_with_cancel(descend, before_directory, cancelled),
         }
     }
+}
+
+// Find's -I hint has a different meaning in grep.
+fn grep_error(entry: Result<&Entry, WalkError>) -> Result<&Entry, WalkError> {
+    entry.map_err(|mut error| {
+        if error.is_outside_catalog() {
+            error.error = io::Error::other("start is outside the catalog or the index is stale; run ferret index DIR or use -u");
+        }
+        error
+    })
 }

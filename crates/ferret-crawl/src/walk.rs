@@ -381,12 +381,59 @@ pub fn load_policy(
     config: Config,
     visit: impl FnMut(Event<'_, ()>),
 ) -> io::Result<DirRules> {
-    let fd = open_path(path, child_dir_flags(), Mode::empty())?;
+    load_query_policy(path, parent, global, config, false, visit)
+}
+
+/// Loads rg's git, `.ignore` and `.rgignore` inputs with the crawler's scoped
+/// reads. Ferret ignore files are not consulted; content has no size cap.
+/// As in rg, a symlinked `.git` is followed (one that does not resolve
+/// starts no work tree), and a `.git` file contributes `info/exclude` only
+/// through a `commondir`. Diagnostics and directory-open failures follow
+/// [`load_policy`].
+pub fn load_grep_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    load_query_policy(
+        path,
+        parent,
+        global,
+        Config { size_cap: u64::MAX },
+        true,
+        visit,
+    )
+}
+
+fn load_query_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    config: Config,
+    grep: bool,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    // Policy inputs are probed by name, never listed, so grep can load an
+    // ancestor it may search but not read, as rg does.
+    let fd = open_path(
+        path,
+        if grep {
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC
+        } else {
+            child_dir_flags()
+        },
+        Mode::empty(),
+    )?;
     let boundaries = BoundaryIndex::default();
     let mut walker = Walker::new(path, &boundaries, visit);
+    walker.rg_git = grep;
     let loaded = walker.load_ignores(
         fd.as_fd(),
         |name| {
+            if grep && name == ".ferretignore" {
+                return false;
+            }
             !matches!(
                 statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW),
                 Err(Errno::NOENT)
@@ -395,11 +442,29 @@ pub fn load_policy(
         parent.is_some_and(DirRules::in_work_tree),
         (),
     );
+    let ignore = grep
+        .then(|| walker.read_named(fd.as_fd(), ".ignore", ()))
+        .flatten();
+    let rgignore = grep
+        .then(|| walker.read_named(fd.as_fd(), ".rgignore", ()))
+        .flatten();
     let (rules, errors) = if let Some(parent) = parent {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "policy directory has no name")
         })?;
-        parent.enter(name, loaded.files())
+        if grep {
+            parent.grep_enter(name, loaded.files(), ignore.as_deref(), rgignore.as_deref())
+        } else {
+            parent.enter(name, loaded.files())
+        }
+    } else if grep {
+        DirRules::grep_root(
+            path,
+            global,
+            loaded.files(),
+            ignore.as_deref(),
+            rgignore.as_deref(),
+        )
     } else {
         DirRules::root(path, global, loaded.files(), config)
     };
@@ -817,6 +882,12 @@ struct Walker<'b, F> {
     /// [`DENTS_BYTES`].
     dents: Vec<u8>,
     visit: F,
+    /// Rg's reading of `.git`, for grep's policy loads: a symlinked `.git`
+    /// is followed, so one that does not resolve (dangling, or a loop)
+    /// starts no work tree; and a `.git` file's `info/exclude` applies only
+    /// through a `commondir`. D13 opens nothing through a symlinked `.git`,
+    /// counts any `.git` entry, and reads a gitdir's own exclude.
+    rg_git: bool,
 }
 
 /// A worker's `getdents` buffer. 32 KiB holds several hundred entries of
@@ -1061,6 +1132,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             rel: Vec::with_capacity(256),
             dents: Vec::with_capacity(DENTS_BYTES),
             visit,
+            rg_git: false,
         }
     }
 
@@ -1737,9 +1809,15 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     }
 
     fn probe_git(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
-        match openat(dir, DOT_GIT, child_dir_flags(), Mode::empty()) {
+        let flags = if self.rg_git {
+            root_dir_flags()
+        } else {
+            child_dir_flags()
+        };
+        match openat(dir, DOT_GIT, flags, Mode::empty()) {
             Ok(fd) => GitProbe::Directory(fd),
             Err(Errno::NOENT) => GitProbe::Missing,
+            Err(Errno::LOOP) if self.rg_git => GitProbe::Missing,
             Err(Errno::LOOP) => GitProbe::Present,
             Err(Errno::NOTDIR) => self.probe_git_file(dir, token),
             Err(error) => self.probe_git_failed(dir, error, token),
@@ -1770,7 +1848,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// `.git` is not a directory. `O_NOFOLLOW` so a symlink that appeared
     /// since the listing is not a gitdir file.
     fn probe_git_file(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
-        match openat(dir, DOT_GIT, nofollow_file_flags(), Mode::empty()) {
+        let flags = if self.rg_git {
+            nofollow_file_flags() - OFlags::NOFOLLOW
+        } else {
+            nofollow_file_flags()
+        };
+        match openat(dir, DOT_GIT, flags, Mode::empty()) {
             Ok(fd) => match read_regular(fd) {
                 Ok(Some(bytes)) => GitProbe::File(bytes),
                 Ok(None) => GitProbe::Present,
@@ -1831,6 +1914,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let Some((common, commondir)) = self.common_dir(gitdir, token) else {
             return (None, None);
         };
+        let excluded = commondir.is_some() || !self.rg_git;
         let (kind, common_path) = match commondir {
             Some(text) => (WorkTreeKind::Linked, gitdir_path.join(text)),
             None if in_work_tree => (WorkTreeKind::Submodule, gitdir_path),
@@ -1843,7 +1927,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 common_dir: normalize(&common_path),
                 common_id,
             });
-        (work_tree, self.read_exclude(common, token))
+        let exclude = if excluded {
+            self.read_exclude(common, token)
+        } else {
+            None
+        };
+        (work_tree, exclude)
     }
 
     /// The directory being loaded, as a path: the root the caller gave, made

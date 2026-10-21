@@ -1275,6 +1275,60 @@ impl Catalog {
         }
     }
 
+    /// Configured root paths for routing, without loading name tables or
+    /// building the namespace graph. Checks the root/string checksums and
+    /// path bounds and applies committed root changes. This does not prove
+    /// inode liveness: use [`Self::load`] and [`Self::roots`] for traversal.
+    pub fn configured_paths(&self) -> Result<Vec<Vec<u8>>, OpenError> {
+        self.load_one(Section::Strings)?;
+        let roots = if let Source::File { file, read, .. } = self.source.as_ref() {
+            let (start, end) = self.layout.range(Section::Roots);
+            let mut bytes = vec![0; end - start];
+            file.read_exact_at(&mut bytes, start as u64)
+                .map_err(OpenError::Io)?;
+            read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            bytes
+        } else {
+            self.section(Section::Roots).to_vec()
+        };
+        let corrupt = || OpenError::Decode(DecodeError::Corrupt("roots"));
+        if crate::generation::checksum(&roots) != self.layout.checksums[Section::Roots as usize] {
+            return Err(corrupt());
+        }
+        let strings = self.section(Section::Strings);
+        let mut paths = std::collections::BTreeMap::new();
+        let mut last = None;
+        for row in roots.chunks_exact(PAIR_ROW) {
+            let id = u32_at(row, 0);
+            let offset = u32_at(row, 4) as usize;
+            if id as usize >= self.layout.dirs || last.is_some_and(|last| id <= last) {
+                return Err(corrupt());
+            }
+            let rest = strings.get(offset..).ok_or_else(corrupt)?;
+            let end = rest
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or_else(corrupt)?;
+            paths.insert(id, rest[..end].to_vec());
+            last = Some(id);
+        }
+        if let Some(overlay) = &self.overlay {
+            overlay.load(Family::Namespace)?;
+            for record in overlay.projection(Family::Namespace).records(overlay::ROOT) {
+                match record {
+                    Record::RootPut { id, path } => {
+                        paths.insert(*id, path.clone());
+                    }
+                    Record::RootDelete { id } => {
+                        paths.remove(id);
+                    }
+                    _ => unreachable!("root projection contains only root records"),
+                }
+            }
+        }
+        Ok(paths.into_values().collect())
+    }
+
     /// The configured roots, as `(top directory, path)`. Needs
     /// [`Section::Roots`].
     pub fn roots(&self) -> impl Iterator<Item = (InoId, &[u8])> + '_ {

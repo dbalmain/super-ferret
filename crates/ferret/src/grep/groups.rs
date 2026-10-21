@@ -414,30 +414,23 @@ pub(super) fn read_file(
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
 ) -> ReadOutcome {
+    read_file_policy(path, listed, plan, each, stopped, false)
+}
+
+fn read_file_policy(
+    path: &Path,
+    listed: Option<&engine::reader::Parent>,
+    plan: &Plan,
+    each: ferret_query::Consumer<'_>,
+    stopped: &dyn Fn() -> bool,
+    rg: bool,
+) -> ReadOutcome {
     let recursive = listed.is_some();
-    let cap = (recursive && !plan.traversal.unrestricted)
+    let cap = (recursive && !plan.traversal.unrestricted && !rg)
         .then(|| ferret_policy::Config::default().size_cap);
     let mut pass = |input: &mut dyn Read, size| {
-        if recursive && !plan.text {
-            // Unrestricted recursion follows rg's initial scan-window
-            // binary gate, including early quiet/name modes. Policy walks
-            // retain D13's indexing sniffer; explicit files bypass both.
-            let probe = if plan.traversal.unrestricted {
-                CHUNK
-            } else {
-                ferret_policy::SNIFF_LEN
-            };
-            let mut buffered = io::BufReader::with_capacity(probe, input);
-            let head = buffered.fill_buf()?;
-            let binary = if plan.traversal.unrestricted {
-                head.contains(&0)
-            } else {
-                ferret_policy::sniff(head) == ferret_policy::Content::Binary
-            };
-            if binary {
-                return Ok(());
-            }
-            each(&mut buffered, size)
+        if recursive {
+            read_content(input, size, plan, rg, each)
         } else {
             each(input, size)
         }
@@ -445,6 +438,54 @@ pub(super) fn read_file(
     match listed {
         None => engine::reader::direct(path, cap, &mut pass, stopped),
         Some(parent) => engine::reader::listed(parent, path, cap, &mut pass, stopped),
+    }
+}
+
+// The size cap bounds content indexing, not grep. Catalogued oversized files
+// and candidates that grew past the cap use rg's initial binary window.
+fn read_catalogued(
+    read: &mut CheckedReader<'_>,
+    name: NameId,
+    plan: &Plan,
+    each: ferret_query::Consumer<'_>,
+    stopped: &dyn Fn() -> bool,
+    unindexed: bool,
+) -> ReadOutcome {
+    let mut pass = |input: &mut dyn Read, size| {
+        if unindexed || size > ferret_policy::DEFAULT_SIZE_CAP {
+            read_content(input, size, plan, true, each)
+        } else {
+            each(input, size)
+        }
+    };
+    read(name, ReadRequest::Stream(&mut pass, stopped))
+}
+
+fn read_content(
+    input: &mut dyn Read,
+    size: u64,
+    plan: &Plan,
+    rg: bool,
+    each: ferret_query::Consumer<'_>,
+) -> io::Result<()> {
+    if plan.text {
+        return each(input, size);
+    }
+    // Rg recursion probes its first scan window even in quiet/name modes.
+    // D13 --live retains the indexing sniffer instead.
+    let rg = rg || plan.traversal.unrestricted;
+    let probe = if rg { CHUNK } else { ferret_policy::SNIFF_LEN };
+    let mut buffered = io::BufReader::with_capacity(probe, input);
+    let head = buffered.fill_buf()?;
+    let binary = if rg {
+        head.contains(&0)
+    } else {
+        ferret_policy::sniff(head) == ferret_policy::Content::Binary
+    };
+    if binary {
+        Ok(())
+    } else {
+        each(&mut buffered, size)
     }
 }
 
@@ -543,11 +584,11 @@ pub(super) enum Job {
     Direct(PathBuf, PathBuf),
     /// A walked file and the directory it was listed in, which it is opened
     /// beneath, never through a symlink.
-    Listed(PathBuf, PathBuf, engine::reader::Parent),
+    Listed(PathBuf, PathBuf, engine::reader::Parent, bool),
     Checked(PathBuf, NameId, u32),
-    /// A catalogued name with no document, searched under `-a` because it is
-    /// binary: read through the checked catalog walk, uncached.
-    Binary(PathBuf, NameId),
+    /// A catalogued file omitted from content indexing: oversized, or binary
+    /// under -a. Read through the checked catalog walk, uncached.
+    Unindexed(PathBuf, NameId),
     Failed(PathBuf, String),
     // Catalog posting absence only: explicit/live inputs always read bytes.
     Absent(PathBuf),
@@ -556,9 +597,9 @@ impl Job {
     fn path(&self) -> &Path {
         match self {
             Self::Direct(p, _)
-            | Self::Listed(p, _, _)
+            | Self::Listed(p, _, _, _)
             | Self::Checked(p, _, _)
-            | Self::Binary(p, _)
+            | Self::Unindexed(p, _)
             | Self::Failed(p, _)
             | Self::Absent(p) => p,
         }
@@ -569,7 +610,7 @@ impl Job {
     /// would otherwise keep its directory's descriptor open.
     fn finished(self) -> Self {
         match self {
-            Self::Listed(path, actual, _) => Self::Direct(path, actual),
+            Self::Listed(path, actual, _, _) => Self::Direct(path, actual),
             job => job,
         }
     }
@@ -718,7 +759,7 @@ fn prepare(
             let observed = observe_streaming(
                 &render,
                 buffer,
-                &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
+                &mut |each| read_catalogued(read, *name, plan, each, stopped, false),
                 eligible,
                 target,
             )?;
@@ -731,14 +772,14 @@ fn prepare(
                 observed
             }
         }
-        Job::Binary(_, name) => {
+        Job::Unindexed(_, name) => {
             let Some(read) = read else {
                 return Err(io::Error::other("catalogued input has no checked reader"));
             };
             observe_streaming(
                 &render,
                 buffer,
-                &mut |each| read(*name, ReadRequest::Stream(each, stopped)),
+                &mut |each| read_catalogued(read, *name, plan, each, stopped, true),
                 false,
                 target,
             )?
@@ -750,10 +791,10 @@ fn prepare(
             false,
             target,
         )?,
-        Job::Listed(_, actual, directory) => observe_streaming(
+        Job::Listed(_, actual, directory, rg) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file(actual, Some(directory), plan, each, stopped),
+            &mut |each| read_file_policy(actual, Some(directory), plan, each, stopped, *rg),
             false,
             target,
         )?,
@@ -1224,7 +1265,9 @@ pub(super) fn walk<W: Write>(
                                 };
                                 schedule::run(
                                     &schedule,
-                                    sources::live(&path, &filter.cwd).retaining_parents(),
+                                    sources::live(&path, &filter.cwd)
+                                        .following_links(filter.traversal.follow)
+                                        .retaining_parents(),
                                     Walked {
                                         descend: true,
                                         policy: policy.map(live::Policy::deferring),
@@ -1428,6 +1471,7 @@ impl Filter<'_> {
                 return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
             }
         };
+        let rg = policy.as_ref().is_some_and(|policy| policy.rg());
         let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
         if self
             .traversal
@@ -1442,16 +1486,21 @@ impl Filter<'_> {
                 .traversal
                 .max_depth
                 .is_none_or(|limit| entry.depth() < limit)
-                && self
-                    .selection
-                    .descend(relative.as_os_str().as_bytes(), entry.depth())
-                && !self.selection.hides_stripped(
-                    entry.path().as_os_str().as_bytes(),
-                    relative.as_os_str().as_bytes(),
-                    entry.depth(),
-                );
+                && (rg
+                    || (self
+                        .selection
+                        .descend(relative.as_os_str().as_bytes(), entry.depth())
+                        && !self.selection.hides_stripped(
+                            entry.path().as_os_str().as_bytes(),
+                            relative.as_os_str().as_bytes(),
+                            entry.depth(),
+                        )));
             if *descend && let Some(policy) = policy {
-                let accepted = policy.accepts(entry, true, stopped);
+                let accepted = if rg {
+                    policy.selects(entry, self.selection, &self.cwd, true, stopped)
+                } else {
+                    policy.accepts(entry, true, stopped)
+                };
                 let warnings = policy.take_warnings();
                 if !warnings.is_empty() {
                     // Not inside another file's group.
@@ -1471,19 +1520,24 @@ impl Filter<'_> {
             return None;
         }
         if kind != FileKind::File
-            || !self
-                .selection
-                .allows(relative.as_os_str().as_bytes(), entry.depth())
-            || self.selection.hides_stripped(
-                entry.path().as_os_str().as_bytes(),
-                relative.as_os_str().as_bytes(),
-                entry.depth(),
-            )
+            || (!rg
+                && (!self
+                    .selection
+                    .allows(relative.as_os_str().as_bytes(), entry.depth())
+                    || self.selection.hides_stripped(
+                        entry.path().as_os_str().as_bytes(),
+                        relative.as_os_str().as_bytes(),
+                        entry.depth(),
+                    )))
         {
             return None;
         }
         if let Some(policy) = policy {
-            match policy.accepts(entry, true, stopped) {
+            match if rg {
+                policy.selects(entry, self.selection, &self.cwd, true, stopped)
+            } else {
+                policy.accepts(entry, true, stopped)
+            } {
                 Ok(true) => {}
                 Ok(false) => return None,
                 Err(error) => {
@@ -1495,10 +1549,12 @@ impl Filter<'_> {
         if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
             let inode = catalog.name(name).child;
             let Some(doc) = catalog.doc(inode) else {
-                if self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary {
+                if catalog.inode(inode).stat.size > ferret_policy::DEFAULT_SIZE_CAP
+                    || self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary
+                {
                     return Some((
                         catalog.inode(inode).stat.size,
-                        Job::Binary(entry.path().to_owned(), name),
+                        Job::Unindexed(entry.path().to_owned(), name),
                     ));
                 }
                 return None;
@@ -1515,6 +1571,17 @@ impl Filter<'_> {
             return Some((
                 catalog.inode(inode).stat.size,
                 Job::Checked(entry.path().to_owned(), name, doc.0),
+            ));
+        }
+        if self.traversal.follow {
+            return Some((
+                0,
+                Job::Listed(
+                    entry.path().to_owned(),
+                    self.cwd.join(entry.path()),
+                    engine::reader::Parent::Followed,
+                    true,
+                ),
             ));
         }
         // Content walks retain parents or, past their budget, the parent's
@@ -1535,7 +1602,12 @@ impl Filter<'_> {
         };
         Some((
             0,
-            Job::Listed(entry.path().to_owned(), self.cwd.join(entry.path()), parent),
+            Job::Listed(
+                entry.path().to_owned(),
+                self.cwd.join(entry.path()),
+                parent,
+                rg,
+            ),
         ))
     }
 }
@@ -1608,12 +1680,9 @@ impl<'a> Source<'a> {
     /// Whether a directory operand walks the live tree, which [`walk`] can
     /// spread over workers.
     pub(super) fn walks_live(&self) -> bool {
-        (self.filter.traversal.unrestricted || self.live.is_some())
-            && self
-                .inputs
-                .as_slice()
-                .iter()
-                .any(|input| matches!(input, Input::Directory(_)))
+        self.inputs.as_slice().iter().any(|input| {
+            matches!(input, Input::Directory(path) if self.filter.traversal.unrestricted || self.live.is_some_and(|anchors| anchors.walks(path)))
+        })
     }
 
     /// Whether the walk selected any file: it passed depth, glob, hidden and
@@ -1682,6 +1751,7 @@ impl<'a> Source<'a> {
                 Input::Directory(path) => {
                     self.policy = match self
                         .live
+                        .filter(|anchors| anchors.walks(&path))
                         .map(|anchors| anchors.start(&path, stopped))
                         .transpose()
                     {
@@ -1692,9 +1762,15 @@ impl<'a> Source<'a> {
                         &path,
                         self.filter.catalog,
                         &self.filter.cwd,
-                        self.filter.traversal.unrestricted || self.live.is_some(),
+                        self.filter.traversal.unrestricted || self.policy.is_some(),
                     ) {
-                        Ok(source) => self.source = Some(source.retaining_parents()),
+                        Ok(source) => {
+                            self.source = Some(
+                                source
+                                    .following_links(self.filter.traversal.follow)
+                                    .retaining_parents(),
+                            )
+                        }
                         Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
                     }
                     self.descend = true;
@@ -1744,6 +1820,7 @@ mod tests {
             "display/file".into(),
             actual,
             engine::reader::Parent::Closed(stat.dev(), stat.ino()),
+            false,
         ));
         let fork = || -> Option<Box<CheckedReader<'_>>> { None };
         run(
