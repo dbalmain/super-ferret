@@ -27,6 +27,7 @@
 //! never wrong about a document; at worst it holds a dead one, which
 //! liveness hides and a merge purges.
 
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -38,7 +39,7 @@ use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
 use crate::merge;
 use crate::segment::{
-    Hit, Inverter, ReadAt, ReadError, Segment, Sizes, TrigramInverter, WriteError, Writer,
+    CHUNK, Hit, Inverter, ReadAt, ReadError, Segment, Sizes, TrigramInverter, WriteError, Writer,
 };
 
 /// Follow flush charge for terms plus 16 bytes per buffered trigram pair.
@@ -98,6 +99,7 @@ pub struct Budget<'a> {
     pub cancelled: &'a dyn Fn() -> bool,
     /// Called before each bounded index-file transfer: the shared background
     /// pacer, or a no-op for explicit commands. An error aborts the transfer.
+    /// A merge charges each input page once, however often it reads it.
     /// Document reads are paced separately by the host's reader.
     pub pace: &'a dyn Fn(usize) -> io::Result<()>,
 }
@@ -848,22 +850,11 @@ impl IndexWriter {
         };
         let inputs = self.current.segments[run.clone()]
             .iter()
-            .map(|segment| {
-                Segment::open(Paced {
-                    file: segment.source(),
-                    pace: &merge_pace,
-                })
-            })
+            .map(|segment| PacedInput::open(segment.source(), &merge_pace))
             .collect::<Result<Vec<_>, _>>()?;
-
         let trigram_inputs = self.current.trigrams[run.clone()]
             .iter()
-            .map(|segment| {
-                Segment::open(Paced {
-                    file: segment.source(),
-                    pace: &merge_pace,
-                })
-            })
+            .map(|segment| PacedInput::open(segment.source(), &merge_pace))
             .collect::<Result<Vec<_>, _>>()?;
         let number = manifest.next_number;
         let scratch = self.dir.join(format!("tmp-{number}.postings"));
@@ -1202,21 +1193,73 @@ fn remove_unnamed(dir: &Path, manifest: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
-/// A segment file with the host's pacer in front of every transfer.
+/// A segment file being written, with the host's pacer in front of every
+/// transfer.
 struct Paced<'a> {
     file: &'a File,
     pace: &'a dyn Fn(usize) -> io::Result<()>,
 }
 
-impl ReadAt for Paced<'_> {
+/// A merge input with the host's pacer in front of its reads, charged once
+/// per page. Checked reads widen to whole chunks, so a merge's cursors read
+/// most pages many times over, and each repeat is a page-cache hit the
+/// limiter has already been charged for.
+struct PacedInput<'a> {
+    file: &'a File,
+    pace: &'a dyn Fn(usize) -> io::Result<()>,
+    size: u64,
+    /// One bit per [`CHUNK`]-byte page of the file, set once it is charged.
+    charged: RefCell<Vec<u64>>,
+}
+
+impl<'a> PacedInput<'a> {
+    fn open(
+        file: &'a File,
+        pace: &'a dyn Fn(usize) -> io::Result<()>,
+    ) -> Result<Segment<Self>, ReadError> {
+        let size = file.size()?;
+        let pages = size.div_ceil(CHUNK as u64);
+        Segment::open(Self {
+            file,
+            pace,
+            size,
+            charged: RefCell::new(vec![0; pages.div_ceil(64) as usize]),
+        })
+    }
+
+    /// Bytes of the pages `[start, end)` touches that no earlier read did,
+    /// which are charged from now on.
+    fn uncharged(&self, start: u64, end: u64) -> u64 {
+        let page = CHUNK as u64;
+        let mut charged = self.charged.borrow_mut();
+        let mut bytes = 0;
+        for p in start / page..end.div_ceil(page) {
+            // Past the end the read itself fails.
+            let Some(word) = charged.get_mut((p / 64) as usize) else {
+                break;
+            };
+            let bit = 1 << (p % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                bytes += self.size.min((p + 1) * page).saturating_sub(p * page);
+            }
+        }
+        bytes
+    }
+}
+
+impl ReadAt for PacedInput<'_> {
     fn size(&self) -> io::Result<u64> {
-        self.file.size()
+        Ok(self.size)
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        for (i, chunk) in buf.chunks_mut(64 << 10).enumerate() {
-            (self.pace)(chunk.len())?;
-            ReadAt::read_exact_at(self.file, chunk, offset + (i * (64 << 10)) as u64)?;
+        for (i, piece) in buf.chunks_mut(64 << 10).enumerate() {
+            let at = offset + (i * (64 << 10)) as u64;
+            // Called even when nothing is new: the pacer is also the
+            // merge's cancellation check.
+            (self.pace)(self.uncharged(at, at + piece.len() as u64) as usize)?;
+            ReadAt::read_exact_at(self.file, piece, at)?;
         }
         Ok(())
     }

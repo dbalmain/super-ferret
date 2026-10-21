@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use super::*;
 use crate::manifest;
+use crate::segment::Section;
 
 const WORDS: [&str; 16] = [
     "amber", "basalt", "cobalt", "dune", "ember", "fjord", "garnet", "heath", "iris", "jade",
@@ -1267,4 +1268,103 @@ fn segment_open_follows_the_thread_count_and_survives_a_refused_spawn() {
         );
     }
     FAIL_OPEN_SPAWN_AT.set(None);
+}
+
+/// A corpus of short postings lists: each document holds 25 words of 3,000,
+/// so a typical list is a few documents and a page holds hundreds of them.
+fn wide_text(doc: u32) -> Vec<u8> {
+    let mut rng = Rng(u64::from(doc) + 1);
+    let words: Vec<String> = (0..25).map(|_| format!("w{}", rng.below(3000))).collect();
+    words.join(" ").into_bytes()
+}
+
+/// An index over [`wide_text`] in several segments.
+fn wide_index(dir: &Dir, catalog: &Catalog) -> IndexWriter {
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    loop {
+        let followed = writer
+            .follow(&catalog.view(), &budget(20_000), &mut |doc, bytes| {
+                bytes.extend_from_slice(&wide_text(doc));
+                Ok(())
+            })
+            .unwrap();
+        if followed.stopped == Stopped::Covered {
+            break;
+        }
+    }
+    let segments = writer.view().manifest().segments.len();
+    assert!(segments >= 4, "{segments} segments");
+    writer
+}
+
+#[test]
+fn a_merge_charges_the_pacer_for_each_input_page_once() {
+    let dir = Dir::new("charge-once");
+    let catalog = Catalog::new(600, &[]);
+    let mut writer = wide_index(&dir, &catalog);
+    let paced = std::cell::Cell::new(0);
+    let pace = |bytes: usize| {
+        paced.set(paced.get() + bytes as u64);
+        Ok(())
+    };
+    let budget = Budget {
+        pace: &pace,
+        ..Budget::unbounded()
+    };
+    let merged = writer.merge_all(&catalog.view(), &budget).unwrap().unwrap();
+    // Reads charge at most the inputs. The writer charges its output, and
+    // at most twice more for a postings section spilled to scratch and
+    // copied back.
+    assert!(
+        paced.get() <= merged.read + 3 * merged.written,
+        "paced {} for {} read and {} written",
+        paced.get(),
+        merged.read,
+        merged.written
+    );
+}
+
+#[test]
+fn a_merge_still_checks_each_input_chunk() {
+    let dir = Dir::new("charge-once-corrupt");
+    let catalog = Catalog::new(600, &[]);
+    let mut writer = wide_index(&dir, &catalog);
+    let path = dir.0.join(writer.view().manifest().segments[1].file_name());
+    let segment = Segment::open(File::open(&path).unwrap()).unwrap();
+    let (blocks, postings) = (
+        segment.section_bytes(Section::Blocks),
+        segment.section_bytes(Section::Postings),
+    );
+    let sections: u64 = [
+        Section::Blocks,
+        Section::Postings,
+        Section::Index,
+        Section::Sums,
+        Section::Fingerprints,
+        Section::FingerprintIndex,
+    ]
+    .map(|s| segment.section_bytes(s))
+    .iter()
+    .sum();
+    let head = fs::metadata(&path).unwrap().len() - sections;
+    let at = head + blocks + postings / 2;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut byte = [0];
+    file.read_exact_at(&mut byte, at).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, &[byte[0] ^ 0xff], at).unwrap();
+
+    let error = writer
+        .merge_all(&catalog.view(), &Budget::unbounded())
+        .err();
+    assert!(
+        matches!(
+            error,
+            Some(Error::Segment(ReadError::Corrupt(Section::Postings)))
+        ),
+        "{error:?}"
+    );
 }
