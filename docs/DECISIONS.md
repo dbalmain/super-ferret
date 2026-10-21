@@ -6411,3 +6411,130 @@ worth doing for write amplification but is not needed for latency.
 What would change it: a merge-size trace from the daemon on a real tree under
 agent traffic showing merges never much above ~6 MB; then 1 is enough and B
 can wait.
+
+## D115 — Should ferret honour git's `core.excludesFile`?
+
+**Status: open, 2026-10-22.**
+
+Question: should ferret read git's `core.excludesFile` setting, and if so in
+uncovered grep's rg mode (D112 B), in the indexed crawl (D13), or both?
+
+Evidence (rg 15.1 and 15.2, git 2.54, private HOME; full notes in the
+research brief):
+
+- **read-from-code:** the crawl's global layer is ferret's own
+  `$XDG_CONFIG_HOME/ferret/ignore`; it reads no git config. Uncovered grep
+  reads git's default global file (`$XDG_CONFIG_HOME/git/ignore`, else
+  `~/.config/git/ignore`) and applies it only inside a work tree.
+- **measured:** inside a work tree, rg and git both honour an absolute or `~/`
+  `core.excludesFile` set in `~/.gitconfig` or `$XDG_CONFIG_HOME/git/config`
+  (`~/.gitconfig` wins), and the setting replaces the default file. git also
+  honours `[include]`d files and per-repo `.git/config`; rg honours neither.
+- **measured:** on this machine the key is unset everywhere, so uncovered
+  grep already agrees with rg and git here.
+- **measured:** the rejected earlier attempt ran three `git` processes per work
+  tree, 1.55 s across the 585 work trees under `~/w`. Reading the files
+  directly costs 37 µs per uncovered grep, or 4.6 ms per crawl at 585 trees.
+
+Options:
+
+- **A — neither.** No new code. A future `core.excludesFile` setting would
+  hide files from rg and git but not from ferret.
+- **B — uncovered grep only.** Each uncovered grep reads the two global git
+  config files (and `GIT_CONFIG_GLOBAL` when set, as rg 15.2 does), then the
+  chosen excludes file: 37 µs, no watches. Matches rg exactly, including that
+  rg ignores `[include]` and `.git/config`. The index keeps D13's rules.
+- **C — both, matching git.** Read global, included and per-repo config in the
+  crawl too (4.6 ms per crawl), and watch those files. The index would start
+  applying git's global excludes, which it does not today, so what it hides
+  changes; rg mode would then differ from rg on includes and local config.
+- **D — crawl only.** The index half of C; uncovered grep still misses the
+  setting.
+
+Recommendation: **B**. It closes the only rg-compatibility gap at no
+measurable cost and leaves D13's index rules alone.
+
+What would change it: deciding that the index should hide what git's global
+excludes hide. Then add one crawl-wide layer for the global setting (C
+without per-repo config).
+
+## D116 — How long should a spawned daemon stay up when idle?
+
+**Status: open, 2026-10-22.**
+
+Question: should the daemon's 15-minute idle exit change, now that grep,
+search and find all spawn it and agents work in bursts?
+
+Evidence (**read-from-code** unless marked):
+
+- `FERRET_DAEMON_IDLE_MS` defaults to 900,000 (15 min); `0` disables exit.
+  A burst after a longer pause pays a cold start: the command that spawns
+  answers in-process from the last published catalog, and the new daemon
+  then walks every root (the startup backstop) at nice 19.
+- Resident memory is **unmeasured** for a daemon. The nearest **measured**
+  figures are a query-only engine at 10.4M names: 410–800 MiB current RSS
+  (ROADMAP S1b M1/M3). A daemon adds a writer, content and one inotify watch
+  per directory.
+- The hourly backstop walk keeps running while the daemon lives.
+- Separately, being built now without a decision because it changes no
+  policy: `ferret index` and `roots remove` spawn the daemon after they
+  publish, as search, find and grep already do.
+
+Options:
+
+- **A — keep 15 minutes.** Memory and watches go away after a short pause.
+  A burst after a longer gap starts cold, and its first command may answer
+  from a stale catalog.
+- **B — raise the default to 4 hours** (an estimate of one sitting). One
+  loaded engine and fresh answers across a working session; holds the
+  daemon's memory and watches through the tail, plus up to four hourly
+  backstop walks.
+- **C — have `ferret index` offer the user systemd unit**
+  (`contrib/systemd/ferretd.service`, `--idle-ms 0`). The only setup where the
+  first command always finds a ready daemon. Holds memory for the whole
+  login, and the template's binary path and index do not match this machine
+  yet.
+
+Recommendation: **A**, plus the spawn from `index` that is already being
+built.
+
+What would change it: the daemon's steady RSS on the index you actually use.
+If it is well under ~400 MiB, choose B.
+
+## D117 — Should an answer from a possibly stale index say so?
+
+**Status: open, 2026-10-22.**
+
+Question: when no daemon is reachable and a command answers in-process from
+the published catalog, should it print a one-line notice on stderr if that
+catalog is old?
+
+Evidence (**read-from-code**):
+
+- `search --help` says the daemon keeps names and content within about a
+  second of change. On the fallback path that is false, and nothing says so.
+  A file an agent wrote minutes ago can be missing from `grep`, `find` and
+  `search`.
+- The manifest carries no clock, but every publication renames `current`
+  into place, so its mtime is the publication time: one `stat`.
+- `--quiet` already means "stop after a match" in grep, so a silencing switch
+  would have to be new (for example `FERRET_STALE_NOTICE=0`, shaped like
+  `FERRET_NO_DAEMON`).
+
+Options:
+
+- **A — stay silent.** Nothing changes; stale answers stay unannounced.
+- **B — one stderr line when no ready daemon was reachable and the catalog is
+  older than 60 s.** Exit status is unchanged. 60 s sits above the 1 s
+  debounce and the 10 s startup deadline, so a fresh index stays quiet. A
+  harness that treats any stderr as failure would flag a stale but successful
+  grep.
+- **C — warn on every local answer from an old catalog**, daemon or not.
+  Covers paths that never try the socket (find actions, `-I`), but warns while
+  an idle daemon is correctly keeping an unchanged tree.
+
+Recommendation: **B**, 60 s, on by default.
+
+What would change it: agent harnesses that fail a tool call when stderr is
+non-empty. Then default the notice off for grep and keep it for search and
+find.
