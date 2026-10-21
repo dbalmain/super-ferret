@@ -98,6 +98,60 @@ fn duration(name: &str, default: u64) -> Duration {
             .unwrap_or(default),
     )
 }
+
+// Linux errno. `ErrorKind` maps EMFILE, ENFILE, ENOBUFS and EPROTO to
+// Uncategorized, the same bucket as fatal accept failures such as EBADF.
+const EINTR: i32 = 4;
+const ENOMEM: i32 = 12;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const EPROTO: i32 = 71;
+const ECONNABORTED: i32 = 103;
+const ENOBUFS: i32 = 105;
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
+// EPROTO matches ECONNABORTED: Linux has already dropped one bad queued
+// connection, and one handshake must not take the daemon down with it.
+fn transient_accept(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(EINTR | ENOMEM | ENFILE | EMFILE | EPROTO | ECONNABORTED | ENOBUFS)
+    )
+}
+fn next_accepted(listener: &UnixListener) -> io::Result<UnixStream> {
+    if let Some(error) = take_test_accept_error() {
+        return Err(error);
+    }
+    listener.accept().map(|(stream, _)| stream)
+}
+fn take_test_accept_error() -> Option<io::Error> {
+    // The value is a path. The accept thread injects one error when that file
+    // holds an errno name, then removes it. Release builds have no hook.
+    #[cfg(debug_assertions)]
+    {
+        let path = std::env::var_os("FERRET_DAEMON_TEST_ACCEPT_ERROR")?;
+        let text = fs::read_to_string(&path).ok()?;
+        let code = test_accept_errno(text.trim())?;
+        let _ = fs::remove_file(&path);
+        Some(io::Error::from_raw_os_error(code))
+    }
+    #[cfg(not(debug_assertions))]
+    None
+}
+#[cfg(debug_assertions)]
+fn test_accept_errno(name: &str) -> Option<i32> {
+    Some(match name {
+        "EINTR" => EINTR,
+        "ENOMEM" => ENOMEM,
+        "ENFILE" => ENFILE,
+        "EMFILE" => EMFILE,
+        "EPROTO" => EPROTO,
+        "ECONNABORTED" => ECONNABORTED,
+        "ENOBUFS" => ENOBUFS,
+        "EBADF" => 9,
+        _ => return None,
+    })
+}
 fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let mut index = std::env::var_os("FERRET_INDEX")
         .filter(|value| !value.is_empty())
@@ -162,13 +216,28 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let accept_lock = lock.try_clone()?;
     std::thread::spawn(move || {
         let _lock = &accept_lock;
+        // One line per streak. A persistent EMFILE would otherwise fill stderr.
+        let mut reported = false;
         loop {
-            if accept_send
-                .send(ServerEvent::Accepted(
-                    listener.accept().map(|(stream, _)| stream),
-                ))
-                .is_err()
-            {
+            let accepted = match next_accepted(&listener) {
+                Err(error) if transient_accept(&error) => {
+                    if !reported {
+                        crate::cli::warn(&format!("accept: {error}; continuing"));
+                        reported = true;
+                    }
+                    // EMFILE and ENFILE leave the connection queued. Retrying
+                    // immediately pegs a core until a descriptor frees.
+                    if matches!(error.raw_os_error(), Some(ENFILE | EMFILE)) {
+                        std::thread::sleep(ACCEPT_BACKOFF);
+                    }
+                    continue;
+                }
+                other => {
+                    reported = false;
+                    other
+                }
+            };
+            if accept_send.send(ServerEvent::Accepted(accepted)).is_err() {
                 break;
             }
         }
@@ -204,6 +273,9 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     });
     let writer = writer::start(host.clone(), writer_receive);
     let mut idle_since = Instant::now();
+    // Every exit, including a fatal accept and a dead accept thread, joins
+    // the writer before the socket is removed (D110).
+    let mut exit_error = None;
     loop {
         let draining = host
             .lifecycle
@@ -223,15 +295,20 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         // Once work blocks an expired deadline, its completion notification
         // supplies the next wakeup; a zero timeout would spin.
         let event = if idle.is_zero() || clients != 0 || (busy && idle_since.elapsed() >= idle) {
-            server_receive
-                .recv()
-                .map_err(|_| io::Error::other("accept loop stopped"))?
+            match server_receive.recv() {
+                Ok(event) => event,
+                Err(mpsc::RecvError) => {
+                    exit_error = Some(io::Error::other("accept loop stopped"));
+                    break;
+                }
+            }
         } else {
             match server_receive.recv_timeout(idle.saturating_sub(idle_since.elapsed())) {
                 Ok(event) => event,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::other("accept loop stopped"));
+                    exit_error = Some(io::Error::other("accept loop stopped"));
+                    break;
                 }
             }
         };
@@ -246,7 +323,10 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
                 });
             }
             ServerEvent::Accepted(Ok(_)) => {}
-            ServerEvent::Accepted(Err(error)) => return Err(error),
+            ServerEvent::Accepted(Err(error)) => {
+                exit_error = Some(error);
+                break;
+            }
         }
     }
     host.stop.store(true, Ordering::Release);
@@ -261,14 +341,22 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     }
     // The lifetime-held endpoint lock excludes starters through cleanup. Never
     // unlink a replacement created by somebody else after our socket vanished.
-    if let Ok(current) = fs::symlink_metadata(endpoint.socket())
+    let removed = if let Ok(current) = fs::symlink_metadata(endpoint.socket())
         && current.dev() == own_socket.dev()
         && current.ino() == own_socket.ino()
     {
-        endpoint.remove_socket()?;
-    }
+        endpoint.remove_socket()
+    } else {
+        Ok(())
+    };
     drop(cleanup);
     drop(lock);
+    // The accept error is why this host left. A removal failure still runs
+    // through SocketCleanup above; surfacing it instead would hide the cause.
+    if let Some(error) = exit_error {
+        return Err(error);
+    }
+    removed?;
     Ok(())
 }
 fn owner_responds(socket: &Path) -> bool {

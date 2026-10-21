@@ -139,6 +139,15 @@ impl Tree {
     fn connect(&self) -> (BufReader<UnixStream>, String) {
         ready(UnixStream::connect(self.socket()).unwrap())
     }
+    fn try_wait(&self, pid: u32) -> Option<std::process::ExitStatus> {
+        self.children
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|child| child.id() == pid)?
+            .try_wait()
+            .unwrap()
+    }
 }
 impl Drop for Tree {
     fn drop(&mut self) {
@@ -2841,4 +2850,165 @@ fn text_stats_reads_the_daemon_pin_when_the_snapshot_is_hidden() {
         String::from_utf8_lossy(&local.stderr)
     );
     assert_eq!(fixture_daemons(&tree.base).len(), 1);
+}
+
+fn publish_accept_error(path: &std::path::Path, name: &str) {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, name).unwrap();
+    fs::rename(&temporary, path).unwrap();
+}
+
+fn task_names(pid: u32) -> Vec<String> {
+    fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_to_string(entry.path().join("comm")).ok())
+        .map(|name| name.trim().to_owned())
+        .collect()
+}
+
+fn ready_within(tree: &Tree, bound: Duration) -> String {
+    let socket = tree.socket();
+    let stream = UnixStream::connect(&socket).unwrap();
+    stream.set_read_timeout(Some(bound)).unwrap();
+    stream.set_write_timeout(Some(bound)).unwrap();
+    let mut reader = BufReader::new(stream);
+    let until = Instant::now() + bound;
+    loop {
+        assert!(Instant::now() < until, "daemon did not become ready");
+        let hello = line(&mut reader);
+        if hello.contains("\"state\":\"ready\"") {
+            return hello;
+        }
+        assert!(hello.contains("\"state\":\"loading\""), "{hello}");
+    }
+}
+
+/// Fatal accept must join the writer (and therefore its merge worker) and
+/// release the catalog lock before the socket disappears. Process exit would
+/// drop the flock anyway, so the check is the window while ferretd is still
+/// alive: the merge thread is gone, the socket is still there, and another
+/// writer cannot take the lock.
+#[test]
+#[cfg(debug_assertions)]
+fn fatal_accept_error_joins_the_merge_before_removing_the_socket() {
+    let tree = Tree::new();
+    for i in 0..600 {
+        let text = (0..400)
+            .map(|word| format!("word{i}part{word} "))
+            .collect::<String>();
+        fs::write(tree.base.join(format!("src/merge-{i}.txt")), text).unwrap();
+    }
+    let indexed = fixture::command(FERRET, &tree.base)
+        .args(["index", "src"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "index: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let gate = tree.base.join("content-gate");
+    fs::create_dir_all(&gate).unwrap();
+    fs::write(gate.join("merge"), b"hold").unwrap();
+    let hook = tree.base.join("accept-error");
+    let pid = tree.start(&[
+        ("FERRET_DAEMON_IDLE_MS", "0"),
+        ("FERRET_BACKSTOP_MS", "3600000"),
+        ("FERRET_POLL_MS", "300000"),
+        ("FERRET_CONTENT_TEST_GATE", gate.to_str().unwrap()),
+        ("FERRET_DAEMON_TEST_ACCEPT_ERROR", hook.to_str().unwrap()),
+        ("FERRET_DAEMON_TEST_STOP_DELAY_MS", "3000"),
+    ]);
+    ready_within(&tree, Duration::from_secs(60));
+    for i in 0..240 {
+        fs::remove_file(tree.base.join(format!("src/merge-{i}.txt"))).unwrap();
+    }
+    let merge_by = Instant::now() + Duration::from_secs(60);
+    while !gate.join("merge.reached").exists() {
+        assert!(
+            tree.try_wait(pid).is_none(),
+            "daemon exited before the merge was held"
+        );
+        assert!(Instant::now() < merge_by, "merge did not reach the gate");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        task_names(pid).iter().any(|name| name == "ferret-merge"),
+        "merge worker was not running"
+    );
+    publish_accept_error(&hook, "EBADF");
+    let _ = UnixStream::connect(tree.socket());
+    let observed = Instant::now() + Duration::from_secs(15);
+    while tree.try_wait(pid).is_some()
+        || tree.sockets().is_empty()
+        || task_names(pid).iter().any(|name| name == "ferret-merge")
+    {
+        assert!(
+            Instant::now() < observed,
+            "merge stayed up, or the socket vanished, before the writer was joined"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    match ferret_catalog::WriterSession::open(&tree.base.join("index")) {
+        Err(ferret_catalog::log::Error::Locked) => {}
+        Err(error) => panic!("catalog lock released while the socket was still present: {error}"),
+        Ok(_) => panic!("catalog lock released while the socket was still present"),
+    }
+    let exited = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = tree.try_wait(pid) {
+            break status;
+        }
+        assert!(Instant::now() < exited, "daemon did not finish teardown");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(3), "{status}");
+    assert!(tree.sockets().is_empty(), "socket survived teardown");
+    assert!(
+        gate.join("merge").exists(),
+        "the test must not release the merge itself"
+    );
+    let writer = ferret_catalog::WriterSession::open(&tree.base.join("index"))
+        .unwrap_or_else(|error| panic!("catalog lock survived teardown: {error}"));
+    drop(writer);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn transient_accept_errors_do_not_stop_the_daemon() {
+    let tree = Tree::new();
+    let hook = tree.base.join("accept-error");
+    let pid = tree.start(&[("FERRET_DAEMON_TEST_ACCEPT_ERROR", hook.to_str().unwrap())]);
+    for name in [
+        "ECONNABORTED",
+        "EINTR",
+        "EPROTO",
+        "EMFILE",
+        "ENFILE",
+        "ENOBUFS",
+        "ENOMEM",
+    ] {
+        publish_accept_error(&hook, name);
+        let _ = UnixStream::connect(tree.socket());
+        wait(|| !hook.exists());
+        let output = tree.run(&["search", "case:main"]);
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.windows(4).any(|part| part == b"main"),
+            "{name}"
+        );
+        let (_, hello) = tree.connect();
+        assert_eq!(
+            number(&hello, "pid"),
+            Some(pid),
+            "{name} replaced the daemon"
+        );
+        assert_eq!(tree.sockets().len(), 1, "{name}");
+    }
 }
