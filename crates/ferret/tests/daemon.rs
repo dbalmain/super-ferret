@@ -12,7 +12,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
@@ -1386,6 +1387,146 @@ fn drain_closes_a_separate_idle_connection_and_finishes_active_query() {
         }
     }
     wait(|| !socket.exists() && exited(&tree, pid));
+}
+
+#[test]
+fn a_writer_that_meets_a_draining_owner_waits_and_then_indexes_in_process() {
+    // A drained owner closes new connections before hello; writer commands
+    // used to fail with exit 3 instead of waiting for it to go (D110).
+    let tree = Tree::new();
+    let pid = tree.start(&[]);
+    let socket = tree.socket();
+    let (mut idle, _) = tree.connect();
+    let mut active = begin_large(&tree);
+    let (mut control, _) = tree.connect();
+    control
+        .get_mut()
+        .write_all(b"{\"op\":\"drain\"}\n")
+        .unwrap();
+    let mut eof = String::new();
+    assert_eq!(idle.read_line(&mut eof).unwrap(), 0);
+    fs::write(tree.base.join("src/after-drain.txt"), "x").unwrap();
+    let mut child = tree
+        .command(&["index", "src"])
+        .env("FERRET_DAEMON_STARTUP_MS", "10000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the writer did not wait for the draining owner"
+    );
+    while !line(&mut active).contains("\"event\":\"end\"") {}
+    drop(active);
+    wait(|| !socket.exists() && exited(&tree, pid));
+    let indexed = bounded_output(child);
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(tree.local(&["search", "after-drain.txt"]).status.success());
+}
+
+/// An owner that accepts and closes every connection before hello, as an
+/// exiting or draining ferretd does, until `stop` is set. Returns the socket
+/// and the number of connections it has closed.
+fn closing_owner(
+    tree: &Tree,
+) -> (
+    PathBuf,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    let (listener, _, socket) = tree.fake_owner();
+    let closed = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let owner = {
+        let closed = closed.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        closed.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+        })
+    };
+    (socket, closed, stop, owner)
+}
+
+#[test]
+fn a_query_falls_back_at_once_and_a_writer_waits_for_a_leaving_owner() {
+    let tree = Tree::new();
+    let (socket, closed, stop, owner) = closing_owner(&tree);
+    let started = Instant::now();
+    let searched = tree
+        .command(&["search", "main"])
+        .env("FERRET_DAEMON_STARTUP_MS", "10000")
+        .output()
+        .unwrap();
+    assert!(searched.status.success());
+    assert!(started.elapsed() < BOUND, "a query waited for the owner");
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
+
+    fs::write(tree.base.join("src/after-exit.txt"), "x").unwrap();
+    let child = tree
+        .command(&["index", "src"])
+        .env("FERRET_DAEMON_STARTUP_MS", "10000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait(|| closed.load(Ordering::SeqCst) == 2);
+    fs::remove_file(&socket).unwrap();
+    stop.store(true, Ordering::SeqCst);
+    owner.join().unwrap();
+    let indexed = bounded_output(child);
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert_eq!(closed.load(Ordering::SeqCst), 2);
+    assert!(tree.local(&["search", "after-exit.txt"]).status.success());
+}
+
+#[test]
+fn a_writer_times_out_on_an_owner_that_closes_and_never_leaves() {
+    // The client cap closes without hello and keeps its socket; the wait is
+    // bounded by the startup deadline and reports the owner timeout.
+    let tree = Tree::new();
+    let (_, closed, stop, owner) = closing_owner(&tree);
+    let started = Instant::now();
+    let indexed = tree
+        .command(&["index", "src"])
+        .env("FERRET_DAEMON_STARTUP_MS", "400")
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    owner.join().unwrap();
+    assert_eq!(indexed.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&indexed.stderr).contains("daemon owner did not become ready"),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(
+        (Duration::from_millis(400)..BOUND).contains(&elapsed),
+        "{elapsed:?}"
+    );
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
 }
 
 #[test]

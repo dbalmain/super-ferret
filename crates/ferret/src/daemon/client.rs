@@ -204,12 +204,16 @@ fn connect_owner(
     let context = endpoint::context()?;
     let mut draining_socket = None;
     while Instant::now() < until {
-        if let Some(identity) = draining_socket
-            && fs::symlink_metadata(endpoint.socket())
+        if let Some(identity) = draining_socket {
+            if fs::symlink_metadata(endpoint.socket())
                 .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
-        {
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
+            {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            // The leaving owner is gone: carry on as if it had never been
+            // seen, so a writer with nobody listening runs in-process.
+            *observed_owner = false;
         }
         let connected = fs::symlink_metadata(endpoint.socket()).and_then(|metadata| {
             if !metadata.file_type().is_socket()
@@ -221,10 +225,11 @@ fn connect_owner(
                     "unusable daemon socket",
                 ));
             }
-            UnixStream::connect(endpoint.socket())
+            let identity = (metadata.dev(), metadata.ino());
+            UnixStream::connect(endpoint.socket()).map(|stream| (stream, identity))
         });
         match connected {
-            Ok(stream) => {
+            Ok((stream, identity)) => {
                 *observed_owner = true;
                 stream.set_read_timeout(Some(
                     until
@@ -233,15 +238,30 @@ fn connect_owner(
                 ))?;
                 let mut reader = BufReader::new(stream);
                 let mut line = Vec::new();
+                // A close before any hello is an owner that is exiting,
+                // draining or full. A writer waits for its socket to go, as
+                // for a build-mismatch drain: the daemon releases its catalog
+                // lock before removing the socket (D110). Queries answer
+                // in-process at once instead.
+                let mut hello = match event(&mut reader, &mut line) {
+                    Err(error)
+                        if writer
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                            ) =>
+                    {
+                        draining_socket = Some(identity);
+                        continue;
+                    }
+                    hello => hello?,
+                };
                 // Writer commands wait out loading on this connection, within
                 // the startup deadline: answering in-process would race the
-                // daemon's writer ownership. Queries answer in-process instead.
-                let hello = loop {
-                    let hello = event(&mut reader, &mut line)?;
-                    if !(writer && field_text(&hello, "state") == Some("loading")) {
-                        break hello;
-                    }
-                };
+                // daemon's writer ownership.
+                while writer && field_text(&hello, "state") == Some("loading") {
+                    hello = event(&mut reader, &mut line)?;
+                }
                 if field_text(&hello, "event") != Some("hello")
                     || field_number(&hello, "major") != Some(MAJOR)
                     || field_text(&hello, "index") != Some(&endpoint.identity)
