@@ -27,6 +27,13 @@ resident engine. Names-only directory requests reuse the resident catalog;
 the fallback retains the existing four-section lazy open. Names-only `-` is
 just a label and can accompany a remote directory listing. Debug `FERRET_TEST_*` injections also stay local.
 
+When no daemon is running, the first indexed directory content or `--files`
+call starts one and answers in-process immediately, as search does. Later calls
+use the ready owner. Find and grep share endpoint ownership/mode, namespace /
+credentials, index identity, protocol and incarnation checks, plus the existing
+build-mismatch drain/replacement path. A loading, refused or pre-hello-closed
+owner still causes query fallback; D110's behavior is unchanged.
+
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
 data. Missing/incompatible indexes or unindexed directory starts exit 2 with
 index/live advice. Mixed operands use their respective sources. Help/version

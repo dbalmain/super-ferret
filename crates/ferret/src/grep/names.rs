@@ -404,7 +404,8 @@ fn emit(
 ) -> Result<bool, String> {
     *listed = true;
     if plan.quiet {
-        cancelled.store(true, Ordering::Release);
+        // The serial host returns immediately; this is normal completion,
+        // not cancellation of the socket connection supplying the flag.
         return Ok(true);
     }
     presentation::path(

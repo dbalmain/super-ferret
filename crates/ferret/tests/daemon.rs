@@ -107,6 +107,21 @@ impl Tree {
         }
         pid
     }
+    fn fake_owner(&self) -> (UnixListener, String, PathBuf) {
+        self.start(&[]);
+        let (_, hello) = self.connect();
+        let socket = self.socket();
+        {
+            let mut children = self.children.lock().unwrap();
+            children[0].kill().unwrap();
+            children[0].wait().unwrap();
+        }
+        fs::remove_file(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (listener, hello, socket)
+    }
     fn connect(&self) -> (BufReader<UnixStream>, String) {
         ready(UnixStream::connect(self.socket()).unwrap())
     }
@@ -180,6 +195,18 @@ fn wait(mut condition: impl FnMut() -> bool) {
         assert!(Instant::now() < until, "deadline exceeded");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+fn accept_peer(listener: &UnixListener) -> UnixStream {
+    let mut peer = None;
+    wait(|| match listener.accept() {
+        Ok((stream, _)) => {
+            peer = Some(stream);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("accept: {error}"),
+    });
+    peer.unwrap()
 }
 fn line(reader: &mut BufReader<UnixStream>) -> String {
     let mut line = String::new();
@@ -447,29 +474,37 @@ fn stale_socket_is_replaced_and_index_identities_are_isolated() {
 
 #[test]
 fn unsafe_runtime_and_symlink_directory_fall_back_without_creating_files() {
-    for mode in [0o755, 0o770] {
+    for args in [
+        &["search", "main"][..],
+        &["find", "src", "-name", "main.rs"],
+        &["grep", "main", "src"],
+        &["grep", "--files", "src"],
+    ] {
+        for mode in [0o755, 0o770] {
+            let tree = Tree::new();
+            let runtime = tree.base.join("home/runtime");
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(mode)).unwrap();
+            parity(&tree, args);
+            assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+        }
+        let tree = Tree::new();
+        let target = tree.base.join("target");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, tree.base.join("home/runtime/ferret")).unwrap();
+        parity(&tree, args);
+        assert!(fs::read_dir(target).unwrap().next().is_none());
         let tree = Tree::new();
         let runtime = tree.base.join("home/runtime");
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(mode)).unwrap();
-        parity(&tree, &["search", "main"]);
-        assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+        // root-owned /proc is an existing wrong-owner directory without
+        // privileges.
+        let out = tree
+            .command(args)
+            .env("XDG_RUNTIME_DIR", "/proc")
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, tree.local(args).stdout);
+        assert!(fs::read_dir(runtime).unwrap().next().is_none());
     }
-    let tree = Tree::new();
-    let target = tree.base.join("target");
-    fs::create_dir(&target).unwrap();
-    symlink(&target, tree.base.join("home/runtime/ferret")).unwrap();
-    parity(&tree, &["search", "main"]);
-    assert!(fs::read_dir(target).unwrap().next().is_none());
-    let tree = Tree::new();
-    let runtime = tree.base.join("home/runtime");
-    // root-owned /proc is an existing wrong-owner directory without privileges.
-    let out = tree
-        .command(&["search", "main"])
-        .env("XDG_RUNTIME_DIR", "/proc")
-        .output()
-        .unwrap();
-    assert_eq!(out.stdout, tree.local(&["search", "main"]).stdout);
-    assert!(fs::read_dir(runtime).unwrap().next().is_none());
 }
 
 #[test]
@@ -848,46 +883,57 @@ fn cancelling_blocked_output_and_hangup_release_all_query_slots() {
 #[test]
 #[cfg(debug_assertions)]
 fn build_mismatch_drains_finishes_in_flight_and_restarts_client_binary() {
-    let tree = Tree::new();
-    let old_pid = tree.start(&[("FERRET_DAEMON_TEST_BUILD", "old-build")]);
-    let mut active = begin_large(&tree);
-    let socket = tree.socket();
-    let child = tree
-        .command(&["search", "main"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // The old query is blocked, so graceful replacement must still be waiting.
-    std::thread::sleep(Duration::from_millis(60));
-    assert!(socket.exists());
-    assert!(
-        tree.children.lock().unwrap()[0]
-            .try_wait()
-            .unwrap()
-            .is_none()
-    );
-    let mut ended = false;
-    loop {
-        let mut next = String::new();
-        if active.read_line(&mut next).unwrap() == 0 {
-            break;
+    for args in [
+        &["search", "main"][..],
+        &["find", "src", "-name", "main.rs"],
+        &["grep", "main", "src"],
+        &["grep", "--files", "src"],
+    ] {
+        let tree = Tree::new();
+        let old_pid = tree.start(&[("FERRET_DAEMON_TEST_BUILD", "old-build")]);
+        let mut active = begin_large(&tree);
+        let socket = tree.socket();
+        let child = tree
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The old query is blocked, so graceful replacement must still be
+        // waiting.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(socket.exists());
+        assert!(
+            tree.children.lock().unwrap()[0]
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        let mut ended = false;
+        loop {
+            let mut next = String::new();
+            if active.read_line(&mut next).unwrap() == 0 {
+                break;
+            }
+            if next.contains("\"event\":\"end\"") {
+                assert!(next.contains("\"exit\":0"), "{next}");
+                ended = true;
+            }
         }
-        if next.contains("\"event\":\"end\"") {
-            assert!(next.contains("\"exit\":0"), "{next}");
-            ended = true;
-        }
+        assert!(ended);
+        let output = bounded_output(child);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let local = tree.local(args);
+        assert_eq!(output.stdout, local.stdout, "{args:?}");
+        assert_eq!(output.stderr, local.stderr, "{args:?}");
+        let (_, hello) = tree.connect();
+        assert_ne!(number(&hello, "pid"), Some(old_pid));
+        assert!(!hello.contains("old-build"));
     }
-    assert!(ended);
-    let output = bounded_output(child);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let (_, hello) = tree.connect();
-    assert_ne!(number(&hello, "pid"), Some(old_pid));
-    assert!(!hello.contains("old-build"));
 }
 
 #[test]
@@ -1868,19 +1914,9 @@ fn grep_falls_back_when_a_peer_closes_before_hello_or_refuses_it() {
 #[test]
 fn a_client_accepts_legacy_frames_when_raw_output_is_not_advertised() {
     let tree = Tree::new();
-    tree.start(&[]);
-    let (_, hello) = tree.connect();
-    let socket = tree.socket();
-    {
-        let mut children = tree.children.lock().unwrap();
-        children[0].kill().unwrap();
-        children[0].wait().unwrap();
-    }
-    fs::remove_file(&socket).unwrap();
-    let listener = UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let (listener, hello, socket) = tree.fake_owner();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_peer(&listener);
         stream.set_read_timeout(Some(BOUND)).unwrap();
         stream
             .write_all(hello.replace(",\"raw-output-v1\"", "").as_bytes())
@@ -1936,5 +1972,93 @@ fn raw_output_negotiation_is_per_request_and_preserves_legacy_peers() {
                 break;
             }
         }
+        // A normal quiet listing must not cancel the connection; the next
+        // iteration reuses this same peer and can negotiate another codec.
+        let quiet = request.replace(r#"["main","src"]"#, r#"["--files","-q","src"]"#);
+        peer.get_mut()
+            .write_all(format!("{quiet}\n").as_bytes())
+            .unwrap();
+        assert!(line(&mut peer).contains("\"event\":\"begin\""));
+        let end = line(&mut peer);
+        assert!(end.contains("\"event\":\"end\""));
+        assert_eq!(number(&end, "exit"), Some(0));
+        assert!(end.contains("\"cancelled\":false"), "{end}");
     }
+}
+
+// Search starts a daemon and answers its first query locally. Grep must do the
+// same, including --files, rather than waiting for the new owner to load.
+#[test]
+#[cfg(debug_assertions)]
+fn directory_grep_starts_one_daemon_and_answers_first_locally() {
+    for args in [&["grep", "main", "src"][..], &["grep", "--files", "src"]] {
+        let tree = Tree::new();
+        assert!(tree.sockets().is_empty());
+        let first = tree
+            .command(args)
+            .env("FERRET_DAEMON_LOAD_DELAY_MS", "5000")
+            .output()
+            .unwrap();
+        let local = tree.local(args);
+        assert!(first.status.success(), "{first:?}");
+        assert_eq!(first.stdout, local.stdout);
+        assert_eq!(first.stderr, local.stderr);
+        wait(|| fixture_daemons(&tree.base).len() == 1 && tree.sockets().len() == 1);
+        let stream = UnixStream::connect(tree.socket()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut peer = BufReader::new(stream);
+        // The first query has already completed while the server cannot yet
+        // execute any query: its output necessarily came from the local host.
+        assert!(line(&mut peer).contains("\"state\":\"loading\""));
+        loop {
+            if line(&mut peer).contains("\"state\":\"ready\"") {
+                break;
+            }
+        }
+        let second = tree.run(args);
+        assert!(second.status.success(), "{second:?}");
+        assert_eq!(second.stdout, first.stdout);
+        assert_eq!(second.stderr, first.stderr);
+        assert_eq!(fixture_daemons(&tree.base).len(), 1);
+    }
+}
+
+#[test]
+fn find_and_grep_refuse_the_same_incompatible_owner_hellos() {
+    let tree = Tree::new();
+    let (listener, hello, socket) = tree.fake_owner();
+    let mutations = [
+        ("\"major\":1", "\"major\":99"),
+        ("\"index\":\"", "\"index\":\"wrong-"),
+        ("\"context\":\"", "\"context\":\"wrong-"),
+        ("\"incarnation\":\"", "\"incarnation\":\"wrong-"),
+    ];
+    let server = std::thread::spawn(move || {
+        for (from, to) in mutations {
+            assert!(hello.contains(from));
+            for _ in 0..3 {
+                let mut stream = accept_peer(&listener);
+                stream.set_read_timeout(Some(BOUND)).unwrap();
+                stream
+                    .write_all(hello.replace(from, to).as_bytes())
+                    .unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                assert!(request.is_empty(), "query sent to an incompatible owner");
+            }
+        }
+    });
+    for _ in mutations {
+        for args in [
+            &["find", "src", "-name", "main.rs"][..],
+            &["grep", "main", "src"],
+            &["grep", "--files", "src"],
+        ] {
+            parity(&tree, args);
+        }
+    }
+    server.join().unwrap();
+    fs::remove_file(socket).unwrap();
 }

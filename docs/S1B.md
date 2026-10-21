@@ -267,6 +267,8 @@ payload is transport failure, and clients reject oversized/unnegotiated lengths.
 Peers without the capability retain base64 JSON. Public JSON find and batch
 stdout retain their existing JSON-only format. Existing build-mismatch owner
 replacement still applies independently of this optional codec negotiation.
+A successful `--files -q` ends with `cancelled: false`: it returns from the
+serial listing without cancelling the connection, which remains reusable.
 
 D111 adds `op: "grep"` with ordinary content or `--files` argv and an absolute `cwd`.
 The required `grep` object carries explicit boolean `color`, `heading`,
