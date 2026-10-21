@@ -28,7 +28,7 @@ mod rules;
 use std::fmt;
 use std::path::PathBuf;
 
-pub use grep::{GrepGlobError, GrepSelection};
+pub use grep::{GrepGlobError, GrepIgnore, GrepSelection};
 pub use rules::DirRules;
 
 /// What setup writes to a new global ignore file: the M1 list, measured on

@@ -150,7 +150,8 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         None
     };
     let covered = routing.as_ref().is_none_or(live::Anchors::all_covered);
-    if plan.traversal.follow
+    if recursive
+        && plan.traversal.follow
         && !plan.traversal.unrestricted
         && routing
             .as_ref()
@@ -370,8 +371,8 @@ impl Execution<'_> {
             let mut segment = Vec::new();
             while inputs.peek().is_some_and(|input| {
                 !matches!(input, Input::Stdin)
-                    && (!(buffered_path_output(plan, runtime.tty) || !covered_inputs(live))
-                        || segment.is_empty())
+                    && (segment.is_empty()
+                        || !buffered_path_output(plan, runtime.tty) && covered_inputs(live))
             }) {
                 if let Some(input) = inputs.next() {
                     segment.push(input);

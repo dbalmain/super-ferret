@@ -139,7 +139,12 @@ fn nested_git_repository_uses_its_own_rules() {
 fn hidden_entries_are_skipped_unless_hidden_is_set() {
     let f = Fixture::new("hidden");
     f.repo();
-    for path in ["visible.txt", ".hidden.txt", ".hidden/deep.txt"] {
+    for path in [
+        "visible.txt",
+        ".hidden.txt",
+        ".hidden/deep.txt",
+        ".git/objects/data",
+    ] {
         f.write(path, b"hit\n");
     }
     f.compare_all(
@@ -168,7 +173,7 @@ fn files_over_eight_mib_are_searched() {
     let mut contents = vec![b'x'; 8 * 1024 * 1024 + 1];
     contents.extend_from_slice(b"\nhit\n");
     f.write("large.txt", &contents);
-    f.compare(&f.tree, &["-l", "hit", "large.txt"], true);
+    f.compare(&f.tree, &["-l", "hit", "."], true);
 }
 
 #[test]
@@ -187,6 +192,9 @@ fn symlinked_directory_is_skipped_unless_follow_is_set() {
     f.repo();
     f.write("real/match.txt", b"hit\n");
     symlink("real", f.tree.join("linked")).unwrap();
+    f.write("real/binary", b"hit\0binary\n");
+    symlink("real/match.txt", f.tree.join("file-link")).unwrap();
+    f.compare(&f.tree, &["-L", "-l", "hit", "."], true);
     f.compare_all(
         &f.tree,
         &[
@@ -194,4 +202,101 @@ fn symlinked_directory_is_skipped_unless_follow_is_set() {
             (&["-L", "-l", "hit", "."], true),
         ],
     );
+}
+
+// An unrelated index must never make an uncovered search open content or
+// contact a daemon: a corrupt content manifest would otherwise fail the call.
+#[test]
+fn uncovered_search_bypasses_unrelated_content_and_daemon() {
+    let f = Fixture::new("unrelated-index");
+    let indexed = f.base.join("indexed");
+    fs::create_dir(&indexed).unwrap();
+    fs::write(indexed.join("file"), b"hit\n").unwrap();
+    f.index(&indexed);
+    fs::write(f.base.join("index/index/manifest"), b"broken").unwrap();
+    f.write("visible.txt", b"hit\n");
+    f.compare(&f.tree, &["-l", "hit", "."], true);
+    let mut command = f.command(std::ffi::OsStr::new(env!("CARGO_BIN_EXE_ferret")), &f.tree);
+    let output = command
+        .env_remove("FERRET_NO_DAEMON")
+        .env("FERRET_DAEMON_BIN", "/does/not/exist")
+        .args(["grep", "-l", "hit", "."])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"./visible.txt\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(!f.base.join("home/runtime/ferret").exists());
+}
+
+// Covered operands retain snapshot membership while uncovered operands read
+// current names. Both orders must preserve operand barriers and output shape.
+#[test]
+fn mixed_operands_use_snapshot_and_live_in_operand_order() {
+    let f = Fixture::new("mixed");
+    f.write("covered/old.txt", b"hit\n");
+    f.index(&f.tree.join("covered"));
+    f.write("covered/new.txt", b"hit\n");
+    f.write("uncovered/new.txt", b"hit\n");
+    for (args, expected) in [
+        (
+            ["covered", "uncovered"],
+            "covered/old.txt\nuncovered/new.txt\n",
+        ),
+        (
+            ["uncovered", "covered"],
+            "uncovered/new.txt\ncovered/old.txt\n",
+        ),
+    ] {
+        let actual = f.ferret(&f.tree, &["-l", "hit", args[0], args[1]]);
+        assert_eq!(actual.status.code(), Some(0), "{actual:?}");
+        assert_eq!(actual.stdout, expected.as_bytes());
+        let actual = f.ferret(&f.tree, &["--files", args[0], args[1]]);
+        assert_eq!(actual.status.code(), Some(0), "{actual:?}");
+        assert_eq!(actual.stdout, expected.as_bytes());
+    }
+}
+
+#[test]
+fn rgignore_outranks_a_closer_gitignore() {
+    let f = Fixture::new("cross-depth-precedence");
+    f.repo();
+    f.write(".rgignore", b"!*.log\n");
+    f.write("sub/.gitignore", b"*.log\n");
+    f.write("sub/keep.log", b"hit\n");
+    f.compare(&f.tree, &["-l", "hit", "."], true);
+}
+
+#[test]
+fn overrides_and_ignore_whitelists_reveal_ignored_and_hidden_entries() {
+    let f = Fixture::new("override-visibility");
+    f.repo();
+    f.write(".gitignore", b"*.log\n!.hidden.txt\n!.hidden-dir/\n");
+    for path in [
+        "drop.log",
+        "ordinary.txt",
+        ".hidden.txt",
+        ".hidden-dir/file",
+    ] {
+        f.write(path, b"hit\n");
+    }
+    f.compare(&f.tree, &["-l", "hit", "."], true);
+    f.compare(&f.tree, &["-g", "*.log", "-l", "hit", "."], true);
+    f.compare(&f.tree, &["-g", "!.hidden.txt", "-l", "hit", "."], true);
+}
+
+#[test]
+fn default_global_excludes_apply_outside_git_and_keep_the_operand_anchor() {
+    let f = Fixture::new("nested-global");
+    let global = f.base.join("home/config/git/ignore");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(&global, b"/global.txt\n").unwrap();
+    f.write("global.txt", b"hit\n");
+    f.write("nested/.git/HEAD", b"ref: refs/heads/main\n");
+    f.write("nested/global.txt", b"hit\n");
+    f.write("nested/keep.txt", b"hit\n");
+    f.compare(&f.tree, &["-l", "hit", "."], true);
+    f.compare(&f.tree, &["-l", "hit", "nested"], true);
+    fs::write(&global, b"global.txt\n").unwrap();
+    f.compare(&f.tree, &["-l", "hit", "."], true);
 }

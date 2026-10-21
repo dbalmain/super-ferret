@@ -1,6 +1,6 @@
-//! Current-tree D13 policy over find's live source. Catalog roots anchor the
-//! policy; names and postings never exclude live input. Pure rule decisions
-//! remain in ferret-policy; ferret-crawl owns scoped policy loading.
+//! Current-tree policy over find's live source: D13 for --live, rg rules
+//! for uncovered operands. Coverage is resolved before engine/daemon routing.
+//! ferret-policy owns rule decisions; ferret-crawl owns scoped input reads.
 
 use super::*;
 use ferret_catalog::{Catalog, Section};
@@ -22,6 +22,7 @@ pub(super) struct Anchors {
     fallback: bool,
     faults: Arc<[(PathBuf, io::Error)]>,
     global: Arc<str>,
+    git_global: Arc<ferret_policy::GrepIgnore>,
     index: Arc<Path>,
 }
 
@@ -41,10 +42,21 @@ impl Anchors {
         catalog.load(&[Section::Roots]).map_err(|e| e.to_string())?;
         #[cfg(test)]
         OPENED.with_borrow_mut(|opened| *opened = Some(catalog.clone()));
+        Self::from_paths(
+            index,
+            global,
+            catalog.roots().map(|(_, path)| path.to_vec()),
+        )
+    }
+    fn from_paths(
+        index: &Path,
+        global: Arc<str>,
+        paths: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<Self, String> {
         let mut roots = Vec::new();
         let mut faults = Vec::new();
-        for (_, root) in catalog.roots() {
-            let path = Path::new(std::ffi::OsStr::from_bytes(root));
+        for root in paths {
+            let path = Path::new(std::ffi::OsStr::from_bytes(&root));
             match fs::canonicalize(path) {
                 Ok(root) => roots.push(root),
                 // Stored roots retain symlink spellings. Even failed anchors
@@ -65,34 +77,27 @@ impl Anchors {
             fallback: false,
             faults: faults.into(),
             global,
+            git_global: Arc::default(),
             index: index.to_owned().into(),
         })
     }
     /// Resolves coverage before either the engine or the daemon is opened.
     pub fn routing(index: Option<&Path>, inputs: &[Input]) -> Result<Self, String> {
         let index = index_path(index)?;
-        let mut anchors = if Catalog::snapshot_path(&index)
+        let paths = Catalog::open(&index)
             .map_err(|e| e.to_string())?
-            .is_some()
-        {
-            Self::load(&index, "".into())?
-        } else {
-            Self {
-                roots: Arc::default(),
-                uncovered: Arc::default(),
-                fallback: true,
-                faults: Arc::default(),
-                global: "".into(),
-                index: index.into(),
-            }
-        };
+            .map(|catalog| catalog.configured_paths())
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let mut anchors = Self::from_paths(&index, "".into(), paths)?;
         anchors.fallback = true;
         let mut uncovered = Vec::new();
         for input in inputs {
             if let Input::Directory(path) = input {
                 let real = fs::canonicalize(path).map_err(|e| e.to_string())?;
                 if !anchors.roots.iter().any(|root| real.starts_with(root)) {
-                    uncovered.push(real);
+                    uncovered.push(path.clone());
                 }
             }
         }
@@ -112,11 +117,14 @@ impl Anchors {
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default()
                 .into();
+            let (rules, errors) = ferret_policy::GrepIgnore::new(&anchors.global);
+            for error in errors { eprintln!("ferret: warning: ignore pattern skipped: {error}"); }
+            anchors.git_global = Arc::new(rules);
         }
         Ok(anchors)
     }
     pub fn walks(&self, path: &Path) -> bool {
-        !self.fallback || fs::canonicalize(path).is_ok_and(|real| self.uncovered.contains(&real))
+        !self.fallback || self.uncovered.iter().any(|operand| operand == path)
     }
     pub fn all_covered(&self) -> bool {
         self.uncovered.is_empty()
@@ -141,9 +149,9 @@ impl Anchors {
                 format!("policy root {}: {error}", root.display()),
             ));
         }
-        if !self.roots.iter().any(|root| current.starts_with(root))
-            && !self.uncovered.contains(&current)
-        {
+        let covered = self.roots.iter().any(|root| current.starts_with(root))
+            || self.fallback && self.walks(path);
+        if !covered {
             return Err(io::Error::other(
                 "directory is outside configured roots; index it or use --no-ignore",
             ));
@@ -210,7 +218,7 @@ impl Anchors {
             .ancestors()
             .find(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
             .unwrap_or(&real);
-        let mut rules = load_rg(root, None, Some(&self.global), None, stopped)?;
+        let mut rules = load_rg(root, None, None, None, stopped)?;
         let mut at = root.to_owned();
         for component in real
             .strip_prefix(root)
@@ -356,11 +364,32 @@ impl Policy {
             .unwrap_or_default()
     }
 
+    pub fn selects(
+        &mut self,
+        entry: &Entry,
+        selection: &GrepSelection,
+        cwd: &Path,
+        content: bool,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<bool> {
+        self.accepts_with(entry, content, stopped, Some((selection, cwd)))
+    }
+
     pub fn accepts(
         &mut self,
         entry: &Entry,
         content: bool,
         stopped: &dyn Fn() -> bool,
+    ) -> io::Result<bool> {
+        self.accepts_with(entry, content, stopped, None)
+    }
+
+    fn accepts_with(
+        &mut self,
+        entry: &Entry,
+        content: bool,
+        stopped: &dyn Fn() -> bool,
+        selection: Option<(&GrepSelection, &Path)>,
     ) -> io::Result<bool> {
         if stopped() {
             return Err(io::ErrorKind::ConnectionAborted.into());
@@ -390,7 +419,11 @@ impl Policy {
             .ok_or_else(|| io::Error::other("live policy stack lost its parent"))?;
         let kind = entry.kind()?;
         let directory = kind == FileKind::Directory;
-        if directory && !matches!(state, State::Bypass) && self.anchors.roots.contains(&path) {
+        if directory
+            && !self.anchors.fallback
+            && !matches!(state, State::Bypass)
+            && self.anchors.roots.contains(&path)
+        {
             let state = self.anchors.root(&path, self.warnings.as_mut(), stopped)?;
             self.stack.push((path, state));
             return Ok(true);
@@ -403,15 +436,57 @@ impl Policy {
             FileKind::Symlink => PolicyEntry::Symlink,
             _ => PolicyEntry::Other,
         };
-        let decision = match state {
-            State::Rules { root, rules } => {
-                rules.decide(path.strip_prefix(root).map_err(io::Error::other)?, item)
+        let local_rule = match state {
+            State::Rules { rules, .. } => rules.ignore_match(std::ffi::OsStr::from_bytes(entry.name()), directory),
+            State::Bypass => None,
+        };
+        let ignore_rule = local_rule.or_else(|| {
+            let (_, cwd) = selection?;
+            let absolute = cwd.join(entry.path());
+            self.anchors.git_global.decision(absolute.strip_prefix(cwd).ok().map(|path| path.as_os_str().as_bytes()), entry.name(), directory)
+        });
+        let override_rule = if let Some((selection, cwd)) = selection {
+            let relative = entry
+                .path()
+                .strip_prefix(cwd)
+                .unwrap_or(entry.path())
+                .as_os_str()
+                .as_bytes();
+            let whitelist = ignore_rule == Some(true);
+            if !selection.selects(
+                entry.path().as_os_str().as_bytes(),
+                relative,
+                entry.depth(),
+                directory,
+                whitelist,
+            ) {
+                return Ok(false);
             }
-            State::Bypass => match item {
-                PolicyEntry::Dir => Decision::Descend,
-                PolicyEntry::File { size } if size <= Config::default().size_cap => Decision::Index,
-                _ => Decision::Catalog(ferret_policy::Reason::TooLarge),
-            },
+            selection.override_for(relative, directory)
+        } else {
+            None
+        };
+        let decision = if override_rule == Some(true) {
+            if directory {
+                Decision::Descend
+            } else {
+                Decision::Index
+            }
+        } else if selection.is_some() && ignore_rule == Some(false) {
+            Decision::Skip
+        } else {
+            match state {
+                State::Rules { root, rules } => {
+                    rules.decide(path.strip_prefix(root).map_err(io::Error::other)?, item)
+                }
+                State::Bypass => match item {
+                    PolicyEntry::Dir => Decision::Descend,
+                    PolicyEntry::File { size } if size <= Config::default().size_cap => {
+                        Decision::Index
+                    }
+                    _ => Decision::Catalog(ferret_policy::Reason::TooLarge),
+                },
+            }
         };
         if directory {
             let next = match (decision, state) {
@@ -454,10 +529,10 @@ fn load(
     path: &Path,
     parent: Option<&DirRules>,
     global: Option<&str>,
-    mut warnings: Option<&mut Vec<String>>,
+    warnings: Option<&mut Vec<String>>,
     stopped: &dyn Fn() -> bool,
 ) -> io::Result<DirRules> {
-    load_kind(path, parent, global, warnings.take(), stopped, false)
+    load_kind(path, parent, global, warnings, stopped, false)
 }
 
 fn load_rg(

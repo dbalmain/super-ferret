@@ -533,6 +533,26 @@ pub struct WalkError {
     pub error: io::Error,
 }
 
+#[derive(Debug)]
+struct OutsideCatalog;
+impl std::fmt::Display for OutsideCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "start is outside the catalog or the index is stale; run ferret index DIR or use -I",
+        )
+    }
+}
+impl std::error::Error for OutsideCatalog {}
+impl WalkError {
+    /// The explicit start has no catalog resolution. Hosts can supply their
+    /// own live-mode advice without interpreting the find diagnostic text.
+    pub fn is_outside_catalog(&self) -> bool {
+        self.error
+            .get_ref()
+            .is_some_and(|error| error.is::<OutsideCatalog>())
+    }
+}
+
 /// Ordered entries with a feedback channel for prune. A source is configured
 /// with the plan's global traversal options before execution. After yielding an
 /// entry, `next(false)` prevents descent; post-order sources already descended.
@@ -1227,11 +1247,15 @@ impl LiveWalk {
                                     _ => None,
                                 });
                     }
-                    let resolved = match resolve(catalog, self.entry.lookup_path().as_ref(), follow || self.entry.path.ends_with(b"/")) {
+                    let resolved = match resolve(
+                        catalog,
+                        self.entry.lookup_path().as_ref(),
+                        follow || self.entry.path.ends_with(b"/"),
+                    ) {
                         Ok(Some(resolved)) => resolved,
-                        Ok(None) => return Some(Err(self.entry.error(io::Error::other(
-                            "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
-                        )))),
+                        Ok(None) => {
+                            return Some(Err(self.entry.error(io::Error::other(OutsideCatalog))));
+                        }
                         Err(error) => return Some(Err(self.entry.error(error))),
                     };
                     if !resolved.1

@@ -164,7 +164,7 @@ impl DirRules {
     }
 
     /// Rg's directory rules, without ferret defaults or a content size cap.
-    /// Git sources apply only inside a work tree; `.ignore` and `.rgignore`
+    /// `.gitignore` and exclude apply inside a work tree; `.ignore` and `.rgignore`
     /// each outrank every git source, including closer gitignore files.
     pub fn grep_root(
         root: &Path,
@@ -283,6 +283,12 @@ impl DirRules {
     /// `.gitignore` where those rules cannot apply.
     pub fn in_work_tree(&self) -> bool {
         self.state.git.is_some()
+    }
+
+    /// Last matching ignore rule for this entry: true includes, false
+    /// excludes, and None leaves the decision to lower-priority sources.
+    pub fn ignore_match(&self, name: &OsStr, directory: bool) -> Option<bool> {
+        self.list.last_match(name.as_bytes(), directory).map(|(include, _)| include)
     }
 
     /// Decides the entry at root-relative `path`, which must be a direct child

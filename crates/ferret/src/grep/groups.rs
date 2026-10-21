@@ -1441,6 +1441,7 @@ impl Filter<'_> {
                 return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
             }
         };
+        let rg = policy.as_ref().is_some_and(|policy| policy.rg());
         let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
         if self
             .traversal
@@ -1455,16 +1456,21 @@ impl Filter<'_> {
                 .traversal
                 .max_depth
                 .is_none_or(|limit| entry.depth() < limit)
-                && self
-                    .selection
-                    .descend(relative.as_os_str().as_bytes(), entry.depth())
-                && !self.selection.hides_stripped(
-                    entry.path().as_os_str().as_bytes(),
-                    relative.as_os_str().as_bytes(),
-                    entry.depth(),
-                );
+                && (rg
+                    || (self
+                        .selection
+                        .descend(relative.as_os_str().as_bytes(), entry.depth())
+                        && !self.selection.hides_stripped(
+                            entry.path().as_os_str().as_bytes(),
+                            relative.as_os_str().as_bytes(),
+                            entry.depth(),
+                        )));
             if *descend && let Some(policy) = policy {
-                let accepted = policy.accepts(entry, true, stopped);
+                let accepted = if rg {
+                    policy.selects(entry, self.selection, &self.cwd, true, stopped)
+                } else {
+                    policy.accepts(entry, true, stopped)
+                };
                 let warnings = policy.take_warnings();
                 if !warnings.is_empty() {
                     // Not inside another file's group.
@@ -1484,20 +1490,24 @@ impl Filter<'_> {
             return None;
         }
         if kind != FileKind::File
-            || !self
-                .selection
-                .allows(relative.as_os_str().as_bytes(), entry.depth())
-            || self.selection.hides_stripped(
-                entry.path().as_os_str().as_bytes(),
-                relative.as_os_str().as_bytes(),
-                entry.depth(),
-            )
+            || (!rg
+                && (!self
+                    .selection
+                    .allows(relative.as_os_str().as_bytes(), entry.depth())
+                    || self.selection.hides_stripped(
+                        entry.path().as_os_str().as_bytes(),
+                        relative.as_os_str().as_bytes(),
+                        entry.depth(),
+                    )))
         {
             return None;
         }
-        let rg = policy.as_ref().is_some_and(|policy| policy.rg());
         if let Some(policy) = policy {
-            match policy.accepts(entry, true, stopped) {
+            match if rg {
+                policy.selects(entry, self.selection, &self.cwd, true, stopped)
+            } else {
+                policy.accepts(entry, true, stopped)
+            } {
                 Ok(true) => {}
                 Ok(false) => return None,
                 Err(error) => {
@@ -1534,7 +1544,12 @@ impl Filter<'_> {
         if self.traversal.follow {
             return Some((
                 0,
-                Job::Direct(entry.path().to_owned(), self.cwd.join(entry.path())),
+                Job::Listed(
+                    entry.path().to_owned(),
+                    self.cwd.join(entry.path()),
+                    engine::reader::Parent::Followed,
+                    true,
+                ),
             ));
         }
         // Content walks retain parents or, past their budget, the parent's
@@ -1633,12 +1648,9 @@ impl<'a> Source<'a> {
     /// Whether a directory operand walks the live tree, which [`walk`] can
     /// spread over workers.
     pub(super) fn walks_live(&self) -> bool {
-        (self.filter.traversal.unrestricted || self.inputs.as_slice().iter().any(|input| matches!(input, Input::Directory(path) if self.live.is_some_and(|anchors| anchors.walks(path)))))
-            && self
-                .inputs
-                .as_slice()
-                .iter()
-                .any(|input| matches!(input, Input::Directory(_)))
+        self.inputs.as_slice().iter().any(|input| {
+            matches!(input, Input::Directory(path) if self.filter.traversal.unrestricted || self.live.is_some_and(|anchors| anchors.walks(path)))
+        })
     }
 
     /// Whether the walk selected any file: it passed depth, glob, hidden and

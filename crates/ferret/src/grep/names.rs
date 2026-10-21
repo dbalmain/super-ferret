@@ -10,7 +10,12 @@ use super::*;
 
 pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bool) -> Exit {
     let inputs = resolve_inputs(&plan.paths, true);
-    let routing = if !plan.traversal.unrestricted && !plan.traversal.live {
+    let routing = if inputs
+        .iter()
+        .any(|input| matches!(input, Input::Directory(_)))
+        && !plan.traversal.unrestricted
+        && !plan.traversal.live
+    {
         match live::Anchors::routing(index, &inputs) {
             Ok(anchors) => Some(anchors),
             Err(error) => return failure(&error),
@@ -18,7 +23,10 @@ pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bo
     } else {
         None
     };
-    if plan.traversal.follow
+    if inputs
+        .iter()
+        .any(|input| matches!(input, Input::Directory(_)))
+        && plan.traversal.follow
         && !plan.traversal.unrestricted
         && routing
             .as_ref()
@@ -32,7 +40,7 @@ pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bo
         && !plan.traversal.unrestricted
         && !plan.traversal.live
         && !test_injections()
-        && daemon_operands(&resolve_inputs(&plan.paths, true))
+        && daemon_operands(&inputs)
     {
         if let Err(error) = selection(plan) {
             return failure(&error);
@@ -319,20 +327,26 @@ impl Listing<'_> {
                             .unwrap_or(entry.path())
                             .as_os_str()
                             .as_bytes();
+                        let rg = policy.as_ref().is_some_and(|policy| policy.rg());
                         match entry.kind() {
                             Ok(FileKind::Directory) => {
                                 descend = plan
                                     .traversal
                                     .max_depth
                                     .is_none_or(|limit| entry.depth() < limit)
-                                    && selection.descend(relative, entry.depth())
-                                    && !selection.hides_stripped(
-                                        entry.path().as_os_str().as_bytes(),
-                                        relative,
-                                        entry.depth(),
-                                    );
+                                    && (rg
+                                        || (selection.descend(relative, entry.depth())
+                                            && !selection.hides_stripped(
+                                                entry.path().as_os_str().as_bytes(),
+                                                relative,
+                                                entry.depth(),
+                                            )));
                                 if descend && let Some(policy) = &mut policy {
-                                    match policy.accepts(entry, false, &stopped) {
+                                    match if rg {
+                                        policy.selects(entry, &selection, cwd, false, &stopped)
+                                    } else {
+                                        policy.accepts(entry, false, &stopped)
+                                    } {
                                         Ok(allowed) => descend = allowed,
                                         Err(error) => {
                                             errors = true;
@@ -352,15 +366,20 @@ impl Listing<'_> {
                                 }
                             }
                             Ok(FileKind::File)
-                                if selection.allows(relative, entry.depth())
-                                    && !selection.hides_stripped(
-                                        entry.path().as_os_str().as_bytes(),
-                                        relative,
-                                        entry.depth(),
-                                    ) =>
+                                if rg
+                                    || (selection.allows(relative, entry.depth())
+                                        && !selection.hides_stripped(
+                                            entry.path().as_os_str().as_bytes(),
+                                            relative,
+                                            entry.depth(),
+                                        )) =>
                             {
                                 if let Some(policy) = &mut policy {
-                                    match policy.accepts(entry, false, &stopped) {
+                                    match if rg {
+                                        policy.selects(entry, &selection, cwd, false, &stopped)
+                                    } else {
+                                        policy.accepts(entry, false, &stopped)
+                                    } {
                                         Ok(true) => {}
                                         Ok(false) => continue,
                                         Err(error) => {

@@ -329,3 +329,55 @@ fn a_kept_inner_root_allows_the_outer_to_change() {
     assert_eq!(exact_paths(&removed), ["/a/b/f"]);
     assert_eq!(roots_of(&removed), ["/a/b", "/ab"]);
 }
+
+// Grep coverage must not reintroduce D111's whole-catalog startup cost.
+#[test]
+fn configured_paths_do_not_load_or_validate_unrelated_names() {
+    use crate::Section;
+    use std::os::unix::fs::FileExt;
+    let scratch = Scratch::new("routing-paths");
+    three_roots(&scratch.path);
+    let snapshot = Catalog::snapshot_path(&scratch.path).unwrap().unwrap();
+    let bytes = std::fs::read(&snapshot).unwrap();
+    let layout = crate::format::decode_table(&bytes, bytes.len() as u64).unwrap();
+    let (offset, _) = layout.range(Section::Names);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&snapshot)
+        .unwrap();
+    file.write_all_at(&[bytes[offset] ^ 1], offset as u64)
+        .unwrap();
+    let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+    assert_eq!(
+        catalog.configured_paths().unwrap(),
+        [b"/a".to_vec(), b"/b".to_vec(), b"/c".to_vec()]
+    );
+    assert!(!catalog.is_loaded(Section::Names));
+    assert!(!catalog.is_loaded(Section::Roots));
+    assert!(catalog.load(&[Section::Roots]).is_err());
+}
+
+#[test]
+fn configured_paths_reject_a_damaged_root_checksum() {
+    use crate::Section;
+    use std::os::unix::fs::FileExt;
+    let scratch = Scratch::new("routing-root-checksum");
+    three_roots(&scratch.path);
+    let snapshot = Catalog::snapshot_path(&scratch.path).unwrap().unwrap();
+    let bytes = std::fs::read(&snapshot).unwrap();
+    let layout = crate::format::decode_table(&bytes, bytes.len() as u64).unwrap();
+    let (offset, _) = layout.range(Section::Roots);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&snapshot)
+        .unwrap();
+    file.write_all_at(&[bytes[offset] ^ 1], offset as u64)
+        .unwrap();
+    assert!(
+        Catalog::open(&scratch.path)
+            .unwrap()
+            .unwrap()
+            .configured_paths()
+            .is_err()
+    );
+}

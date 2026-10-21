@@ -434,3 +434,27 @@ fn document_reference_dependencies_load_effective_fields_and_check_bindings() {
         }
     }
 }
+
+#[test]
+fn configured_paths_apply_committed_root_changes_without_loading_names() {
+    let s = fixture("routing-root-delta");
+    let c = changes(
+        &s,
+        vec![Record::RootPut {
+            id: 0,
+            path: b"/moved".to_vec(),
+        }],
+    );
+    let mut writer = Writer::open(&s.path).unwrap();
+    writer.commit(writer.generation(), &c).unwrap();
+    let view = Catalog::open(&s.path).unwrap().unwrap();
+    assert_eq!(view.configured_paths().unwrap(), [b"/moved".to_vec()]);
+    assert!(!view.is_loaded(Section::Names));
+    view.load(&[Section::Roots]).unwrap();
+    assert_eq!(
+        view.roots()
+            .map(|(_, path)| path.to_vec())
+            .collect::<Vec<_>>(),
+        view.configured_paths().unwrap()
+    );
+}

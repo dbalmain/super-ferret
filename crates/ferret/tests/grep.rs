@@ -545,9 +545,8 @@ fn direct_inputs_help_and_version_do_not_need_an_index_or_config() {
             "{output:?}"
         );
     }
-    let output = fixture.ferret(&["grep", "red", "."], None);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+    // D112: recursive operands no longer need a pre-existing index either.
+    fixture.compare(&["red", "."], None);
 }
 
 #[test]
@@ -594,7 +593,7 @@ fn binary_message_is_the_documented_difference_and_quiet_agrees() {
 }
 
 #[test]
-fn unindexed_directory_is_a_fatal_presearch_error_even_in_quiet_mode() {
+fn unindexed_directory_is_searched_beside_an_explicit_file() {
     let fixture = Fixture::new("unindexed");
     let outside = fixture.base.join("outside");
     fs::create_dir_all(&outside).unwrap();
@@ -603,11 +602,8 @@ fn unindexed_directory_is_a_fatal_presearch_error_even_in_quiet_mode() {
         vec!["grep", "-q", "red", "one.rs", outside.to_str().unwrap()],
     ] {
         let output = fixture.ferret(&args, None);
-        assert_eq!(output.status.code(), Some(2));
-        assert!(
-            output.stdout.is_empty() && !output.stderr.is_empty(),
-            "{output:?}"
-        );
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 }
 
@@ -1602,7 +1598,7 @@ fn files_explicit_operands_need_no_index_and_never_open_streams() {
 }
 
 #[test]
-fn files_requires_directory_coverage_before_any_output_including_quiet() {
+fn files_lists_an_uncovered_directory_beside_an_explicit_file() {
     let fixture = Fixture::new("files-coverage");
     let outside = fixture.base.join("outside");
     fs::create_dir_all(&outside).unwrap();
@@ -1613,8 +1609,8 @@ fn files_requires_directory_coverage_before_any_output_including_quiet() {
         }
         args.extend(["one.rs", outside.to_str().unwrap()]);
         let output = fixture.ferret(&args, None);
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
-        assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty());
     }
 }
 
@@ -2530,12 +2526,8 @@ fn m6_unrestricted_needs_no_index_and_preserves_override_order() {
     ] {
         fixture.compare(&args, None);
     }
-    assert!(
-        fixture
-            .ferret(&["grep", "red", "."], None)
-            .stdout
-            .is_empty()
-    );
+    // D112's default fallback respects ignore rules without an index.
+    fixture.compare(&["red", "."], None);
 }
 
 #[test]

@@ -425,11 +425,13 @@ fn load_query_policy(
     let loaded = walker.load_ignores(
         fd.as_fd(),
         |name| {
-            !(grep && name == ".ferretignore")
-                && !matches!(
-                    statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW),
-                    Err(Errno::NOENT)
-                )
+            if grep && name == ".ferretignore" {
+                return false;
+            }
+            !matches!(
+                statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW),
+                Err(Errno::NOENT)
+            )
         },
         parent.is_some_and(DirRules::in_work_tree),
         (),
@@ -452,7 +454,7 @@ fn load_query_policy(
     } else if grep {
         DirRules::grep_root(
             path,
-            global.filter(|_| loaded.git_root),
+            global,
             loaded.files(),
             ignore.as_deref(),
             rgignore.as_deref(),

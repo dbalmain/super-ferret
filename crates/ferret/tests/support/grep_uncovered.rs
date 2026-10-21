@@ -53,6 +53,7 @@ impl Fixture {
             .env("XDG_STATE_HOME", self.base.join("home/state"))
             .env("XDG_RUNTIME_DIR", self.base.join("home/runtime"))
             .env("FERRET_NO_DAEMON", "1")
+            .env("FERRET_INDEX", self.base.join("index"))
             .env("LC_ALL", "C.UTF-8")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -83,10 +84,27 @@ impl Fixture {
         command.output().unwrap()
     }
 
+    pub fn index(&self, path: &Path) {
+        let mut command = self.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")), &self.tree);
+        let output = command.arg("index").arg(path).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
     pub fn compare(&self, cwd: &Path, args: &[&str], names: bool) {
         let rg = self.oracle(cwd, args);
         let ferret = self.ferret(cwd, args);
         assert_equal(&rg, &ferret, names);
+        // Every recursive name-producing content case also exercises --files.
+        if names && args.contains(&"-l") {
+            let files: Vec<_> = args
+                .iter()
+                .copied()
+                .filter(|arg| *arg != "-l" && *arg != "hit")
+                .collect();
+            let mut files = files;
+            files.insert(0, "--files");
+            assert_equal(&self.oracle(cwd, &files), &self.ferret(cwd, &files), true);
+        }
     }
 
     pub fn compare_all(&self, cwd: &Path, cases: &[(&[&str], bool)]) {

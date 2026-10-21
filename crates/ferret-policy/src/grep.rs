@@ -32,6 +32,25 @@ impl std::fmt::Display for GrepGlobError {
 
 impl std::error::Error for GrepGlobError {}
 
+/// Git-global excludes, whose slash-anchored patterns are relative to the
+/// command's cwd even when a named operand starts another work tree.
+#[derive(Clone, Debug, Default)]
+pub struct GrepIgnore { rules: Vec<Pattern> }
+impl GrepIgnore {
+    /// Compiles gitignore syntax with the shared parser and matcher.
+    pub fn new(text: &str) -> (Self, Vec<crate::PatternError>) {
+        let (rules, errors) = crate::gitignore::parse(text);
+        let errors = errors.into_iter().map(|error| crate::PatternError::Line { file: crate::IgnoreFile::Global, line: error.line, pattern: error.pattern, detail: error.detail }).collect();
+        (Self { rules }, errors)
+    }
+    /// Last matching rule: true includes, false excludes. Outside cwd,
+    /// only unanchored basename rules can match.
+    pub fn decision(&self, relative: Option<&[u8]>, name: &[u8], directory: bool) -> Option<bool> {
+        if self.rules.is_empty() { return None; }
+        with_components(relative.unwrap_or(name), |parts| self.rules.iter().rev().find(|rule| (relative.is_some() || rule.is_shared_basename()) && rule.matches_override(parts, directory)).map(Pattern::is_whitelist))
+    }
+}
+
 /// Ordered command-line overrides. A positive rule admits held hidden names,
 /// but cannot restore a name excluded from the catalog by ferret policy.
 #[derive(Clone, Debug, Default)]
@@ -95,21 +114,22 @@ impl GrepSelection {
                     .take(depth.max(1))
                     .all(|name| !name.starts_with(b"."));
         }
-        with_components(path, |components| self.allows_components(components, depth))
+        with_components(path, |components| {
+            self.allows_components(components, depth, self.hidden)
+        })
     }
 
-    fn allows_components(&self, components: &[&[u8]], depth: usize) -> bool {
+    fn allows_components(&self, components: &[&[u8]], depth: usize, hidden: bool) -> bool {
         for end in components.len().saturating_sub(depth) + 1..components.len() {
             let matched = self.decision(&components[..end], true);
             if matched == Some(false)
-                || (!self.hidden && components[end - 1].starts_with(b".") && matched != Some(true))
+                || (!hidden && components[end - 1].starts_with(b".") && matched != Some(true))
             {
                 return false;
             }
         }
         self.decision(components, false).unwrap_or_else(|| {
-            !self.positive
-                && (self.hidden || !components.last().is_some_and(|p| p.starts_with(b".")))
+            !self.positive && (hidden || !components.last().is_some_and(|p| p.starts_with(b".")))
         })
     }
 
@@ -126,10 +146,12 @@ impl GrepSelection {
                     .next()
                     .is_some_and(|name| name.starts_with(b"."));
         }
-        with_components(path, |components| self.descend_components(components))
+        with_components(path, |components| {
+            self.descend_components(components, self.hidden)
+        })
     }
 
-    fn descend_components(&self, components: &[&[u8]]) -> bool {
+    fn descend_components(&self, components: &[&[u8]], hidden: bool) -> bool {
         // No components: the directory is cwd itself.
         let matched = if components.is_empty() {
             self.cwd_decision()
@@ -138,7 +160,7 @@ impl GrepSelection {
         };
         matched != Some(false)
             && (matched == Some(true)
-                || self.hidden
+                || hidden
                 || !components.last().is_some_and(|p| p.starts_with(b".")))
     }
 
@@ -164,6 +186,41 @@ impl GrepSelection {
                 .nth(kept)
                 .is_some_and(|name| name.starts_with(b"."))
             && self.cwd_decision() != Some(true)
+    }
+
+    /// A matching command-line glob, before ignore-file and hidden rules.
+    pub fn override_for(&self, path: &[u8], directory: bool) -> Option<bool> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        with_components(path, |parts| self.decision(parts, directory))
+    }
+
+    /// Selection for an rg walk: an ignore-file whitelist also reveals a
+    /// hidden entry, while explicit command-line exclusions still win.
+    pub fn selects(
+        &self,
+        walked: &[u8],
+        relative: &[u8],
+        depth: usize,
+        directory: bool,
+        whitelisted: bool,
+    ) -> bool {
+        if whitelisted {
+            with_components(relative, |parts| {
+                if directory {
+                    depth == 0 || self.descend_components(parts, true)
+                } else {
+                    self.allows_components(parts, 0, true)
+                }
+            })
+        } else {
+            (if directory {
+                self.descend(relative, depth)
+            } else {
+                self.allows(relative, 0)
+            }) && !self.hides_stripped(walked, relative, depth.min(1))
+        }
     }
 
     /// The last rule matching cwd's own path relative to itself, the empty
@@ -373,15 +430,19 @@ mod tests {
             let selection = GrepSelection::default().with_hidden(hidden);
             for path in paths() {
                 for depth in (0..=6).chain([39, 40, 41, 100]) {
-                    let general = with_components(&path, |c| selection.allows_components(c, depth));
+                    let general = with_components(&path, |c| {
+                        selection.allows_components(c, depth, selection.hidden)
+                    });
                     assert_eq!(
                         selection.allows(&path, depth),
                         general,
                         "allows {:?} depth {depth} hidden {hidden}",
                         path.escape_ascii().to_string(),
                     );
-                    let general =
-                        depth == 0 || with_components(&path, |c| selection.descend_components(c));
+                    let general = depth == 0
+                        || with_components(&path, |c| {
+                            selection.descend_components(c, selection.hidden)
+                        });
                     assert_eq!(
                         selection.descend(&path, depth),
                         general,

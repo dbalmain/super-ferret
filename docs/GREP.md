@@ -13,6 +13,7 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 | Input | Source |
 | --- | --- |
 | Recursive directory, default `.` | Pinned catalog and S3 trigram postings; current bytes for candidates |
+| Uncovered directory (D112 B) | Live rg visibility, anchored at the nearest enclosing `.git`, or the operand outside git |
 | Explicit file, file symlink, or `-` | Direct current-byte search, without opening an index |
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
 | `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
@@ -20,7 +21,7 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 Indexed directory content searches and `--files` use the resident daemon (D111 A), falling
 back to the shared in-process host when it is unavailable or refuses the hello.
 The client resolves presentation, terminal defaults, search threads, cwd and
-pattern files. Only requests whose every operand is a directory route; any
+pattern files. Only requests whose every operand is a covered directory route; any
 explicit file, missing operand or `-` keeps the whole request local, because
 ferretd would resolve its spelling again in its own process, where
 `/proc/self/fd/N`, `/dev/fd/N` or `/proc/self/cwd` name its descriptors and
@@ -39,8 +40,21 @@ build-mismatch drain/replacement path. A loading, refused or pre-hello-closed
 owner still causes query fallback; D110's behavior is unchanged.
 
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
-data. Missing/incompatible indexes or unindexed directory starts exit 2 with
-index/live advice. Mixed operands use their respective sources. Help/version
+data. Incompatible indexes exit 2 with reindexing advice. An absent index or
+uncovered directory selects an in-process live search, without opening the
+content index or contacting the daemon. Mixed covered/uncovered requests stay
+local: each covered operand uses the snapshot, each uncovered operand walks
+live, in operand order. Covered-only requests retain daemon routing.
+
+The D112 fallback reads `.gitignore` from the work-tree top down,
+`.git/info/exclude`, `$XDG_CONFIG_HOME/git/ignore` (or `~/.config/git/ignore`),
+`.ignore`, and `.rgignore`, in increasing precedence. It applies no ferret
+ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
+read `core.excludesFile`. Hidden entries are skipped unless requested or whitelisted by ignore rules. Named
+ignored operands are searched, while ancestor rules still apply inside them.
+`-L`/`--follow` follows links in uncovered and unrestricted walks; indexed
+`-L` remains unsupported (use `-u`). `--live` retains D13 and requires covering
+catalog roots. Help/version
 skip index/config; no query log or find config. Diagnose nonempty
 `RIPGREP_CONFIG_PATH`: pass flags explicitly. Refuse global `ferret --json`
 framing; `ferret grep --json` means rg output.

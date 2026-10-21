@@ -48,7 +48,8 @@ impl Tree {
             base,
             children: Mutex::new(Vec::new()),
         };
-        assert!(tree.local(&["index", "src"]).status.success());
+        let indexed = tree.local(&["index", "src"]);
+        assert!(indexed.status.success(), "{indexed:?}");
         tree
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -2229,7 +2230,7 @@ fn mixed_grep_operands_keep_the_clients_process_identity() {
 }
 
 // The routing half of the test above, observed at the socket: those requests
-// never connect, while directory-only content and --files requests do.
+// never connect, while covered directory-only content and --files requests do.
 #[test]
 fn only_directory_only_grep_requests_reach_the_daemon() {
     let tree = descriptor_tree();
@@ -2242,10 +2243,24 @@ fn only_directory_only_grep_requests_reach_the_daemon() {
             "{case:?} connected to the daemon: {output:?}"
         );
     }
+    // D112: an uncovered operand keeps the whole mixed request local.
+    fs::create_dir(tree.base.join("uncovered")).unwrap();
+    fs::write(tree.base.join("uncovered/file"), b"red live\n").unwrap();
+    for case in [
+        &["red", "src", "uncovered"][..],
+        &["--files", "uncovered", "src"],
+    ] {
+        let output = grep_with_descriptor(&tree, case, false);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{case:?} connected: {output:?}"
+        );
+    }
     for case in [
         &["red", "src"][..],
         &["--files", "src"],
-        &["red", "src", "."],
+        &["red", "src", "src/nested"],
     ] {
         let server = std::thread::scope(|scope| {
             let server = scope.spawn(|| {

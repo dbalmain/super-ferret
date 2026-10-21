@@ -98,7 +98,7 @@ impl EntrySource for Directory {
 // Find's -I hint has a different meaning in grep.
 fn grep_error(entry: Result<&Entry, WalkError>) -> Result<&Entry, WalkError> {
     entry.map_err(|mut error| {
-        if error.error.to_string() == "start is outside the catalog or the index is stale; run ferret index DIR or use -I" {
+        if error.is_outside_catalog() {
             error.error = io::Error::other("start is outside the catalog or the index is stale; run ferret index DIR or use -u");
         }
         error
