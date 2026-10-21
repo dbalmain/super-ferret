@@ -6173,7 +6173,21 @@ the no-daemon path.
 
 ## D112 — Grep on a directory no index covers
 
-**Status: open, 2026-10-21.**
+**Status: answered B, with rg's ignore behaviour, 2026-10-21.**
+
+> Dave: go with D112 B, matching rg's ignore behaviour
+
+Read as: an operand no index covers is searched live, anchored at the
+enclosing work tree, with rg's ignore rules rather than D13's. So the
+fallback reads `.gitignore` files from the work-tree top down, plus
+`.git/info/exclude`, the global git excludes file, `.ignore` and `.rgignore`;
+skips hidden entries; applies no `DEFAULT_IGNORE` and no 8 MiB size cap; and
+always searches an operand it is given by name, even an ignored one, while
+still applying the parent directories' rules inside it. Checked with rg
+15.1.0 (2026-10-21): with `.gitignore` holding `target/` and `*.log`,
+`rg hit target` searches `target/a.txt` and `target/sub/b.txt` but not
+`target/c.log`. Behaviour is pinned by differential tests against the dev
+shell's `FERRET_RG`, not by reading rg's source. A's message fixes land too.
 
 Question: when `ferret grep PATTERN DIR` names a directory that no index
 covers, should it fail as it does today, or search the directory, and with
