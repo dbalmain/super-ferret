@@ -5556,10 +5556,19 @@ fn swap_after_listing(fixture: &Fixture, dir: &str, limit: Option<u32>) -> Vec<S
         // first: then the setup, not the code, failed.
         let early =
             String::from_utf8_lossy(&start).contains("hit victim") || stdout.contains("hit victim");
-        if early
-            || stdout.contains("OUTSIDE")
-            || output.status.code() != Some(2)
-            || !stderr.contains(&changed)
+        // Four workers can open the last name before a blocked publisher
+        // stops them. Exit 0 with the victim's own bytes and an unused link
+        // means the swap missed that window. One thread is blocked on the
+        // previous file, so its window stands.
+        let missed = threads != "1"
+            && early
+            && !stdout.contains("OUTSIDE")
+            && output.status.code() == Some(0);
+        if !missed
+            && (early
+                || stdout.contains("OUTSIDE")
+                || output.status.code() != Some(2)
+                || !stderr.contains(&changed))
         {
             failed.push(format!(
                 "{mode:?} on {threads} threads: {:?}, through the link: {}, \
