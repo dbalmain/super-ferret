@@ -189,7 +189,9 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         identity: endpoint.identity.clone(),
         context: advertised_context()?,
         build: test_build(),
-        query_limit: QUERIES.min(ferret_crawl::default_workers()),
+        query_limit: ferret_query::line_grep::IoBudget::request_limit(
+            QUERIES.min(ferret_crawl::default_workers()),
+        ),
         format: advertised_format(),
         writer_send,
         writer_status: Mutex::new(writer::Status::default()),
@@ -728,7 +730,9 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
             unreachable!("writer requests routed before query selection")
         }
         Op::Search => crate::batch::search_request(request, Some(session), None, destination),
-        Op::Grep => crate::batch::grep_request(request, Some(session), destination),
+        Op::Grep => {
+            crate::batch::grep_request(request, Some(session), destination, host.query_limit)
+        }
         Op::Find => {
             // Clear all action grants. Even a direct socket caller cannot ask
             // the daemon to execute, prompt, delete or open an output file.

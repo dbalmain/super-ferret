@@ -373,9 +373,12 @@ including reopened parents, input files and simultaneous context spools during
 compaction. It always permits one operation; additional workers wait when the
 limit is tight, without changing the thread count or warning. At limit 1,024
 with sixteen workers, every worker and the producer fit and local admission
-takes no mutex. Concurrent daemon greps share one process-wide admission mutex;
-their independent capture pools are bounded in aggregate by the daemon's
-four-query admission limit. Each read reserves its whole allowance through the closing check, so a
+takes no mutex. Daemon queries reserve fixed shares of the process allowance;
+query admission falls below four when fewer complete allowances exist. At
+NOFILE=64 two admitted requests each retain one allowance, so a stopped output
+consumer cannot starve the other. Client thread requests are capped at the
+resident engine's search-verification grant before sizing pools; each request
+keeps its own capture pool. Each read reserves its whole allowance through the closing check, so a
 stream holding the publisher never needs a descriptor permit held by another
 reader. Capture-byte waits preserve this order: descriptor admission
 before reading or capturing, and no further admission until that read closes;

@@ -2103,3 +2103,47 @@ fn daemon_grep_bounds_client_threads_before_allocating_and_survives_bad_counts()
     }
     assert!(tree.run(&["grep", "main", "src"]).status.success());
 }
+
+// Under NOFILE=64 the process has two read admissions. A stopped publisher
+// must not hold both while an independent admitted request has no way forward.
+#[test]
+fn stopped_grep_consumer_leaves_a_descriptor_share_for_another_request() {
+    let tree = Tree::new();
+    fs::write(tree.base.join("src/a"), b"red\n").unwrap();
+    assert!(tree.local(&["index", "src"]).status.success());
+    let mut dense = fs::File::create(tree.base.join("dense")).unwrap();
+    let mut record = b"red ".to_vec();
+    record.extend(std::iter::repeat_n(b'x', 8187));
+    record.push(b'\n');
+    for _ in 0..3072 {
+        dense.write_all(&record).unwrap();
+    }
+    drop(dense);
+    tree.start_limited("ulimit -n 64");
+    let (mut slow, _) = tree.connect();
+    let request = format!(
+        r#"{{"id":"slow","op":"grep","args":["red","dense","dense","src"],"cwd":"{}","grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":2,"pattern_files":[]}}}}"#,
+        tree.base.display()
+    );
+    slow.get_mut()
+        .write_all(format!("{request}\n").as_bytes())
+        .unwrap();
+    assert!(line(&mut slow).contains("\"event\":\"begin\""));
+    assert!(line(&mut slow).contains("\"event\":\"stdout\""));
+    // Leave this socket open without consuming any more output. Give the
+    // second reader time to fill capture space behind the blocked publisher.
+    std::thread::sleep(Duration::from_millis(250));
+    let (mut quiet, _) = tree.connect();
+    quiet
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let request = request
+        .replace("\"slow\"", "\"quiet\"")
+        .replace(r#"["red","dense","dense","src"]"#, r#"["-q","red","src"]"#);
+    let response = block(&mut quiet, format!("{request}\n").as_bytes());
+    assert!(response.contains("\"event\":\"end\""), "{response}");
+    assert_eq!(number(&response, "exit"), Some(0), "{response}");
+    drop(slow);
+    assert!(tree.run(&["grep", "-q", "red", "src"]).status.success());
+}

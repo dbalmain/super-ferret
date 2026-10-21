@@ -763,9 +763,13 @@ colour, heading, numbering and thread settings plus pattern-file bytes; the
 server never resolves those against its own environment. Stdout/stderr frames
 preserve host flush boundaries and grep's native 0/1/2 exits. Connection hangup
 or cancel stops grep through the scheduler's existing cancellation flag.
-Descriptor admission is shared across greps because RLIMIT_NOFILE and retained
-parent caches are process-wide. Each request retains its own capture budget and
-streaming owner; query admission bounds the aggregate to four request pools.
+The server caps requested grep threads at its resident search-verification
+grant before sizing pools. Descriptor allowances reserve fixed shares per
+admitted request because RLIMIT_NOFILE and retained parent caches are
+process-wide. Query admission is at most four and falls to the number of
+complete read allowances at low descriptor limits (two at NOFILE=64). A stalled
+request cannot consume another admitted request's share. Each request retains
+its own capture budget and streaming owner.
 
 Ordinary queries connect to the daemon, spawning it on first use; unavailable
 background operation or `FERRET_NO_DAEMON` uses the same engine in process.

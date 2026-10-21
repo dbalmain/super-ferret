@@ -54,6 +54,7 @@ pub(crate) fn serve(
     request: &Request,
     pin: Option<&engine::QuerySession>,
     destination: &Destination,
+    requests: usize,
 ) -> io::Result<Exit> {
     let start = std::time::Instant::now();
     let record = AtomicU64::new(0);
@@ -72,19 +73,12 @@ pub(crate) fn serve(
     };
     let stderr = |message: &str| emit("stderr", format!("ferret: {message}\n").as_bytes());
     let local_cancelled = AtomicBool::new(false);
-    let runtime = Runtime {
+    let mut runtime = Runtime {
         cancelled: destination.cancellation().unwrap_or(&local_cancelled),
         stderr: &stderr,
         tty: request.grep.as_ref().is_some_and(|options| options.tty),
         warned: AtomicBool::new(false),
-        // Retained-directory caches and RLIMIT_NOFILE belong to the process.
-        // Force admission even when one request's workers would fit alone.
-        descriptors: Some({
-            static BUDGET: OnceLock<Arc<line_grep::IoBudget>> = OnceLock::new();
-            BUDGET
-                .get_or_init(|| Arc::new(line_grep::IoBudget::new(usize::MAX)))
-                .clone()
-        }),
+        descriptors: None,
     };
     let Some(options) = &request.grep else {
         return Ok(runtime.failure("missing resolved grep environment"));
@@ -170,6 +164,12 @@ pub(crate) fn serve(
     let Some(pin) = pin else {
         return Ok(runtime.failure("no index available"));
     };
+    // The resident engine owns the verification grant; client options must
+    // never size pools before being bounded by that grant.
+    let threads = options.threads.min(pin.search_threads());
+    runtime.descriptors = Some(Arc::new(line_grep::IoBudget::for_request(
+        threads, requests,
+    )));
     let mut selection = GrepSelection::default().with_hidden(plan.hidden);
     for glob in &plan.globs {
         if let Err(error) = selection.push(glob) {
@@ -185,9 +185,7 @@ pub(crate) fn serve(
         pin: Some(pin),
         live: None,
         cwd: &cwd,
-        // The resident engine owns the verification grant; client options
-        // must never size pools before being bounded by that grant.
-        threads: options.threads.min(pin.search_threads()),
+        threads,
         runtime: &runtime,
         start,
     };
