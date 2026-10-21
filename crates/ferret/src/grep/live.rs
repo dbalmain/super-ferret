@@ -118,7 +118,9 @@ impl Anchors {
                 .unwrap_or_default()
                 .into();
             let (rules, errors) = ferret_policy::GrepIgnore::new(&anchors.global);
-            for error in errors { eprintln!("ferret: warning: ignore pattern skipped: {error}"); }
+            for error in errors {
+                eprintln!("ferret: warning: ignore pattern skipped: {error}");
+            }
             anchors.git_global = Arc::new(rules);
         }
         Ok(anchors)
@@ -437,13 +439,22 @@ impl Policy {
             _ => PolicyEntry::Other,
         };
         let local_rule = match state {
-            State::Rules { rules, .. } => rules.ignore_match(std::ffi::OsStr::from_bytes(entry.name()), directory),
+            State::Rules { rules, .. } => {
+                rules.ignore_match(std::ffi::OsStr::from_bytes(entry.name()), directory)
+            }
             State::Bypass => None,
         };
         let ignore_rule = local_rule.or_else(|| {
             let (_, cwd) = selection?;
             let absolute = cwd.join(entry.path());
-            self.anchors.git_global.decision(absolute.strip_prefix(cwd).ok().map(|path| path.as_os_str().as_bytes()), entry.name(), directory)
+            self.anchors.git_global.decision(
+                absolute
+                    .strip_prefix(cwd)
+                    .ok()
+                    .map(|path| path.as_os_str().as_bytes()),
+                entry.name(),
+                directory,
+            )
         });
         let override_rule = if let Some((selection, cwd)) = selection {
             let relative = entry

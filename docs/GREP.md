@@ -50,7 +50,8 @@ The D112 fallback reads `.gitignore` from the work-tree top down,
 `.git/info/exclude`, `$XDG_CONFIG_HOME/git/ignore` (or `~/.config/git/ignore`),
 `.ignore`, and `.rgignore`, in increasing precedence. It applies no ferret
 ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
-read `core.excludesFile`. Hidden entries are skipped unless requested or whitelisted by ignore rules. Named
+read `core.excludesFile`. Slash-anchored global patterns are relative to the
+command's cwd, including when an operand starts a nested work tree. Hidden entries are skipped unless requested or whitelisted by ignore rules. Named
 ignored operands are searched, while ancestor rules still apply inside them.
 `-L`/`--follow` follows links in uncovered and unrestricted walks; indexed
 `-L` remains unsupported (use `-u`). `--live` retains D13 and requires covering
@@ -1191,3 +1192,23 @@ ten warmups / 100 runs: before routing **2.66 / 6.30 ms** at 64k / 251k names;
 after routing **1.91 / 2.00 ms**. Local controls remain 2.74 / 6.22 ms. The
 resident path lists from its pinned catalog; unavailable-daemon fallback still
 uses the four-section lazy open, with identical names, ordering and exits.
+
+
+### D112 uncovered routing measurements (2026-10-21)
+
+Warm release binaries, an isolated 60-file / 26,409-byte tree, 16 configured
+search threads. Hyperfine `-N`, ten warmups and 100 runs, one benchmark at a
+time after checking `pgrep -x hyperfine`. Daemon runs require a bound socket
+and a private 0700 runtime directory. Mean times in milliseconds:
+
+| Call | Before D112 | After D112 | rg 15.2.0 |
+| --- | ---: | ---: | ---: |
+| Indexed `grep -q 'needle' DIR`, daemon | 1.874 | 1.926 | — |
+| Uncovered `grep -l 'x' DIR` | — | 2.448 | 3.497 |
+
+The daemon startup difference is 0.052 ms, within run variation (standard
+deviations 0.114 / 0.174 ms). Coverage reads checked root paths and strings,
+without loading the name tables or opening content. A regression test damages
+an unrelated content manifest and still requires uncovered content and names
+searches to succeed without contacting a daemon. Mixed requests stay local
+with an operand barrier between catalog and live sources.

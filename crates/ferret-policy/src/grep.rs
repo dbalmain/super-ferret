@@ -35,19 +35,40 @@ impl std::error::Error for GrepGlobError {}
 /// Git-global excludes, whose slash-anchored patterns are relative to the
 /// command's cwd even when a named operand starts another work tree.
 #[derive(Clone, Debug, Default)]
-pub struct GrepIgnore { rules: Vec<Pattern> }
+pub struct GrepIgnore {
+    rules: Vec<Pattern>,
+}
 impl GrepIgnore {
     /// Compiles gitignore syntax with the shared parser and matcher.
     pub fn new(text: &str) -> (Self, Vec<crate::PatternError>) {
         let (rules, errors) = crate::gitignore::parse(text);
-        let errors = errors.into_iter().map(|error| crate::PatternError::Line { file: crate::IgnoreFile::Global, line: error.line, pattern: error.pattern, detail: error.detail }).collect();
+        let errors = errors
+            .into_iter()
+            .map(|error| crate::PatternError::Line {
+                file: crate::IgnoreFile::Global,
+                line: error.line,
+                pattern: error.pattern,
+                detail: error.detail,
+            })
+            .collect();
         (Self { rules }, errors)
     }
     /// Last matching rule: true includes, false excludes. Outside cwd,
     /// only unanchored basename rules can match.
     pub fn decision(&self, relative: Option<&[u8]>, name: &[u8], directory: bool) -> Option<bool> {
-        if self.rules.is_empty() { return None; }
-        with_components(relative.unwrap_or(name), |parts| self.rules.iter().rev().find(|rule| (relative.is_some() || rule.is_shared_basename()) && rule.matches_override(parts, directory)).map(Pattern::is_whitelist))
+        if self.rules.is_empty() {
+            return None;
+        }
+        with_components(relative.unwrap_or(name), |parts| {
+            self.rules
+                .iter()
+                .rev()
+                .find(|rule| {
+                    (relative.is_some() || rule.is_shared_basename())
+                        && rule.matches_override(parts, directory)
+                })
+                .map(Pattern::is_whitelist)
+        })
     }
 }
 
