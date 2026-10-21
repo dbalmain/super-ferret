@@ -246,6 +246,10 @@ pub(crate) fn search_request(
             let catalog = session.catalog();
             bytes_read = catalog.bytes_read();
             let mut output_error = None;
+            // Reused across rows. A fresh pair per row dominated dense
+            // listings: two allocations, then a full JSON parse on the client.
+            let mut encoded = Vec::with_capacity(256);
+            let mut framed = Vec::with_capacity(320);
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
@@ -268,14 +272,14 @@ pub(crate) fn search_request(
                         if request.capabilities.iter().any(|c| c == "test-panic") {
                             panic!("injected query panic");
                         }
-                        let mut bytes = Vec::new();
-                        json_row(&mut bytes, catalog, row);
-                        let mut output = Vec::new();
-                        let mut object = Object::new(&mut output);
+                        encoded.clear();
+                        json_row(&mut encoded, catalog, row);
+                        framed.clear();
+                        let mut object = Object::new(&mut framed);
                         object.str("id", &request.id).str("event", "row");
-                        object.raw_fields(&bytes[1..bytes.len() - 1]);
+                        object.raw_fields(&encoded[1..encoded.len() - 1]);
                         object.end();
-                        if let Err(error) = destination.send(&output) {
+                        if let Err(error) = destination.send(&framed) {
                             output_error = Some(error);
                             return ControlFlow::Break(());
                         }

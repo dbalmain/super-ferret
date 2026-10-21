@@ -58,12 +58,15 @@ impl<'a> Object<'a> {
     /// see the module doc.
     pub fn bytes(&mut self, key: &str, value: &[u8]) -> &mut Self {
         self.key(key);
-        string(self.out, &String::from_utf8_lossy(value));
-        if std::str::from_utf8(value).is_err() {
-            self.key(&format!("{key}_base64"));
-            self.out.push(b'"');
-            encode_base64(self.out, value);
-            self.out.push(b'"');
+        match std::str::from_utf8(value) {
+            Ok(text) => string(self.out, text),
+            Err(_) => {
+                string(self.out, &String::from_utf8_lossy(value));
+                self.key(&format!("{key}_base64"));
+                self.out.push(b'"');
+                encode_base64(self.out, value);
+                self.out.push(b'"');
+            }
         }
         self
     }

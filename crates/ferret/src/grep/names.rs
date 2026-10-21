@@ -142,6 +142,7 @@ fn execute_routed(
         tty: io::stdout().is_terminal(),
         warned: AtomicBool::new(false),
         descriptors: None,
+        defer_stdout: false,
     };
     Listing {
         plan,
