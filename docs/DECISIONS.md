@@ -6059,7 +6059,15 @@ join is always short.
 
 ## D111 — Indexed grep pays for the whole index on every call
 
-**Status: open, 2026-10-21.**
+**Status: answered A, 2026-10-21.** Directory grep goes through the daemon;
+B is not done.
+
+> Dave: I'm not sure I understand why A is more work and helps less. For any
+> user that can't reach the daemon, perhaps ferret is not for them. I've had no
+> issues having my agents reach the daemon. If something is heavily sandboxed,
+> there is likely less data to search so they wouldn't really benefit from
+> ferret over rg anyway. Using the daemon seems like the right direction to me
+> in general.
 
 Question: should a directory `ferret grep` stop paying, on every call, a
 start-up cost that grows with every name in the index rather than with the
