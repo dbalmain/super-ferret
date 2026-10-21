@@ -1428,7 +1428,9 @@ uses deterministic traversal scopes. The user service is a template only.
 
 M5a retains one writer lock, routes index/root edits to an existing compatible
 host without spawning from index, and returns the real producer report after
-publication. One writer queue serializes commands and debounced inotify refreshes;
+publication. A later change spawns ferretd after an in-process index or roots
+remove returns the writer lock (`FERRET_NO_DAEMON` still does not). One writer
+queue serializes commands and debounced inotify refreshes;
 queries keep the last checked view. Uncertain publication recovers under the
 same lock. Crawl arms watches through observed directory handles before listing;
 a separate intake thread drains during crawl and compaction. Physical parent/name

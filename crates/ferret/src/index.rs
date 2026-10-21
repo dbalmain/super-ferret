@@ -7,7 +7,9 @@
 //! `roots remove DIR...` drops each, which re-walks any root it was inside
 //! (ferret-crawl widens the run). The change is applied under the writer
 //! lock ([`ferret_crawl::index_change`]), so concurrent runs cannot lose
-//! each other's roots.
+//! each other's roots. When that in-process run returns the lock, and no
+//! other writer still holds it, ferretd is started for later queries.
+//! `FERRET_NO_DAEMON` does not start one.
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -285,6 +287,15 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
         }
         follow_committed(catalog, &context.index)
     });
+    // `index_change_then` drops its writer lock before returning, including
+    // on the paths that publish nothing. Spawning earlier races ferretd for
+    // that lock. `Begin(Locked)` means another writer still holds it.
+    if !matches!(
+        &completed,
+        Err(IndexError::Begin(ferret_catalog::BeginError::Locked))
+    ) {
+        crate::daemon::spawn_resident(&context.index);
+    }
     let (result, content) = match completed {
         Ok((report, content)) => (Ok(report), content),
         Err(error) => (Err(error), Ok(())),

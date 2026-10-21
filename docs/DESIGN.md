@@ -23,7 +23,9 @@ when content changes.
 `ferret` also builds `ferretd`, the socket host and retained serial writer. std supplies
 Unix sockets, file locking and Linux no-follow opens through OpenOptionsExt.
 Retained directory handles anchor endpoint operations through /proc/self/fd.
-S1b M5a routes index/root commands to an existing compatible host; index never spawns it.
+S1b M5a routes index/root commands to an existing compatible host. An in-process
+index or roots remove spawns ferretd after that call returns the writer lock,
+never before; `FERRET_NO_DAEMON` does not spawn.
 
 One cargo workspace (D1). Each line lists a crate's dependencies; there are no
 cycles. This block is enforced: `crates/ferret/tests/layering.rs` fails when a
@@ -779,6 +781,8 @@ and batch remain local too. M5a retains one WriterSession and its lock;
 explicit index/root commands are ordering barriers in one writer queue. Commands
 use the real session producer and return the ordinary report after publication.
 No-daemon indexing stays direct and fails promptly against a daemon-held lock.
+A direct index or roots remove that finishes then spawns ferretd, unless
+`FERRET_NO_DAEMON` is set.
 Queries pin the last checked view while refresh/recovery runs. Recovery retains
 the same lock and revalidates the durable prefix before rebuilding writer lookups.
 

@@ -2579,3 +2579,197 @@ fn compare_over_cap_grep(name: &str, nul: Option<usize>) {
         }
     }
 }
+
+fn release_spawned(tree: &Tree) {
+    terminate_fixture_daemons(&tree.base);
+    wait(|| fixture_daemons(&tree.base).is_empty());
+    for path in tree.sockets() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn assert_index_owner(tree: &Tree) {
+    let (_, hello) = tree.connect();
+    let meta = fs::metadata(tree.base.join("index")).unwrap();
+    let identity = format!("{:x}-{:x}", meta.dev(), meta.ino());
+    assert!(
+        hello.contains(&format!("\"index\":\"{identity}\"")),
+        "{hello}"
+    );
+    assert_eq!(fixture_daemons(&tree.base).len(), 1);
+}
+
+fn assert_no_daemon(tree: &Tree, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fixture_daemons(&tree.base).is_empty(),
+        "FERRET_NO_DAEMON still spawned {:?}",
+        fixture_daemons(&tree.base)
+    );
+}
+
+/// `ferret index` / `roots remove` with no daemon publish in process, drop
+/// the writer lock, then start ferretd for that index. `FERRET_NO_DAEMON`
+/// does not. Directory grep on a miss starts the same kind of host.
+#[test]
+fn in_process_index_roots_remove_and_grep_spawn_that_index_daemon() {
+    let tree = Tree::new();
+    assert!(fixture_daemons(&tree.base).is_empty());
+    assert!(tree.sockets().is_empty());
+
+    let indexed = tree.run(&["index", "src"]);
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert_index_owner(&tree);
+    release_spawned(&tree);
+
+    let grep = tree.run(&["grep", "fn", "src"]);
+    assert!(
+        grep.status.success(),
+        "{}",
+        String::from_utf8_lossy(&grep.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&grep.stdout).contains("fn main"),
+        "{grep:?}"
+    );
+    assert_index_owner(&tree);
+    release_spawned(&tree);
+
+    assert_no_daemon(&tree, &tree.local(&["grep", "fn", "src"]));
+    assert_no_daemon(&tree, &tree.local(&["index", "src"]));
+
+    let removed = tree.run(&["roots", "remove", "src"]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert_index_owner(&tree);
+}
+
+fn census_count(text: &str, label: &str) -> u32 {
+    text.lines()
+        .find(|line| line.starts_with(label))
+        .unwrap_or_else(|| panic!("no {label} line:\n{text}"))
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("{label} has no count:\n{text}"))
+        .parse()
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+}
+
+/// Text stats asks the running daemon and does not start one. Hiding the
+/// published snapshot makes a local open fail while the paused daemon's pin
+/// still answers, so text and JSON describe that pin. There is no stable
+/// window where the pin's generation is ahead of `Published::open`: select
+/// runs after commit.
+#[test]
+fn text_stats_reads_the_daemon_pin_when_the_snapshot_is_hidden() {
+    let tree = Tree::new();
+    let power = tree.base.join("power");
+    fs::create_dir_all(power.join("BAT0")).unwrap();
+    fs::write(power.join("BAT0/type"), "Battery\n").unwrap();
+    fs::write(power.join("BAT0/status"), "Discharging\n").unwrap();
+    let indexed = tree
+        .command(&["index", "src"])
+        .env("FERRET_SIGNAL_POWER", &power)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert_index_owner(&tree);
+
+    let remote = tree.run(&["stats"]);
+    let local = tree.local(&["stats"]);
+    assert!(
+        remote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remote.stderr)
+    );
+    assert!(
+        local.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    assert_eq!(
+        remote.stdout,
+        local.stdout,
+        "daemon text\n{}\nlocal text\n{}",
+        String::from_utf8_lossy(&remote.stdout),
+        String::from_utf8_lossy(&local.stdout)
+    );
+    let json = tree.run(&["stats", "--json"]);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json_line = String::from_utf8(json.stdout).unwrap();
+    let text = String::from_utf8(remote.stdout.clone()).unwrap();
+    assert_eq!(
+        number(&json_line, "names"),
+        Some(census_count(&text, "entries"))
+    );
+    assert_eq!(
+        number(&json_line, "documents"),
+        Some(census_count(&text, "documents"))
+    );
+
+    let index = tree.base.join("index");
+    let mut hidden = 0;
+    for entry in fs::read_dir(&index).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("snapshot.") || name.starts_with("changes.") {
+            let mut aside = entry.path();
+            aside.set_extension("aside");
+            fs::rename(entry.path(), aside).unwrap();
+            hidden += 1;
+        }
+    }
+    assert!(hidden > 0, "index published no snapshot to hide");
+
+    let after = tree.run(&["stats"]);
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    assert_eq!(after.stdout, remote.stdout);
+    let json = tree.run(&["stats", "--json"]);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json_line = String::from_utf8(json.stdout).unwrap();
+    let text = String::from_utf8(after.stdout).unwrap();
+    assert_eq!(
+        number(&json_line, "names"),
+        Some(census_count(&text, "entries"))
+    );
+    assert_eq!(
+        number(&json_line, "documents"),
+        Some(census_count(&text, "documents"))
+    );
+    let local = tree.local(&["stats"]);
+    assert_eq!(
+        local.status.code(),
+        Some(3),
+        "local stats still opened the hidden snapshot: {}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    assert_eq!(fixture_daemons(&tree.base).len(), 1);
+}

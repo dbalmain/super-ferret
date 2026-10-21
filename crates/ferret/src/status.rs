@@ -54,6 +54,11 @@ pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
         );
 }
 
+/// Local status, used when no daemon is running. The printed sizes are the
+/// resident catalog (`catalog_bytes` counts every family load), the name
+/// planner (including its overlay delta), interned name postings, and the
+/// opened content segments. A smaller open changes those numbers, so this
+/// stays the full engine open.
 pub(crate) fn local(context: &Context, census: bool) -> Exit {
     let engine = match Engine::open(&context.index) {
         Ok(engine) => engine,
