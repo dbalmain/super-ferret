@@ -6609,6 +6609,34 @@ keep A's exit after C, with a longer timeout.
 
 > Dave: go with C for D116
 
+Done, 2026-10-23 (7acaf31, 033ea6a, 07fc3dc, aeadcab, dd73ad9, 1c45275). The
+watcher keeps failures exactly for the first 1,024 directories per root and
+counts the rest. A daemon with no catalog creates one. A poll that outlasts its
+interval is spaced to four times its duration, and a polled root is walked like
+a backstop rather than as one whole-root selection. `malloc_trim` runs after
+any refresh of a second or more and after each command. Staying up is the
+default; `FERRET_DAEMON_IDLE_MS` still sets an exit.
+
+Measured on geekom's `/nix/store` (5.4M entries, past the watch cap), release
+build:
+
+| | Before C | After C |
+| --- | --- | --- |
+| Startup rewalk | ~60 s | ~60 s (33 s CPU) |
+| Peak RSS | 2.36 GB | 1.07 GB |
+| Idle, anonymous | 1.69–2.0 GB | ~640 MB, flat |
+| Polls past the cap | back to back | ~30 s CPU every ~5 min |
+
+`malloc_trim` accounts for about 78 MB of the idle figure (715 → 637 MB). Two
+defects turned up on the way and are fixed: polls re-walked the whole root as
+a selection, so they never finished and `watch_failed` grew; and with an
+overlay, `finish_observations` re-sorted a large directory's children for each
+small group, which made one startup rewalk take 16 minutes.
+
+D is not added. The 300 MB threshold was for a home-sized tree, which has not
+been measured; scaling B's home estimate (0.5 GB) by `/nix/store`'s fall (1.7
+GB → 0.64 GB) gives about 0.2 GB.
+
 ## D117 — Should an answer from a possibly stale index say so?
 
 **Status: answered B, 60 s, on by default, 2026-10-22.**
