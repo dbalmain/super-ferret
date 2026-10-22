@@ -1599,8 +1599,9 @@ impl Output {
     }
 }
 
-/// Debug-build hold for a crawl worker that has made its priority decision.
-/// While `$FERRET_CRAWL_TEST_GATE/worker` exists, each worker records its
+/// Debug-build hold for an explicit command's crawl worker once it has made
+/// its priority decision; background crawls never stop here. While
+/// `$FERRET_CRAWL_TEST_GATE/worker` exists, each worker records its
 /// thread id as `worker.<tid>.reached` and waits, so a test can read the nice
 /// of a worker that is known to be past the point where it could lower itself.
 #[cfg(debug_assertions)]
@@ -1635,7 +1636,9 @@ impl EventVisitor for Hasher<'_> {
             self.priority_error = crate::lower_index_priority().err();
         }
         #[cfg(debug_assertions)]
-        worker_checkpoint();
+        if !self.lower_priority {
+            worker_checkpoint();
+        }
     }
     type Dir = DirToken;
 

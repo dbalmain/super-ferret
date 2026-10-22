@@ -1465,6 +1465,9 @@ fn queued_command_covers_content_while_background_follow_is_held() {
     write(&worker_gate, "held");
     let (output, seen) = std::thread::scope(|scope| {
         let index = scope.spawn(|| tree.run(&["index", "src"]));
+        // Only an explicit command's crawl stops at this gate. Read the
+        // markers before the task list: a worker that reaches the gate after
+        // the snapshot is not in it.
         let reached = || -> Vec<String> {
             std::fs::read_dir(&gate)
                 .unwrap_or_else(|error| panic!("read gate: {error}"))
@@ -1476,21 +1479,24 @@ fn queued_command_covers_content_while_background_follow_is_held() {
                 .collect()
         };
         wait(|| !reached().is_empty());
+        let tids = reached();
         let rows = task_rows(pid);
-        let seen: Vec<_> = reached()
+        let seen: Vec<_> = tids
             .into_iter()
             .map(|tid| {
-                let row = rows
+                let (_, comm, nice) = rows
                     .iter()
-                    .find(|(row_tid, _, _)| *row_tid == tid)
+                    .find(|(row, _, _)| *row == tid)
                     .unwrap_or_else(|| panic!("held worker {tid} missing: {rows:?}"));
-                assert!(
-                    !before_tids.contains(&tid),
-                    "held worker {tid} predates the command"
-                );
-                (tid, (row.1.clone(), row.2))
+                (tid, (comm.clone(), *nice))
             })
             .collect();
+        for (tid, _) in &seen {
+            assert!(
+                !before_tids.contains(tid),
+                "held worker {tid} predates the command"
+            );
+        }
         std::fs::remove_file(&worker_gate).unwrap_or_else(|error| panic!("release: {error}"));
         let output = index
             .join()

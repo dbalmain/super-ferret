@@ -864,10 +864,13 @@ impl<W: Write> Host<'_, W> {
         // alone, like rg's block buffer once it has something to show. A
         // failed publish still flushes: the accepted prefix has to leave the
         // buffer before the error returns.
+        // A binary notice is written by `publish` itself, with an empty
+        // buffer, and marks the group emitted.
+        let wrote = has_output || self.emitted_group;
         let defer = self.runtime.is_some_and(|runtime| runtime.defer_stdout);
-        if published.is_err() || !defer || (has_output && !self.sent_output) {
+        if published.is_err() || !defer || (wrote && !self.sent_output) {
             self.writer.flush()?;
-            self.sent_output |= has_output;
+            self.sent_output |= wrote;
         }
         published
     }
@@ -1339,6 +1342,107 @@ mod tests {
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    // A deferring daemon host batches groups after its first, so the flush
+    // before a diagnostic is what keeps an earlier group ahead of it. When
+    // that flush fails, the host stops before reporting the input.
+    #[test]
+    fn deferred_groups_flush_before_diagnostics_and_stop_on_flush_failure() {
+        struct Recorder<'a> {
+            pending: Vec<u8>,
+            log: &'a std::sync::Mutex<Vec<String>>,
+            flushes: usize,
+            fail_flush: Option<usize>,
+        }
+        impl Write for Recorder<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.pending.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.pending.is_empty() {
+                    return Ok(());
+                }
+                self.flushes += 1;
+                if self.fail_flush == Some(self.flushes) {
+                    return Err(io::ErrorKind::StorageFull.into());
+                }
+                let text = String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned();
+                self.log.lock().unwrap().push(format!("out {text}"));
+                Ok(())
+            }
+        }
+        let line_grep::Command::Search(plan) = line_grep::parse(&["red".into()]).unwrap() else {
+            panic!("search")
+        };
+        for fail_flush in [None, Some(2)] {
+            let log = std::sync::Mutex::new(Vec::new());
+            let stderr = |message: &str| {
+                log.lock().unwrap().push(format!("err {message}"));
+                Ok(())
+            };
+            let cancelled = AtomicBool::new(false);
+            let runtime = Runtime {
+                cancelled: &cancelled,
+                stderr: &stderr,
+                tty: false,
+                warned: AtomicBool::new(false),
+                descriptors: None,
+                defer_stdout: true,
+            };
+            let mut host = Host {
+                plan: &plan,
+                runtime: Some(&runtime),
+                filename: true,
+                writer: Recorder {
+                    pending: Vec::new(),
+                    log: &log,
+                    flushes: 0,
+                    fail_flush,
+                },
+                buffer: Vec::new(),
+                matched: false,
+                emitted_group: false,
+                sent_output: false,
+                json_stats: json::Stats::default(),
+                errors: false,
+                cancelled: None,
+            };
+            for name in ["a", "b"] {
+                let line = format!("red {name}\n");
+                let mut reader = |_, request: ReadRequest<'_>| {
+                    let ReadRequest::Stream(each, _) = request else {
+                        panic!("stream")
+                    };
+                    each(&mut line.as_bytes(), line.len() as u64).unwrap();
+                    ReadOutcome::Stable(ReadVersion::Current)
+                };
+                host.checked(Path::new(name), NameId(0), &mut reader)
+                    .unwrap();
+            }
+            let mut failing = |_, _: ReadRequest<'_>| {
+                ReadOutcome::Failed(ReadFault::Io(
+                    ReadOperation::Read,
+                    io::ErrorKind::PermissionDenied.into(),
+                ))
+            };
+            let result = host.checked(Path::new("c"), NameId(0), &mut failing);
+            let log = log.into_inner().unwrap();
+            match fail_flush {
+                None => {
+                    result.unwrap();
+                    assert_eq!(log.len(), 3, "{log:?}");
+                    assert_eq!(log[0], "out a:red a\n");
+                    assert_eq!(log[1], "out b:red b\n");
+                    assert!(log[2].starts_with("err grep: c: "), "{log:?}");
+                }
+                Some(_) => {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::StorageFull);
+                    assert_eq!(log, ["out a:red a\n"]);
+                }
+            }
+        }
     }
 
     // A short group can fit entirely in the destination buffer. Its late

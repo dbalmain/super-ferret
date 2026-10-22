@@ -84,6 +84,15 @@ impl Tree {
         wait(|| self.sockets().len() == 1);
         self.sockets().pop().unwrap()
     }
+    /// Waits for a daemon this tree started and has since killed.
+    fn reap(&self, pid: u32) {
+        let mut children = self.children.lock().unwrap();
+        let child = children
+            .iter_mut()
+            .find(|child| child.id() == pid)
+            .unwrap_or_else(|| panic!("daemon {pid} was not started here"));
+        child.wait().unwrap();
+    }
     fn start(&self, extra: &[(&str, &str)]) -> u32 {
         self.start_at(extra, &self.base)
     }
@@ -1022,7 +1031,10 @@ fn socket_loss_after_first_bytes_is_transport_failure_and_never_replays() {
         output.stdout.len() + bytes.len() < 500_000,
         "query was replayed"
     );
-    // No replacement may appear after any query output was delivered.
+    // No replacement may appear after any query output was delivered. The
+    // client can see its connection fail before the killed daemon has closed
+    // its listener, so reap it first.
+    tree.reap(pid);
     assert!(UnixStream::connect(tree.socket()).is_err());
 }
 
@@ -2196,19 +2208,35 @@ fn raw_output_negotiation_is_per_request_and_preserves_legacy_peers() {
 // still shows its first match, as a search shows its first row.
 #[test]
 fn daemon_grep_sends_its_first_matching_group_before_batching() {
+    let text = |name: &str| format!("hit in {name}\n").into_bytes();
+    first_group_goes_out_alone(&text, &["hit", "src"]);
+    // A binary file's notice is written by the host, not captured with the
+    // group, and still counts as the first output.
+    let binary = |_: &str| [b"hit\n".repeat(40_000), b"\0\n".to_vec()].concat();
+    first_group_goes_out_alone(&binary, &["-o", "^", "src"]);
+}
+
+fn first_group_goes_out_alone(contents: &dyn Fn(&str) -> Vec<u8>, args: &[&str]) {
     let tree = Tree::new();
     let src = tree.base.join("src");
     for name in ["a.txt", "b.txt", "c.txt"] {
-        fs::write(src.join(name), format!("hit in {name}\n")).unwrap();
+        fs::write(src.join(name), contents(name)).unwrap();
     }
     let indexed = tree.local(&["index", "src"]);
     assert!(indexed.status.success(), "{indexed:?}");
     tree.start(&[]);
-    let local = tree.local(&["grep", "hit", "src"]);
+    let mut local_args = vec!["grep"];
+    local_args.extend_from_slice(args);
+    let local = tree.local(&local_args);
     assert_eq!(local.status.code(), Some(0), "{local:?}");
     let (mut peer, _) = tree.connect();
+    let args = args
+        .iter()
+        .map(|arg| format!("{arg:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let request = format!(
-        r#"{{"id":"g","op":"grep","args":["hit","src"],"cwd":"{}","capabilities":["raw-output-v1"],"grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
+        r#"{{"id":"g","op":"grep","args":[{args}],"cwd":"{}","capabilities":["raw-output-v1"],"grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
         tree.base.display()
     );
     peer.get_mut()
