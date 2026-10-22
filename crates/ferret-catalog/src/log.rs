@@ -431,7 +431,7 @@ impl Writer {
         })?;
         Self::open_locked(dir, lock)
     }
-    fn open_locked(dir: &Path, lock: crate::lock::Lock) -> Result<Self, Error> {
+    pub(crate) fn open_locked(dir: &Path, lock: crate::lock::Lock) -> Result<Self, Error> {
         let result: Result<(File, Manifest, Catalog, crate::budget::Budget), Error> = (|| {
             let pinned = Published::open(dir)
                 .map_err(Error::Previous)?

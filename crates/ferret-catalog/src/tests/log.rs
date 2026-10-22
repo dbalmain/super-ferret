@@ -981,3 +981,32 @@ fn retained_session_recovers_uncertain_append_without_releasing_ownership() {
         session.commit(&changes, SNIFFER).unwrap();
     }
 }
+
+/// A daemon's first session publishes an empty catalog without letting go of
+/// the lock, and leaves an existing publication exactly as it was.
+#[test]
+fn open_or_create_publishes_once_and_never_releases_the_lock() {
+    let s = Scratch::new("open-or-create");
+    let empty = crate::WriterSession::open_or_create(&s.path, 7, [3; 16]).unwrap();
+    assert!(matches!(
+        Transaction::begin(&s.path, 7),
+        Err(crate::BeginError::Locked)
+    ));
+    let view = empty.view();
+    assert_eq!(view.roots().count(), 0);
+    assert_eq!(view.policy(), [3; 16]);
+    let created = view.generation();
+    drop(empty);
+
+    commit(&s.path, |txn| {
+        let mut batch = txn.batch();
+        batch.root(b"/root", dir_stat(1));
+        txn.add(batch);
+    });
+    let published = Catalog::open(&s.path).unwrap().unwrap().generation();
+    assert_ne!(published, created);
+    let kept = crate::WriterSession::open_or_create(&s.path, 7, [9; 16]).unwrap();
+    assert_eq!(kept.view().generation(), published);
+    assert_eq!(kept.view().roots().count(), 1);
+    assert_ne!(kept.view().policy(), [9; 16]);
+}

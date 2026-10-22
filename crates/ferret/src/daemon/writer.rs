@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferret_catalog::WriterSession;
 use ferret_crawl::watch::{Config, Limits, Watch};
 use ferret_crawl::{IndexOptions, Refresh, RefreshReason, RootChange};
 
@@ -185,24 +184,10 @@ fn serve(
     let loading = Operation::start(host, "loading");
     #[cfg(debug_assertions)]
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
-    let session = match WriterSession::open(&host.index) {
-        // A daemon started before the first `ferret index` publishes an
-        // empty catalog, so the commands it serves can add roots to it. No
-        // roots change: if another process published first, nothing is
-        // walked and its roots stay.
-        Err(ferret_catalog::log::Error::MissingCheckpoint) => {
-            ferret_crawl::index_change(
-                &host.index,
-                RootChange::default(),
-                Refresh::Only(&[]),
-                &IndexOptions::default(),
-            )
-            .map_err(io::Error::other)?;
-            WriterSession::open(&host.index)
-        }
-        opened => opened,
-    }
-    .map_err(io::Error::other)?;
+    // A daemon started before the first `ferret index` publishes an empty
+    // catalog, holding the lock until its session owns it.
+    let session = ferret_crawl::open_or_create(&host.index, &IndexOptions::default())
+        .map_err(io::Error::other)?;
     let engine = Arc::new(Engine::from_writer(session));
     engine
         .attach_content(&host.index)

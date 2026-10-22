@@ -394,6 +394,16 @@ pub struct RootChange<'a> {
     pub remove: &'a [PathBuf],
 }
 
+/// Opens the writer session for `dir`, first publishing an empty catalog
+/// under the same lock when nothing is published there. A daemon started
+/// before any `ferret index` serves commands that add roots to it.
+pub fn open_or_create(
+    dir: &Path,
+    options: &IndexOptions,
+) -> Result<WriterSession, ferret_catalog::log::Error> {
+    WriterSession::open_or_create(dir, options.sniffer, fingerprint(options))
+}
+
 /// [`index`], with the root set given as a change to the previous
 /// generation's roots rather than in full. The change is applied after the
 /// writer lock is taken, so two runs that each add a root cannot drop each

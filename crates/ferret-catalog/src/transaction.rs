@@ -639,6 +639,33 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     publication::sync(&File::open(dir)?, Point::DirectorySync)
 }
 
+/// Takes the writer lock for `dir` and, when nothing is published there,
+/// publishes an empty generation with `policy` before returning the lock
+/// still held. An existing publication is left as it is.
+pub(crate) fn create_if_absent(
+    dir: &Path,
+    sniffer: u32,
+    policy: crate::Hash,
+) -> Result<crate::lock::Lock, crate::log::Error> {
+    use crate::log::Error;
+    fs::create_dir_all(dir).map_err(Error::Io)?;
+    let lock = crate::lock::Lock::open(dir).map_err(|e| match e {
+        crate::lock::Error::Locked => Error::Locked,
+        crate::lock::Error::Io(e) => Error::Io(e),
+    })?;
+    if crate::log::Published::open(dir)
+        .map_err(Error::Previous)?
+        .is_none()
+    {
+        remove_temp(dir).map_err(Error::Io)?;
+        sync_ancestors(dir).map_err(Error::Io)?;
+        let mut txn = Transaction::from_locked(dir.to_owned(), lock.share(), None, sniffer);
+        txn.set_policy(policy);
+        txn.commit().map_err(Error::Rebuild)?;
+    }
+    Ok(lock)
+}
+
 /// Syncs every ancestor of `dir`, from its parent up to `/`, so the chain of
 /// entries naming it is on disk. Resolved first, so a symlinked component
 /// syncs the directory that actually holds the entry.

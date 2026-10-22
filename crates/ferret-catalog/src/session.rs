@@ -33,7 +33,19 @@ impl WriterSession {
     /// Takes the writer lock. Initial indexing needs a checkpoint first.
     pub fn open(dir: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(dir).map_err(Error::Io)?;
-        let writer = Writer::open(dir)?;
+        Ok(Self::with_writer(Writer::open(dir)?))
+    }
+
+    /// Like [`Self::open`], but when nothing is published in `dir` it first
+    /// publishes an empty generation with `policy`, under the same lock, so
+    /// no other writer can publish or take the lock in between. An existing
+    /// publication is opened as it is.
+    pub fn open_or_create(dir: &Path, sniffer: u32, policy: Hash) -> Result<Self, Error> {
+        let lock = crate::transaction::create_if_absent(dir, sniffer, policy)?;
+        Ok(Self::with_writer(Writer::open_locked(dir, lock)?))
+    }
+
+    fn with_writer(writer: Writer) -> Self {
         let mut session = Self {
             lookup_base: writer.view(),
             writer,
@@ -51,7 +63,7 @@ impl WriterSession {
             input_limits: crate::InputLimits::default(),
         };
         session.rebuild();
-        Ok(session)
+        session
     }
 
     fn rebuild(&mut self) {
