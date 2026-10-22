@@ -6421,7 +6421,9 @@ can wait.
 
 ## D115 — Should ferret honour git's `core.excludesFile`?
 
-**Status: open, 2026-10-22.**
+**Status: answered B, 2026-10-22.**
+
+> Dave: Let's go with your recommendation for now.
 
 Question: should ferret read git's `core.excludesFile` setting, and if so in
 uncovered grep's rg mode (D112 B), in the indexed crawl (D13), or both?
@@ -6467,7 +6469,11 @@ without per-repo config).
 
 ## D116 — How long should a spawned daemon stay up when idle?
 
-**Status: open, 2026-10-22.**
+**Status: open, 2026-10-22. Dave asked a question; options brief to follow.**
+
+> Dave: For D116, don't we want the daemon to stay running for indexing
+> purposes? Perhaps the question should be what can the daemon drop from
+> memory when not being searched?
 
 Question: should the daemon's 15-minute idle exit change, now that grep,
 search and find all spawn it and agents work in bursts?
@@ -6510,7 +6516,9 @@ If it is well under ~400 MiB, choose B.
 
 ## D117 — Should an answer from a possibly stale index say so?
 
-**Status: open, 2026-10-22.**
+**Status: answered B, 60 s, on by default, 2026-10-22.**
+
+> Dave: Agree with your D117 recommendation too.
 
 Question: when no daemon is reachable and a command answers in-process from
 the published catalog, should it print a one-line notice on stderr if that
