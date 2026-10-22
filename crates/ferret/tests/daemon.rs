@@ -2373,9 +2373,13 @@ fn daemon_search_raw_frames_batch_paths_to_64_kib() {
         joined.extend_from_slice(&payload);
     }
     assert_eq!(joined, local.stdout);
-    assert!(lengths.len() > 1, "{lengths:?}");
+    // The first path is a frame of its own, so a sparse search shows its
+    // first row before a part fills; later parts are full.
+    let first_path = local.stdout.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    assert_eq!(lengths[0], first_path, "{lengths:?}");
+    assert!(lengths.len() > 2, "{lengths:?}");
     assert!(
-        lengths[..lengths.len() - 1]
+        lengths[1..lengths.len() - 1]
             .iter()
             .all(|len| *len == 64 * 1024),
         "{lengths:?}"

@@ -279,6 +279,15 @@ pub(crate) fn search_request(
                             if let Err(error) = raw_out
                                 .write(destination, &request.id, row.path)
                                 .and_then(|()| raw_out.write(destination, &request.id, b"\n"))
+                                // The first path goes out alone, as the first
+                                // JSON row does; later paths fill parts.
+                                .and_then(|()| {
+                                    if rows == 0 {
+                                        raw_out.send_pending(destination, &request.id)
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
                             {
                                 output_error = Some(error);
                                 return ControlFlow::Break(());

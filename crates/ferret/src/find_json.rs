@@ -295,6 +295,25 @@ impl RawStdout {
         Ok(())
     }
 
+    /// Sends what is pending as a non-final part, so a caller can put its
+    /// first bytes on the wire before a part fills.
+    pub(crate) fn send_pending(&mut self, destination: &Destination, id: &str) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            frame(
+                destination,
+                id,
+                "stdout",
+                self.record,
+                self.part,
+                &self.pending,
+                false,
+            )?;
+            self.part += 1;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(&mut self, destination: &Destination, id: &str) -> io::Result<()> {
         if !self.pending.is_empty() {
             frame(
