@@ -6425,6 +6425,15 @@ can wait.
 
 > Dave: Let's go with your recommendation for now.
 
+Done, 2026-10-23 (b768ad8). Uncovered grep picks its global excludes file as
+rg 15.2.0 does, measured as a black box: the first `excludesFile = VALUE` line
+in `$GIT_CONFIG_GLOBAL`, `~/.gitconfig`, then the XDG git config, in any
+section. rg's line grammar is narrower than git's (one word of value, nothing
+after it), and a named file it cannot read means no global excludes. GREP.md
+has the rules; a 19-case differential test pins them. One existing divergence
+went with it: an unreadable `git/ignore` failed ferret's grep, and rg skips it
+silently. The crawl is unchanged.
+
 Question: should ferret read git's `core.excludesFile` setting, and if so in
 uncovered grep's rg mode (D112 B), in the indexed crawl (D13), or both?
 
@@ -6642,6 +6651,10 @@ GB → 0.64 GB) gives about 0.2 GB.
 **Status: answered B, 60 s, on by default, 2026-10-22.**
 
 > Dave: Agree with your D117 recommendation too.
+
+Done, 2026-10-23 (7bc802a). Search, default find and indexed grep that answer
+in-process print `ferret: warning: no daemon answered; …` with the index's age
+when `current` is more than 60 s old. `FERRET_STALE_NOTICE=0` silences it.
 
 Question: when no daemon is reachable and a command answers in-process from
 the published catalog, should it print a one-line notice on stderr if that
