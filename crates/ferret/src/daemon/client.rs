@@ -41,9 +41,11 @@ pub(crate) fn search(
         now,
         Some(context),
     )
+    .or_else(|| stale_notice(&context.index, now))
 }
 pub(crate) fn find(index: &Path, args: &[OsString], json: bool, now: SystemTime) -> Option<Exit> {
     query(index, args, "find", json, Options::default(), now, None)
+        .or_else(|| stale_notice(index, now))
 }
 
 pub(crate) fn grep(
@@ -63,6 +65,41 @@ pub(crate) fn grep(
         SystemTime::now(),
         None,
     )
+    .or_else(|| stale_notice(index, SystemTime::now()))
+}
+
+/// How old a publication may be before a command that answers it in-process
+/// says so (D117 B). Above the 1 s debounce and the 10 s startup deadline, so
+/// an index a daemon or `ferret index` just wrote stays quiet.
+const STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// Says on stderr that no daemon answered and the catalog in `index` was
+/// published more than [`STALE_AFTER`] before `now`, so the answer may miss
+/// recent changes. Every publication renames `current` into place, so its
+/// mtime is the publication time. `FERRET_STALE_NOTICE=0` silences it. Always
+/// returns `None`: the caller answers in-process either way.
+fn stale_notice(index: &Path, now: SystemTime) -> Option<Exit> {
+    if std::env::var_os("FERRET_STALE_NOTICE").is_some_and(|value| value == "0") {
+        return None;
+    }
+    let published = fs::metadata(index.join("current")).ok()?.modified().ok()?;
+    let age = now.duration_since(published).ok()?;
+    if age > STALE_AFTER {
+        cli::warn(&format!(
+            "no daemon answered; this answer comes from the index as published {} ago and may miss later changes (FERRET_STALE_NOTICE=0 silences this)",
+            approximate(age)
+        ));
+    }
+    None
+}
+/// `age` to the nearest whole minute, hour or day.
+fn approximate(age: Duration) -> String {
+    let minutes = (age.as_secs() + 30) / 60;
+    match minutes {
+        0..=89 => format!("{minutes} min"),
+        90..=2159 => format!("{} h", (minutes + 30) / 60),
+        _ => format!("{} days", (minutes + 720) / 1440),
+    }
 }
 
 pub(crate) fn writer_command(

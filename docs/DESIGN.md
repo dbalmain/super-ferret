@@ -778,7 +778,10 @@ its own capture budget and streaming owner.
 Search, default find and covered directory grep connect to the daemon,
 spawning it on first use. `status` and `stats --json` connect without
 spawning; text `stats` stays local. Unavailable background operation or
-`FERRET_NO_DAEMON` uses the same engine in process.
+`FERRET_NO_DAEMON` uses the same engine in process. Such an answer from a
+catalog whose `current` was renamed into place over 60 s ago prints one stderr
+warning that it may miss later changes; `FERRET_STALE_NOTICE=0` silences it
+(D117 B).
 D56 A keeps effectful find in the local client; live/information-only find
 and batch remain local too. M5a retains one WriterSession and its lock;
 explicit index/root commands are ordering barriers in one writer queue. Each

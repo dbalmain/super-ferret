@@ -2435,3 +2435,53 @@ fn search_output_is_the_same_at_any_verify_thread_count() {
     }
     fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
 }
+
+/// D117 B: an in-process answer from a catalog published more than a minute
+/// ago says so on stderr, once, and keeps its exit status.
+#[test]
+fn an_answer_from_an_old_index_says_so() {
+    let env = Env::new("stale-notice");
+    env.seed_ignore_file();
+    let file = env.write("notes.txt", b"hello\n");
+    assert!(
+        env.run(&[os("index"), env.tree().as_os_str()])
+            .status
+            .success()
+    );
+    let notice = "no daemon answered";
+
+    let fresh = env.run(&[os("search"), os("notes.txt")]);
+    assert_eq!(paths(&fresh), std::slice::from_ref(&file));
+    assert!(!stderr(&fresh).contains(notice), "{}", stderr(&fresh));
+
+    File::options()
+        .write(true)
+        .open(env.index().join("current"))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3 * 3600))
+        .unwrap();
+    let old = env.run(&[os("search"), os("notes.txt")]);
+    assert_eq!(paths(&old), std::slice::from_ref(&file));
+    assert!(old.status.success());
+    let message = stderr(&old);
+    assert_eq!(message.matches(notice).count(), 1, "{message}");
+    assert!(message.contains("published 3 h ago"), "{message}");
+    for args in [
+        [os("find"), env.tree().as_os_str()],
+        [os("grep"), os("hello")],
+    ] {
+        let mut command = env.command(&args);
+        command.current_dir(env.tree());
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert!(stderr(&output).contains(notice), "{args:?}");
+    }
+
+    let silenced = env
+        .command(&[os("search"), os("notes.txt")])
+        .env("FERRET_STALE_NOTICE", "0")
+        .output()
+        .unwrap();
+    assert_eq!(paths(&silenced), [file]);
+    assert!(!stderr(&silenced).contains(notice), "{}", stderr(&silenced));
+}
