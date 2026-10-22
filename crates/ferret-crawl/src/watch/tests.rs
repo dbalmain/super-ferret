@@ -451,6 +451,50 @@ fn a_deferred_burst_keeps_its_oldest_age_when_collapsed_to_a_complete_backstop()
     assert_eq!(watch.status().backstop, Some(RefreshReason::Backstop));
 }
 
+/// Another root's counted failures must not keep a repaired root polling.
+#[test]
+fn a_repaired_root_stops_polling_while_another_stays_over_the_bound() {
+    let mut tree = Tree::new("failure-two-roots", 100, 1 << 20);
+    let root = tree.path.join("root");
+    let wide = root.join("wide");
+    for i in 0..150 {
+        fs::create_dir_all(wide.join(i.to_string()))
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"));
+    }
+    let other = tree.path.join("zother");
+    for i in 0..EXACT_FAILURES + 100 {
+        fs::create_dir_all(other.join(i.to_string()))
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"));
+    }
+    let options = IndexOptions {
+        watch: Some(tree.watch.clone()),
+        workers: 1,
+        ..IndexOptions::default()
+    };
+    let roots = [root.clone(), other.clone()];
+    crate::recrawl(&mut tree.writer, &roots, Refresh::All, &options)
+        .unwrap_or_else(|error| panic!("over the cap: {error:?}"));
+    tree.watch.reconcile(&tree.writer.view());
+    assert_eq!(tree.watch.polling_roots(&tree.writer.view()), roots);
+
+    fs::remove_dir_all(&wide).unwrap_or_else(|error| panic!("fixture: {error:?}"));
+    tree.watch
+        .drain()
+        .unwrap_or_else(|error| panic!("drain: {error:?}"));
+    crate::recrawl(
+        &mut tree.writer,
+        &roots,
+        Refresh::Only(std::slice::from_ref(&root)),
+        &options,
+    )
+    .unwrap_or_else(|error| panic!("root repaired: {error:?}"));
+    tree.watch.reconcile(&tree.writer.view());
+    assert_eq!(
+        tree.watch.polling_roots(&tree.writer.view()),
+        std::slice::from_ref(&other)
+    );
+}
+
 #[test]
 fn failures_past_the_exact_bound_are_counted_and_retired_by_a_complete_observation() {
     let mut tree = Tree::new("failure-bound", 100, 1 << 20);

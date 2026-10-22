@@ -121,8 +121,11 @@ struct Hint {
     from: bool,
     to: bool,
 }
-/// Failures kept by key for one root. A scoped refresh that later installs one
-/// of these clears it; past the bound, only the next complete observation does.
+/// Failures kept by key for one root, directories and policy inputs together.
+/// A scoped refresh that later installs one of these clears it; past the
+/// bound, and for a loss with no key, only the next complete observation does.
+/// Counted failures are attempts, not distinct watches, so a status count past
+/// the bound can repeat a directory.
 const EXACT_FAILURES: usize = 1024;
 /// Watches that could not be installed for one root since its latest complete
 /// observation began. The first few are kept by key. The rest are only counted:
@@ -144,6 +147,9 @@ enum Failed<K> {
     Directory((u64, u64)),
     /// The input's path, computed only while it can still be kept.
     Policy(K),
+    /// Coverage lost with nothing to key it by. Only a complete observation
+    /// of the root retires it.
+    Lost,
 }
 #[derive(Debug)]
 struct State {
@@ -182,6 +188,7 @@ pub struct Watch {
 pub struct Status {
     pub installed: usize,
     pub needed: usize,
+    /// Failed watches; approximate past 1,024 for one root.
     pub failed: usize,
     pub pending: usize,
     pub bytes: usize,
@@ -401,11 +408,11 @@ impl Watch {
         }
     }
     fn gap(&self, root: &Path) {
-        self.state
+        let mut s = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .gaps
-            .insert(root.to_owned());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fail(&mut s, root, Failed::<fn() -> PathBuf>::Lost);
     }
     /// Reads until EAGAIN. Kernel buffers are always consumed even when the
     /// userspace accumulator has collapsed to a complete backstop marker.
@@ -877,14 +884,11 @@ impl Watch {
             }
             s.unreliable
                 .retain(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
-            if s.failures
-                .values()
-                .all(|f| f.directories.is_empty() && f.counted == 0)
-            {
-                s.gaps = s.unreliable.clone();
-                let failed = s.failures.keys().cloned().collect::<Vec<_>>();
-                s.gaps.extend(failed);
-            }
+            // Failures are per root, so a root leaves the gaps once its own
+            // record is gone, whatever another root still holds.
+            s.gaps = s.unreliable.clone();
+            let failed = s.failures.keys().cloned().collect::<Vec<_>>();
+            s.gaps.extend(failed);
             s.descriptors
                 .iter()
                 .map(|(&wd, d)| (wd, d.clone()))
@@ -940,7 +944,9 @@ fn fail<K: FnOnce() -> PathBuf>(s: &mut State, root: &Path, failed: Failed<K>) {
             ..Failures::default()
         };
     }
-    if record.directories.len() + record.policies.len() >= EXACT_FAILURES {
+    if matches!(failed, Failed::Lost)
+        || record.directories.len() + record.policies.len() >= EXACT_FAILURES
+    {
         record.counted += 1;
         return;
     }
@@ -951,6 +957,7 @@ fn fail<K: FnOnce() -> PathBuf>(s: &mut State, root: &Path, failed: Failed<K>) {
         Failed::Policy(key) => {
             record.policies.insert(key());
         }
+        Failed::Lost => {}
     }
 }
 fn loss(s: &mut State, reason: RefreshReason) {
