@@ -157,6 +157,26 @@ pub(super) fn start(
             super::wake_listener(&host);
         })
 }
+/// Returns heap freed by a rewalk or a command to the kernel. glibc keeps it
+/// otherwise: after a `/nix/store` rewalk, RSS stayed about 0.5 GB above the
+/// live heap for as long as the daemon ran (D116).
+fn release_freed_memory() {
+    // D11: on geekom's /nix/store (5.4M entries, past the watch cap) the
+    // idle daemon held 715 MB anonymous without this and 637 MB with it,
+    // flat for 20 minutes after the startup rewalk (2026-10-23).
+    // SAFETY: malloc_trim takes no pointers and locks each arena itself; it
+    // only returns whole free pages to the kernel.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[allow(unsafe_code)]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
 fn serve(
     host: &Arc<Host>,
     receive: mpsc::Receiver<Message>,
@@ -351,6 +371,7 @@ fn serve(
                 // the next command begins.
                 let _ = command.reply.send(reply);
                 host.writer_pending.fetch_sub(1, Ordering::AcqRel);
+                release_freed_memory();
                 content_due = Instant::now();
                 continue;
             }
@@ -465,9 +486,13 @@ fn serve(
         // refresh spaces the next poll by four times its duration, so polling
         // holds the writer at most a fifth of the time. Short bursts leave the
         // poll alone.
-        let spacing = started.elapsed().saturating_mul(4);
+        let elapsed = started.elapsed();
+        let spacing = elapsed.saturating_mul(4);
         if spacing > polling {
             poll_due = poll_due.max(Instant::now() + spacing);
+        }
+        if elapsed >= Duration::from_secs(1) {
+            release_freed_memory();
         }
         let deferred = result
             .as_ref()
