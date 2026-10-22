@@ -895,10 +895,83 @@ fn core_excludes_file_is_read_as_rg_reads_it() {
             differences.push(format!("{name}: rg {rg:?}; ferret {ferret:?}"));
         }
     }
+    // Byte-level edges: name, then the ~/.gitconfig and XDG config bytes.
+    set(None, None, None);
+    let tilde: &[u8] = b"[core]\n\texcludesFile = ~/ex-tilde\n";
+    type Bytes = (&'static str, Option<&'static [u8]>, &'static [u8]);
+    let bytes: [Bytes; 11] = [
+        ("quoted empty", None, b"[core]\n\texcludesFile = \"\"\n"),
+        ("lone quote", None, b"[core]\n\texcludesFile = \"\n"),
+        (
+            "quoted empty before a value",
+            None,
+            b"[core]\n\texcludesFile = \"\"\n\texcludesFile = ~/ex-tilde\n",
+        ),
+        (
+            "quoted empty in home",
+            Some(b"[core]\n\texcludesFile = \"\"\n"),
+            tilde,
+        ),
+        (
+            "tabs around =",
+            None,
+            b"[core]\n\texcludesFile\t=\t~/ex-tilde\n",
+        ),
+        ("CRLF", None, b"[core]\r\n\texcludesFile = ~/ex-tilde\r\n"),
+        (
+            "invalid UTF-8 comment first",
+            None,
+            b"# \xff\xfe\n[core]\n\texcludesFile = ~/ex-tilde\n",
+        ),
+        (
+            "NUL in value",
+            None,
+            b"[core]\n\texcludesFile = ~/ex\0tilde\n",
+        ),
+        (
+            "no-break space in value",
+            None,
+            b"[core]\n\texcludesFile = ~/ex\xc2\xa0tilde\n",
+        ),
+        (
+            "invalid UTF-8 value before a value",
+            None,
+            b"[core]\n\texcludesFile = ~/ex-\xfftilde\n\texcludesFile = ~/ex-tilde\n",
+        ),
+        (
+            "invalid UTF-8 value in home",
+            Some(b"[core]\n\texcludesFile = ~/ex-\xfftilde\n"),
+            tilde,
+        ),
+    ];
+    for (name, home_config, text) in bytes {
+        match home_config {
+            Some(home_config) => fs::write(home.join(".gitconfig"), home_config).unwrap(),
+            None => {
+                let _ = fs::remove_file(home.join(".gitconfig"));
+            }
+        }
+        fs::write(xdg.join("config"), text).unwrap();
+        let args = ["-l", "hit", "."];
+        let rg = f.oracle(&f.tree, &args);
+        let ferret = f.ferret(&f.tree, &args);
+        if rg.status.code() != ferret.status.code()
+            || sorted(&rg.stdout) != sorted(&ferret.stdout)
+            || rg.stderr != ferret.stderr
+        {
+            differences.push(format!("{name}: rg {rg:?}; ferret {ferret:?}"));
+        }
+    }
     assert!(differences.is_empty(), "{}", differences.join("\n"));
     // rg skips a global excludes file it cannot read, without a message.
     set(None, None, None);
     fs::set_permissions(xdg.join("ignore"), fs::Permissions::from_mode(0o000)).unwrap();
-    f.compare(&f.tree, &["-l", "hit", "."], true);
+    let args = ["-l", "hit", "."];
+    let rg = f.oracle(&f.tree, &args);
+    let ferret = f.ferret(&f.tree, &args);
     fs::set_permissions(xdg.join("ignore"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(rg.status.code(), ferret.status.code());
+    assert_eq!(sorted(&rg.stdout), sorted(&ferret.stdout));
+    assert!(rg.stderr.is_empty(), "{rg:?}");
+    assert!(ferret.stderr.is_empty(), "{ferret:?}");
 }

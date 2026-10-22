@@ -67,8 +67,9 @@ line `excludesFile = VALUE` in `$GIT_CONFIG_GLOBAL`, `~/.gitconfig`, then
 `$XDG_CONFIG_HOME/git/config` (or `~/.config/git/config`), in any section, and
 only with a single-word value, optionally quoted, and nothing after it. `~/`
 expands to `$HOME`; a relative value is relative to the current directory. A
-named file that cannot be read means no global excludes, not the default; no
-global source is ever an error. Includes and `.git/config` are not read. As in
+named file that cannot be read, or a value that is only quotes, means no
+global excludes, not the default; a value that is not UTF-8 skips its whole
+config file. No global source is ever an error. Includes and `.git/config` are not read. As in
 rg 15.2.0, the three git sources apply only
 in directories inside a work tree: any ancestor holding a `.git` that
 resolves counts (a stray `.git` above a scratch directory makes it a work

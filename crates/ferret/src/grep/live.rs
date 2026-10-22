@@ -700,9 +700,11 @@ fn git_global_excludes() -> Option<Vec<u8>> {
     let named = sources.into_iter().flatten().find_map(|source| {
         let text = read_global(&source).ok().flatten()?;
         let value = text.split(|&b| b == b'\n').find_map(excludes_file)?;
-        Some(match (value.strip_prefix(b"~/"), &home) {
-            (Some(rest), Some(home)) => home.join(std::ffi::OsStr::from_bytes(rest)),
-            _ => PathBuf::from(std::ffi::OsStr::from_bytes(value)),
+        // A value that is not UTF-8 discards the whole file, as in rg.
+        let value = std::str::from_utf8(value).ok()?;
+        Some(match (value.strip_prefix("~/"), &home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(value),
         })
     });
     let path = named.or_else(|| config.map(|config| config.join("git/ignore")))?;
@@ -712,7 +714,8 @@ fn git_global_excludes() -> Option<Vec<u8>> {
 /// The value of an `excludesFile = VALUE` line, as rg recognises one: the
 /// key in any case at the start of the line, and one word of value, with
 /// either quote optional. Anything after the value, a comment included,
-/// means the line does not count.
+/// means the line does not count. A value that is only quotes counts and
+/// names no file, so no global excludes apply.
 fn excludes_file(line: &[u8]) -> Option<&[u8]> {
     let line = line.trim_ascii();
     let key = b"excludesfile";
@@ -723,9 +726,11 @@ fn excludes_file(line: &[u8]) -> Option<&[u8]> {
         .trim_ascii_start()
         .strip_prefix(b"=")?
         .trim_ascii_start();
+    if value.is_empty() || value.iter().any(u8::is_ascii_whitespace) {
+        return None;
+    }
     let value = value.strip_prefix(b"\"").unwrap_or(value);
-    let value = value.strip_suffix(b"\"").unwrap_or(value);
-    (!value.is_empty() && !value.iter().any(u8::is_ascii_whitespace)).then_some(value)
+    Some(value.strip_suffix(b"\"").unwrap_or(value))
 }
 
 // Global configuration is not a scoped crawl input: it has no 1 MiB limit
