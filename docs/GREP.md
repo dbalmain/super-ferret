@@ -61,8 +61,15 @@ excludes (`$XDG_CONFIG_HOME/git/ignore`, or `~/.config/git/ignore`), then
 `.ignore`, then `.rgignore`. `.ignore` and `.rgignore` are also read from
 every ancestor up to `/`, and each outranks every git source, including a
 closer `.gitignore`. It applies no ferret
-ignore file, `DEFAULT_IGNORE`, or content size cap. Ferret does not currently
-read `core.excludesFile`. As in rg 15.2.0, the three git sources apply only
+ignore file, `DEFAULT_IGNORE`, or content size cap. `core.excludesFile`
+replaces the default global file as rg 15.2.0 reads it (D115 B): the first
+line `excludesFile = VALUE` in `$GIT_CONFIG_GLOBAL`, `~/.gitconfig`, then
+`$XDG_CONFIG_HOME/git/config` (or `~/.config/git/config`), in any section, and
+only with a single-word value, optionally quoted, and nothing after it. `~/`
+expands to `$HOME`; a relative value is relative to the current directory. A
+named file that cannot be read means no global excludes, not the default; no
+global source is ever an error. Includes and `.git/config` are not read. As in
+rg 15.2.0, the three git sources apply only
 in directories inside a work tree: any ancestor holding a `.git` that
 resolves counts (a stray `.git` above a scratch directory makes it a work
 tree); a symlinked `.git` is followed, and one that does not resolve (a loop,

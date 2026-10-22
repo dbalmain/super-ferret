@@ -116,17 +116,7 @@ impl Anchors {
         }
         anchors.uncovered = uncovered.into();
         if !anchors.uncovered.is_empty() {
-            let config = std::env::var_os("XDG_CONFIG_HOME")
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
-                });
-            anchors.global = config
-                .map(|p| read_global(&p.join("git/ignore")))
-                .transpose()
-                .map_err(|e| e.to_string())?
-                .flatten()
+            anchors.global = git_global_excludes()
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default()
                 .into();
@@ -685,6 +675,57 @@ fn load_kind(
         return Err(error);
     }
     Ok(rules)
+}
+
+/// Git's global excludes as rg 15.2 reads them (D115 B, measured as a black
+/// box). The first line of the form `excludesFile = VALUE` in
+/// `$GIT_CONFIG_GLOBAL`, then `~/.gitconfig`, then the git config under the
+/// XDG config directory names the file, whatever section holds the line; a
+/// file without one passes to the next. With none, git's default `git/ignore`
+/// in that directory applies. A named file that cannot be read means no
+/// global excludes rather than the default, and nothing here is an error.
+fn git_global_excludes() -> Option<Vec<u8>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    let sources = [
+        std::env::var_os("GIT_CONFIG_GLOBAL")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
+        home.as_ref().map(|home| home.join(".gitconfig")),
+        config.as_ref().map(|config| config.join("git/config")),
+    ];
+    let named = sources.into_iter().flatten().find_map(|source| {
+        let text = read_global(&source).ok().flatten()?;
+        let value = text.split(|&b| b == b'\n').find_map(excludes_file)?;
+        Some(match (value.strip_prefix(b"~/"), &home) {
+            (Some(rest), Some(home)) => home.join(std::ffi::OsStr::from_bytes(rest)),
+            _ => PathBuf::from(std::ffi::OsStr::from_bytes(value)),
+        })
+    });
+    let path = named.or_else(|| config.map(|config| config.join("git/ignore")))?;
+    read_global(&path).ok().flatten()
+}
+
+/// The value of an `excludesFile = VALUE` line, as rg recognises one: the
+/// key in any case at the start of the line, and one word of value, with
+/// either quote optional. Anything after the value, a comment included,
+/// means the line does not count.
+fn excludes_file(line: &[u8]) -> Option<&[u8]> {
+    let line = line.trim_ascii();
+    let key = b"excludesfile";
+    if line.len() < key.len() || !line[..key.len()].eq_ignore_ascii_case(key) {
+        return None;
+    }
+    let value = line[key.len()..]
+        .trim_ascii_start()
+        .strip_prefix(b"=")?
+        .trim_ascii_start();
+    let value = value.strip_prefix(b"\"").unwrap_or(value);
+    let value = value.strip_suffix(b"\"").unwrap_or(value);
+    (!value.is_empty() && !value.iter().any(u8::is_ascii_whitespace)).then_some(value)
 }
 
 // Global configuration is not a scoped crawl input: it has no 1 MiB limit

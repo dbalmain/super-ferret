@@ -9,6 +9,8 @@ use std::process::{Command, Output, Stdio};
 pub struct Fixture {
     pub base: PathBuf,
     pub tree: PathBuf,
+    /// Extra environment for both binaries.
+    pub env: std::cell::RefCell<Vec<(&'static str, PathBuf)>>,
 }
 
 impl Fixture {
@@ -29,7 +31,11 @@ impl Fixture {
             fs::create_dir_all(base.join(path)).unwrap();
         }
         fs::write(base.join("home/config/ferret/ignore"), b"# fixture\n").unwrap();
-        Self { base, tree }
+        Self {
+            base,
+            tree,
+            env: Default::default(),
+        }
     }
 
     pub fn write(&self, path: &str, bytes: &[u8]) {
@@ -55,6 +61,7 @@ impl Fixture {
             .env("FERRET_NO_DAEMON", "1")
             .env("FERRET_INDEX", self.base.join("index"))
             .env("LC_ALL", "C.UTF-8")
+            .envs(self.env.borrow().iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

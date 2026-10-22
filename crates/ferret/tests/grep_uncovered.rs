@@ -759,3 +759,146 @@ fn running_as_root() -> bool {
     }
     root
 }
+
+// D115 B: `core.excludesFile` chooses the global excludes file as rg 15.2
+// does. Each case rewrites the three config sources and compares.
+#[test]
+fn core_excludes_file_is_read_as_rg_reads_it() {
+    let f = Fixture::new("core-excludes");
+    f.repo();
+    let home = f.base.join("home");
+    let xdg = home.join("config/git");
+    fs::create_dir_all(&xdg).unwrap();
+    fs::write(xdg.join("ignore"), b"default.txt\n").unwrap();
+    for (name, pattern) in [
+        ("ex-xdg", "xdg.txt"),
+        ("ex-home", "home.txt"),
+        ("ex-env", "env.txt"),
+        ("ex-tilde", "tilde.txt"),
+    ] {
+        fs::write(home.join(name), format!("{pattern}\n")).unwrap();
+    }
+    fs::write(f.tree.join("ex-relative"), b"relative.txt\n").unwrap();
+    for name in [
+        "default", "xdg", "home", "env", "tilde", "relative", "plain",
+    ] {
+        f.write(&format!("{name}.txt"), b"hit\n");
+    }
+    let key = |value: &str| format!("[core]\n\texcludesFile = {value}\n");
+    let at = |name: &str| home.join(name).display().to_string();
+    let env_file = f.base.join("env-config");
+    let set = |xdg_config: Option<String>, home_config: Option<String>, env: Option<String>| {
+        for (path, text) in [
+            (xdg.join("config"), xdg_config),
+            (home.join(".gitconfig"), home_config),
+            (env_file.clone(), env),
+        ] {
+            match text {
+                Some(text) => fs::write(path, text).unwrap(),
+                None => {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+    };
+    // Name, then the XDG config, ~/.gitconfig and $GIT_CONFIG_GLOBAL texts.
+    type Case = (&'static str, Option<String>, Option<String>, Option<String>);
+    let cases: Vec<Case> = vec![
+        ("none", None, None, None),
+        ("xdg", Some(key(&at("ex-xdg"))), None, None),
+        (
+            "home beats xdg",
+            Some(key(&at("ex-xdg"))),
+            Some(key(&at("ex-home"))),
+            None,
+        ),
+        (
+            "env beats home",
+            Some(key(&at("ex-xdg"))),
+            Some(key(&at("ex-home"))),
+            Some(key(&at("ex-env"))),
+        ),
+        (
+            "env without the key passes on",
+            None,
+            Some(key(&at("ex-home"))),
+            Some("[user]\n\tname = x\n".into()),
+        ),
+        (
+            "first file's missing target wins",
+            Some(key(&at("ex-xdg"))),
+            Some(key(&at("missing"))),
+            None,
+        ),
+        ("tilde", Some(key("~/ex-tilde")), None, None),
+        ("relative to cwd", Some(key("ex-relative")), None, None),
+        (
+            "uppercase",
+            Some("[CORE]\n\tEXCLUDESFILE = ~/ex-tilde\n".into()),
+            None,
+            None,
+        ),
+        ("quoted", Some(key("\"~/ex-tilde\"")), None, None),
+        (
+            "no spaces",
+            Some("[core]\nexcludesFile=~/ex-tilde\n".into()),
+            None,
+            None,
+        ),
+        (
+            "any section",
+            Some("[user]\n\texcludesFile = ~/ex-tilde\n".into()),
+            None,
+            None,
+        ),
+        (
+            "first line wins",
+            Some(format!("{}{}", key("~/ex-tilde"), key(&at("ex-xdg")))),
+            None,
+            None,
+        ),
+        ("trailing comment", Some(key("~/ex-tilde ; c")), None, None),
+        (
+            "empty value",
+            Some("[core]\n\texcludesFile =\n".into()),
+            None,
+            None,
+        ),
+        ("value with a space", Some(key("~/ex tilde")), None, None),
+        (
+            "same-line header",
+            Some("[core] excludesFile = ~/ex-tilde\n".into()),
+            None,
+            None,
+        ),
+        (
+            "commented",
+            Some("[core]\n#\texcludesFile = ~/ex-tilde\n".into()),
+            None,
+            None,
+        ),
+        ("directory target", Some(key("~/")), None, None),
+    ];
+    f.env
+        .borrow_mut()
+        .push(("GIT_CONFIG_GLOBAL", env_file.clone()));
+    let mut differences = Vec::new();
+    for (name, xdg_config, home_config, env) in cases {
+        set(xdg_config, home_config, env);
+        let args = ["-l", "hit", "."];
+        let rg = f.oracle(&f.tree, &args);
+        let ferret = f.ferret(&f.tree, &args);
+        if rg.status.code() != ferret.status.code()
+            || sorted(&rg.stdout) != sorted(&ferret.stdout)
+            || rg.stderr != ferret.stderr
+        {
+            differences.push(format!("{name}: rg {rg:?}; ferret {ferret:?}"));
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
+    // rg skips a global excludes file it cannot read, without a message.
+    set(None, None, None);
+    fs::set_permissions(xdg.join("ignore"), fs::Permissions::from_mode(0o000)).unwrap();
+    f.compare(&f.tree, &["-l", "hit", "."], true);
+    fs::set_permissions(xdg.join("ignore"), fs::Permissions::from_mode(0o644)).unwrap();
+}

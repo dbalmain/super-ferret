@@ -1466,9 +1466,10 @@ including `.gitignore`, `.ferretignore`, git `info/exclude`, gitdir/commondir
 indirection and the global ferret ignore file. `ferret-policy` remains pure;
 full unprotected observations retire old dependencies. Symlink targets/ancestors,
 global ferret rules and the reserved config entry use parent watches; unwatchable
-inputs poll. There is no ferret config-file parser. `core.excludesFile` is
-deliberately not honoured: it costs git subprocesses per repository per crawl,
-and the global ferret ignore file covers the need.
+inputs poll. There is no ferret config-file parser. The crawl deliberately
+does not honour `core.excludesFile`: the global ferret ignore file covers the
+need, and D115 B keeps D13's index rules. Uncovered grep reads it as rg does
+(GREP.md).
 Statfs magic puts NFS, CIFS/SMB/SMB2, 9P and FUSE roots into polling regardless of
 successful watches, because remote/userspace writes may lack local events.
 
