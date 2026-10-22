@@ -270,7 +270,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         stop: AtomicBool::new(false),
         permits: Permits::new(ferret_crawl::default_workers()),
     });
-    let writer = writer::start(host.clone(), writer_receive);
+    let writer = writer::start(host.clone(), writer_receive)?;
     let mut idle_since = Instant::now();
     // Every exit, including a fatal accept and a dead accept thread, joins
     // the writer before the socket is removed (D110).

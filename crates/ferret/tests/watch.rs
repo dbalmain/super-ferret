@@ -1458,26 +1458,41 @@ fn queued_command_covers_content_while_background_follow_is_held() {
         "writer was not at nice 19 before the command: {before:?}"
     );
     let mut seen = std::collections::HashMap::<String, (String, i32)>::new();
-    let output = std::thread::scope(|scope| {
-        let index = scope.spawn(|| tree.run(&["index", "src"]));
-        while !index.is_finished() {
-            for (tid, comm, nice) in task_rows(pid) {
-                // The merge worker is spawned from the nice-19 writer once
-                // follow finishes, and it can appear before the client has
-                // observed the reply. It is background work.
-                if !before_tids.contains(&tid) && comm != "ferret-merge" {
-                    seen.entry(tid).or_insert((comm, nice));
-                }
-            }
-            // The crawl is short on this tree. A 1ms sleep can miss every
-            // worker between two samples; yielding still lets them run.
-            std::thread::yield_now();
+    // Under load the sampler can miss every short-lived worker of one
+    // command; a later command crawls the same way, so try again.
+    for attempt in 1..=5 {
+        if attempt > 1 {
+            write(tree.path(&format!("src/urgent{attempt}.txt")), "urgent");
         }
-        index
-            .join()
-            .unwrap_or_else(|_| panic!("index thread panicked"))
-    });
-    tree.success(output);
+        let output = std::thread::scope(|scope| {
+            let index = scope.spawn(|| tree.run(&["index", "src"]));
+            while !index.is_finished() {
+                for (tid, comm, nice) in task_rows(pid) {
+                    // An unnamed thread inherits its creator's name, so the
+                    // command's crawl workers read "ferret-command". Once the
+                    // command finishes, and before the client sees the reply,
+                    // the nice-19 writer may resume background work; those
+                    // threads read "ferret-writer" or their own names. Keep
+                    // the highest nice seen: a worker starts at its creator's
+                    // nice and only then could lower itself.
+                    if !before_tids.contains(&tid) && comm == "ferret-command" {
+                        let entry = seen.entry(tid).or_insert((comm, nice));
+                        entry.1 = entry.1.max(nice);
+                    }
+                }
+                // The crawl is short on this tree. A 1ms sleep can miss every
+                // worker between two samples; yielding still lets them run.
+                std::thread::yield_now();
+            }
+            index
+                .join()
+                .unwrap_or_else(|_| panic!("index thread panicked"))
+        });
+        tree.success(output);
+        if !seen.is_empty() {
+            break;
+        }
+    }
     assert!(
         gate.join("follow").exists(),
         "command follow waited in the background content gate"

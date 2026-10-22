@@ -106,7 +106,7 @@ fn timestamp() -> u64 {
 pub(super) fn start(
     host: Arc<Host>,
     receive: mpsc::Receiver<Message>,
-) -> std::thread::JoinHandle<()> {
+) -> io::Result<std::thread::JoinHandle<()>> {
     let scheduler = Arc::new(crate::scheduler::Scheduler::new(
         crate::config::Controller::from_env(),
         std::thread::available_parallelism().map_or(1, |n| n.get()),
@@ -126,31 +126,36 @@ pub(super) fn start(
             signals.sample();
         }
     });
-    std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            serve(&host, receive, scheduler)
-        }));
-        let error = match result {
-            Ok(Ok(())) => return,
-            Ok(Err(error)) => error.to_string(),
-            Err(_) => "writer panicked; restart ferretd to recover".into(),
-        };
-        let mut loaded = host
-            .engine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(*loaded, Loaded::Loading) {
-            *loaded = Loaded::Failed(error.clone());
-        }
-        drop(loaded);
-        host.engine_ready.notify_all();
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .error = Some(error);
-        host.writer_pending.store(0, Ordering::Release);
-        super::wake_listener(&host);
-    })
+    // Named so that threads it starts without a name of their own inherit
+    // "ferret-writer" and can be told from an explicit command's workers,
+    // which inherit "ferret-command".
+    std::thread::Builder::new()
+        .name("ferret-writer".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                serve(&host, receive, scheduler)
+            }));
+            let error = match result {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "writer panicked; restart ferretd to recover".into(),
+            };
+            let mut loaded = host
+                .engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(*loaded, Loaded::Loading) {
+                *loaded = Loaded::Failed(error.clone());
+            }
+            drop(loaded);
+            host.engine_ready.notify_all();
+            host.writer_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .error = Some(error);
+            host.writer_pending.store(0, Ordering::Release);
+            super::wake_listener(&host);
+        })
 }
 fn serve(
     host: &Arc<Host>,
