@@ -6469,7 +6469,7 @@ without per-repo config).
 
 ## D116 — How long should a spawned daemon stay up when idle?
 
-**Status: open, 2026-10-22. Dave's question answered below, with revised options.**
+**Status: answered C, 2026-10-23.** Fix the watcher's bookkeeping, then stay up.
 
 > Dave: For D116, don't we want the daemon to stay running for indexing
 > purposes? Perhaps the question should be what can the daemon drop from
@@ -6606,6 +6606,8 @@ so that it cannot run back to back. That is a bug fix, not a choice.
 What would change it: if C measures above about 300 MB idle on a home-sized
 tree, add D. If you want the daemon off when you are not using ferret at all,
 keep A's exit after C, with a longer timeout.
+
+> Dave: go with C for D116
 
 ## D117 — Should an answer from a possibly stale index say so?
 
