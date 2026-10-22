@@ -485,16 +485,26 @@ impl Plan {
             return fallback();
         }
         // Nested configured roots are separate catalog graph roots but the
-        // find walker attaches them at physical boundaries. Keep that walker.
+        // find walker attaches them at physical boundaries. Keep that walker
+        // for a start that holds a nested root or lies inside one; nesting
+        // elsewhere does not touch this find.
         let roots: Vec<_> = catalog
             .roots()
             .map(|(_, path)| Path::new(std::ffi::OsStr::from_bytes(path)))
             .collect();
-        if roots.iter().enumerate().any(|(i, path)| {
-            roots
+        let nested: Vec<_> = roots
+            .iter()
+            .filter(|path| {
+                roots
+                    .iter()
+                    .any(|other| other != *path && path.starts_with(other))
+            })
+            .collect();
+        if self.paths.iter().any(|start| {
+            let logical = self.options.logical_path(start);
+            nested
                 .iter()
-                .enumerate()
-                .any(|(j, other)| i != j && path.starts_with(other))
+                .any(|root| root.starts_with(&logical) || logical.starts_with(root))
         }) {
             return fallback();
         }

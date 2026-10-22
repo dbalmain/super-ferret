@@ -2296,6 +2296,39 @@ fn first_group_goes_out_alone(contents: &dyn Fn(&str) -> Vec<u8>, args: &[&str])
     );
 }
 
+// Nested roots elsewhere must not cost an unrelated find its name index:
+// with them every find walked the whole catalog.
+#[test]
+fn indexed_find_ignores_nested_roots_outside_its_start() {
+    let tree = Tree::new();
+    fs::create_dir_all(tree.base.join("outer/inner")).unwrap();
+    fs::write(tree.base.join("outer/inner/main.rs"), b"x").unwrap();
+    let indexed = tree.local(&["index", "outer", "outer/inner"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    tree.start(&[]);
+    let plans = || {
+        let stats = tree.run(&["stats", "--json"]);
+        assert!(stats.status.success(), "{stats:?}");
+        // Either plan means the find reached the name index; on a tree
+        // this small it picks a scope walk.
+        let text = String::from_utf8_lossy(&stats.stdout);
+        let count = |field| number(&text, field).unwrap_or_else(|| panic!("{stats:?}"));
+        count("postings_plans") + count("scope_walk_plans")
+    };
+    let before = plans();
+    let found = tree.run(&["find", "src", "-name", "main.rs"]);
+    assert_eq!(found.status.code(), Some(0), "{found:?}");
+    assert_eq!(found.stdout, b"src/main.rs\n");
+    assert!(
+        plans() > before,
+        "find walked instead of using the name index"
+    );
+    // A find whose start holds a nested root keeps the walker, and its rows.
+    let nested = tree.run(&["find", "outer", "-name", "main.rs"]);
+    assert_eq!(nested.status.code(), Some(0), "{nested:?}");
+    assert_eq!(nested.stdout, b"outer/inner/main.rs\n");
+}
+
 // A non-json search through the real daemon prints the same path bytes as
 // in-process, including a newline and a non-UTF-8 byte. Counting newlines or
 // printing the JSON escaping of that name would not match.
