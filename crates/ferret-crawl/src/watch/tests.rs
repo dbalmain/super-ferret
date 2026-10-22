@@ -555,3 +555,46 @@ fn failures_past_the_exact_bound_are_counted_and_retired_by_a_complete_observati
     assert_eq!(tree.watch.status().failed, 0);
     assert!(tree.watch.polling_roots(&tree.writer.view()).is_empty());
 }
+
+/// Coverage lost with no key survives a scoped refresh and is retired only by
+/// a complete observation of its root.
+#[test]
+fn a_lost_watch_is_retired_only_by_a_complete_observation() {
+    let mut tree = Tree::new("lost-retirement", 100, 1 << 20);
+    let root = tree.path.join("root");
+    let options = IndexOptions {
+        watch: Some(tree.watch.clone()),
+        workers: 1,
+        ..IndexOptions::default()
+    };
+    tree.watch.gap(&root);
+    tree.watch.reconcile(&tree.writer.view());
+    assert_eq!(
+        tree.watch.polling_roots(&tree.writer.view()),
+        std::slice::from_ref(&root)
+    );
+
+    fs::write(root.join("a/old"), b"scoped").unwrap_or_else(|error| panic!("file: {error:?}"));
+    tree.watch
+        .event(tree.descriptor("a"), ReadFlags::MODIFY, 0, b"old");
+    let request = tree.due().request(&tree.writer.view());
+    assert!(!request.scopes.is_empty());
+    crate::refresh(&mut tree.writer, request, &options)
+        .unwrap_or_else(|error| panic!("scoped: {error:?}"));
+    tree.watch.reconcile(&tree.writer.view());
+    assert_eq!(
+        tree.watch.polling_roots(&tree.writer.view()),
+        std::slice::from_ref(&root),
+        "a scoped refresh cannot prove the lost watch came back"
+    );
+
+    crate::recrawl(
+        &mut tree.writer,
+        std::slice::from_ref(&root),
+        Refresh::All,
+        &options,
+    )
+    .unwrap_or_else(|error| panic!("complete: {error:?}"));
+    tree.watch.reconcile(&tree.writer.view());
+    assert!(tree.watch.polling_roots(&tree.writer.view()).is_empty());
+}
