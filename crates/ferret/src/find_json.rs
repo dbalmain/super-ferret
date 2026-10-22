@@ -314,8 +314,10 @@ impl RawStdout {
         Ok(())
     }
 
+    /// Ends the record. A record with parts already sent always gets a
+    /// `last` part, empty if nothing is pending.
     pub(crate) fn finish(&mut self, destination: &Destination, id: &str) -> io::Result<()> {
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || self.part > 0 {
             frame(
                 destination,
                 id,

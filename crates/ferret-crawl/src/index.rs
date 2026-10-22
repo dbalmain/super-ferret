@@ -1599,6 +1599,33 @@ impl Output {
     }
 }
 
+/// Debug-build hold for a crawl worker that has made its priority decision.
+/// While `$FERRET_CRAWL_TEST_GATE/worker` exists, each worker records its
+/// thread id as `worker.<tid>.reached` and waits, so a test can read the nice
+/// of a worker that is known to be past the point where it could lower itself.
+#[cfg(debug_assertions)]
+fn worker_checkpoint() {
+    let Some(gate) = std::env::var_os("FERRET_CRAWL_TEST_GATE").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let held = gate.join("worker");
+    if !held.exists() {
+        return;
+    }
+    let tid = std::fs::read_link("/proc/thread-self")
+        .ok()
+        .and_then(|link| link.file_name().map(|name| name.to_owned()));
+    let Some(tid) = tid else { return };
+    let mut reached = std::ffi::OsString::from("worker.");
+    reached.push(tid);
+    reached.push(".reached");
+    let _ = std::fs::write(gate.join(reached), b"checkpoint");
+    while held.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 impl EventVisitor for Hasher<'_> {
     fn dedicated_worker(&self) -> bool {
         true
@@ -1607,6 +1634,8 @@ impl EventVisitor for Hasher<'_> {
         if self.lower_priority {
             self.priority_error = crate::lower_index_priority().err();
         }
+        #[cfg(debug_assertions)]
+        worker_checkpoint();
     }
     type Dir = DirToken;
 

@@ -353,6 +353,7 @@ impl Execution<'_> {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+            sent_output: false,
             json_stats: json::Stats::default(),
             errors: false,
             cancelled: Some(cancelled),
@@ -633,6 +634,10 @@ struct Host<'a, W> {
     buffer: Vec<u8>,
     matched: bool,
     emitted_group: bool,
+    /// Some group's output has been flushed. A deferring daemon host still
+    /// flushes its first one, so a sparse or slow grep shows its first match
+    /// before the block buffer fills.
+    sent_output: bool,
     json_stats: json::Stats,
     errors: bool,
     cancelled: Option<&'a AtomicBool>,
@@ -847,6 +852,7 @@ impl<W: Write> Host<'_, W> {
                 hook(&output);
             }
         });
+        let has_output = !output.is_empty();
         let published = self.publish(path, result, output);
         // NUL names keep their line buffer. Redirected path and count
         // listings share the block buffer until an operand boundary.
@@ -854,10 +860,14 @@ impl<W: Write> Host<'_, W> {
             return published;
         }
         // Redirected daemon content shares that buffer, so a group is not
-        // its own socket frame. A failed publish still flushes: the accepted
-        // prefix has to leave the buffer before the error returns.
-        if published.is_err() || !self.runtime.is_some_and(|runtime| runtime.defer_stdout) {
+        // its own socket frame; only the first group with output goes out
+        // alone, like rg's block buffer once it has something to show. A
+        // failed publish still flushes: the accepted prefix has to leave the
+        // buffer before the error returns.
+        let defer = self.runtime.is_some_and(|runtime| runtime.defer_stdout);
+        if published.is_err() || !defer || (has_output && !self.sent_output) {
             self.writer.flush()?;
+            self.sent_output |= has_output;
         }
         published
     }
@@ -1031,6 +1041,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
+                sent_output: false,
                 json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
@@ -1099,6 +1110,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
+                sent_output: false,
                 json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
@@ -1177,6 +1189,7 @@ mod tests {
                     buffer: Vec::new(),
                     matched: false,
                     emitted_group: false,
+                    sent_output: false,
                     json_stats: json::Stats::default(),
                     errors: false,
                     cancelled: None,
@@ -1219,6 +1232,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+            sent_output: false,
             json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
@@ -1262,6 +1276,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
+                sent_output: false,
                 json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
@@ -1313,6 +1328,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+            sent_output: false,
             json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
@@ -1349,6 +1365,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+            sent_output: false,
             json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
@@ -1398,6 +1415,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+            sent_output: false,
             json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
@@ -1433,6 +1451,7 @@ mod tests {
                     buffer: Vec::new(),
                     matched: false,
                     emitted_group: false,
+                    sent_output: false,
                     json_stats: json::Stats::default(),
                     errors: false,
                     cancelled: None,

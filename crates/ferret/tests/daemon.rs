@@ -2191,6 +2191,83 @@ fn raw_output_negotiation_is_per_request_and_preserves_legacy_peers() {
     }
 }
 
+// Redirected daemon grep batches groups into the block buffer, but its first
+// group with output goes out alone: a sparse grep whose next read stalls
+// still shows its first match, as a search shows its first row.
+#[test]
+fn daemon_grep_sends_its_first_matching_group_before_batching() {
+    let tree = Tree::new();
+    let src = tree.base.join("src");
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(src.join(name), format!("hit in {name}\n")).unwrap();
+    }
+    let indexed = tree.local(&["index", "src"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    tree.start(&[]);
+    let local = tree.local(&["grep", "hit", "src"]);
+    assert_eq!(local.status.code(), Some(0), "{local:?}");
+    let (mut peer, _) = tree.connect();
+    let request = format!(
+        r#"{{"id":"g","op":"grep","args":["hit","src"],"cwd":"{}","capabilities":["raw-output-v1"],"grep":{{"color":false,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
+        tree.base.display()
+    );
+    peer.get_mut()
+        .write_all(format!("{request}\n").as_bytes())
+        .unwrap();
+    assert!(line(&mut peer).contains("\"event\":\"begin\""));
+    // Output between two flush markers is one flush of the daemon's writer.
+    let mut frames = Vec::new();
+    let mut current = Vec::new();
+    loop {
+        let header = line(&mut peer);
+        if header.contains("\"event\":\"end\"") {
+            assert_eq!(number(&header, "exit"), Some(0), "{header}");
+            break;
+        }
+        assert!(header.contains("\"event\":\"stdout\""), "{header}");
+        if header.contains("\"flush\":true") {
+            if !current.is_empty() {
+                frames.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let length = number(&header, "length").unwrap_or_else(|| panic!("{header}"));
+        let mut payload = vec![0; length as usize];
+        peer.read_exact(&mut payload).unwrap();
+        current.extend_from_slice(&payload);
+    }
+    if !current.is_empty() {
+        frames.push(current);
+    }
+    let lines = |bytes: &[u8]| bytes.iter().filter(|byte| **byte == b'\n').count();
+    let mut joined: Vec<_> = frames
+        .concat()
+        .split(|b| *b == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
+    let mut expected: Vec<_> = local
+        .stdout
+        .split(|b| *b == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
+    joined.sort();
+    expected.sort();
+    assert_eq!(joined, expected);
+    assert_eq!(lines(&local.stdout), 3, "{local:?}");
+    assert_eq!(
+        lines(&frames[0]),
+        1,
+        "first frame: {:?}",
+        String::from_utf8_lossy(&frames[0])
+    );
+    assert_eq!(lines(&frames[1..].concat()), 2);
+    assert!(
+        frames.len() < 3,
+        "every group was its own frame: {}",
+        frames.len()
+    );
+}
+
 // A non-json search through the real daemon prints the same path bytes as
 // in-process, including a newline and a non-UTF-8 byte. Counting newlines or
 // printing the JSON escaping of that name would not match.
@@ -2299,6 +2376,10 @@ fn daemon_search_prints_raw_paths_the_in_process_client_prints() {
     let mut payload = vec![0; local.stdout.len()];
     peer.read_exact(&mut payload).unwrap();
     assert_eq!(payload, local.stdout);
+    // The first path goes out alone, so the record closes with an empty part.
+    let last = line(&mut peer);
+    assert!(last.contains("\"last\":true"), "{last}");
+    assert_eq!(number(&last, "length"), Some(0), "{last}");
     let end = line(&mut peer);
     assert!(end.contains("\"event\":\"end\""), "{end}");
     assert_eq!(number(&end, "rows"), Some(1), "{end}");
@@ -2353,9 +2434,11 @@ fn daemon_search_raw_frames_batch_paths_to_64_kib() {
     let mut joined = Vec::new();
     let mut lengths = Vec::new();
     let mut first_full = None;
+    let mut last_part = String::new();
     loop {
         let header = line(&mut peer);
         if header.contains("\"event\":\"end\"") {
+            assert!(last_part.contains("\"last\":true"), "{last_part}");
             assert_eq!(number(&header, "rows"), Some(count), "{header}");
             assert_eq!(number(&header, "exit"), Some(0), "{header}");
             assert!(number(&header, "first_row_us").is_some(), "{header}");
@@ -2371,6 +2454,7 @@ fn daemon_search_raw_frames_batch_paths_to_64_kib() {
         }
         lengths.push(len);
         joined.extend_from_slice(&payload);
+        last_part = header;
     }
     assert_eq!(joined, local.stdout);
     // The first path is a frame of its own, so a sparse search shows its
@@ -2389,6 +2473,30 @@ fn daemon_search_raw_frames_batch_paths_to_64_kib() {
         full.iter().filter(|byte| **byte == b'\n').count() > 1,
         "a full frame held one path"
     );
+
+    // One row: the first path went out alone, so the record still needs an
+    // empty last part before the end event.
+    let one =
+        r#"{"id":"one","op":"search","args":["f00001.txt"],"capabilities":["raw-output-v1"]}"#;
+    peer.get_mut()
+        .write_all(format!("{one}\n").as_bytes())
+        .unwrap();
+    assert!(line(&mut peer).contains("\"event\":\"begin\""));
+    let mut parts = Vec::new();
+    loop {
+        let header = line(&mut peer);
+        if header.contains("\"event\":\"end\"") {
+            assert_eq!(number(&header, "rows"), Some(1), "{header}");
+            break;
+        }
+        let mut payload = vec![0; number(&header, "length").unwrap() as usize];
+        peer.read_exact(&mut payload).unwrap();
+        parts.push((header, payload));
+    }
+    let (header, payload) = parts.last().expect("a stdout part");
+    assert!(header.contains("\"last\":true"), "{parts:?}");
+    assert!(payload.is_empty(), "{parts:?}");
+    assert_eq!(parts.len(), 2, "{parts:?}");
 }
 
 fn socket_log(tree: &Tree) -> String {
