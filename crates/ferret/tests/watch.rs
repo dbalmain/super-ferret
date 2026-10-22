@@ -1938,3 +1938,57 @@ fn idle_exit_cancels_a_streaming_merge_and_releases_the_catalog_lock() {
     tree.daemon.take();
     manifest_equals_clean(&tree);
 }
+
+#[test]
+fn slow_bursts_in_watched_directories_do_not_starve_a_poll() {
+    let mut tree = Tree::new();
+    // Cap 3 watches the two policy inputs' directories and `src` itself, so
+    // churn in `src` makes bursts and `src/left` is seen only by polls. The
+    // local search reads the publication, not a live walk.
+    tree.start(&[
+        ("FERRET_WATCH_CAP", "3"),
+        ("FERRET_POLL_MS", "200"),
+        ("FERRET_WATCH_TEST_REFRESH_DELAY_MS", "600"),
+    ]);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = {
+        let stop = stop.clone();
+        let dir = tree.path("src");
+        std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                fs::write(dir.join("churn.txt"), i.to_string())
+                    .unwrap_or_else(|error| panic!("churn: {error:?}"));
+                i += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    // Let the startup walk and the bursts settle into their rhythm first, so
+    // no walk that was already due finds the file.
+    std::thread::sleep(Duration::from_secs(4));
+    let before = number(&tree.status(), "refreshes");
+    fs::write(tree.path("src/left/polled.txt"), "polled")
+        .unwrap_or_else(|error| panic!("fixture: {error:?}"));
+    // Each 600 ms burst would push a poll 2.4 s further out, and a burst
+    // comes sooner than that, so a poll spaced by bursts never runs.
+    let until = Instant::now() + Duration::from_secs(12);
+    let mut found = false;
+    while Instant::now() < until {
+        if tree.local(&["search", "polled.txt"]).status.success() {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    churn
+        .join()
+        .unwrap_or_else(|_| panic!("churn thread panicked"));
+    let status = tree.status();
+    assert!(
+        number(&status, "refreshes") > before + 1,
+        "the churn made no bursts: {status}"
+    );
+    assert!(found, "the poll never ran: {status}");
+}

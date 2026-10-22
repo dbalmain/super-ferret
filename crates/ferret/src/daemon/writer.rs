@@ -272,6 +272,8 @@ fn serve(
     let polling = duration("FERRET_POLL_MS", 5 * 60 * 1000).max(Duration::from_millis(1));
     let mut full_due = Instant::now() + hourly;
     let mut poll_due = Instant::now() + polling;
+    // Whether a poll was issued that no refresh has taken yet.
+    let mut poll_issued = false;
     let mut retry_due: Option<Duration> = None;
     let mut initial = watch.is_none();
     host.writer_status
@@ -406,6 +408,7 @@ fn serve(
                     .fallback_backstop = true;
             }
             poll_due = Instant::now() + polling;
+            poll_issued = true;
         }
         if retry_due.is_some_and(|retry| scheduler.now() < retry) {
             continue;
@@ -444,6 +447,8 @@ fn serve(
                 .blocked = None;
         }
         let started = Instant::now();
+        // The burst taken above holds any poll issued before it.
+        let polled = std::mem::take(&mut poll_issued);
         let _operation = Operation::start(host, "refresh");
         #[cfg(debug_assertions)]
         std::thread::sleep(duration("FERRET_WATCH_TEST_REFRESH_DELAY_MS", 0));
@@ -469,11 +474,12 @@ fn serve(
         // Past the watch cap a poll rewalks a whole root, which can outlast
         // the poll interval and would then run back to back (D116). A long
         // refresh spaces the next poll by four times its duration, so polling
-        // holds the writer at most a fifth of the time. Short bursts leave the
-        // poll alone.
+        // holds the writer at most a fifth of the time. Only a refresh that
+        // walked the polled roots, a poll's or a full one, spaces them: a slow
+        // scoped burst elsewhere must not starve them.
         let elapsed = started.elapsed();
         let spacing = elapsed.saturating_mul(4);
-        if spacing > polling {
+        if (polled || reason != RefreshReason::Burst) && spacing > polling {
             poll_due = poll_due.max(Instant::now() + spacing);
         }
         if elapsed >= Duration::from_secs(1) {
