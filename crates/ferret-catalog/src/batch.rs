@@ -613,8 +613,20 @@ impl Batch {
         let old = self.previous.clone();
         if let Some(old) = old {
             let names = old.name_reader();
-            let mut children = old
-                .children(InoId(pending[0].parent.old))
+            let dir = InoId(pending[0].parent.old);
+            // Merging walks the directory's children from the first; over an
+            // overlay, `children` also sorts all of them. A few files of a
+            // large directory, which a walk delivers in many small groups,
+            // are looked up instead. `/nix/store` holds 62K files in one
+            // directory: merging each group was quadratic (D116).
+            let lookup = self.chunked
+                || old
+                    .entry_count(dir)
+                    .is_some_and(|count| count as usize / 8 > pending.len());
+            let mut children = (!lookup)
+                .then(|| old.children(dir))
+                .into_iter()
+                .flatten()
                 .map(|id| (id, names.get(id)))
                 .peekable();
             // Duplicate observations cannot become a single equal-row proof.
@@ -624,7 +636,7 @@ impl Batch {
             for file in &pending {
                 let name = file.name.of(&bytes);
                 let target = file.target.map(|span| span.of(&bytes));
-                let matched = if self.chunked {
+                let matched = if lookup {
                     old.lookup(InoId(file.parent.old), name)
                         .map(|id| (id, names.get(id)))
                 } else {
