@@ -51,6 +51,8 @@ fn isolate(command: &mut Command, base: &Path) {
         .env("XDG_RUNTIME_DIR", home.join("runtime"))
         .env("FERRET_INDEX", base.join("index"))
         .env("FERRET_NO_DAEMON", "1")
+        // A daemon a test spawns must not outlive the run by default.
+        .env("FERRET_DAEMON_IDLE_MS", "60000")
         .env("FERRET_SIGNAL_PROC", signals.join("proc"))
         .env("FERRET_SIGNAL_POWER", signals.join("power"))
         .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))

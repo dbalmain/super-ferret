@@ -157,7 +157,8 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| crate::xdg::Dirs::from_env().ok().map(|dirs| dirs.data));
-    let mut idle = duration("FERRET_DAEMON_IDLE_MS", 15 * 60 * 1000);
+    // Zero: stay up and keep the index fresh between bursts of use (D116).
+    let mut idle = duration("FERRET_DAEMON_IDLE_MS", 0);
     let mut args = args;
     while let Some(arg) = args.next() {
         match arg.to_str() {

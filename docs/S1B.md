@@ -446,10 +446,10 @@ by constructing a fresh index.
 An optional systemd **user** service runs the same binary and host; no second
 service implementation or mandatory systemd socket activation. Both unit and
 spawn use endpoint/index singleton locking. Install/enable only when explicitly
-requested; first-use spawn needs no setup ceremony. Direct spawn exits after 15
-minutes without clients, with no pending refresh, backstop or publication. The
-explicitly enabled unit stays resident; disable its idle timeout to avoid
-restart loops. On exit, finish a started durable publication, release watches
+requested; first-use spawn needs no setup ceremony. A spawned daemon stays
+resident by default (D116); with `--idle-ms N` it exits after N ms without
+clients, with no pending refresh, backstop or publication. The explicitly
+enabled unit stays resident; disable its idle timeout to avoid restart loops. On exit, finish a started durable publication, release watches
 and locks and unlink only this host's socket under the endpoint lock. Restart
 always re-arms watches and schedules a complete backstop for the downtime gap.
 Writer activity is scoped to loading or an executing operation. Battery-paused
@@ -515,8 +515,8 @@ past the budget.
 incompatible daemon (default 10000). It also bounds a writer command waiting
 for an observed owner to become ready; ordinary queries answer locally during
 loading.
-`FERRET_DAEMON_IDLE_MS` or `--idle-ms` sets idle exit (default 900000, zero
-means disabled). `FERRET_DAEMON_BIN` overrides the sibling `ferretd` used for
+`FERRET_DAEMON_IDLE_MS` or `--idle-ms` sets idle exit (default 0, which means
+stay up; D116). `FERRET_DAEMON_BIN` overrides the sibling `ferretd` used for
 spawn. Diagnostic output goes to the private endpoint `.log`. Debug builds also
 provide load-delay, build/format/context override and query-panic hooks solely
 for the real-binary integration tests; release builds omit them. SIGINT uses

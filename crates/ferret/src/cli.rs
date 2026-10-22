@@ -143,8 +143,8 @@ search freshness:
   Content answers are as of the index's last follow; names are as of the
   catalog's last refresh. While ferretd is running it keeps both within
   about a second of change. Search, default find and indexed grep start
-  it on first use. It exits after 15 minutes idle, and the call that
-  starts it answers from the last publication. Exact Yes rows are not
+  it on first use and it stays running; the call that starts it answers
+  from the last publication. Exact Yes rows are not
   re-read. A Maybe candidate that changed is checked against its current
   bytes; a vanished file is dropped.
   A new term absent from the snapshot can be missed until the next follow:
