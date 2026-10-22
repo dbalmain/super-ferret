@@ -162,11 +162,9 @@ fn a_failed_json_begin_stops_before_find_actions() {
         ])
         .arg(&marker)
         .arg(";")
-        .stdout(Stdio::piped())
+        .stdout(closed_pipe())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    drop(child.stdout.take());
-    let output = child.wait_with_output().unwrap();
+    let output = command.output().unwrap();
     assert_ne!(output.status.code(), Some(0));
     assert!(!marker.exists(), "action ran after begin failed");
     assert!(output.stderr.starts_with(b"ferret: find: writing stdout: "));
@@ -226,4 +224,12 @@ fn json_find_warnings_keep_their_severity_and_render_on_stderr() {
         assert!(text.contains("\"message\":"), "{text}");
         assert!(!text.contains("\"path\":\"\""), "{text}");
     }
+}
+
+/// A pipe whose read end is already closed, so the first write fails. Closing
+/// it after spawn instead races the child's first write into the buffer.
+fn closed_pipe() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    writer.into()
 }
