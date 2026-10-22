@@ -450,3 +450,64 @@ fn a_deferred_burst_keeps_its_oldest_age_when_collapsed_to_a_complete_backstop()
     );
     assert_eq!(watch.status().backstop, Some(RefreshReason::Backstop));
 }
+
+#[test]
+fn failures_past_the_exact_bound_are_counted_and_retired_by_a_complete_observation() {
+    let mut tree = Tree::new("failure-bound", 100, 1 << 20);
+    let root = tree.path.join("root");
+    let many = root.join("many");
+    for i in 0..EXACT_FAILURES + 100 {
+        fs::create_dir_all(many.join(i.to_string()))
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"));
+    }
+    let options = IndexOptions {
+        watch: Some(tree.watch.clone()),
+        workers: 1,
+        ..IndexOptions::default()
+    };
+    crate::recrawl(
+        &mut tree.writer,
+        std::slice::from_ref(&root),
+        Refresh::All,
+        &options,
+    )
+    .unwrap_or_else(|error| panic!("over the cap: {error:?}"));
+    tree.watch.reconcile(&tree.writer.view());
+    let failed = tree.watch.status().failed;
+    assert!(
+        failed > EXACT_FAILURES + 100,
+        "every failure counts: {failed}"
+    );
+    let kept = tree
+        .watch
+        .state
+        .lock()
+        .unwrap_or_else(|error| panic!("state: {error:?}"))
+        .failures
+        .values()
+        .map(|f| f.directories.len() + f.policies.len())
+        .sum::<usize>();
+    assert!(
+        kept <= EXACT_FAILURES,
+        "only a bounded set is kept by key: {kept}"
+    );
+    assert_eq!(
+        tree.watch.polling_roots(&tree.writer.view()),
+        std::slice::from_ref(&root)
+    );
+
+    fs::remove_dir_all(&many).unwrap_or_else(|error| panic!("fixture: {error:?}"));
+    tree.watch
+        .drain()
+        .unwrap_or_else(|error| panic!("drain: {error:?}"));
+    crate::recrawl(
+        &mut tree.writer,
+        std::slice::from_ref(&root),
+        Refresh::All,
+        &options,
+    )
+    .unwrap_or_else(|error| panic!("under the cap: {error:?}"));
+    tree.watch.reconcile(&tree.writer.view());
+    assert_eq!(tree.watch.status().failed, 0);
+    assert!(tree.watch.polling_roots(&tree.writer.view()).is_empty());
+}

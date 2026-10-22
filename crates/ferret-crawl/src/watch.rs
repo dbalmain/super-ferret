@@ -121,6 +121,30 @@ struct Hint {
     from: bool,
     to: bool,
 }
+/// Failures kept by key for one root. A scoped refresh that later installs one
+/// of these clears it; past the bound, only the next complete observation does.
+const EXACT_FAILURES: usize = 1024;
+/// Watches that could not be installed for one root since its latest complete
+/// observation began. The first few are kept by key. The rest are only counted:
+/// a failure makes the root polled, and a poll observes the whole root. Over
+/// the watch cap that is millions of directories (D116).
+#[derive(Debug, Default)]
+struct Failures {
+    epoch: u64,
+    directories: BTreeSet<(u64, u64)>,
+    policies: BTreeSet<PathBuf>,
+    counted: usize,
+}
+impl Failures {
+    fn len(&self) -> usize {
+        self.directories.len() + self.policies.len() + self.counted
+    }
+}
+enum Failed<K> {
+    Directory((u64, u64)),
+    /// The input's path, computed only while it can still be kept.
+    Policy(K),
+}
 #[derive(Debug)]
 struct State {
     descriptors: BTreeMap<i32, Vec<Arc<Directory>>>,
@@ -129,11 +153,11 @@ struct State {
     removed: BTreeSet<i32>,
     gaps: BTreeSet<PathBuf>,
     unreliable: BTreeSet<PathBuf>,
-    policies: BTreeMap<i32, BTreeMap<(PathBuf, Vec<u8>), u64>>,
-    policy_failed: BTreeMap<(PathBuf, PathBuf), u64>,
-    policy_epochs: BTreeMap<PathBuf, u64>,
+    policies: BTreeMap<i32, Vec<policy::Input>>,
+    // Keys double as the interned roots that policy inputs share.
+    policy_epochs: BTreeMap<Arc<Path>, u64>,
     policy_refreshed: BTreeSet<PathBuf>,
-    failed: BTreeSet<(u64, u64)>,
+    failures: BTreeMap<PathBuf, Failures>,
     pending: BTreeMap<(i32, Vec<u8>), Hint>,
     bytes: usize,
     first: Option<Instant>,
@@ -200,10 +224,9 @@ impl Watch {
                 gaps: BTreeSet::new(),
                 unreliable: BTreeSet::new(),
                 policies: BTreeMap::new(),
-                policy_failed: BTreeMap::new(),
                 policy_epochs: BTreeMap::new(),
                 policy_refreshed: BTreeSet::new(),
-                failed: BTreeSet::new(),
+                failures: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 bytes: 0,
                 first: None,
@@ -267,8 +290,11 @@ impl Watch {
                 .cloned()
         };
         if !relative.as_os_str().is_empty() && parent.is_none() {
-            state.gaps.insert(root.to_owned());
-            state.failed.insert(identity);
+            fail(
+                &mut state,
+                root,
+                Failed::<fn() -> PathBuf>::Directory(identity),
+            );
             return;
         }
         let basename = relative.file_name().map_or(&b""[..], OsStr::as_bytes);
@@ -283,8 +309,11 @@ impl Watch {
         if state.identities.len() >= self.config.watch_cap
             && !state.identities.contains_key(&identity)
         {
-            state.gaps.insert(root.to_owned());
-            state.failed.insert(identity);
+            fail(
+                &mut state,
+                root,
+                Failed::<fn() -> PathBuf>::Directory(identity),
+            );
             return;
         }
         // /proc/self/fd follows the already observed handle, including after an
@@ -317,7 +346,7 @@ impl Watch {
                     state.identities.retain(|_, value| *value != wd);
                     loss(&mut state, RefreshReason::Overflow);
                 }
-                let root = parent
+                let shared = parent
                     .as_ref()
                     .map_or_else(|| Arc::new(root.to_owned()), |p| p.root.clone());
                 state
@@ -328,15 +357,18 @@ impl Watch {
                         identity,
                         parent,
                         basename: basename.to_vec(),
-                        root,
+                        root: shared,
                     }));
                 state.identities.insert(identity, wd);
-                state.failed.remove(&identity);
+                if let Some(record) = state.failures.get_mut(root) {
+                    record.directories.remove(&identity);
+                }
             }
-            Err(_) => {
-                state.gaps.insert(root.to_owned());
-                state.failed.insert(identity);
-            }
+            Err(_) => fail(
+                &mut state,
+                root,
+                Failed::<fn() -> PathBuf>::Directory(identity),
+            ),
         }
     }
     /// Attempt a watch even when the later readable directory open will be
@@ -443,7 +475,9 @@ impl Watch {
             state.descriptors.remove(&wd);
             state.identities.retain(|_, value| *value != wd);
             if let Some(inputs) = state.policies.remove(&wd) {
-                state.gaps.extend(inputs.into_keys().map(|(r, _)| r));
+                state
+                    .gaps
+                    .extend(inputs.into_iter().map(|i| i.root.to_path_buf()));
             }
             loss(&mut state, RefreshReason::Overflow);
             return;
@@ -453,9 +487,9 @@ impl Watch {
             .get(&wd)
             .map(|inputs| {
                 inputs
-                    .keys()
-                    .filter(|(_, n)| n == name || name.is_empty())
-                    .map(|(r, _)| r.clone())
+                    .iter()
+                    .filter(|i| name.is_empty() || i.name.as_bytes() == name)
+                    .map(|i| i.root.to_path_buf())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -580,8 +614,10 @@ impl Watch {
         let policies: usize = s
             .policies
             .values()
-            .flat_map(|m| m.keys())
-            .map(|(root, name)| root.as_os_str().len() + name.len() + 128)
+            .map(|inputs| {
+                64 + inputs.capacity() * std::mem::size_of::<policy::Input>()
+                    + inputs.iter().map(|i| i.name.owned_len()).sum::<usize>()
+            })
             .sum();
         let aliases: usize = s
             .file_aliases
@@ -606,9 +642,9 @@ impl Watch {
             + policies
             + aliases
             + s.bytes
-            + s.policy_failed
+            + s.failures
                 .keys()
-                .map(|(r, p)| r.as_os_str().len() + p.as_os_str().len() + 128)
+                .map(|r| r.as_os_str().len() + 128)
                 .sum::<usize>()) as u64
     }
     /// Snapshots intake coverage and monotonic pending age under a short lock.
@@ -617,10 +653,11 @@ impl Watch {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failed = s.failures.values().map(Failures::len).sum::<usize>();
         Status {
             installed: s.identities.len(),
-            needed: s.identities.len() + s.failed.len() + s.policy_failed.len(),
-            failed: s.failed.len() + s.policy_failed.len(),
+            needed: s.identities.len() + failed,
+            failed,
             polling_roots: s
                 .gaps
                 .iter()
@@ -795,13 +832,6 @@ impl Watch {
             .roots()
             .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
             .collect();
-        let identities: BTreeSet<_> = view
-            .dir_ids()
-            .map(|id| {
-                let stat = view.inode(id).stat;
-                (stat.dev, stat.ino)
-            })
-            .collect();
         let protected = view
             .dir_ids()
             .filter(|&id| view.retained_at(id).is_some())
@@ -812,7 +842,6 @@ impl Watch {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.failed.retain(|identity| identities.contains(identity));
             s.file_aliases.retain(|_, aliases| {
                 aliases.names.retain(|_, owners| {
                     owners.retain(|r| roots.contains(r));
@@ -822,17 +851,17 @@ impl Watch {
             });
             let refreshed = std::mem::take(&mut s.policy_refreshed);
             let epochs = s.policy_epochs.clone();
-            let keep = |r: &PathBuf, epoch: u64| {
+            let keep = |r: &Path, epoch: u64| {
                 roots.contains(r)
                     && (!refreshed.contains(r)
                         || protected.contains(r)
                         || epochs.get(r).is_some_and(|current| *current == epoch))
             };
-            s.policy_epochs.retain(|r, _| roots.contains(r));
-            s.policy_failed.retain(|(r, _), epoch| keep(r, *epoch));
+            s.policy_epochs.retain(|r, _| roots.contains(&**r));
+            s.failures.retain(|r, f| f.len() > 0 && keep(r, f.epoch));
             let mut retired = Vec::new();
             for (&wd, inputs) in &mut s.policies {
-                inputs.retain(|(r, _), epoch| keep(r, *epoch));
+                inputs.retain(|i| keep(&i.root, i.epoch));
                 if inputs.is_empty() {
                     retired.push(wd);
                 }
@@ -848,13 +877,12 @@ impl Watch {
             }
             s.unreliable
                 .retain(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
-            if s.failed.is_empty() {
+            if s.failures
+                .values()
+                .all(|f| f.directories.is_empty() && f.counted == 0)
+            {
                 s.gaps = s.unreliable.clone();
-                let failed = s
-                    .policy_failed
-                    .keys()
-                    .map(|(r, _)| r.clone())
-                    .collect::<Vec<_>>();
+                let failed = s.failures.keys().cloned().collect::<Vec<_>>();
                 s.gaps.extend(failed);
             }
             s.descriptors
@@ -891,6 +919,37 @@ impl Watch {
             if !s.policies.contains_key(&wd) && inotify::remove_watch(&self.fd, wd).is_ok() {
                 s.removed.insert(wd);
             }
+        }
+    }
+}
+/// Records a failed watch. Past the exact bound it allocates nothing.
+fn fail<K: FnOnce() -> PathBuf>(s: &mut State, root: &Path, failed: Failed<K>) {
+    let epoch = s.policy_epochs.get(root).copied().unwrap_or(0);
+    if !s.gaps.contains(root) {
+        s.gaps.insert(root.to_owned());
+    }
+    if !s.failures.contains_key(root) {
+        s.failures.insert(root.to_owned(), Failures::default());
+    }
+    let Some(record) = s.failures.get_mut(root) else {
+        return;
+    };
+    if record.epoch != epoch {
+        *record = Failures {
+            epoch,
+            ..Failures::default()
+        };
+    }
+    if record.directories.len() + record.policies.len() >= EXACT_FAILURES {
+        record.counted += 1;
+        return;
+    }
+    match failed {
+        Failed::Directory(identity) => {
+            record.directories.insert(identity);
+        }
+        Failed::Policy(key) => {
+            record.policies.insert(key());
         }
     }
 }

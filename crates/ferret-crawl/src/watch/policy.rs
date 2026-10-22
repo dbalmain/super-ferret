@@ -22,10 +22,67 @@ fn open_parent(parent: &Path) -> Result<OwnedFd, Errno> {
         Mode::empty(),
     )
 }
-fn failure(s: &mut State, root: &Path, path: PathBuf) {
-    let epoch = s.policy_epochs.get(root).copied().unwrap_or(0);
-    s.gaps.insert(root.to_owned());
-    s.policy_failed.insert((root.to_owned(), path), epoch);
+
+/// The crawl consults a few names in every directory; those cost no
+/// allocation. A followed symlink's ancestors can have any name.
+const NAMES: [&[u8]; 6] = [
+    b".ferretignore",
+    b".git",
+    b".gitignore",
+    b"info",
+    b"exclude",
+    b"commondir",
+];
+#[derive(Debug)]
+pub(super) enum Name {
+    Static(&'static [u8]),
+    Owned(Box<[u8]>),
+}
+impl Name {
+    fn new(name: &[u8]) -> Self {
+        NAMES
+            .iter()
+            .find(|n| **n == name)
+            .map_or_else(|| Self::Owned(name.into()), |n| Self::Static(n))
+    }
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Static(name) => name,
+            Self::Owned(name) => name,
+        }
+    }
+    pub(super) fn owned_len(&self) -> usize {
+        match self {
+            Self::Static(_) => 0,
+            Self::Owned(name) => name.len(),
+        }
+    }
+}
+/// One policy read registered at a watch. A watched directory typically holds
+/// two or three, all for one root, so the root is shared rather than copied.
+#[derive(Debug)]
+pub(super) struct Input {
+    pub(super) root: Arc<Path>,
+    pub(super) name: Name,
+    pub(super) epoch: u64,
+}
+fn failure(s: &mut State, root: &Path, key: impl FnOnce() -> PathBuf) {
+    fail(s, root, Failed::Policy(key));
+}
+/// The path a policy input is recorded under when its watch fails.
+fn input_key(proc: &Path, name: &OsStr) -> PathBuf {
+    std::fs::read_link(proc)
+        .unwrap_or_else(|_| proc.to_owned())
+        .join(name)
+}
+/// The shared root and its current epoch. The root is interned on first use.
+fn root_epoch(s: &mut State, root: &Path) -> (Arc<Path>, u64) {
+    if let Some((root, &epoch)) = s.policy_epochs.get_key_value(root) {
+        return (root.clone(), epoch);
+    }
+    let shared: Arc<Path> = Arc::from(root);
+    s.policy_epochs.insert(shared.clone(), 0);
+    (shared, 0)
 }
 impl Watch {
     /// Starts dependency retirement only for a complete root observation.
@@ -34,8 +91,10 @@ impl Watch {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let epoch = s.policy_epochs.entry(root.to_owned()).or_default();
-        *epoch = epoch.wrapping_add(1);
+        let (_, epoch) = root_epoch(&mut s, root);
+        if let Some(current) = s.policy_epochs.get_mut(root) {
+            *current = epoch.wrapping_add(1);
+        }
         s.policy_refreshed.insert(root.to_owned());
         s.unreliable.remove(root);
     }
@@ -72,14 +131,18 @@ impl Watch {
                     candidate = parent.to_owned();
                 }
                 Err(_) => {
-                    let mut s = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let key = std::fs::canonicalize(parent)
-                        .map(|p| p.join(candidate.file_name().unwrap_or_default()))
-                        .unwrap_or_else(|_| path.to_owned());
-                    failure(&mut s, root, key);
+                    failure(
+                        &mut self
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        root,
+                        || {
+                            std::fs::canonicalize(parent)
+                                .map(|p| p.join(candidate.file_name().unwrap_or_default()))
+                                .unwrap_or_else(|_| path.to_owned())
+                        },
+                    );
                     return;
                 }
             }
@@ -110,7 +173,7 @@ impl Watch {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner),
                         root,
-                        prefix.clone(),
+                        || prefix.clone(),
                     ),
                 }
             }
@@ -118,9 +181,6 @@ impl Watch {
     }
     pub(crate) fn policy_input(&self, root: &Path, parent: BorrowedFd<'_>, name: &OsStr) {
         let proc = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
-        let key = std::fs::read_link(&proc)
-            .unwrap_or_else(|_| proc.clone())
-            .join(name);
         let Ok(stat) = fstat(parent) else {
             self.gap(root);
             return;
@@ -150,7 +210,7 @@ impl Watch {
             | WatchFlags::MASK_ADD;
         let installed = s.identities.len();
         if installed >= self.config.watch_cap && !s.identities.contains_key(&identity) {
-            failure(&mut s, root, key);
+            failure(&mut s, root, || input_key(&proc, name));
             return;
         }
         let result = s
@@ -168,26 +228,41 @@ impl Watch {
                     loss(&mut s, RefreshReason::Overflow);
                 }
                 s.identities.insert(identity, wd);
-                let epoch = s.policy_epochs.get(root).copied().unwrap_or(0);
-                s.policies
+                let (shared, epoch) = root_epoch(&mut s, root);
+                let inputs = s
+                    .policies
                     .entry(wd)
-                    .or_default()
-                    .insert((root.to_owned(), name.as_bytes().to_vec()), epoch);
-                s.policy_failed.remove(&(root.to_owned(), key.clone()));
+                    .or_insert_with(|| Vec::with_capacity(3));
+                match inputs
+                    .iter_mut()
+                    .find(|i| *i.root == *root && i.name.as_bytes() == name.as_bytes())
+                {
+                    Some(input) => input.epoch = epoch,
+                    None => inputs.push(Input {
+                        root: shared,
+                        name: Name::new(name.as_bytes()),
+                        epoch,
+                    }),
+                }
+                if let Some(record) = s.failures.get_mut(root)
+                    && !record.policies.is_empty()
+                {
+                    record.policies.remove(&input_key(&proc, name));
+                }
             }
             Ok(wd) => {
                 let _ = inotify::remove_watch(&self.fd, wd);
                 s.removed.insert(wd);
-                failure(&mut s, root, key.clone());
+                failure(&mut s, root, || input_key(&proc, name));
             }
-            Err(_) => {
-                failure(&mut s, root, key.clone());
-            }
+            Err(_) => failure(&mut s, root, || input_key(&proc, name)),
         }
         drop(s);
         if !matches!(name.as_bytes(), b".git" | b".gitignore" | b"commondir")
             && std::fs::symlink_metadata(proc.join(name)).is_ok_and(|m| m.file_type().is_symlink())
         {
+            // Only a followed symlink needs the input's own path.
+            let key = input_key(&proc, name);
             match std::fs::read_link(proc.join(name)) {
                 Ok(target) => {
                     let target = if target.is_absolute() {
@@ -207,17 +282,18 @@ impl Watch {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner),
                             root,
-                            key,
+                            || key,
                         ),
                     }
                 }
-                _ => {
-                    let mut s = self
+                _ => failure(
+                    &mut self
                         .state
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    failure(&mut s, root, key);
-                }
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    root,
+                    || key,
+                ),
             }
         }
     }
