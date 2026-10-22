@@ -550,6 +550,32 @@ fn watch_cap_reports_uncovered_and_polling_preserves_the_tree() {
 }
 
 #[test]
+fn a_daemon_started_before_any_index_serves_the_first_index() {
+    let mut tree = Tree::new();
+    fs::remove_dir_all(tree.path("index")).unwrap_or_else(|error| panic!("index: {error:?}"));
+    tree.start(&[]);
+    tree.success(tree.run(&["index", "src"]));
+    assert!(tree.run(&["search", "original.txt"]).status.success());
+}
+
+#[test]
+fn a_poll_that_outlasts_its_interval_is_spaced_out() {
+    let mut tree = Tree::new();
+    tree.start(&[
+        ("FERRET_WATCH_CAP", "1"),
+        ("FERRET_POLL_MS", "100"),
+        ("FERRET_WATCH_TEST_REFRESH_DELAY_MS", "300"),
+    ]);
+    let before = number(&tree.status(), "refreshes");
+    std::thread::sleep(Duration::from_secs(3));
+    let status = tree.status();
+    // Back to back, 3 s holds about ten of these refreshes. Spaced by four
+    // times a refresh's duration, it holds at most three.
+    let refreshes = number(&status, "refreshes") - before;
+    assert!((1..=4).contains(&refreshes), "{refreshes}: {status}");
+}
+
+#[test]
 fn polling_does_not_refresh_a_fully_covered_tree() {
     let mut tree = Tree::new();
     tree.start(&[("FERRET_POLL_MS", "500")]);

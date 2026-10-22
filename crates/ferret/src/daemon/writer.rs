@@ -165,7 +165,24 @@ fn serve(
     let loading = Operation::start(host, "loading");
     #[cfg(debug_assertions)]
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
-    let session = WriterSession::open(&host.index).map_err(io::Error::other)?;
+    let session = match WriterSession::open(&host.index) {
+        // A daemon started before the first `ferret index` publishes an
+        // empty catalog, so the commands it serves can add roots to it. No
+        // roots change: if another process published first, nothing is
+        // walked and its roots stay.
+        Err(ferret_catalog::log::Error::MissingCheckpoint) => {
+            ferret_crawl::index_change(
+                &host.index,
+                RootChange::default(),
+                Refresh::Only(&[]),
+                &IndexOptions::default(),
+            )
+            .map_err(io::Error::other)?;
+            WriterSession::open(&host.index)
+        }
+        opened => opened,
+    }
+    .map_err(io::Error::other)?;
     let engine = Arc::new(Engine::from_writer(session));
     engine
         .attach_content(&host.index)
@@ -420,6 +437,7 @@ fn serve(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .blocked = None;
         }
+        let started = Instant::now();
         let _operation = Operation::start(host, "refresh");
         #[cfg(debug_assertions)]
         std::thread::sleep(duration("FERRET_WATCH_TEST_REFRESH_DELAY_MS", 0));
@@ -442,6 +460,15 @@ fn serve(
                 reason = request.reason;
                 engine.refresh(request, &options).map_err(io::Error::other)
             });
+        // Past the watch cap a poll rewalks a whole root, which can outlast
+        // the poll interval and would then run back to back (D116). A long
+        // refresh spaces the next poll by four times its duration, so polling
+        // holds the writer at most a fifth of the time. Short bursts leave the
+        // poll alone.
+        let spacing = started.elapsed().saturating_mul(4);
+        if spacing > polling {
+            poll_due = poll_due.max(Instant::now() + spacing);
+        }
         let deferred = result
             .as_ref()
             .ok()

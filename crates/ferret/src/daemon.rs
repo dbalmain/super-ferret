@@ -176,7 +176,11 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             }
         }
     }
-    let index = fs::canonicalize(index.ok_or_else(|| io::Error::other("no index directory"))?)?;
+    let index = index.ok_or_else(|| io::Error::other("no index directory"))?;
+    // The endpoint is named after the directory's identity, so a daemon
+    // started before the first index creates it, as the writer would.
+    fs::create_dir_all(&index)?;
+    let index = fs::canonicalize(index)?;
     let endpoint = Endpoint::open(&index)?;
     let lock = endpoint.private_file("lock")?;
     let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
