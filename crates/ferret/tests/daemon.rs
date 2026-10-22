@@ -2303,17 +2303,19 @@ fn indexed_find_ignores_nested_roots_outside_its_start() {
     let tree = Tree::new();
     fs::create_dir_all(tree.base.join("outer/inner")).unwrap();
     fs::write(tree.base.join("outer/inner/main.rs"), b"x").unwrap();
-    let indexed = tree.local(&["index", "outer", "outer/inner"]);
+    // Enough other names that one hit in src costs less by postings than by
+    // walking the scope, so the plan is the accelerated one.
+    for i in 0..16 {
+        fs::write(tree.base.join(format!("src/filler-{i}.txt")), b"x").unwrap();
+    }
+    let indexed = tree.local(&["index", "src", "outer", "outer/inner"]);
     assert!(indexed.status.success(), "{indexed:?}");
     tree.start(&[]);
     let plans = || {
         let stats = tree.run(&["stats", "--json"]);
         assert!(stats.status.success(), "{stats:?}");
-        // Either plan means the find reached the name index; on a tree
-        // this small it picks a scope walk.
         let text = String::from_utf8_lossy(&stats.stdout);
-        let count = |field| number(&text, field).unwrap_or_else(|| panic!("{stats:?}"));
-        count("postings_plans") + count("scope_walk_plans")
+        number(&text, "postings_plans").unwrap_or_else(|| panic!("{stats:?}"))
     };
     let before = plans();
     let found = tree.run(&["find", "src", "-name", "main.rs"]);
@@ -2321,7 +2323,7 @@ fn indexed_find_ignores_nested_roots_outside_its_start() {
     assert_eq!(found.stdout, b"src/main.rs\n");
     assert!(
         plans() > before,
-        "find walked instead of using the name index"
+        "find walked instead of using the name index's postings"
     );
     // A find whose start holds a nested root keeps the walker, and its rows.
     let nested = tree.run(&["find", "outer", "-name", "main.rs"]);
