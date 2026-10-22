@@ -6469,7 +6469,7 @@ without per-repo config).
 
 ## D116 — How long should a spawned daemon stay up when idle?
 
-**Status: open, 2026-10-22. Dave asked a question; options brief to follow.**
+**Status: open, 2026-10-22. Dave's question answered below, with revised options.**
 
 > Dave: For D116, don't we want the daemon to stay running for indexing
 > purposes? Perhaps the question should be what can the daemon drop from
@@ -6513,6 +6513,99 @@ built.
 
 What would change it: the daemon's steady RSS on the index you actually use.
 If it is well under ~400 MiB, choose B.
+
+### Answer to Dave's question (2026-10-22)
+
+Yes: a daemon that exits stops indexing, and each respawn pays a full rewalk.
+The measurements below say most of an idle daemon's memory is not the index at
+all. It is the file watcher's bookkeeping, which is a data-structure fix rather
+than a lifecycle choice. So the revised question is below; the original
+options above stand as asked.
+
+Evidence (`c9b17e8`, release builds, private XDG dirs and index):
+
+- **measured, msa2, `~/w`:** 65,291 entries, 8,044 directories, 7,901
+  watches. The daemon idles at **30 MB** RSS (22 MB heap) after an index, a
+  find and two greps, unchanged over 10 minutes.
+- **measured, geekom, `/nix/store`:** 5.38M entries, 1.39M directories. The
+  watcher wants 3.26M watches; the cap is 458,752 (seven eighths of the
+  kernel's per-user limit). The rest of the root is uncovered, so the daemon
+  rewalks all of `/nix/store` every 5 minutes (`FERRET_POLL_MS`). Each rewalk
+  outlasts the interval, so the writer never goes idle: one nice-19 thread at
+  about 65% CPU, reading. RSS **2.0 GB** after 10 minutes, peak 2.36 GB.
+- **measured, same index, polling and the hourly backstop pushed to a day:**
+  the startup rewalk finishes in about 60 s (peak 2.0 GB), then the daemon
+  sits idle at **1.69 GB** heap, flat for 10 minutes.
+- **measured, heaptrack, same setup:** 1.27 GB live at exit against 1.82 GB
+  RSS, so about 0.5 GB is memory glibc kept after the rewalk's peak. The live
+  heap, by allocation site:
+
+  ```text
+  watcher: policy inputs (per watched dir, per ignore file)   634 MB
+  watcher: policy failures (one full path per unwatched dir)   181 MB
+  watcher: arming and reconcile                                114 MB
+  catalog, resident sections                                    167 MB
+  catalog, resident names                                        45 MB
+  writer session tables                                          55 MB
+  content index (segments, trigram inverter, doc names)          66 MB
+  name index                                                      5 MB
+  ```
+
+  The watcher's 930 MB is about 1.6 KB per watched directory. Each record
+  owns a copy of the root path and the file name, in nested `BTreeMap`s
+  (`ferret-crawl/src/watch/policy.rs`). Past the cap, every failed directory
+  also keeps a `(root, full path)` record, although the whole root is polled
+  anyway.
+- **measured, `/nix/store`:** find with no daemon (open the catalog, answer,
+  exit) takes 0.41–0.52 s and 415–435 MB peak; through the daemon, 0.05 s.
+- **estimated, not measured:** your home on msa2 is about 3.3M entries and
+  185K directories once `target`, `node_modules` and `.git` are pruned, so it
+  fits under the watch cap. Scaling the per-directory and per-entry figures
+  above gives roughly 300 MB of watcher state and 200 MB of index state. I
+  did not index it: reading every private file's content into a test index
+  was refused by the session's permission check.
+- **read-from-code:** the writer needs the catalog to apply changes
+  (`WriterSession::lookup_base`), so the catalog cannot be dropped while the
+  daemon indexes. Only query-side state (name postings, content segments, doc
+  names, planner) is free to drop: about 130 MB at 5.4M entries.
+- **measured, side finding:** a `ferretd` started before any catalog exists
+  fails for good. `ferret index` then exits 3 with "daemon could not open the
+  catalog" until the daemon is restarted. An always-on unit hits this on a
+  fresh install.
+
+Question: should the daemon stay up to keep indexing, and what should it drop
+to make that cheap?
+
+Options:
+
+- **A — keep the 15-minute exit (today).** Frees everything between bursts.
+  The index goes stale while no daemon runs (D117 B now says so). Each respawn
+  rewalks every root: about 60 s of nice-19 I/O and a 2.0 GB peak on
+  `/nix/store`.
+- **B — stay up, as the code is today.** Always fresh. Costs about 1.7 GB on
+  `/nix/store`, an estimated 0.5 GB on your home, and, past the watch cap, a
+  rewalk that never stops.
+- **C — fix the watcher's bookkeeping, then stay up.** Store a root as an id
+  and the policy file names as a small enum instead of owned paths. Drop
+  per-path failure records once a root is polled. Return freed memory after a
+  rewalk with `malloc_trim` (an `unsafe` FFI call, per D11). Expected,
+  unmeasured: about 1.27 GB live falls to about 0.4 GB on `/nix/store`, and
+  home falls to about 0.25 GB. Also make a daemon with no catalog able to
+  create one. A few days' work; it helps A as much as B, since the same 930 MB
+  is held for each 15-minute window.
+- **D — C, plus drop query-side state after N minutes without a query.**
+  Saves about another 130 MB at 5.4M entries. The next query reloads it,
+  bounded by the 0.4–0.5 s in-process figure above (unmeasured inside the
+  daemon).
+
+Recommendation: **C**, and make "stay up" the default once C's idle figure is
+measured. The watcher fix is needed whichever lifecycle wins. Separately, the
+poll interval past the watch cap should grow with the last rewalk's duration
+so that it cannot run back to back. That is a bug fix, not a choice.
+
+What would change it: if C measures above about 300 MB idle on a home-sized
+tree, add D. If you want the daemon off when you are not using ferret at all,
+keep A's exit after C, with a longer timeout.
 
 ## D117 — Should an answer from a possibly stale index say so?
 
