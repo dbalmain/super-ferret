@@ -137,10 +137,55 @@ struct Failures {
     directories: BTreeSet<(u64, u64)>,
     policies: BTreeSet<PathBuf>,
     counted: usize,
+    /// Failures from before `epoch` began. The complete observation that
+    /// started it may still fail, so only its success retires them.
+    earlier: Option<Box<Failures>>,
 }
 impl Failures {
+    fn exact(&self) -> usize {
+        self.directories.len()
+            + self.policies.len()
+            + self.earlier.as_ref().map_or(0, |e| e.exact())
+    }
     fn len(&self) -> usize {
-        self.directories.len() + self.policies.len() + self.counted
+        self.exact() + self.counted + self.earlier.as_ref().map_or(0, |e| e.counted)
+    }
+    /// The failures to report. A complete observation in progress repeats
+    /// the earlier epoch's counted attempts, so the two counts overlap.
+    fn reported(&self) -> usize {
+        self.exact()
+            + self
+                .counted
+                .max(self.earlier.as_ref().map_or(0, |e| e.counted))
+    }
+    fn repair_directory(&mut self, identity: &(u64, u64)) {
+        self.directories.remove(identity);
+        if let Some(earlier) = &mut self.earlier {
+            earlier.directories.remove(identity);
+        }
+    }
+    fn repair_policy(&mut self, key: &Path) {
+        self.policies.remove(key);
+        if let Some(earlier) = &mut self.earlier {
+            earlier.policies.remove(key);
+        }
+    }
+    /// Starts `epoch`'s failures, keeping every older one as `earlier`.
+    fn advance(&mut self, epoch: u64) {
+        let mut now = std::mem::replace(
+            self,
+            Failures {
+                epoch,
+                ..Failures::default()
+            },
+        );
+        let mut earlier = now.earlier.take().map_or_else(Failures::default, |e| *e);
+        earlier.directories.append(&mut now.directories);
+        earlier.policies.append(&mut now.policies);
+        earlier.counted += now.counted;
+        if earlier.len() > 0 {
+            self.earlier = Some(Box::new(earlier));
+        }
     }
 }
 enum Failed<K> {
@@ -368,7 +413,7 @@ impl Watch {
                     }));
                 state.identities.insert(identity, wd);
                 if let Some(record) = state.failures.get_mut(root) {
-                    record.directories.remove(&identity);
+                    record.repair_directory(&identity);
                 }
             }
             Err(_) => fail(
@@ -660,7 +705,7 @@ impl Watch {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let failed = s.failures.values().map(Failures::len).sum::<usize>();
+        let failed = s.failures.values().map(Failures::reported).sum::<usize>();
         Status {
             installed: s.identities.len(),
             needed: s.identities.len() + failed,
@@ -865,7 +910,12 @@ impl Watch {
                         || epochs.get(r).is_some_and(|current| *current == epoch))
             };
             s.policy_epochs.retain(|r, _| roots.contains(&**r));
-            s.failures.retain(|r, f| f.len() > 0 && keep(r, f.epoch));
+            s.failures.retain(|r, f| {
+                if refreshed.contains(r) && !protected.contains(r) {
+                    f.earlier = None;
+                }
+                f.len() > 0 && keep(r, f.epoch)
+            });
             let mut retired = Vec::new();
             for (&wd, inputs) in &mut s.policies {
                 inputs.retain(|i| keep(&i.root, i.epoch));
@@ -926,7 +976,9 @@ impl Watch {
         }
     }
 }
-/// Records a failed watch. Past the exact bound it allocates nothing.
+/// Records a failed watch. Past the exact bound it keeps nothing new, and it
+/// computes a policy key only while one can be kept or an earlier epoch holds
+/// policy keys it may repeat.
 fn fail<K: FnOnce() -> PathBuf>(s: &mut State, root: &Path, failed: Failed<K>) {
     let epoch = s.policy_epochs.get(root).copied().unwrap_or(0);
     if !s.gaps.contains(root) {
@@ -939,25 +991,43 @@ fn fail<K: FnOnce() -> PathBuf>(s: &mut State, root: &Path, failed: Failed<K>) {
         return;
     };
     if record.epoch != epoch {
-        *record = Failures {
-            epoch,
-            ..Failures::default()
-        };
+        record.advance(epoch);
     }
-    if matches!(failed, Failed::Lost)
-        || record.directories.len() + record.policies.len() >= EXACT_FAILURES
-    {
-        record.counted += 1;
-        return;
-    }
+    // A failure already kept, here or by the earlier epoch, is held once.
     match failed {
+        Failed::Lost => record.counted += 1,
         Failed::Directory(identity) => {
-            record.directories.insert(identity);
+            let repeated = record
+                .earlier
+                .as_mut()
+                .is_some_and(|e| e.directories.remove(&identity));
+            if repeated || record.directories.contains(&identity) || record.exact() < EXACT_FAILURES
+            {
+                record.directories.insert(identity);
+            } else {
+                record.counted += 1;
+            }
         }
         Failed::Policy(key) => {
-            record.policies.insert(key());
+            let earlier = record
+                .earlier
+                .as_ref()
+                .is_some_and(|e| !e.policies.is_empty());
+            if !earlier && record.exact() >= EXACT_FAILURES {
+                record.counted += 1;
+                return;
+            }
+            let key = key();
+            let repeated = record
+                .earlier
+                .as_mut()
+                .is_some_and(|e| e.policies.remove(&key));
+            if repeated || record.policies.contains(&key) || record.exact() < EXACT_FAILURES {
+                record.policies.insert(key);
+            } else {
+                record.counted += 1;
+            }
         }
-        Failed::Lost => {}
     }
 }
 fn loss(s: &mut State, reason: RefreshReason) {

@@ -245,9 +245,9 @@ impl Watch {
                     }),
                 }
                 if let Some(record) = s.failures.get_mut(root)
-                    && !record.policies.is_empty()
+                    && record.exact() > 0
                 {
-                    record.policies.remove(&input_key(&proc, name));
+                    record.repair_policy(&input_key(&proc, name));
                 }
             }
             Ok(wd) => {

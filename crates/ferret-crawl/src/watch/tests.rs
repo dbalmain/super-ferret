@@ -529,7 +529,7 @@ fn failures_past_the_exact_bound_are_counted_and_retired_by_a_complete_observati
         .unwrap_or_else(|error| panic!("state: {error:?}"))
         .failures
         .values()
-        .map(|f| f.directories.len() + f.policies.len())
+        .map(Failures::exact)
         .sum::<usize>();
     assert!(
         kept <= EXACT_FAILURES,
@@ -586,6 +586,68 @@ fn a_lost_watch_is_retired_only_by_a_complete_observation() {
         tree.watch.polling_roots(&tree.writer.view()),
         std::slice::from_ref(&root),
         "a scoped refresh cannot prove the lost watch came back"
+    );
+
+    crate::recrawl(
+        &mut tree.writer,
+        std::slice::from_ref(&root),
+        Refresh::All,
+        &options,
+    )
+    .unwrap_or_else(|error| panic!("complete: {error:?}"));
+    tree.watch.reconcile(&tree.writer.view());
+    assert!(tree.watch.polling_roots(&tree.writer.view()).is_empty());
+}
+
+#[test]
+fn a_lost_watch_outlasts_a_failed_complete_observation_and_its_repairs() {
+    use std::os::unix::fs::MetadataExt;
+    let mut tree = Tree::new("lost-epoch", 100, 1 << 20);
+    let root = tree.path.join("root");
+    let options = IndexOptions {
+        watch: Some(tree.watch.clone()),
+        workers: 1,
+        ..IndexOptions::default()
+    };
+    tree.watch.gap(&root);
+    tree.watch.reconcile(&tree.writer.view());
+
+    // A complete observation begins, a watch fails during it, and it aborts.
+    tree.watch.begin_policy_root(&root);
+    fs::create_dir(root.join("a/new")).unwrap_or_else(|error| panic!("new: {error:?}"));
+    let new = fs::metadata(root.join("a/new")).unwrap_or_else(|error| panic!("new: {error:?}"));
+    fail(
+        &mut tree
+            .watch
+            .state
+            .lock()
+            .unwrap_or_else(|error| panic!("state: {error:?}")),
+        &root,
+        Failed::<fn() -> PathBuf>::Directory((new.dev(), new.ino())),
+    );
+    tree.watch.abort_policy_roots();
+    tree.watch.reconcile(&tree.writer.view());
+
+    // A scoped refresh installs that watch.
+    tree.watch.event(
+        tree.descriptor("a"),
+        ReadFlags::CREATE | ReadFlags::ISDIR,
+        0,
+        b"new",
+    );
+    let request = tree.due().request(&tree.writer.view());
+    crate::refresh(&mut tree.writer, request, &options)
+        .unwrap_or_else(|error| panic!("scoped: {error:?}"));
+    assert_eq!(
+        tree.watch.status().failed,
+        1,
+        "the scoped refresh repaired the new failure; only the loss remains"
+    );
+    tree.watch.reconcile(&tree.writer.view());
+    assert_eq!(
+        tree.watch.polling_roots(&tree.writer.view()),
+        std::slice::from_ref(&root),
+        "repairing the aborted observation's failure cannot retire the older loss"
     );
 
     crate::recrawl(
