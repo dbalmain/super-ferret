@@ -576,6 +576,26 @@ fn a_poll_that_outlasts_its_interval_is_spaced_out() {
 }
 
 #[test]
+fn repeated_polls_do_not_accumulate_watch_failures() {
+    let mut tree = Tree::new();
+    // Past 1,024 failures a root's are counted rather than kept by key.
+    for i in 0..1100 {
+        fs::create_dir_all(tree.path(&format!("src/many/{i}")))
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"));
+    }
+    tree.success(tree.local(&["index", "src"]));
+    tree.start(&[("FERRET_WATCH_CAP", "1"), ("FERRET_POLL_MS", "100")]);
+    let first = number(&tree.status(), "watch_failed");
+    assert!(first > 0);
+    let before = number(&tree.status(), "refreshes");
+    wait(|| number(&tree.status(), "refreshes") >= before + 3);
+    // Each poll observes the whole root, so it replaces the failures the
+    // previous one recorded rather than adding to them.
+    let status = tree.status();
+    assert_eq!(number(&status, "watch_failed"), first, "{status}");
+}
+
+#[test]
 fn polling_does_not_refresh_a_fully_covered_tree() {
     let mut tree = Tree::new();
     tree.start(&[("FERRET_POLL_MS", "500")]);

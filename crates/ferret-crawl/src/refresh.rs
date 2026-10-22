@@ -234,8 +234,13 @@ pub fn refresh(
         }
     }
     let named: Vec<_> = selected.keys().cloned().collect();
+    // A selection that covers its whole root selects nothing out: the root
+    // is walked like a backstop's, without a per-entry selection lookup, and
+    // is a complete observation for the watcher's policy epochs. A poll past
+    // the watch cap is one (D116).
     let selections = selected
         .into_iter()
+        .filter(|(_, paths)| !paths.contains(Path::new("")))
         .map(|(root, paths)| (root, Arc::new(Selection::new(paths))))
         .collect();
     let scope = match request.reason {
