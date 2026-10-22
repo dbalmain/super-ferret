@@ -993,7 +993,9 @@ fn fail<K: FnOnce() -> PathBuf>(s: &mut State, root: &Path, failed: Failed<K>) {
     if record.epoch != epoch {
         record.advance(epoch);
     }
-    // A failure already kept, here or by the earlier epoch, is held once.
+    // A key this record already holds is held once. Past the bound a policy
+    // key is computed only to match an earlier epoch's, so a repeat of one
+    // counted here is counted again; that only keeps the root polled.
     match failed {
         Failed::Lost => record.counted += 1,
         Failed::Directory(identity) => {
