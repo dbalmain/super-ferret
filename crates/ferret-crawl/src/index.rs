@@ -913,8 +913,7 @@ fn observe(
     let mut batches = Vec::new();
     for root in &plan.refresh {
         let bulk_read = matches!(source, Source::Rebuild(..))
-            || plan.selections.is_empty()
-            || plan.selections.get(root).is_some_and(|s| s.whole_root());
+            || plan.selections.get(root).is_none_or(|s| s.whole_root());
         if bulk_read
             && let Source::Bounded(session, ..) = source
             && let Some(control) = &options.bulk

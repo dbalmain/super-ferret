@@ -593,3 +593,63 @@ fn conflicting_alias_content_observations_publish_shared_fault_and_match_a_fault
     let result = refresh(&mut session, req, &options()).unwrap();
     oracle(&tmp, &result.view);
 }
+
+#[derive(Debug)]
+struct Refusing(std::sync::Arc<ferret_catalog::bulk::Limiter>);
+impl ferret_catalog::bulk::Control for Refusing {
+    fn admit(
+        &self,
+        _kind: ferret_catalog::bulk::Kind,
+        _view: &Catalog,
+    ) -> Result<(), ferret_catalog::bulk::Blocked> {
+        Err(ferret_catalog::bulk::Blocked::Battery)
+    }
+    fn limiter(&self) -> std::sync::Arc<ferret_catalog::bulk::Limiter> {
+        self.0.clone()
+    }
+    fn workers(&self) -> usize {
+        1
+    }
+}
+
+/// A root a burst names with no selection is walked whole, so it asks for
+/// bulk admission even when another root in the burst is selected (D116).
+#[test]
+fn a_whole_root_beside_a_selected_root_still_asks_for_bulk_admission() {
+    let tmp = Tmp::new("refresh-mixed-bulk");
+    tmp.write("one/a", b"a");
+    tmp.write("two/b", b"b");
+    let roots = [tmp.at("one"), tmp.at("two")];
+    index(&tmp.cat(), &roots, Refresh::All, &options()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
+    tmp.write("two/c", b"c");
+    let parent = directory(&session.view(), &tmp, "two");
+    let req = request(
+        &session,
+        vec![
+            RefreshScope::Root(tmp.at("one")),
+            RefreshScope::Entry {
+                parent,
+                basename: b"c".to_vec(),
+            },
+        ],
+    );
+    let refusing = IndexOptions {
+        bulk: Some(std::sync::Arc::new(Refusing(std::sync::Arc::new(
+            ferret_catalog::bulk::Limiter::new(
+                0,
+                std::sync::Arc::new(ferret_catalog::bulk::Monotonic::default()),
+            ),
+        )))),
+        ..options()
+    };
+    let result = refresh(&mut session, req, &refusing).unwrap();
+    assert!(
+        matches!(
+            result.outcome,
+            RefreshOutcome::DeferredBulk(ferret_catalog::bulk::Blocked::Battery)
+        ),
+        "{:?}",
+        result.outcome
+    );
+}
