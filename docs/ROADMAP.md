@@ -1942,6 +1942,72 @@ Also from D62: a side investigation compares query languages across search
 tools (Elasticsearch/KQL, Splunk, JQL, Datadog, Dynatrace and others) to test
 `ferret search`'s grammar against agent habits.
 
+### Timing against rg at 02a98cb (2026-10-23)
+
+The 2026-10-18 measurement (a05e100) repeated at HEAD, on the same private
+corpus: 112,377 files, 3.98 GB, one flat directory, warm cache, msa2 (32
+CPUs). Release build; rg 15.2.0 with `--no-config`; hyperfine 2.0.0 with 3
+warmups, 10 runs, `-N`, stdout to `/dev/null`. Medians in ms; ratios are
+ferret / rg. The index build took 205.5 s and is 582,570,153 B, both as
+before. Columns:
+
+- *local* is `FERRET_NO_DAEMON=1`, answered in-process from the index.
+- *daemon* is the default path. The client asks a resident ferretd, started
+  beforehand and idle, which answers from its resident index (D111).
+- *live* is `--live`, which walks and reads the tree with no index.
+
+Threads are `FERRET_SEARCH_THREADS=t` for ferret and `-jt` for rg. RSS is the
+client's peak; the daemon itself held 473 MiB resident after the run. Every
+query's output matched rg's, sorted, for both local and daemon. The JSON row
+matched on match-event count.
+
+| query | t | local | daemon | live | rg | local/rg | daemon/rg | 10-18 local/rg | local RSS MiB | rg RSS MiB |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1-rare | 1 | 257 | 193 | 1211 | 812 | 0.32× | 0.24× | 1.27× | 87 | 21 |
+| 1-rare | 32 | 108 | 60 | 632 | 232 | 0.46× | 0.26× | 1.17× | 225 | 330 |
+| 2-the | 1 | 1201 | 1437 | 1741 | 1198 | 1.00× | 1.20× | 3.54× | 86 | 21 |
+| 2-the | 32 | 381 | 570 | 771 | 326 | 1.17× | 1.75× | 3.75× | 345 | 488 |
+| 3-the-i | 1 | 1315 | 1567 | — | 1312 | 1.00× | 1.19× | 3.43× | 87 | 21 |
+| 3-the-i | 32 | 407 | 598 | — | 332 | 1.23× | 1.80× | 3.88× | 348 | 488 |
+| 4-ing | 1 | 1634 | 1904 | — | 1699 | 0.96× | 1.12× | 10.28× | 87 | 22 |
+| 4-ing | 32 | 432 | 637 | — | 342 | 1.26× | 1.86× | 7.68× | 358 | 508 |
+| 5-the-c | 1 | 909 | 848 | — | 1032 | 0.88× | 0.82× | 2.91× | 86 | 21 |
+| 5-the-c | 32 | 217 | 141 | — | 232 | 0.94× | 0.61× | 2.75× | 226 | 319 |
+| 6-rare-l | 1 | 257 | 195 | — | 811 | 0.32× | 0.24× | 1.25× | 85 | 21 |
+| 6-rare-l | 32 | 111 | 58 | — | 229 | 0.49× | 0.25× | 1.19× | 223 | 321 |
+| 7-rare-q | 1 | 145 | 85 | — | 95 | 1.53× | 0.90× | 5.18× | 79 | 21 |
+| 7-rare-q | 32 | 61 | 30 | — | 103 | 0.59× | 0.29× | 1.56× | 110 | 121 |
+| 8-multiline | 1 | 3642 | 3562 | — | 3274 | 1.11× | 1.09× | 3.37× | 97 | 20 |
+| 8-multiline | 32 | 390 | 348 | — | 402 | 0.97× | 0.87× | 9.17× | 382 | 304 |
+| 9-json | 1 | 336 | 272 | — | 951 | 0.35× | 0.29× | 1.11× | 88 | 21 |
+| 9-json | 32 | 112 | 65 | — | 248 | 0.45× | 0.26× | 1.18× | 232 | 333 |
+| 10-absent | 1 | 259 | 195 | 1203 | 806 | 0.32× | 0.24× | 1.30× | 87 | 21 |
+| 10-absent | 32 | 111 | 59 | 601 | 230 | 0.48× | 0.26× | 1.21× | 226 | 321 |
+
+Queries: 1 `-F -a xylophone`, 2 `-F -a the`, 3 `-i -F -a the`, 4 `-a
+'\w+ing\b'`, 5 `-c -F -a the`, 6 `-l` of 1, 7 `-q` of 1, 8 `-U -c -a
+'\w+\n\w+'`, 9 `--json` of 1, 10 `-F -a kerfuffle` (absent).
+
+Findings:
+
+- **Sparse queries are now 2–4× faster than rg**, daemon or not: rows 1, 6,
+  9 and 10 at 0.24–0.49×, against 1.1–1.3× before. Most of the gain is per
+  query rather than in matching. The daemon adds a further 25–45%.
+- **Dense output to `/dev/null` is at parity in-process**: 0.88–1.26× across
+  rows 2–5, against 2.8–10.3× before. Through the daemon it is 1.1–1.9×.
+  The daemon pays for framing every output byte over the socket, which is
+  measurable only when nothing downstream reads the output.
+- **Through a pipe, ferret is ahead.** With `| cat > /dev/null` at 32
+  threads, `-F -a the` took 757 ms local, 806 daemon and 847 for rg; `\w+ing\b`
+  took 848, 904 and 975.
+- **`--live` is 1.5–2.7× slower than rg** (rows 1, 2 and 10). This is the
+  path for a directory no index covers (D112). It is now the largest gap.
+- **`-q` at 1 thread, local,** is 1.53× slower than rg, at 145 ms against 95:
+  in-process setup with nothing to amortise it over. Through the daemon it
+  takes 85 ms.
+- The client's peak RSS at 1 thread is about 86 MiB, against rg's 21; at 32
+  threads ferret is the lower of the two in most rows.
+
 ## S4 — Agent skill
 
 A Claude Code skill that routes AI agents' file and content search through
