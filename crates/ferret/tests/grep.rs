@@ -2078,6 +2078,7 @@ fn max_columns_omits_long_lines_as_rg_does() {
     fixture.write("pair", b"foo\nctx\n");
     fixture.write("crlf2", b"short foo\r\nxx\r\n");
     fixture.write("bare", b"short foo");
+    fixture.write("bare3", b"abc");
     for args in [
         &["-n", "-M", "20", "foo", "wide"][..],
         &["-M9", "foo", "wide"],
@@ -2093,34 +2094,12 @@ fn max_columns_omits_long_lines_as_rg_does() {
         &["-M", "9", "foo", "bare"],
         &["-o", "-M", "3", "foo", "wide"],
         &["-o", "-M", "2", "foo", "wide"],
-        &["-o", "-M", "3", "-r", "XYZW", "foo", "wide"],
-        &["-o", "-M", "2", "-r", "X", "foo", "wide"],
-        &["-M", "9", "-r", "ab", "foo", "wide"],
-        &["-M", "8", "-r", "abcdef", "foo", "wide"],
-        &["-M", "20", "-C1", "-v", "-r", "X", "foo", "wide"],
         &["-U", "-nM", "12", "foo\\nb+\\nfoo", "lines"],
-        &["-U", "-M", "12", "-r", "Z", "foo\\nb+\\nfoo", "lines"],
         &["-U", "-o", "-M", "3", "foo\\nctx", "pair"],
+        &["-U", "--multiline-dotall", "-M3", "a.*", "bare3"],
+        &["-U", "--multiline-dotall", "-M4", "a.*", "bare3"],
         &["--color=always", "-nM9", "foo", "wide"],
-        &[
-            "--color=always",
-            "-M",
-            "20",
-            "-C1",
-            "-r",
-            "X",
-            "foo",
-            "wide",
-        ],
         &["--color=always", "-M", "20", "-C1", "-v", "foo", "wide"],
-        &[
-            "--color=always",
-            "-U",
-            "-M",
-            "12",
-            "foo\\nb+\\nfoo",
-            "lines",
-        ],
         &["--color=always", "-M", "3", "x*", "pair"],
         &["--color=always", "-M", "3", "o*", "pair"],
         &["--color=always", "-o", "-M", "2", "foo", "wide"],
@@ -2150,8 +2129,25 @@ fn max_columns_omits_long_lines_as_rg_does() {
     let whole = lines(&["grep", "--json", "red", "-"]);
     assert_eq!(whole.len(), 2);
     assert_eq!(lines(&["grep", "--json", "-M", "5", "red", "-"]), whole);
-    let refused = fixture.ferret(&["grep", "-M", "x", "foo", "wide"], None);
-    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    // rg's notice then counts source matches or a multiline group's matches,
+    // which ferret's rendered lines do not keep: refused, as other flags are.
+    for args in [
+        &["-M", "x", "foo", "wide"][..],
+        &["-M", "9", "-r", "ab", "foo", "wide"],
+        &["-o", "-M", "2", "-r", "", "foo", "wide"],
+        &["--color=always", "-U", "-M", "12", "foo", "lines"],
+        &["--pretty", "-U", "-M", "12", "foo", "lines"],
+    ] {
+        let refused = fixture.ferret(&[&["grep"][..], args].concat(), None);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {refused:?}");
+        assert!(refused.stdout.is_empty(), "{args:?}: {refused:?}");
+    }
+    // JSON ignores both, so it is not refused.
+    let json = fixture.ferret(
+        &["grep", "--json", "-U", "-M5", "-r", "X", "foo", "lines"],
+        None,
+    );
+    assert!(json.status.success(), "{json:?}");
 }
 
 #[test]

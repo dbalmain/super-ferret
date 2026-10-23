@@ -123,6 +123,15 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     }
     let tty = presentation::resolve(&mut plan.presentation);
     plan.line_number = plan.presentation.numbers.unwrap_or(tty || plan.json);
+    // In colour rg's notice counts a multiline group's matches, which the
+    // rendered lines do not keep.
+    if plan.max_columns.is_some()
+        && plan.multiline
+        && plan.presentation.color.enabled()
+        && !plan.json
+    {
+        return failure("-M with -U in colour is not supported; use rg for this command");
+    }
     let mut selection = GrepSelection::default().with_hidden(plan.hidden);
     for glob in &plan.globs {
         if let Err(error) = selection.push(glob) {

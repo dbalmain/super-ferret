@@ -269,21 +269,18 @@ impl Render<'_> {
     }
 
     /// rg's `--max-columns` notice for a line over the limit. The width counts
-    /// the line's terminator, except for an `-o` fragment. When colour or a
-    /// replacement has found the matches, a line that has any says how many.
+    /// the line's terminator, except for an `-o` fragment. In colour, a line
+    /// with matches says how many, empty ones included; highlights merge and
+    /// drop those, so the line is searched again. Parsing refuses `-M` with
+    /// `-r`, and with `-U` in colour, whose counts these lines cannot give.
     fn omission(&self, line: &line_grep::Line<'_>) -> Option<Vec<u8>> {
         let limit = self.plan.max_columns?;
         let width = line.bytes.len() as u64 + u64::from(line.terminated && !line.fragment);
         if width <= limit {
             return None;
         }
-        let counted = !line.fragment
-            && (self.plan.presentation.color.enabled() || self.plan.replacement.is_some());
-        let matches = if counted {
-            line.highlights.map_or_else(
-                || self.plan.grep.borrowed_search().spans(line.bytes).count(),
-                <[_]>::len,
-            )
+        let matches = if !line.fragment && self.plan.presentation.color.enabled() {
+            self.plan.grep.borrowed_search().spans(line.bytes).count()
         } else {
             0
         };

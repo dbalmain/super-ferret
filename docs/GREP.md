@@ -140,7 +140,7 @@ Remaining ranked flags, in ranking order within each milestone:
 | M6 | `--no-ignore`, `-a`, `-u`, `--max-depth` |
 | M7 | `--multiline-dotall` |
 | M9 | `--json` (rank 25, postponed for coherent output work) |
-| S4 | `-M`/`--max-columns` (Claude Code's Grep tool passes `--max-columns 500` on every call; D118) |
+| S4 | `-M`/`--max-columns` (Claude Code's Grep tool passes `--max-columns 500` on every call; D118). Refused with `-r`, and with `-U` in colour: rg's notice there counts source or whole-group matches, which rendered lines do not keep |
 
 M1 adds `--color=never`, help/version and `--scan`/`--scan-uncovered`; M5 adds
 colour auto/always/ansi. Support rg aliases (`-.`, `-p`) and negating switches.

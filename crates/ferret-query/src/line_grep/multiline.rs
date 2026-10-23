@@ -450,7 +450,7 @@ pub(super) fn scan_progress(
                 emit(Line {
                     offset: range.start as u64,
                     source_lines: None,
-                    terminated: true,
+                    terminated: content_end < range.end,
                     number: index as u64 + 1,
                     bytes: &bytes[range.start..content_end],
                     kind,
