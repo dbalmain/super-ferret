@@ -2062,6 +2062,98 @@ fn m5_context_gaps_overlap_adjacency_and_long_spills() {
     fixture.compare_raw(&["--color=always", "-nC25000", "red", "spilled"], None);
 }
 
+/// rg's `--max-columns` (Claude Code's Grep tool passes 500). The width counts
+/// the terminator, except for `-o`; colour or a replacement counts matches.
+#[test]
+fn max_columns_omits_long_lines_as_rg_does() {
+    let fixture = Fixture::new("max-columns");
+    fixture.write(
+        "wide",
+        b"short foo\nthis is a long foo line with foo twice and more\nctx line that is quite long\nfoo\n",
+    );
+    fixture.write(
+        "lines",
+        b"aaaa foo\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nfoo end\n",
+    );
+    fixture.write("pair", b"foo\nctx\n");
+    fixture.write("crlf2", b"short foo\r\nxx\r\n");
+    fixture.write("bare", b"short foo");
+    for args in [
+        &["-n", "-M", "20", "foo", "wide"][..],
+        &["-M9", "foo", "wide"],
+        &["-M", "10", "foo", "wide"],
+        &["-M", "0", "foo", "wide"],
+        &["--max-columns=20", "-HC1", "foo", "wide"],
+        &["--max-columns", "20", "-nA1", "foo", "wide"],
+        &["-M", "20", "-v", "foo", "wide"],
+        &["-M", "20", "-c", "foo", "wide"],
+        &["-M", "20", "-l", "--null", "foo", "wide"],
+        &["-M", "10", "foo", "crlf2"],
+        &["-M", "11", "foo", "crlf2"],
+        &["-M", "9", "foo", "bare"],
+        &["-o", "-M", "3", "foo", "wide"],
+        &["-o", "-M", "2", "foo", "wide"],
+        &["-o", "-M", "3", "-r", "XYZW", "foo", "wide"],
+        &["-o", "-M", "2", "-r", "X", "foo", "wide"],
+        &["-M", "9", "-r", "ab", "foo", "wide"],
+        &["-M", "8", "-r", "abcdef", "foo", "wide"],
+        &["-M", "20", "-C1", "-v", "-r", "X", "foo", "wide"],
+        &["-U", "-nM", "12", "foo\\nb+\\nfoo", "lines"],
+        &["-U", "-M", "12", "-r", "Z", "foo\\nb+\\nfoo", "lines"],
+        &["-U", "-o", "-M", "3", "foo\\nctx", "pair"],
+        &["--color=always", "-nM9", "foo", "wide"],
+        &[
+            "--color=always",
+            "-M",
+            "20",
+            "-C1",
+            "-r",
+            "X",
+            "foo",
+            "wide",
+        ],
+        &["--color=always", "-M", "20", "-C1", "-v", "foo", "wide"],
+        &[
+            "--color=always",
+            "-U",
+            "-M",
+            "12",
+            "foo\\nb+\\nfoo",
+            "lines",
+        ],
+        &["--color=always", "-M", "3", "x*", "pair"],
+        &["--color=always", "-M", "3", "o*", "pair"],
+        &["--color=always", "-o", "-M", "2", "foo", "wide"],
+    ] {
+        fixture.compare_raw(args, None);
+    }
+    // The indexed tree, in rg's file groups, and stdin.
+    for args in [
+        &["-M", "5", "-Hn", "red", "."][..],
+        &["-M", "5", "red", "."],
+    ] {
+        fixture.compare(args, None);
+    }
+    let input = b"red\nthe red line\n";
+    fixture.compare(&["-M", "5", "red", "-"], Some(input));
+    // rg leaves JSON whole; only its timings would differ from a comparison.
+    let lines = |args: &[&str]| {
+        let output = fixture.ferret(args, Some(input));
+        assert!(output.status.success(), "{output:?}");
+        output
+            .stdout
+            .split(|&byte| byte == b'\n')
+            .filter(|line| line.starts_with(b"{\"type\":\"match\""))
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>()
+    };
+    let whole = lines(&["grep", "--json", "red", "-"]);
+    assert_eq!(whole.len(), 2);
+    assert_eq!(lines(&["grep", "--json", "-M", "5", "red", "-"]), whole);
+    let refused = fixture.ferret(&["grep", "-M", "x", "foo", "wide"], None);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+}
+
 #[test]
 fn m5_before_context_spill_failure_discards_only_its_file() {
     let fixture = Fixture::new("before-context-fault");

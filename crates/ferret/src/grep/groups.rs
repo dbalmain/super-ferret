@@ -219,6 +219,7 @@ impl Render<'_> {
         }
         cursor.printed = true;
         cursor.gap = false;
+        let omitted = self.omission(&line);
         let delimiter: &[u8] = if line.kind == line_grep::LineKind::Context {
             b"-"
         } else {
@@ -240,7 +241,7 @@ impl Render<'_> {
                 &mut [
                     IoSlice::new(prefix.unwrap_or_default()),
                     IoSlice::new(separator),
-                    IoSlice::new(line.bytes),
+                    IoSlice::new(omitted.as_deref().unwrap_or(line.bytes)),
                     IoSlice::new(b"\n"),
                 ],
             );
@@ -259,8 +260,38 @@ impl Render<'_> {
             presentation::number(&self.plan.presentation, &mut output, line.number)?;
             output.write_all(delimiter)?;
         }
-        presentation::text(self.plan, &mut output, line)?;
+        if let Some(notice) = omitted {
+            output.write_all(&notice)?;
+        } else {
+            presentation::text(self.plan, &mut output, line)?;
+        }
         output.write_all(b"\n")
+    }
+
+    /// rg's `--max-columns` notice for a line over the limit. The width counts
+    /// the line's terminator, except for an `-o` fragment. When colour or a
+    /// replacement has found the matches, a line that has any says how many.
+    fn omission(&self, line: &line_grep::Line<'_>) -> Option<Vec<u8>> {
+        let limit = self.plan.max_columns?;
+        let width = line.bytes.len() as u64 + u64::from(line.terminated && !line.fragment);
+        if width <= limit {
+            return None;
+        }
+        let counted = !line.fragment
+            && (self.plan.presentation.color.enabled() || self.plan.replacement.is_some());
+        let matches = if counted {
+            line.highlights.map_or_else(
+                || self.plan.grep.borrowed_search().spans(line.bytes).count(),
+                <[_]>::len,
+            )
+        } else {
+            0
+        };
+        Some(match (matches, line.kind) {
+            (0, line_grep::LineKind::Match) => b"[Omitted long matching line]".to_vec(),
+            (0, line_grep::LineKind::Context) => b"[Omitted long context line]".to_vec(),
+            (count, _) => format!("[Omitted long line with {count} matches]").into_bytes(),
+        })
     }
 
     fn scan(

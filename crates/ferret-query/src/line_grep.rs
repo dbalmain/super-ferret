@@ -98,6 +98,9 @@ pub struct Plan {
     pub stdin_patterns: bool,
     pub include_zero: bool,
     pub max_count: Option<u64>,
+    /// rg's `--max-columns`: a rendered line longer than this many bytes,
+    /// counting its terminator, prints as an omission notice. `None` for 0.
+    pub max_columns: Option<u64>,
     pub before: u64,
     pub after: u64,
     pub presentation: Presentation,
@@ -158,6 +161,7 @@ pub enum ParseError {
     Number(String),
     Context(String),
     Depth(String),
+    Columns(String),
     Utf8(&'static str),
     Unsupported(String),
     Pattern(ferret_verify::GrepError),
@@ -178,6 +182,10 @@ impl std::fmt::Display for ParseError {
             Self::Depth(value) => write!(
                 f,
                 "invalid --max-depth {value:?}; expected a nonnegative integer"
+            ),
+            Self::Columns(value) => write!(
+                f,
+                "invalid --max-columns {value:?}; expected a nonnegative integer"
             ),
             Self::Context(value) => write!(
                 f,
@@ -257,6 +265,7 @@ pub fn parse_with(
     let mut files = false;
     let mut include_zero = false;
     let mut max_count = None;
+    let mut max_columns = None;
     let (mut before, mut after, mut around) = (None, None, 0);
     let mut presentation = Presentation::default();
     let mut output = Output::Lines;
@@ -382,7 +391,7 @@ pub fn parse_with(
                 }
                 "--scan" | "--scan-uncovered" if value.is_none() => {}
                 "--glob" | "--color" | "--regexp" | "--max-count" | "--before-context"
-                | "--after-context" | "--context" | "--max-depth" => {
+                | "--after-context" | "--context" | "--max-depth" | "--max-columns" => {
                     let value = value
                         .map(str::to_owned)
                         .or_else(|| args.next().and_then(|s| s.to_str()).map(str::to_owned))
@@ -403,6 +412,7 @@ pub fn parse_with(
                         "--max-count" => {
                             max_count = Some(value.parse().map_err(|_| ParseError::Number(value))?)
                         }
+                        "--max-columns" => max_columns = columns(&value)?,
                         "--glob" => globs.push(value),
                         "--regexp" => sources.push(PatternSource::Argument(value)),
                         _ => {
@@ -499,7 +509,7 @@ pub fn parse_with(
                         sources.push(PatternSource::File(path));
                         break;
                     }
-                    b'g' | b'e' | b'm' | b'A' | b'B' | b'C' => {
+                    b'g' | b'e' | b'm' | b'M' | b'A' | b'B' | b'C' => {
                         let value = if at + 1 < bytes.len() {
                             std::str::from_utf8(&bytes[at + 1..]).ok()
                         } else {
@@ -521,6 +531,8 @@ pub fn parse_with(
                                     .parse()
                                     .map_err(|_| ParseError::Number(value.to_owned()))?,
                             );
+                        } else if flag == b'M' {
+                            max_columns = columns(value)?;
                         } else if flag == b'g' {
                             globs.push(value.to_owned());
                         } else {
@@ -638,6 +650,7 @@ pub fn parse_with(
         stdin_patterns,
         include_zero,
         max_count,
+        max_columns,
         before: before.unwrap_or(around),
         after: after.unwrap_or(around),
         presentation,
@@ -668,6 +681,13 @@ fn unrestricted(
 enum PatternSource {
     Argument(String),
     File(PathBuf),
+}
+
+fn columns(value: &str) -> Result<Option<u64>, ParseError> {
+    let limit: u64 = value
+        .parse()
+        .map_err(|_| ParseError::Columns(value.to_owned()))?;
+    Ok((limit > 0).then_some(limit))
 }
 
 fn unsupported(flag: &str) -> ParseError {

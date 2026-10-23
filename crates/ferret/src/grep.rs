@@ -53,6 +53,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   --include-zero     print zero counts (exit 1 without matches)\n\
   --files-without-match print paths with no selected line\n\
   -m, --max-count N   stop after N selected lines per file\n\
+  -M, --max-columns N print lines over N bytes as an omission notice\n\
   --files            list selected file names without reading contents\n\
   --hidden, -.       include held hidden files and directories\n\
   -A/-B/-C N         after/before/around context\n\
