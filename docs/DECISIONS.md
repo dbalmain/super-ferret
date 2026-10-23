@@ -6727,3 +6727,28 @@ The skill ships first under any option; it documents `ferret search` and
 **Fact that would change it:** if the captured invocations rely on flags
 ferret grep rejects often enough that the shim mostly falls back, then B for
 Grep alone, since a refusal at least tells the model what to do instead.
+
+> Dave (2026-10-24, in chat): Agree with the recommendation. Asked whether
+> the shim should also run the equivalent rg or find in the background to
+> verify ferret's answers, rather than only recording queries for later.
+
+Checked on 2026-10-24, before any logging day:
+
+- `USE_BUILTIN_RIPGREP=0` works. With a logging `rg` first on PATH, a
+  `claude -p` session (2.1.296) ran every Grep and Glob call through it.
+- Glob goes through rg too, as
+  `--files --null --glob PATTERN --sort=modified --no-ignore --hidden .`, so
+  "Glob is not routed" above was wrong. Its `--no-ignore` asks for files the
+  index leaves out, so Glob stays with the real rg either way.
+- Every Grep call passes `--hidden`, six `--glob !.VCS` excludes and
+  `--max-columns 500`, then `-l --null`, `--json -n`, or similar. Today
+  ferret grep rejects `--max-columns` (exit 2), so the shim would fall back on
+  every Grep call until ferret supports it.
+
+Proposed in reply: step 1 becomes a shadow rather than a log. The shim serves the real rg's
+answer, then runs `ferret grep` with the same argv in the background at idle
+priority and records whether the two agree. The agent never waits for or sees
+ferret's answer. A mismatch is re-run once after a pause; one that then
+agrees is index lag, not a wrong answer. Commands with side effects (`--pre`
+for rg; `-exec`, `-delete`, `-ok`, `-fprint` for find) are never shadowed.
+After the switch the roles reverse, with rg shadowing ferret on a sample.
