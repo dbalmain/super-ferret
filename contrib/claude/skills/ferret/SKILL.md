@@ -119,6 +119,8 @@ the first search starts it. A warning on stderr,
 means a file written since then may be missing. Re-run the search a few seconds
 later, or use `ferret grep` / `ferret find -I` on the path you just wrote to.
 
-Ignored paths (`.gitignore`, `.ignore`, ferret's own ignore file) are not in the
-index, so `search` and a recursive `grep` or `find` never return them. A file
-named on the command line is still read.
+Paths ignored by `.gitignore` or ferret's own ignore file are not in the index,
+so `search` and a recursive `grep` or `find` never return them. A file named on
+the command line is still read. `.ignore` and `.rgignore` do not apply to the
+index, so ferret can return files rg would skip; only `grep` outside the
+indexed roots honours them.
