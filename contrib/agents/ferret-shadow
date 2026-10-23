@@ -33,6 +33,14 @@
 # A command that searches this script's own directories is not compared or
 # logged: the caller's rg may still be reading them.
 #
+# The caller must never lose input to the replay, so the shadow opens nothing
+# it has not first found to be a regular file, and skips (special) when the
+# roots reach any FIFO, device or socket. Limits of that check: a path
+# replaced after it is made; config injected by GIT_CONFIG_PARAMETERS or
+# `git -c`; and include paths written across lines or with escapes, which the
+# config reader does not parse. includeIf conditions are ignored, so every
+# included file is checked.
+#
 # An `agree` is a screen, not proof: order within a file and diagnostic text
 # are not compared. Step 2 replays the log through the ordered differential.
 
