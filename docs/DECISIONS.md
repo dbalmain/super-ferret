@@ -6689,3 +6689,41 @@ Recommendation: **B**, 60 s, on by default.
 What would change it: agent harnesses that fail a tool call when stderr is
 non-empty. Then default the notice off for grep and keep it for search and
 find.
+
+## D118 — How agents' searches reach ferret (S4)
+
+**Question:** Should agents reach ferret through a skill they may choose to
+use, through a hook that refuses the built-in search tools, or through ferret
+answering as `rg` itself?
+
+Context:
+
+- Claude Code's Grep tool runs its bundled rg, and its system prompt prefers
+  Grep and Glob over Bash. Codex, grok and Bash calls run whichever `rg` is
+  first on PATH.
+- Measured on 2026-10-23 (ROADMAP § Timing against rg): through ferret,
+  sparse queries are 2–4× faster than rg and dense output is at parity; through
+  a pipe ferret is ahead. `--live`, for a path no index covers, is 1.5–2.7×
+  slower than rg.
+- The query log records only ferret calls, so it fills only as fast as
+  routing does.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Skill only: `contrib/claude/skills/ferret/SKILL.md`, symlinked into `~/.claude/skills` | Advisory. The model reaches for Grep and Glob first, so most searches never touch ferret and the query log stays thin. | No risk to any search. Agents learn `ferret search` for what rg cannot do: name, content and age in one query, and indexed find. |
+| B. Skill, plus a PreToolUse hook that refuses Grep and Glob under an indexed root and names the ferret command | One refused call and a Bash retry for each search: an extra turn (several seconds, plus tokens) until the model adapts, again in every new session. Needs `Bash(ferret:*)` allowed. The model translates Glob to `ferret search` or find, and a wrong translation costs a further turn. | Every search under a root goes through ferret; a full query log. |
+| C. Skill, plus an `rg` shim: a script named `rg` early on agents' PATH. It runs `ferret grep` for paths under a root and execs the real rg otherwise, or on a usage error (exit 2). Claude Code is pointed at PATH's rg with `USE_BUILTIN_RIPGREP=0`. | ferret grep must accept every flag the Grep tool passes, or fall back. A ferret bug silently degrades every agent's search until someone notices. One more file to install. Glob is not routed. The variable exists in the Claude Code 2.1.296 binary; its exact effect is unverified. | Transparent for every agent (Claude, codex, grok) with no extra turns. It tests the drop-in thesis on real traffic. The query log fills with real rg-shaped queries. Uncovered paths keep rg's speed. |
+
+**Recommendation: C, in two steps.**
+
+1. The shim only logs: it records each argv it sees and then execs the real
+   rg. Run it for a day of normal agent work.
+2. Replay the captured invocations through the grep differential against rg.
+   Only when they agree does the shim switch to ferret.
+
+The skill ships first under any option; it documents `ferret search` and
+`ferret find`, which no rg route reaches.
+
+**Fact that would change it:** if the captured invocations rely on flags
+ferret grep rejects often enough that the shim mostly falls back, then B for
+Grep alone, since a refusal at least tells the model what to do instead.
