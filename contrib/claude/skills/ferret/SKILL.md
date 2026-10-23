@@ -11,9 +11,10 @@ description:
 # Searching with ferret
 
 `ferret` keeps an index of the directories it has been told about (its roots). A
-query under a root reads the index, not the tree, so it costs about the same on
-a million files as on a hundred. Outside every root it falls back to walking,
-which is slower than rg.
+query under a root reads the index, not the tree, so a selective query costs
+about the same on a million files as on a hundred. Outside every root,
+`ferret grep` walks the tree, slower than rg; `ferret find` refuses unless given
+`-I`; `ferret search` sees only roots.
 
 Check what is indexed once per session:
 
@@ -30,7 +31,9 @@ ferret roots list
 | A find(1) command                                              | `ferret find [PATH...] [EXPRESSION]` |
 
 `ferret grep` takes rg's syntax and prints what rg prints, including `--json`,
-`-l`, `-c`, `-n`, `-g GLOB` and `-U`. Write it exactly as you would write rg.
+`-l`, `-c`, `-n`, `-g GLOB` and `-U`. Write it as you would write rg. A flag it
+does not support (`-t`, `-P`, `--sort` and others) exits 2 with
+`... is not supported; use rg for this command`; then run rg.
 
 ## `ferret search`
 
@@ -117,4 +120,5 @@ means a file written since then may be missing. Re-run the search a few seconds
 later, or use `ferret grep` / `ferret find -I` on the path you just wrote to.
 
 Ignored paths (`.gitignore`, `.ignore`, ferret's own ignore file) are not in the
-index and are never returned.
+index, so `search` and a recursive `grep` or `find` never return them. A file
+named on the command line is still read.
