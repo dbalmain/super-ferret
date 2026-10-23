@@ -44,7 +44,10 @@ scratch=${XDG_RUNTIME_DIR:-$state}
 
 # Reads argv as rg does: which options take a value, short options bundled,
 # and operands after `--`. Sets the flags below and `operands`, the paths.
-json=0 files=0 names=0 null=0 hidden=0 unrestricted=0 sources=0 why=
+# --files, --count, --files-with-matches and --json override one another, the
+# last one winning, so `mode` holds the last: files, count, names, json or
+# lines.
+mode=lines null=0 hidden=0 unrestricted=0 sources=0 why=
 operands=()
 value_short=ABCdEefgjMmrtT
 value_long=' regexp file pre pre-glob dfa-size-limit encoding engine max-count
@@ -65,12 +68,18 @@ option() {
             ;;
         pre | hostname-bin) why=${why:-effects} ;;
         h | help | V | version) why=${why:-info} ;;
-        json) json=1 ;;
-        files) files=1 ;;
-        l | files-with-matches | files-without-match) names=1 ;;
+        json) mode=json ;;
+        no-json) if [[ $mode == json ]]; then mode=lines; fi ;;
+        files) mode=files ;;
+        c | count | count-matches) mode=count ;;
+        l | files-with-matches | files-without-match) mode=names ;;
         0 | null) null=1 ;;
         . | hidden) hidden=1 ;;
-        u) unrestricted=$((unrestricted + 1)) ;;
+        no-hidden) hidden=0 ;;
+        u)
+            unrestricted=$((unrestricted + 1))
+            if ((unrestricted == 2)); then hidden=1; fi
+            ;;
     esac
 }
 
@@ -114,9 +123,12 @@ while ((i < ${#args[@]})); do
         *) operands+=("$arg") ;;
     esac
 done
-if ((unrestricted >= 2)); then
-    hidden=1
-fi
+json=0 files=0 names=0
+case $mode in
+    json) json=1 ;;
+    files) files=1 ;;
+    names) names=1 ;;
+esac
 if ((!sources && !files)); then
     operands=("${operands[@]:1}")
 fi
@@ -125,7 +137,8 @@ for operand in "${operands[@]}"; do
         why=stdin
     fi
 done
-if ((${#operands[@]} == 0)) && [[ ${FERRET_SHADOW_STDIN:-0} == 1 ]]; then
+# A listing never reads stdin.
+if ((${#operands[@]} == 0 && !files)) && [[ ${FERRET_SHADOW_STDIN:-0} == 1 ]]; then
     why=stdin
 fi
 
