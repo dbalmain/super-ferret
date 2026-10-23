@@ -2018,9 +2018,10 @@ Draft skill: `contrib/claude/skills/ferret/SKILL.md` (2026-10-24). Every
 example in it was run against an index of this repository. Routing is D118:
 answered C, a stand-in `rg` on agents' PATH.
 
-Step 1, shadowing: `contrib/agents/rg` (2026-10-24) serves the real rg's
-answer and then runs `ferret grep` on the same argv in the background, logging
-agree, lag, differ or rejected per call. In a `claude -p` run with it on PATH
+Step 1, shadowing: `contrib/agents/rg` (2026-10-24) execs the real rg for its
+caller, after starting `contrib/agents/ferret-shadow`, which reruns the argv
+through rg and `ferret grep` in the background, logging agree, lag, differ or
+rejected per call. In a `claude -p` run with it on PATH
 and `USE_BUILTIN_RIPGREP=0`, all three Grep calls agreed; Glob's
 `--sort=modified --no-ignore` is rejected and stays with rg. Step 2 switches
 the shim to answer from ferret once a day's log is clean.
