@@ -4,15 +4,18 @@
 # for its caller; usage: ferret-shadow REAL_RG ARG...
 #
 # Both run here, one after the other, with stdin from /dev/null, so they see
-# the same input and nearly the same tree. Nothing here reaches the caller.
+# the same input and nearly the same tree. Nothing here reaches the caller,
+# and nothing it writes is under a path the caller searches.
 #
 # Environment:
-#   FERRET_BIN         ferret (default: ferret on PATH)
-#   FERRET_SHADOW_DIR  log and kept mismatches
-#                      (default: $XDG_STATE_HOME/ferret/shadow)
+#   FERRET_BIN          ferret (default: ferret on PATH)
+#   FERRET_SHADOW_DIR   log and kept mismatches
+#                       (default: $XDG_STATE_HOME/ferret/shadow)
+#   FERRET_SHADOW_STDIN 1 when the caller's stdin could be read (set by `rg`)
 #
 # One log line per call, tab-separated: time, verdict, rg exit, ferret exit,
-# cwd, argv. cwd and argv are shell-quoted, so a line can be replayed.
+# cwd, argv. cwd and argv are shell-quoted, so a line can be replayed. The log
+# moves to log.1 past 16 MiB, and the newest 100 mismatches are kept.
 # Verdicts:
 #   agree      same exit status, same stdout records in any order, and
 #              diagnostics from both or neither
@@ -23,62 +26,154 @@
 #   rejected:MESSAGE  ferret grep refused the command (exit 2)
 #   skipped:WHY  not compared: busy (another comparison is running), stdin
 #              (the command reads it), info (--help, --version), effects
-#              (--pre runs a program per file), large (over 64 MiB), slow
-#              (over two minutes), setup
+#              (it runs a program), config (RIPGREP_CONFIG_PATH is set), large
+#              (over 64 MiB), slow (over two minutes), setup
+# A command that searches this script's own directories is not compared or
+# logged: the caller's rg may still be reading them.
 #
 # An `agree` is a screen, not proof: order within a file and diagnostic text
 # are not compared. Step 2 replays the log through the ordered differential.
 
+umask 077
 real=$1
 shift
 args=("$@")
 ferret=${FERRET_BIN:-ferret}
 state=${FERRET_SHADOW_DIR:-${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}/ferret/shadow}
-mkdir -p -m 700 "$state" || exit 0
-# Appending to anything but a file could block, as a FIFO with no reader does.
-if [[ -e $state/log && ! -f $state/log ]]; then
+scratch=${XDG_RUNTIME_DIR:-$state}
+
+# Reads argv as rg does: which options take a value, short options bundled,
+# and operands after `--`. Sets the flags below and `operands`, the paths.
+json=0 files=0 names=0 null=0 hidden=0 unrestricted=0 sources=0 why=
+operands=()
+value_short=ABCdEefgjMmrtT
+value_long=' regexp file pre pre-glob dfa-size-limit encoding engine max-count
+    regex-size-limit threads glob iglob ignore-file max-depth max-filesize type
+    type-not type-add type-clear after-context before-context color colors
+    context context-separator field-context-separator field-match-separator
+    hostname-bin hyperlink-format max-columns path-separator replace sort
+    sortr generate '
+value_long=${value_long//$'\n'/ }
+
+# One option and its value, if it takes one.
+option() {
+    case $1 in
+        e | regexp) sources=1 ;;
+        f | file)
+            sources=1
+            if [[ $2 == - ]]; then why=stdin; fi
+            ;;
+        pre | hostname-bin) why=${why:-effects} ;;
+        h | help | V | version) why=${why:-info} ;;
+        json) json=1 ;;
+        files) files=1 ;;
+        l | files-with-matches | files-without-match) names=1 ;;
+        0 | null) null=1 ;;
+        . | hidden) hidden=1 ;;
+        u) unrestricted=$((unrestricted + 1)) ;;
+    esac
+}
+
+i=0
+while ((i < ${#args[@]})); do
+    arg=${args[i]}
+    i=$((i + 1))
+    case $arg in
+        --)
+            operands+=("${args[@]:i}")
+            break
+            ;;
+        --*=*)
+            name=${arg%%=*}
+            option "${name:2}" "${arg#*=}"
+            ;;
+        --?*)
+            name=${arg:2}
+            if [[ $value_long == *" $name "* ]]; then
+                option "$name" "${args[i]-}"
+                i=$((i + 1))
+            else
+                option "$name" ""
+            fi
+            ;;
+        -?*)
+            for ((j = 1; j < ${#arg}; j++)); do
+                c=${arg:j:1}
+                if [[ $value_short == *"$c"* ]]; then
+                    value=${arg:j+1}
+                    if [[ -z $value ]]; then
+                        value=${args[i]-}
+                        i=$((i + 1))
+                    fi
+                    option "$c" "$value"
+                    break
+                fi
+                option "$c" ""
+            done
+            ;;
+        *) operands+=("$arg") ;;
+    esac
+done
+if ((unrestricted >= 2)); then
+    hidden=1
+fi
+if ((!sources && !files)); then
+    operands=("${operands[@]:1}")
+fi
+for operand in "${operands[@]}"; do
+    if [[ $operand == - ]]; then
+        why=stdin
+    fi
+done
+if ((${#operands[@]} == 0)) && [[ ${FERRET_SHADOW_STDIN:-0} == 1 ]]; then
+    why=stdin
+fi
+
+# Would the caller's search walk into our own files? Then stay out entirely:
+# even a log line could land in its results.
+inside() {
+    local here there
+    there=$(realpath -m -- "$1")
+    for here in "${operands[@]:-.}"; do
+        here=$(realpath -m -- "$here") || continue
+        if [[ $there == "$here" || $there == "${here%/}"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+if inside "$state" || inside "$scratch"; then
     exit 0
 fi
 
+mkdir -p "$state" || exit 0
+# Opening anything but a file could block, as a FIFO with no reader does.
+for file in log lock; do
+    if [[ -e $state/$file && ! -f $state/$file ]]; then
+        exit 0
+    fi
+done
+
 log() {
+    if [[ $(stat -c %s "$state/log" 2> /dev/null) -gt $((16 << 20)) ]]; then
+        mv -f "$state/log" "$state/log.1"
+    fi
     printf '%s\t%s\t%s\t%s\t%q\t%s\n' "$(date +%FT%T%z)" "$1" "$2" "$3" "$PWD" \
         "$(printf '%q ' "${args[@]}")" >> "$state/log"
 }
 
+# The replay would run rg with a configuration ferret grep refuses, and that
+# may name a --pre program.
+if [[ -n ${RIPGREP_CONFIG_PATH:-} ]]; then
+    why=${why:-config}
+fi
+if [[ -n $why ]]; then
+    log "skipped:$why" - -
+    exit 0
+fi
+
 renice -n 19 $$ > /dev/null 2>&1
 ionice -c 3 -p $$ > /dev/null 2>&1
-
-# Commands whose replay would differ from the caller's run, or cost it twice.
-json=0 files=0 hidden=0 previous=
-for arg in "${args[@]}"; do
-    case $previous in
-        -f | --file)
-            if [[ $arg == - ]]; then
-                log skipped:stdin - -
-                exit 0
-            fi
-            ;;
-    esac
-    case $arg in
-        - | -f- | --file=-)
-            log skipped:stdin - -
-            exit 0
-            ;;
-        --pre | --pre=*)
-            log skipped:effects - -
-            exit 0
-            ;;
-        --help | -h | --version | -V)
-            log skipped:info - -
-            exit 0
-            ;;
-        --json) json=1 ;;
-        --files) files=1 ;;
-        --hidden | -. | -uu | -uuu) hidden=1 ;;
-        --) break ;;
-    esac
-    previous=$arg
-done
 
 # One comparison at a time. The lock is this shell's alone: every command
 # below runs with descriptor 9 closed, so no child, and no daemon a child
@@ -89,53 +184,52 @@ if ! flock -n 9; then
     exit 0
 fi
 
-run=$(mktemp -d "${XDG_RUNTIME_DIR:-$state}/ferret-shadow.XXXXXX") || {
+run=$(mktemp -d "$scratch/ferret-shadow.XXXXXX") || {
     log skipped:setup - -
     exit 0
 }
 trap 'rm -rf "$run"' EXIT
 
-# Runs one side into $run/NAME.out and NAME.err; 64 MiB of output at most.
+# Runs one side into $run/NAME.out and NAME.err; 64 MiB of output at most
+# (bash counts ulimit -f in KiB).
 side() {
     local name=$1
     shift
     (
-        ulimit -f $((64 * 2048))
-        exec timeout 120 "$@" < /dev/null > "$run/$name.out" 2> "$run/$name.err" 9>&-
+        ulimit -f $((64 * 1024))
+        exec timeout -k 5 120 "$@" < /dev/null > "$run/$name.out" 2> "$run/$name.err" 9>&-
     )
 }
 
 # Output records in any order: rg's worker threads finish files in any order.
-# A NUL-terminated listing sorts as NUL records. JSON drops elapsed times and
-# the summary, which counts files read, and an index reads fewer.
+# `-0` with a listing ends records with NUL. JSON drops elapsed times and the
+# summary, which counts files read, and an index reads fewer.
+if ((null && (files || names))); then
+    split=-z
+else
+    split=
+fi
 normal() {
     if ((json)); then
         sed -E '/^\{"(type":"summary"|data":\{"elapsed_total")/d; /^\{"type":"end"/s/"elapsed":\{[^}]*\}//' "$1" |
             LC_ALL=C sort
-    elif [[ -s $1 ]] && ! grep -q $'\n' "$1" 2> /dev/null && grep -qaF $'\0' "$1"; then
-        LC_ALL=C sort -z "$1"
     else
-        LC_ALL=C sort "$1"
+        LC_ALL=C sort $split "$1"
     fi
-}
-
-# Diagnostics from both or neither; ferret's own stale-index notice aside.
-spoke() {
-    grep -qv 'no daemon answered' "$1"
 }
 
 compare() {
     side rg "$real" "${args[@]}"
     echo $? > "$run/rg.status"
-    side ferret "$ferret" grep "${args[@]}"
+    FERRET_STALE_NOTICE=0 side ferret "$ferret" grep "${args[@]}"
     echo $? > "$run/ferret.status"
 }
 
 verdict() {
-    local rg ferret
+    local rg ferret rs fs same=agree
     rg=$(< "$run/rg.status") ferret=$(< "$run/ferret.status")
     case "$rg $ferret" in
-        124\ * | *\ 124)
+        124\ * | *\ 124 | 137\ * | *\ 137)
             echo skipped:slow
             return
             ;;
@@ -154,27 +248,27 @@ verdict() {
     fi
     if ! cmp -s <(normal "$run/rg.out") <(normal "$run/ferret.out"); then
         if ((files && hidden)) &&
-            cmp -s <(tr '\0' '\n' < "$run/rg.out" | grep -Ev '(^|/)\.git(/|$)' | LC_ALL=C sort) \
-                <(tr '\0' '\n' < "$run/ferret.out" | LC_ALL=C sort); then
-            echo known:git
+            cmp -s <(LC_ALL=C grep -a $split -Ev '(^|/)\.git(/|$)' "$run/rg.out" | LC_ALL=C sort $split) \
+                <(normal "$run/ferret.out"); then
+            same=known:git
         else
             echo differ
+            return
         fi
-        return
     fi
-    if spoke "$run/rg.err"; then rs=1; else rs=0; fi
-    if spoke "$run/ferret.err"; then fs=1; else fs=0; fi
+    if [[ -s $run/rg.err ]]; then rs=1; else rs=0; fi
+    if [[ -s $run/ferret.err ]]; then fs=1; else fs=0; fi
     if ((rs != fs)); then
         echo differ
         return
     fi
-    echo agree
+    echo $same
 }
 
 compare 9>&-
 first=$(verdict 9>&-)
 case $first in
-    agree | skipped:* | rejected:*)
+    agree | known:git | skipped:* | rejected:*)
         log "$first" "$(< "$run/rg.status")" "$(< "$run/ferret.status")"
         exit 0
         ;;
@@ -185,14 +279,16 @@ mv "$run"/*.out "$run"/*.err "$run"/*.status "$run/first/"
 sleep 2
 compare 9>&-
 again=$(verdict 9>&-)
-if [[ $again == agree ]]; then
+if [[ $again == agree || $again == known:git ]]; then
     log lag "${statuses[@]}"
     exit 0
 fi
 log "$first" "${statuses[@]}"
 if [[ $first == differ ]]; then
     keep=$state/mismatch/$(date +%Y%m%dT%H%M%S)-$$
-    mkdir -p -m 700 "$keep" && mv "$run"/* "$keep/"
+    mkdir -p "$keep" && mv "$run"/* "$keep/"
     printf '%q ' "${args[@]}" > "$keep/argv"
     printf '%q\n' "$PWD" > "$keep/cwd"
+    find "$state/mismatch" -mindepth 1 -maxdepth 1 -print0 | LC_ALL=C sort -rz |
+        tail -zn +101 | xargs -0r rm -rf --
 fi

@@ -34,6 +34,13 @@ shadow=${self%/*}/ferret-shadow
 # A terminal reader sees colour and headings, which a captured replay would
 # not, so terminal calls are not compared.
 if [[ ${FERRET_SHADOW:-1} != 0 && ! -t 1 && -x $shadow ]]; then
+    # rg reads a stdin that is not a terminal or /dev/null when given no path,
+    # and the replay's is /dev/null, so say which this was. Tested here: an
+    # asynchronous subshell's stdin is already /dev/null.
+    stdin=0
+    if [[ ! -c /dev/stdin ]]; then
+        stdin=1
+    fi
     (
         for fd in "/proc/$BASHPID/fd/"*; do
             fd=${fd##*/}
@@ -41,7 +48,7 @@ if [[ ${FERRET_SHADOW:-1} != 0 && ! -t 1 && -x $shadow ]]; then
                 eval "exec $fd>&-"
             fi
         done
-        exec setsid "$shadow" "$real" "$@" < /dev/null > /dev/null 2>&1
+        FERRET_SHADOW_STDIN=$stdin exec setsid "$shadow" "$real" "$@" < /dev/null > /dev/null 2>&1
     ) 2> /dev/null &
 fi
 exec "$real" "$@"
