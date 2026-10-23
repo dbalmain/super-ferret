@@ -319,6 +319,29 @@ fn a_named_fifo_is_left_to_the_caller() {
     ] {
         assert_eq!(verdict(&bed, ferret, args), "skipped:special", "{args:?}");
     }
+    // So is an ignore file rg would open by itself, in the tree or above it.
+    let policy = Bed::new("policy-fifo", false);
+    policy.write("sub/x", b"hit\n");
+    let fifo_ignore = policy.tree.join("sub/.ignore");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo_ignore)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(verdict(&policy, ferret, &["hit", "."]), "skipped:special");
+    fs::remove_file(&fifo_ignore).unwrap();
+    assert_eq!(verdict(&policy, ferret, &["hit", "."]), "agree");
+    let above = policy.tree.join(".gitignore");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&above)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(verdict(&policy, ferret, &["hit", "sub"]), "skipped:special");
     // Through the stand-in, the caller reads the whole stream.
     let child = bed
         .command(&script("rg"), ferret)

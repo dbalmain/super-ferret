@@ -25,8 +25,8 @@
 #   differ     still differed; both runs are kept under mismatch/
 #   rejected:MESSAGE  ferret grep refused the command (exit 2)
 #   skipped:WHY  not compared: busy (another comparison is running), stdin
-#              (the command reads it), special (it names a FIFO, device or
-#              socket), heading (--heading or --pretty output), info (--help,
+#              (the command reads it), special (it names, or would read an
+#              ignore file that is, a FIFO, device or socket), heading (--heading or --pretty output), info (--help,
 #              --version), effects (it runs a program), config
 #              (RIPGREP_CONFIG_PATH is set), large (over 64 MiB), slow (over
 #              two minutes), setup
@@ -212,6 +212,42 @@ ionice -c 3 -p $$ > /dev/null 2>&1
 exec 9> "$state/lock" || exit 0
 if ! flock -n 9; then
     log skipped:busy - -
+    exit 0
+fi
+
+# rg also opens by name the ignore files it finds, in and above each root.
+# One that is not a file would be consumed as an operand would; finding one
+# costs a metadata walk of the roots, which is cheaper than the replay.
+special_policy() {
+    local root dir name names=(.ignore .rgignore .gitignore .git/info/exclude)
+    local global=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/git/ignore
+    if [[ -e $global && ! -f $global ]]; then
+        return 0
+    fi
+    for root in "${operands[@]:-.}"; do
+        if [[ ! -d $root ]]; then
+            continue
+        fi
+        if find "$root" \( -name .ignore -o -name .rgignore -o -name .gitignore \
+            -o -path '*/.git/info/exclude' \) ! -type f -print -quit 2> /dev/null |
+            grep -q .; then
+            return 0
+        fi
+        dir=$(realpath -m -- "$root")
+        while [[ $dir != / ]]; do
+            dir=${dir%/*}
+            dir=${dir:-/}
+            for name in "${names[@]}"; do
+                if [[ (-e $dir/$name || -L $dir/$name) && ! -f $dir/$name ]]; then
+                    return 0
+                fi
+            done
+        done
+    done
+    return 1
+}
+if special_policy 9>&-; then
+    log skipped:special - -
     exit 0
 fi
 
