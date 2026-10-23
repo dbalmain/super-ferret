@@ -1169,6 +1169,21 @@ fn idle_cleanup_does_not_unlink_a_replacement_socket() {
     drop(replacement);
 }
 
+// A plain find the daemon answers ends quietly when its reader goes away,
+// as the in-process find does (D94).
+#[test]
+fn daemon_find_into_a_closed_pipe_exits_quietly() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let mut command = tree.command(&["find", "src"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
 #[test]
 fn search_broken_pipe_is_quiet_and_sigint_cancels_without_killing_host() {
     use std::os::unix::process::ExitStatusExt;

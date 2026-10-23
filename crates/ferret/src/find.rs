@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
@@ -168,6 +169,9 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
         }
     };
     let flushed = effects.flush();
+    if STDOUT_CLOSED.load(Ordering::Relaxed) {
+        return Exit::Ok;
+    }
     if let Err(error) = flushed {
         cli::error(&format!("find: writing stdout: {error}"));
         return Exit::NoMatch;
@@ -292,6 +296,11 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     if status == 0 { Exit::Ok } else { Exit::NoMatch }
 }
 
+/// Set once a write to stdout finds its reader gone. As for grep (D94), find
+/// then ends silently with exit 0: what it would still report has nowhere to
+/// go, and GNU find would already have died of SIGPIPE.
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone)]
 enum Output {
     Stdout,
@@ -307,7 +316,15 @@ impl Output {
         write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
     ) -> io::Result<()> {
         match self {
-            Self::Stdout => write(&mut io::stdout().lock()),
+            Self::Stdout => {
+                let written = write(&mut io::stdout().lock());
+                if let Err(error) = &written
+                    && error.kind() == io::ErrorKind::BrokenPipe
+                {
+                    STDOUT_CLOSED.store(true, Ordering::Relaxed);
+                }
+                written
+            }
             #[cfg(test)]
             Self::Test(writer) => write(
                 &mut **writer
@@ -343,11 +360,15 @@ impl Effects for Output {
     }
 
     fn warning(&mut self, message: &str) {
-        cli::error(&format!("find: {message}"));
+        if !STDOUT_CLOSED.load(Ordering::Relaxed) {
+            cli::error(&format!("find: {message}"));
+        }
     }
 
     fn error(&mut self, error: &WalkError) {
-        cli::error(&format!("find: {}: {}", error.path.display(), error.error));
+        if !STDOUT_CLOSED.load(Ordering::Relaxed) {
+            cli::error(&format!("find: {}: {}", error.path.display(), error.error));
+        }
     }
 }
 

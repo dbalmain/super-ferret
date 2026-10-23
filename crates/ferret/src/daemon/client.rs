@@ -736,7 +736,8 @@ fn query(
         Ok(exit) => exit,
         Err(error) if output_failure => {
             cancel(reader.get_mut());
-            if op == "grep" && error.kind() == io::ErrorKind::BrokenPipe {
+            if (op == "grep" || op == "find" && !json) && error.kind() == io::ErrorKind::BrokenPipe
+            {
                 Exit::Ok
             } else if op == "search" && error.kind() == io::ErrorKind::BrokenPipe {
                 if rows > 0 { Exit::Ok } else { Exit::NoMatch }

@@ -903,8 +903,16 @@ fn every_command_exits_normally_into_a_closed_pipe() {
         &["help"],
         &["--version"],
     ];
+    let tree = env.tree();
+    let finds: [&[&OsStr]; 2] = [
+        &[os("find"), tree.as_os_str()],
+        &[os("find"), os("-I"), tree.as_os_str()],
+    ];
+    let cases = cases
+        .iter()
+        .map(|args| args.iter().map(os).collect::<Vec<_>>())
+        .chain(finds.iter().map(|args| args.to_vec()));
     for args in cases {
-        let args: Vec<&OsStr> = args.iter().map(os).collect();
         let output = env.command(&args).stdout(closed_pipe()).output().unwrap();
         assert_eq!(code(&output), 0, "{args:?}: {}", stderr(&output));
         assert_eq!(stderr(&output), "", "{args:?}");
