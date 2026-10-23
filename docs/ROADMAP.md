@@ -2014,6 +2014,10 @@ A Claude Code skill that routes AI agents' file and content search through
 `ferret` (JSON lines, stable exit codes, byte offsets). Its usage log is the
 second source of real queries.
 
+Draft skill: `contrib/claude/skills/ferret/SKILL.md` (2026-10-24). Every
+example in it was run against an index of this repository. How agents get
+routed to it is D118, open.
+
 ## S5 — Daemon for the content index
 
 S1b's daemon extended to the content index: postings kept current from its
