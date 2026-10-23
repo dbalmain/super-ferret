@@ -307,8 +307,7 @@ fn heading_output_is_not_compared_line_by_line() {
 fn a_named_fifo_is_left_to_the_caller() {
     let bed = Bed::new("named-fifo", false);
     let fifo = bed.tree.join("fifo");
-    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
-    assert!(status.success());
+    mkfifo(&fifo);
     // Checked before anything opens it: a replay would block here, or with a
     // writer, take part of the caller's input.
     let ferret = Path::new(FERRET);
@@ -319,56 +318,6 @@ fn a_named_fifo_is_left_to_the_caller() {
     ] {
         assert_eq!(verdict(&bed, ferret, args), "skipped:special", "{args:?}");
     }
-    // So is an ignore file rg would open by itself, in the tree or above it.
-    let policy = Bed::new("policy-fifo", false);
-    policy.write("sub/x", b"hit\n");
-    let fifo_ignore = policy.tree.join("sub/.ignore");
-    assert!(
-        Command::new("mkfifo")
-            .arg(&fifo_ignore)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert_eq!(verdict(&policy, ferret, &["hit", "."]), "skipped:special");
-    fs::remove_file(&fifo_ignore).unwrap();
-    assert_eq!(verdict(&policy, ferret, &["hit", "."]), "agree");
-    let above = policy.tree.join(".gitignore");
-    assert!(
-        Command::new("mkfifo")
-            .arg(&above)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert_eq!(verdict(&policy, ferret, &["hit", "sub"]), "skipped:special");
-    // rg walks into a root given as a symlink, and with -L into any.
-    fs::remove_file(&above).unwrap();
-    assert!(
-        Command::new("mkfifo")
-            .arg(&fifo_ignore)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let link = |target: &Path, name: &str| {
-        std::os::unix::fs::symlink(target, policy.tree.join(name)).unwrap()
-    };
-    link(&policy.tree.join("sub"), "link");
-    assert_eq!(
-        verdict(&policy, ferret, &["hit", "link"]),
-        "skipped:special"
-    );
-    let outside = policy.base.join("outside");
-    fs::create_dir(&outside).unwrap();
-    fs::rename(&fifo_ignore, outside.join(".ignore")).unwrap();
-    fs::create_dir(policy.tree.join("other")).unwrap();
-    link(&outside, "other/link");
-    assert_eq!(verdict(&policy, ferret, &["hit", "other"]), "agree");
-    assert_eq!(
-        verdict(&policy, ferret, &["-L", "hit", "other"]),
-        "skipped:special"
-    );
     // Through the stand-in, the caller reads the whole stream.
     let child = bed
         .command(&script("rg"), ferret)
@@ -393,4 +342,74 @@ fn a_named_fifo_is_left_to_the_caller() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(bed.log()[3].split('\t').nth(1), Some("skipped:special"));
+}
+
+fn mkfifo(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    assert!(Command::new("mkfifo").arg(path).status().unwrap().success());
+}
+
+#[test]
+fn any_reachable_special_file_skips_the_comparison() {
+    // rg opens ignore files by name, in and above the roots and through
+    // symlinks its walk would not follow, so the shadow refuses when the roots
+    // reach anything that is not a file or a directory.
+    use std::os::unix::fs::symlink;
+    let ferret = Path::new(FERRET);
+    let bed = |name: &str| {
+        let bed = Bed::new(name, false);
+        bed.write("sub/x", b"hit\n");
+        bed
+    };
+    let skipped = |bed: &Bed, args: &[&str]| {
+        assert_eq!(verdict(bed, ferret, args), "skipped:special", "{args:?}")
+    };
+
+    let plain = bed("reach-plain");
+    mkfifo(&plain.tree.join("sub/.ignore"));
+    skipped(&plain, &["hit", "."]);
+    fs::remove_file(plain.tree.join("sub/.ignore")).unwrap();
+    assert_eq!(verdict(&plain, ferret, &["hit", "."]), "agree");
+    // A broken symlink opens nothing.
+    symlink("missing", plain.tree.join("sub/broken")).unwrap();
+    assert_eq!(verdict(&plain, ferret, &["hit", "."]), "agree");
+
+    let above = bed("reach-above");
+    mkfifo(&above.tree.join(".gitignore"));
+    skipped(&above, &["hit", "sub"]);
+
+    let linked = bed("reach-linked");
+    let outside = linked.base.join("outside");
+    mkfifo(&outside.join(".ignore"));
+    symlink(&outside, linked.tree.join("sub/link")).unwrap();
+    skipped(&linked, &["hit", "."]);
+    symlink(&outside, linked.tree.join("root")).unwrap();
+    skipped(&linked, &["hit", "root"]);
+
+    let gitlink = bed("reach-gitlink");
+    let gitdir = gitlink.base.join("gitdir");
+    mkfifo(&gitdir.join("info/exclude"));
+    symlink(&gitdir, gitlink.tree.join(".git")).unwrap();
+    skipped(&gitlink, &["hit", "."]);
+
+    let gitfile = bed("reach-gitfile");
+    let gitdir = gitfile.base.join("worktree");
+    fs::create_dir_all(&gitdir).unwrap();
+    fs::write(gitdir.join("commondir"), "../common\n").unwrap();
+    mkfifo(&gitfile.base.join("common/info/exclude"));
+    let pointer = format!("gitdir: {}\n", gitdir.display());
+    gitfile.write("sub/.git", pointer.as_bytes());
+    skipped(&gitfile, &["hit", "."]);
+    skipped(&gitfile, &["hit", "sub"]);
+
+    let excludes = bed("reach-excludes");
+    let file = excludes.base.join("excludes");
+    mkfifo(&file);
+    let config = format!("[core]\n\texcludesFile = {}\n", file.display());
+    fs::write(excludes.base.join("home/.gitconfig"), config).unwrap();
+    skipped(&excludes, &["hit", "."]);
+
+    let looped = bed("reach-loop");
+    symlink("..", looped.tree.join("sub/up")).unwrap();
+    skipped(&looped, &["hit", "."]);
 }

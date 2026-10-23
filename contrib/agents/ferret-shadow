@@ -25,8 +25,8 @@
 #   differ     still differed; both runs are kept under mismatch/
 #   rejected:MESSAGE  ferret grep refused the command (exit 2)
 #   skipped:WHY  not compared: busy (another comparison is running), stdin
-#              (the command reads it), special (it names, or would read an
-#              ignore file that is, a FIFO, device or socket), heading (--heading or --pretty output), info (--help,
+#              (the command reads it), special (it names a FIFO, device or
+#              socket, or its roots reach one, or cannot be walked), heading (--heading or --pretty output), info (--help,
 #              --version), effects (it runs a program), config
 #              (RIPGREP_CONFIG_PATH is set), large (over 64 MiB), slow (over
 #              two minutes), setup
@@ -49,7 +49,7 @@ scratch=${XDG_RUNTIME_DIR:-$state}
 # --files, --count, --files-with-matches and --json override one another, the
 # last one winning, so `mode` holds the last: files, count, names, json or
 # lines.
-mode=lines null=0 hidden=0 unrestricted=0 sources=0 heading=0 follow=0 why=
+mode=lines null=0 hidden=0 unrestricted=0 sources=0 heading=0 why=
 operands=() inputs=()
 value_short=ABCdEefgjMmrtT
 value_long=' regexp file pre pre-glob dfa-size-limit encoding engine max-count
@@ -72,8 +72,6 @@ option() {
         ignore-file) inputs+=("$2") ;;
         heading | p | pretty) heading=1 ;;
         no-heading) heading=0 ;;
-        L | follow) follow=1 ;;
-        no-follow) follow=0 ;;
         pre | hostname-bin) why=${why:-effects} ;;
         h | help | V | version) why=${why:-info} ;;
         json) mode=json ;;
@@ -217,27 +215,60 @@ if ! flock -n 9; then
     exit 0
 fi
 
-# rg also opens by name the ignore files it finds, in and above each root.
-# One that is not a file would be consumed as an operand would; finding one
-# costs a metadata walk of the roots, which is cheaper than the replay.
-special_policy() {
-    local root dir name names=(.ignore .rgignore .gitignore .git/info/exclude)
-    local walk=-H
-    if ((follow)); then
-        walk=-L
+# rg opens by name the ignore files it finds, and git's, in and above each
+# root, by rules for symlinks that differ from its walk's. Anything there that
+# is not a file would be consumed, not copied, by the replay. So the roots are
+# walked first, following every symlink, and any FIFO, device or socket
+# reachable from them skips the comparison, as does a walk that cannot finish:
+# a loop, an unreadable directory or more than 30 seconds. Broken symlinks open
+# nothing and pass.
+special_file() {
+    [[ (-e $1 || -L $1) && ! -f $1 ]]
+}
+# A .git file names the git dir whose info/exclude rg reads, and a linked
+# worktree's names a common dir too.
+special_gitdir() {
+    local file=$1 gitdir common
+    gitdir=$(sed -n 's/^gitdir: //p' "$file" 2> /dev/null | head -n 1)
+    if [[ -z $gitdir ]]; then
+        return 1
     fi
-    local global=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/git/ignore
-    if [[ -e $global && ! -f $global ]]; then
+    if [[ $gitdir != /* ]]; then
+        gitdir=${file%/*}/$gitdir
+    fi
+    if special_file "$gitdir/info/exclude"; then
+        return 0
+    fi
+    common=$(head -n 1 "$gitdir/commondir" 2> /dev/null)
+    if [[ -n $common && $common != /* ]]; then
+        common=$gitdir/$common
+    fi
+    [[ -n $common ]] && special_file "$common/info/exclude"
+}
+special_policy() {
+    local root dir name found excludes
+    local names=(.ignore .rgignore .gitignore .git/info/exclude)
+    if special_file "${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/git/ignore"; then
         return 0
     fi
     for root in "${operands[@]:-.}"; do
         if [[ ! -d $root ]]; then
             continue
         fi
-        # rg descends into a root that is a symlink, and with -L into every one.
-        if find "$walk" "$root" \( -name .ignore -o -name .rgignore -o -name .gitignore \
-            -o -path '*/.git/info/exclude' \) ! -type f -print -quit 2> /dev/null |
-            grep -q .; then
+        found=$run/walk
+        if ! timeout -k 5 30 find -L "$root" \( ! -type f ! -type d ! -type l \
+            -printf 'S\0' -quit \) -o \( -name .git -type f -printf 'G%p\0' \) \
+            > "$found" 2> /dev/null; then
+            return 0
+        fi
+        while IFS= read -rd '' name; do
+            if [[ $name == S ]] || special_gitdir "${name#G}"; then
+                return 0
+            fi
+        done < "$found"
+        excludes=$(git -C "$root" config --get core.excludesFile 2> /dev/null)
+        excludes=${excludes/#\~/${HOME:-/nonexistent}}
+        if [[ -n $excludes ]] && special_file "$excludes"; then
             return 0
         fi
         dir=$(realpath -m -- "$root")
@@ -245,24 +276,27 @@ special_policy() {
             dir=${dir%/*}
             dir=${dir:-/}
             for name in "${names[@]}"; do
-                if [[ (-e $dir/$name || -L $dir/$name) && ! -f $dir/$name ]]; then
+                if special_file "$dir/$name"; then
                     return 0
                 fi
             done
+            if [[ -f $dir/.git ]] && special_gitdir "$dir/.git"; then
+                return 0
+            fi
         done
     done
     return 1
 }
-if special_policy 9>&-; then
-    log skipped:special - -
-    exit 0
-fi
-
 run=$(mktemp -d "$scratch/ferret-shadow.XXXXXX") || {
     log skipped:setup - -
     exit 0
 }
 trap 'rm -rf "$run"' EXIT
+
+if special_policy 9>&-; then
+    log skipped:special - -
+    exit 0
+fi
 
 # Runs one side into $run/NAME.out and NAME.err; 64 MiB of output at most
 # (bash counts ulimit -f in KiB).
