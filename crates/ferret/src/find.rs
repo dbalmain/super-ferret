@@ -5,9 +5,10 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferret_catalog::Catalog;
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
@@ -147,7 +148,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     if plan.permission_warning() {
         cli::error(PERMISSION_WARNING);
     }
-    let mut effects = Output::Stdout;
+    let mut effects = Output::stdout();
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
         Some(FindCatalog::Engine(engine)) => engine.pin().find(&plan, effects.clone(), workers),
@@ -169,7 +170,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
         }
     };
     let flushed = effects.flush();
-    if STDOUT_CLOSED.load(Ordering::Relaxed) {
+    if effects.closed() {
         return Exit::Ok;
     }
     if let Err(error) = flushed {
@@ -296,19 +297,28 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     if status == 0 { Exit::Ok } else { Exit::NoMatch }
 }
 
-/// Set once a write to stdout finds its reader gone. As for grep (D94), find
-/// then ends silently with exit 0: what it would still report has nowhere to
-/// go, and GNU find would already have died of SIGPIPE.
-static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone)]
 enum Output {
-    Stdout,
+    /// Set once a write finds the reader gone, and shared by this invocation's
+    /// worker clones. As for grep (D94), find then ends silently with exit 0:
+    /// what it would still report has nowhere to go, and GNU find would
+    /// already have died of SIGPIPE.
+    Stdout(Arc<AtomicBool>),
     #[cfg(test)]
     Test(Arc<Mutex<Box<dyn Write + Send>>>),
 }
 
 impl Output {
+    fn stdout() -> Self {
+        Self::Stdout(Arc::new(AtomicBool::new(false)))
+    }
+    fn closed(&self) -> bool {
+        match self {
+            Self::Stdout(closed) => closed.load(Ordering::Relaxed),
+            #[cfg(test)]
+            Self::Test(_) => false,
+        }
+    }
     // The engine holds its transaction gate. Stdout's own lock covers the
     // destination, including its internal line buffer, without another mutex.
     fn with_writer(
@@ -316,12 +326,12 @@ impl Output {
         write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
     ) -> io::Result<()> {
         match self {
-            Self::Stdout => {
+            Self::Stdout(closed) => {
                 let written = write(&mut io::stdout().lock());
                 if let Err(error) = &written
                     && error.kind() == io::ErrorKind::BrokenPipe
                 {
-                    STDOUT_CLOSED.store(true, Ordering::Relaxed);
+                    closed.store(true, Ordering::Relaxed);
                 }
                 written
             }
@@ -360,13 +370,13 @@ impl Effects for Output {
     }
 
     fn warning(&mut self, message: &str) {
-        if !STDOUT_CLOSED.load(Ordering::Relaxed) {
+        if !self.closed() {
             cli::error(&format!("find: {message}"));
         }
     }
 
     fn error(&mut self, error: &WalkError) {
-        if !STDOUT_CLOSED.load(Ordering::Relaxed) {
+        if !self.closed() {
             cli::error(&format!("find: {}: {}", error.path.display(), error.error));
         }
     }
