@@ -49,7 +49,7 @@ scratch=${XDG_RUNTIME_DIR:-$state}
 # --files, --count, --files-with-matches and --json override one another, the
 # last one winning, so `mode` holds the last: files, count, names, json or
 # lines.
-mode=lines null=0 hidden=0 unrestricted=0 sources=0 heading=0 why=
+mode=lines null=0 hidden=0 unrestricted=0 sources=0 heading=0 follow=0 why=
 operands=() inputs=()
 value_short=ABCdEefgjMmrtT
 value_long=' regexp file pre pre-glob dfa-size-limit encoding engine max-count
@@ -72,6 +72,8 @@ option() {
         ignore-file) inputs+=("$2") ;;
         heading | p | pretty) heading=1 ;;
         no-heading) heading=0 ;;
+        L | follow) follow=1 ;;
+        no-follow) follow=0 ;;
         pre | hostname-bin) why=${why:-effects} ;;
         h | help | V | version) why=${why:-info} ;;
         json) mode=json ;;
@@ -220,6 +222,10 @@ fi
 # costs a metadata walk of the roots, which is cheaper than the replay.
 special_policy() {
     local root dir name names=(.ignore .rgignore .gitignore .git/info/exclude)
+    local walk=-H
+    if ((follow)); then
+        walk=-L
+    fi
     local global=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/git/ignore
     if [[ -e $global && ! -f $global ]]; then
         return 0
@@ -228,7 +234,8 @@ special_policy() {
         if [[ ! -d $root ]]; then
             continue
         fi
-        if find "$root" \( -name .ignore -o -name .rgignore -o -name .gitignore \
+        # rg descends into a root that is a symlink, and with -L into every one.
+        if find "$walk" "$root" \( -name .ignore -o -name .rgignore -o -name .gitignore \
             -o -path '*/.git/info/exclude' \) ! -type f -print -quit 2> /dev/null |
             grep -q .; then
             return 0

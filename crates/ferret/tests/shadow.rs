@@ -342,6 +342,33 @@ fn a_named_fifo_is_left_to_the_caller() {
             .success()
     );
     assert_eq!(verdict(&policy, ferret, &["hit", "sub"]), "skipped:special");
+    // rg walks into a root given as a symlink, and with -L into any.
+    fs::remove_file(&above).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo_ignore)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let link = |target: &Path, name: &str| {
+        std::os::unix::fs::symlink(target, policy.tree.join(name)).unwrap()
+    };
+    link(&policy.tree.join("sub"), "link");
+    assert_eq!(
+        verdict(&policy, ferret, &["hit", "link"]),
+        "skipped:special"
+    );
+    let outside = policy.base.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::rename(&fifo_ignore, outside.join(".ignore")).unwrap();
+    fs::create_dir(policy.tree.join("other")).unwrap();
+    link(&outside, "other/link");
+    assert_eq!(verdict(&policy, ferret, &["hit", "other"]), "agree");
+    assert_eq!(
+        verdict(&policy, ferret, &["-L", "hit", "other"]),
+        "skipped:special"
+    );
     // Through the stand-in, the caller reads the whole stream.
     let child = bed
         .command(&script("rg"), ferret)
