@@ -126,6 +126,8 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     // In colour rg's notice counts a multiline group's matches, which the
     // rendered lines do not keep.
     if plan.max_columns.is_some()
+        && plan.output == Output::Lines
+        && !plan.quiet
         && plan.multiline
         && plan.presentation.color.enabled()
         && !plan.json

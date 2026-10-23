@@ -2142,6 +2142,23 @@ fn max_columns_omits_long_lines_as_rg_does() {
         assert_eq!(refused.status.code(), Some(2), "{args:?}: {refused:?}");
         assert!(refused.stdout.is_empty(), "{args:?}: {refused:?}");
     }
+    // Counts, names, quiet and listings print no lines, so nothing to refuse.
+    for args in [
+        &["-c", "-M", "9", "-r", "ab", "foo", "wide"][..],
+        &["-l", "-M", "9", "-r", "ab", "foo", "wide"],
+        &["--color=always", "-c", "-U", "-M", "12", "foo", "lines"],
+        &["--color=always", "-l", "-U", "-M", "12", "foo", "lines"],
+    ] {
+        fixture.compare_raw(args, None);
+    }
+    for args in [
+        &["-q", "-M", "9", "-r", "ab", "foo", "wide"][..],
+        &["--color=always", "-q", "-U", "-M", "12", "foo", "lines"],
+        &["--files", "-M", "9", "-r", "ab", "wide"],
+    ] {
+        let output = fixture.ferret(&[&["grep"][..], args].concat(), None);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+    }
     // JSON ignores both, so it is not refused.
     let json = fixture.ferret(
         &["grep", "--json", "-U", "-M5", "-r", "X", "foo", "lines"],

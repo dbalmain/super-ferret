@@ -560,10 +560,6 @@ pub fn parse_with(
         only_matching = false;
         replacement = None;
     }
-    // rg's notice counts source matches, which expansion does not keep.
-    if max_columns.is_some() && replacement.is_some() {
-        return Err(unsupported("-M with -r"));
-    }
     if files {
         return Ok(Command::Files(Names {
             paths: positionals.into_iter().map(PathBuf::from).collect(),
@@ -573,6 +569,11 @@ pub fn parse_with(
             presentation,
             traversal,
         }));
+    }
+    // rg's notice counts source matches, which expansion does not keep. Only
+    // printed lines carry the notice.
+    if max_columns.is_some() && replacement.is_some() && output == Output::Lines && !quiet {
+        return Err(unsupported("-M with -r"));
     }
     if sources.is_empty() {
         if positionals.is_empty() {
