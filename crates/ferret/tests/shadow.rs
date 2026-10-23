@@ -278,3 +278,69 @@ fn the_stand_in_answers_as_rg_and_logs_in_the_background() {
     }
     assert_eq!(bed.log()[0].split('\t').nth(1), Some("agree"));
 }
+
+#[test]
+fn heading_output_is_not_compared_line_by_line() {
+    // Sorted lines lose which heading a line sat under, so bodies swapped
+    // between files would read as agreement.
+    let bed = Bed::new("heading", false);
+    bed.write("a", b"red\n");
+    bed.write("b", b"blue\n");
+    let swapped = bed.fake("swapped", "sed 's/red/@/; s/blue/red/; s/@/blue/'");
+    for args in [
+        &["--heading", "red|blue", "a", "b"][..],
+        &["-p", "red|blue", "a", "b"],
+        &["--pretty", "--color=never", "red|blue", "a", "b"],
+    ] {
+        assert_eq!(verdict(&bed, &swapped, args), "skipped:heading", "{args:?}");
+    }
+    // A later --no-heading, or a mode without lines, is compared.
+    for args in [
+        &["--heading", "--no-heading", "red|blue", "a", "b"][..],
+        &["--heading", "-c", "red|blue", "a", "b"],
+    ] {
+        assert_ne!(verdict(&bed, &swapped, args), "skipped:heading", "{args:?}");
+    }
+}
+
+#[test]
+fn a_named_fifo_is_left_to_the_caller() {
+    let bed = Bed::new("named-fifo", false);
+    let fifo = bed.tree.join("fifo");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+    // Checked before anything opens it: a replay would block here, or with a
+    // writer, take part of the caller's input.
+    let ferret = Path::new(FERRET);
+    for args in [
+        &["hit", "fifo"][..],
+        &["-f", "fifo", "."],
+        &["--ignore-file=fifo", "x", "."],
+    ] {
+        assert_eq!(verdict(&bed, ferret, args), "skipped:special", "{args:?}");
+    }
+    // Through the stand-in, the caller reads the whole stream.
+    let child = bed
+        .command(&script("rg"), ferret)
+        .env("FERRET_REAL_RG", rg())
+        .arg("-c")
+        .arg("hit")
+        .arg(&fifo)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+    for _ in 0..100 {
+        std::io::Write::write_all(&mut writer, &b"hit\n".repeat(100)).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(writer);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.stdout, b"10000\n", "{output:?}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while bed.log().len() < 4 {
+        assert!(Instant::now() < deadline, "the shadow logged nothing");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(bed.log()[3].split('\t').nth(1), Some("skipped:special"));
+}

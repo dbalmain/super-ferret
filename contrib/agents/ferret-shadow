@@ -25,9 +25,11 @@
 #   differ     still differed; both runs are kept under mismatch/
 #   rejected:MESSAGE  ferret grep refused the command (exit 2)
 #   skipped:WHY  not compared: busy (another comparison is running), stdin
-#              (the command reads it), info (--help, --version), effects
-#              (it runs a program), config (RIPGREP_CONFIG_PATH is set), large
-#              (over 64 MiB), slow (over two minutes), setup
+#              (the command reads it), special (it names a FIFO, device or
+#              socket), heading (--heading or --pretty output), info (--help,
+#              --version), effects (it runs a program), config
+#              (RIPGREP_CONFIG_PATH is set), large (over 64 MiB), slow (over
+#              two minutes), setup
 # A command that searches this script's own directories is not compared or
 # logged: the caller's rg may still be reading them.
 #
@@ -47,8 +49,8 @@ scratch=${XDG_RUNTIME_DIR:-$state}
 # --files, --count, --files-with-matches and --json override one another, the
 # last one winning, so `mode` holds the last: files, count, names, json or
 # lines.
-mode=lines null=0 hidden=0 unrestricted=0 sources=0 why=
-operands=()
+mode=lines null=0 hidden=0 unrestricted=0 sources=0 heading=0 why=
+operands=() inputs=()
 value_short=ABCdEefgjMmrtT
 value_long=' regexp file pre pre-glob dfa-size-limit encoding engine max-count
     regex-size-limit threads glob iglob ignore-file max-depth max-filesize type
@@ -64,8 +66,12 @@ option() {
         e | regexp) sources=1 ;;
         f | file)
             sources=1
+            inputs+=("$2")
             if [[ $2 == - ]]; then why=stdin; fi
             ;;
+        ignore-file) inputs+=("$2") ;;
+        heading | p | pretty) heading=1 ;;
+        no-heading) heading=0 ;;
         pre | hostname-bin) why=${why:-effects} ;;
         h | help | V | version) why=${why:-info} ;;
         json) mode=json ;;
@@ -137,6 +143,18 @@ for operand in "${operands[@]}"; do
         why=stdin
     fi
 done
+# A FIFO, device or socket named outright is consumed, not copied: a replay
+# would take input from the caller. A walk passes them by. Named after the
+# caller's rg has started, so a path replaced in between is not caught.
+for input in "${operands[@]}" "${inputs[@]}"; do
+    if [[ $input != - && -e $input && ! -f $input && ! -d $input ]]; then
+        why=${why:-special}
+    fi
+done
+# Headings label the lines after them, which sorting lines would lose.
+if [[ $mode == lines ]] && ((heading)); then
+    why=${why:-heading}
+fi
 # A listing never reads stdin.
 if ((${#operands[@]} == 0 && !files)) && [[ ${FERRET_SHADOW_STDIN:-0} == 1 ]]; then
     why=stdin
