@@ -223,32 +223,85 @@ fi
 # a loop, an unreadable directory or more than 30 seconds. Broken symlinks open
 # nothing and pass.
 special_file() {
-    [[ (-e $1 || -L $1) && ! -f $1 ]]
+    [[ -e $1 && ! -f $1 && ! -d $1 ]]
 }
-# A .git file names the git dir whose info/exclude rg reads, and a linked
-# worktree's names a common dir too.
+# Every git dir met adds its info/exclude to check and its config to read.
+# A .git file names its git dir, and a linked worktree's names a common dir.
+# Nothing is read here before it is known to be a regular file.
+configs=()
 special_gitdir() {
-    local file=$1 gitdir common
-    gitdir=$(sed -n 's/^gitdir: //p' "$file" 2> /dev/null | head -n 1)
-    if [[ -z $gitdir ]]; then
-        return 1
+    local gitdir=$1 common
+    if [[ -f $gitdir ]]; then
+        gitdir=$(sed -n 's/^gitdir: //p' "$gitdir" | head -n 1)
+        if [[ -z $gitdir ]]; then
+            return 1
+        fi
+        if [[ $gitdir != /* ]]; then
+            gitdir=${1%/*}/$gitdir
+        fi
     fi
-    if [[ $gitdir != /* ]]; then
-        gitdir=${file%/*}/$gitdir
-    fi
-    if special_file "$gitdir/info/exclude"; then
+    if special_file "$gitdir/info/exclude" || special_file "$gitdir/commondir"; then
         return 0
     fi
-    common=$(head -n 1 "$gitdir/commondir" 2> /dev/null)
-    if [[ -n $common && $common != /* ]]; then
-        common=$gitdir/$common
+    configs+=("$gitdir/config")
+    if [[ -f $gitdir/commondir ]]; then
+        common=$(head -n 1 "$gitdir/commondir")
+        if [[ -n $common && $common != /* ]]; then
+            common=$gitdir/$common
+        fi
+        if [[ -n $common ]]; then
+            if special_file "$common/info/exclude"; then
+                return 0
+            fi
+            configs+=("$common/config")
+        fi
     fi
-    [[ -n $common ]] && special_file "$common/info/exclude"
+    return 1
+}
+# Git config names an excludes file and may include other config files. Every
+# config file that could apply is checked before it is read, then every
+# excludesFile and include path in it, whatever section it sits in; the paths
+# are checked as written, from the home dir and from the file's own dir.
+special_configs() {
+    local queue=("$@") seen=" " file key value candidate
+    while ((${#queue[@]})); do
+        file=${queue[0]}
+        queue=("${queue[@]:1}")
+        if [[ $seen == *" $file "* ]]; then
+            continue
+        fi
+        seen+="$file "
+        if special_file "$file"; then
+            return 0
+        fi
+        if [[ ! -f $file ]]; then
+            continue
+        fi
+        while IFS=$'\t' read -r key value; do
+            for candidate in "$value" "${value/#\~/${HOME:-/nonexistent}}" "${file%/*}/$value"; do
+                if special_file "$candidate"; then
+                    return 0
+                fi
+            done
+            if [[ $key == path ]]; then
+                queue+=("${value/#\~/${HOME:-/nonexistent}}")
+                if [[ $value != /* && $value != \~* ]]; then
+                    queue+=("${file%/*}/$value")
+                fi
+            fi
+        done < <(sed -nE 's/^[[:space:]]*(excludesfile|path)[[:space:]]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\L\1\E\t\2/Ip' "$file")
+    done
+    return 1
 }
 special_policy() {
-    local root dir name found excludes
-    local names=(.ignore .rgignore .gitignore .git/info/exclude)
-    if special_file "${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/git/ignore"; then
+    local root dir name found
+    local home=${HOME:-/nonexistent} xdg=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}
+    local names=(.ignore .rgignore .gitignore)
+    configs=("$home/.gitconfig" "$xdg/git/config" "${GIT_CONFIG_SYSTEM:-/etc/gitconfig}")
+    if [[ -n ${GIT_CONFIG_GLOBAL:-} ]]; then
+        configs+=("$GIT_CONFIG_GLOBAL")
+    fi
+    if special_file "$xdg/git/ignore"; then
         return 0
     fi
     for root in "${operands[@]:-.}"; do
@@ -257,7 +310,7 @@ special_policy() {
         fi
         found=$run/walk
         if ! timeout -k 5 30 find -L "$root" \( ! -type f ! -type d ! -type l \
-            -printf 'S\0' -quit \) -o \( -name .git -type f -printf 'G%p\0' \) \
+            -printf 'S\0' -quit \) -o \( -name .git -printf 'G%p\0' \) \
             > "$found" 2> /dev/null; then
             return 0
         fi
@@ -266,11 +319,6 @@ special_policy() {
                 return 0
             fi
         done < "$found"
-        excludes=$(git -C "$root" config --get core.excludesFile 2> /dev/null)
-        excludes=${excludes/#\~/${HOME:-/nonexistent}}
-        if [[ -n $excludes ]] && special_file "$excludes"; then
-            return 0
-        fi
         dir=$(realpath -m -- "$root")
         while [[ $dir != / ]]; do
             dir=${dir%/*}
@@ -280,12 +328,12 @@ special_policy() {
                     return 0
                 fi
             done
-            if [[ -f $dir/.git ]] && special_gitdir "$dir/.git"; then
+            if special_file "$dir/.git" || { [[ -e $dir/.git ]] && special_gitdir "$dir/.git"; }; then
                 return 0
             fi
         done
     done
-    return 1
+    special_configs "${configs[@]}"
 }
 run=$(mktemp -d "$scratch/ferret-shadow.XXXXXX") || {
     log skipped:setup - -

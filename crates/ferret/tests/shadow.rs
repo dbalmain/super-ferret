@@ -409,6 +409,34 @@ fn any_reachable_special_file_skips_the_comparison() {
     fs::write(excludes.base.join("home/.gitconfig"), config).unwrap();
     skipped(&excludes, &["hit", "."]);
 
+    // The check itself reads no config that is not a regular file, and
+    // follows includes.
+    let config = bed("reach-config");
+    let gitconfig = config.base.join("home/.gitconfig");
+    mkfifo(&gitconfig);
+    skipped(&config, &["hit", "."]);
+    fs::remove_file(&gitconfig).unwrap();
+    let included = config.base.join("included");
+    fs::write(&gitconfig, "[include]\n\tpath = ../included\n").unwrap();
+    mkfifo(&included);
+    skipped(&config, &["hit", "."]);
+    fs::remove_file(&included).unwrap();
+    let file = config.base.join("excludes");
+    mkfifo(&file);
+    let excluding = format!("[core]\n\texcludesFile = \"{}\"\n", file.display());
+    fs::write(&included, excluding).unwrap();
+    skipped(&config, &["hit", "."]);
+    fs::remove_file(&file).unwrap();
+    // An ordinary repository, and config naming ordinary files, compare.
+    fs::create_dir_all(config.tree.join(".git/info")).unwrap();
+    fs::write(config.tree.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    fs::write(config.tree.join(".git/info/exclude"), "").unwrap();
+    assert_eq!(verdict(&config, ferret, &["hit", "."]), "agree");
+    assert_eq!(verdict(&config, ferret, &["hit", "sub"]), "agree");
+    fs::remove_file(config.tree.join(".git/config")).unwrap();
+    mkfifo(&config.tree.join(".git/config"));
+    skipped(&config, &["hit", "sub"]);
+
     let looped = bed("reach-loop");
     symlink("..", looped.tree.join("sub/up")).unwrap();
     skipped(&looped, &["hit", "."]);
