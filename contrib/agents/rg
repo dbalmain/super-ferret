@@ -1,36 +1,25 @@
 #!/usr/bin/env bash
-# A stand-in `rg` for agents' PATH (D118, step 1). The caller always gets the
-# real rg's answer. Afterwards, in the background and at idle priority, the
-# same argv runs through `ferret grep`, and one line per call records whether
-# the two agreed. Nothing here changes what the caller sees.
+# A stand-in `rg` for agents' PATH (D118, step 1). The caller gets the real rg
+# itself: this script execs it, so output, diagnostics, exit status, signals
+# and closed pipes are rg's own. Before that it starts ferret-shadow, detached
+# and holding none of the caller's descriptors, which runs the same argv
+# through rg and `ferret grep` at idle priority and logs whether they agree.
 #
 # Enable for Claude Code by putting this directory first on PATH and setting
 # USE_BUILTIN_RIPGREP=0; codex and Bash calls already use PATH's rg.
 #
 # Environment:
 #   FERRET_REAL_RG     the real rg (default: the next rg on PATH)
-#   FERRET_BIN         ferret (default: ferret on PATH)
-#   FERRET_SHADOW=0    serve rg only, record nothing
-#   FERRET_SHADOW_DIR  log and mismatches (default: $XDG_STATE_HOME/ferret/shadow)
-#
-# Log columns, tab-separated: time, verdict, rg exit, ferret exit, cwd, argv.
-# cwd and argv are shell-quoted, so a line can be replayed. Verdicts:
-#   agree     same exit status and the same output lines, in any order
-#   lag       differed, then agreed when both ran again two seconds later
-#   differ    still differed; both outputs are kept under mismatch/
-#   known:git differed only by rg listing .git under --hidden
-#   rejected  ferret grep refused the flags (exit 2); its message is kept
-#   skipped:* not compared: tty, no path (stdin or --version), side effects,
-#             busy, large, cut short
-set -u
+#   FERRET_SHADOW=0    serve rg only, compare nothing
+# ferret-shadow documents the rest.
 
-self=$(readlink -f -- "${BASH_SOURCE[0]}")
+self=$(readlink -f -- "${BASH_SOURCE[0]}" 2> /dev/null)
 real=${FERRET_REAL_RG:-}
 if [[ -z $real ]]; then
-    IFS=: read -ra dirs <<< "$PATH"
+    IFS=: read -ra dirs <<< "${PATH:-}"
     for dir in "${dirs[@]}"; do
         candidate=${dir:-.}/rg
-        if [[ -x $candidate && $(readlink -f -- "$candidate") != "$self" ]]; then
+        if [[ -x $candidate && $(readlink -f -- "$candidate" 2> /dev/null) != "$self" ]]; then
             real=$candidate
             break
         fi
@@ -41,112 +30,18 @@ if [[ -z $real ]]; then
     exit 2
 fi
 
-state=${FERRET_SHADOW_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ferret/shadow}
-log() {
-    mkdir -p -m 700 "$state" 2> /dev/null || return
-    printf '%s\t%s\t%s\t%s\t%q\t%s\n' "$(date +%FT%T%z)" "$1" "$2" "$3" "$PWD" \
-        "$(printf '%q ' "${args[@]}")" >> "$state/log"
-}
-args=("$@")
-
-if [[ ${FERRET_SHADOW:-1} == 0 ]]; then
-    exec "$real" "$@"
+shadow=${self%/*}/ferret-shadow
+# A terminal reader sees colour and headings, which a captured replay would
+# not, so terminal calls are not compared.
+if [[ ${FERRET_SHADOW:-1} != 0 && ! -t 1 && -x $shadow ]]; then
+    (
+        for fd in "/proc/$BASHPID/fd/"*; do
+            fd=${fd##*/}
+            if ((fd > 2)); then
+                eval "exec $fd>&-"
+            fi
+        done
+        exec setsid "$shadow" "$real" "$@" < /dev/null > /dev/null 2>&1
+    ) 2> /dev/null &
 fi
-# A terminal reader sees colour and headings, which a captured run would not.
-if [[ -t 1 ]]; then
-    exec "$real" "$@"
-fi
-# rg reads stdin when no path follows the pattern, and a second run cannot
-# read it again. Calls from agents end with a path; anything else is served
-# without a comparison.
-last=${!#:-}
-if (($# == 0)) || [[ ! -e $last || $last == - ]]; then
-    log skipped:nopath - -
-    exec "$real" "$@"
-fi
-# --pre runs a program on every file; a second run would run it again.
-for arg in "$@"; do
-    case $arg in
-        --pre | --pre=*)
-            log skipped:effects - -
-            exec "$real" "$@"
-            ;;
-    esac
-done
-
-run=$(mktemp -d "${TMPDIR:-/tmp}/ferret-shadow.XXXXXX") || exec "$real" "$@"
-"$real" "$@" | tee "$run/rg" 2> /dev/null
-statuses=("${PIPESTATUS[@]}")
-status=${statuses[0]}
-if ((statuses[1] != 0)); then
-    # The reader went away, so the capture is incomplete.
-    rm -rf "$run"
-    log skipped:cut - -
-    exit "$status"
-fi
-
-compare() {
-    local ferret=${FERRET_BIN:-ferret}
-    mkdir -p -m 700 "$state" || return
-    exec 9> "$state/lock"
-    if ! flock -n 9; then
-        log skipped:busy "$status" -
-        return
-    fi
-    if (($(stat -c %s "$run/rg") > 64 * 1024 * 1024)); then
-        log skipped:large "$status" -
-        return
-    fi
-    # Lines, in any order: rg's worker threads finish files in any order.
-    # JSON timings always differ, and the summary counts files read, which an
-    # index reads fewer of.
-    normal() {
-        sed -E '/^\{"(type":"summary"|data":.*"type":"summary"\}$)/d; s/"elapsed":\{[^}]*\}//g' "$1" |
-            tr '\0' '\n' | LC_ALL=C sort
-    }
-    # rg --hidden lists .git, which the index leaves out (docs/GREP.md).
-    nogit() {
-        normal "$1" | grep -Ev '(^|/)\.git/'
-    }
-    timeout 120 "$ferret" grep "${args[@]}" < /dev/null > "$run/ferret" 2> "$run/stderr"
-    local fstatus=$?
-    if ((fstatus == 2)); then
-        log "rejected:$(head -c 200 "$run/stderr" | head -n 1 | tr '\t' ' ')" "$status" "$fstatus"
-        return
-    fi
-    if ((fstatus == status)) && cmp -s <(normal "$run/rg") <(normal "$run/ferret"); then
-        log agree "$status" "$fstatus"
-        return
-    fi
-    sleep 2
-    "$real" "${args[@]}" < /dev/null > "$run/rg.2" 2> /dev/null
-    local status2=$?
-    timeout 120 "$ferret" grep "${args[@]}" < /dev/null > "$run/ferret.2" 2>> "$run/stderr"
-    local fstatus2=$?
-    if ((fstatus2 == status2)) && cmp -s <(normal "$run/rg.2") <(normal "$run/ferret.2"); then
-        log lag "$status" "$fstatus"
-        return
-    fi
-    if ((fstatus2 == status2)) && cmp -s <(nogit "$run/rg.2") <(normal "$run/ferret.2"); then
-        log known:git "$status" "$fstatus"
-        return
-    fi
-    local keep
-    keep=$state/mismatch/$(date +%Y%m%dT%H%M%S)-$$
-    mkdir -p -m 700 "$keep"
-    mv "$run"/* "$keep/"
-    printf '%q ' "${args[@]}" > "$keep/argv"
-    printf '%q\n' "$PWD" > "$keep/cwd"
-    log differ "$status" "$fstatus"
-}
-
-# Detached from every descriptor the caller holds, so the caller's read of
-# stdout ends with rg's output and never waits for the comparison.
-(
-    trap 'rm -rf "$run"' EXIT
-    renice -n 19 "$BASHPID" > /dev/null 2>&1
-    ionice -c 3 -p "$BASHPID" > /dev/null 2>&1
-    compare
-) < /dev/null > /dev/null 2>&1 &
-disown
-exit "$status"
+exec "$real" "$@"

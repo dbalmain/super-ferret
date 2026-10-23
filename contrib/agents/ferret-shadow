@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# Compares one rg command with `ferret grep` (D118, step 1). Started detached
+# by the stand-in `rg` beside it, after which that script execs the real rg
+# for its caller; usage: ferret-shadow REAL_RG ARG...
+#
+# Both run here, one after the other, with stdin from /dev/null, so they see
+# the same input and nearly the same tree. Nothing here reaches the caller.
+#
+# Environment:
+#   FERRET_BIN         ferret (default: ferret on PATH)
+#   FERRET_SHADOW_DIR  log and kept mismatches
+#                      (default: $XDG_STATE_HOME/ferret/shadow)
+#
+# One log line per call, tab-separated: time, verdict, rg exit, ferret exit,
+# cwd, argv. cwd and argv are shell-quoted, so a line can be replayed.
+# Verdicts:
+#   agree      same exit status, same stdout records in any order, and
+#              diagnostics from both or neither
+#   lag        differed, then agreed when both ran again two seconds later
+#   known:git  `--files --hidden` differed only by rg listing .git, which the
+#              index leaves out (docs/GREP.md)
+#   differ     still differed; both runs are kept under mismatch/
+#   rejected:MESSAGE  ferret grep refused the command (exit 2)
+#   skipped:WHY  not compared: busy (another comparison is running), stdin
+#              (the command reads it), info (--help, --version), effects
+#              (--pre runs a program per file), large (over 64 MiB), slow
+#              (over two minutes), setup
+#
+# An `agree` is a screen, not proof: order within a file and diagnostic text
+# are not compared. Step 2 replays the log through the ordered differential.
+
+real=$1
+shift
+args=("$@")
+ferret=${FERRET_BIN:-ferret}
+state=${FERRET_SHADOW_DIR:-${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}/ferret/shadow}
+mkdir -p -m 700 "$state" || exit 0
+# Appending to anything but a file could block, as a FIFO with no reader does.
+if [[ -e $state/log && ! -f $state/log ]]; then
+    exit 0
+fi
+
+log() {
+    printf '%s\t%s\t%s\t%s\t%q\t%s\n' "$(date +%FT%T%z)" "$1" "$2" "$3" "$PWD" \
+        "$(printf '%q ' "${args[@]}")" >> "$state/log"
+}
+
+renice -n 19 $$ > /dev/null 2>&1
+ionice -c 3 -p $$ > /dev/null 2>&1
+
+# Commands whose replay would differ from the caller's run, or cost it twice.
+json=0 files=0 hidden=0 previous=
+for arg in "${args[@]}"; do
+    case $previous in
+        -f | --file)
+            if [[ $arg == - ]]; then
+                log skipped:stdin - -
+                exit 0
+            fi
+            ;;
+    esac
+    case $arg in
+        - | -f- | --file=-)
+            log skipped:stdin - -
+            exit 0
+            ;;
+        --pre | --pre=*)
+            log skipped:effects - -
+            exit 0
+            ;;
+        --help | -h | --version | -V)
+            log skipped:info - -
+            exit 0
+            ;;
+        --json) json=1 ;;
+        --files) files=1 ;;
+        --hidden | -. | -uu | -uuu) hidden=1 ;;
+        --) break ;;
+    esac
+    previous=$arg
+done
+
+# One comparison at a time. The lock is this shell's alone: every command
+# below runs with descriptor 9 closed, so no child, and no daemon a child
+# starts, can keep it.
+exec 9> "$state/lock" || exit 0
+if ! flock -n 9; then
+    log skipped:busy - -
+    exit 0
+fi
+
+run=$(mktemp -d "${XDG_RUNTIME_DIR:-$state}/ferret-shadow.XXXXXX") || {
+    log skipped:setup - -
+    exit 0
+}
+trap 'rm -rf "$run"' EXIT
+
+# Runs one side into $run/NAME.out and NAME.err; 64 MiB of output at most.
+side() {
+    local name=$1
+    shift
+    (
+        ulimit -f $((64 * 2048))
+        exec timeout 120 "$@" < /dev/null > "$run/$name.out" 2> "$run/$name.err" 9>&-
+    )
+}
+
+# Output records in any order: rg's worker threads finish files in any order.
+# A NUL-terminated listing sorts as NUL records. JSON drops elapsed times and
+# the summary, which counts files read, and an index reads fewer.
+normal() {
+    if ((json)); then
+        sed -E '/^\{"(type":"summary"|data":\{"elapsed_total")/d; /^\{"type":"end"/s/"elapsed":\{[^}]*\}//' "$1" |
+            LC_ALL=C sort
+    elif [[ -s $1 ]] && ! grep -q $'\n' "$1" 2> /dev/null && grep -qaF $'\0' "$1"; then
+        LC_ALL=C sort -z "$1"
+    else
+        LC_ALL=C sort "$1"
+    fi
+}
+
+# Diagnostics from both or neither; ferret's own stale-index notice aside.
+spoke() {
+    grep -qv 'no daemon answered' "$1"
+}
+
+compare() {
+    side rg "$real" "${args[@]}"
+    echo $? > "$run/rg.status"
+    side ferret "$ferret" grep "${args[@]}"
+    echo $? > "$run/ferret.status"
+}
+
+verdict() {
+    local rg ferret
+    rg=$(< "$run/rg.status") ferret=$(< "$run/ferret.status")
+    case "$rg $ferret" in
+        124\ * | *\ 124)
+            echo skipped:slow
+            return
+            ;;
+        153\ * | *\ 153)
+            echo skipped:large
+            return
+            ;;
+    esac
+    if ((ferret == 2 && rg != 2)); then
+        echo "rejected:$(head -n 1 "$run/ferret.err" | head -c 200 | tr '\t' ' ')"
+        return
+    fi
+    if [[ $rg != "$ferret" ]]; then
+        echo differ
+        return
+    fi
+    if ! cmp -s <(normal "$run/rg.out") <(normal "$run/ferret.out"); then
+        if ((files && hidden)) &&
+            cmp -s <(tr '\0' '\n' < "$run/rg.out" | grep -Ev '(^|/)\.git(/|$)' | LC_ALL=C sort) \
+                <(tr '\0' '\n' < "$run/ferret.out" | LC_ALL=C sort); then
+            echo known:git
+        else
+            echo differ
+        fi
+        return
+    fi
+    if spoke "$run/rg.err"; then rs=1; else rs=0; fi
+    if spoke "$run/ferret.err"; then fs=1; else fs=0; fi
+    if ((rs != fs)); then
+        echo differ
+        return
+    fi
+    echo agree
+}
+
+compare 9>&-
+first=$(verdict 9>&-)
+case $first in
+    agree | skipped:* | rejected:*)
+        log "$first" "$(< "$run/rg.status")" "$(< "$run/ferret.status")"
+        exit 0
+        ;;
+esac
+statuses=("$(< "$run/rg.status")" "$(< "$run/ferret.status")")
+mkdir -p "$run/first"
+mv "$run"/*.out "$run"/*.err "$run"/*.status "$run/first/"
+sleep 2
+compare 9>&-
+again=$(verdict 9>&-)
+if [[ $again == agree ]]; then
+    log lag "${statuses[@]}"
+    exit 0
+fi
+log "$first" "${statuses[@]}"
+if [[ $first == differ ]]; then
+    keep=$state/mismatch/$(date +%Y%m%dT%H%M%S)-$$
+    mkdir -p -m 700 "$keep" && mv "$run"/* "$keep/"
+    printf '%q ' "${args[@]}" > "$keep/argv"
+    printf '%q\n' "$PWD" > "$keep/cwd"
+fi
