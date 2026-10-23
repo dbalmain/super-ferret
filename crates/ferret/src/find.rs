@@ -429,6 +429,19 @@ mod tests {
 
     use super::*;
 
+    /// A reader gone in one find says nothing about the next one in the same
+    /// process (0db5cfb replaced a process-wide flag).
+    #[test]
+    fn a_closed_pipe_ends_only_its_own_invocation() {
+        let first = Output::stdout();
+        let Output::Stdout(closed) = &first else {
+            unreachable!()
+        };
+        closed.store(true, Ordering::Relaxed);
+        assert!(first.closed());
+        assert!(!Output::stdout().closed());
+    }
+
     /// An action plan opens only the sections it reads, never the resident
     /// names a `-name` listing's index is built from; a plain listing still
     /// gets the engine.
