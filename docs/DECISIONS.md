@@ -6800,3 +6800,5 @@ unchanged.
 
 **Fact that would change it:** a caller that relies on "nonzero `index`
 means nothing was published" — then C.
+
+> Dave (2026-10-25, in chat): B.
