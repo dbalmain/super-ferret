@@ -3807,6 +3807,73 @@ fn slow_identity_check_does_not_block_other_selections() {
     );
 }
 
+/// A FIFO at the content manifest's temporary name, made after the writer
+/// opened the index (which clears the name), used to block follow's
+/// publication forever: writer busy, no error, so the fatal-writer teardown
+/// above never ran. The writer now unlinks whatever is at a temporary name
+/// and creates its own file, so the follow publishes and the queued `index`
+/// answers.
+#[test]
+#[cfg(debug_assertions)]
+fn a_fifo_at_the_manifest_temporary_after_ready_does_not_wedge_follow() {
+    let tree = Tree::new();
+    let gate = tree.base.join("content-gate");
+    fs::create_dir_all(&gate).unwrap();
+    fs::write(gate.join("follow"), b"hold").unwrap();
+    let pid = tree.start(&[
+        ("FERRET_DAEMON_IDLE_MS", "0"),
+        ("FERRET_BACKSTOP_MS", "3600000"),
+        ("FERRET_POLL_MS", "300000"),
+        ("FERRET_CONTENT_TEST_GATE", gate.to_str().unwrap()),
+    ]);
+    ready_within(&tree, Duration::from_secs(60));
+    for i in 0..20 {
+        fs::write(
+            tree.base.join(format!("src/follow-{i}.txt")),
+            format!("followed{i}\n"),
+        )
+        .unwrap();
+    }
+    let held_by = Instant::now() + Duration::from_secs(60);
+    while !gate.join("follow.reached").exists() {
+        assert!(tree.try_wait(pid).is_none(), "{}", tree.evidence());
+        assert!(
+            Instant::now() < held_by,
+            "follow did not reach the gate; {}",
+            tree.evidence()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let temporary = tree.base.join("index/index/manifest.tmp");
+    let made = Command::new("mkfifo").arg(&temporary).status().unwrap();
+    assert!(made.success());
+    let (mut queued, _) = tree.connect();
+    queued
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let src = tree.base.join("src");
+    let reply = block(
+        &mut queued,
+        format!(
+            "{{\"id\":\"q\",\"op\":\"index\",\"args\":[\"\",\"{}\"]}}\n",
+            src.display()
+        )
+        .as_bytes(),
+    );
+    assert!(reply.contains("\"exit\":0"), "{reply}; {}", tree.evidence());
+    assert!(tree.try_wait(pid).is_none(), "{}", tree.evidence());
+    assert!(
+        fs::symlink_metadata(&temporary).is_err(),
+        "the FIFO is still there"
+    );
+    let found = tree.run(&["grep", "-l", "followed7", "src"]);
+    assert!(
+        String::from_utf8_lossy(&found.stdout).contains("follow-7.txt"),
+        "{found:?}"
+    );
+}
+
 #[test]
 #[cfg(debug_assertions)]
 fn transient_accept_errors_do_not_stop_the_daemon() {
