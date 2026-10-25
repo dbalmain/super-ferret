@@ -1829,8 +1829,9 @@ fn draining_writer_waits_for_a_message_past_expired_background_deadlines() {
     let started = Instant::now();
     std::thread::sleep(Duration::from_millis(500));
     let tasks_after = task_cpu(pid);
-    // The query can still be rendering its next large frame under load.
-    // Count the writer and its named intake, excluding that unrelated CPU.
+    // The query can still be rendering its next large frame under load, so
+    // count only the writer, whose spin this guards against. Watch intake
+    // runs on its own `ferret-intake` thread and is not counted.
     let consumed: u64 = tasks_after
         .iter()
         .filter(|(task, _, _)| task.ends_with("(ferret-writer"))
