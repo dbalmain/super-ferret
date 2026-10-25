@@ -538,7 +538,10 @@ fn run<T>(
                 changes,
             } = match observe_reconcile(&session, &mut plan, options) {
                 Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
-                    let report = full_rewalk(&mut session, &plan.roots, options, usage)?;
+                    // `roots`, not `plan.roots`: D119 may have withdrawn a
+                    // root from the plan, and the rewalk must find and
+                    // report it again.
+                    let report = full_rewalk(&mut session, &roots, options, usage)?;
                     return Ok((report, after(&session.view())));
                 }
                 result => result?,
@@ -662,7 +665,8 @@ pub(crate) fn recrawl_scoped(
         ..
     } = match observe_reconcile(session, &mut plan, options) {
         Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
-            let report = full_rewalk(session, &plan.roots, options, usage)?;
+            // As in `run`: the requested roots, from before any withdrawal.
+            let report = full_rewalk(session, roots, options, usage)?;
             let view = session.view();
             return Ok((
                 report,

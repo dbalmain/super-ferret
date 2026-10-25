@@ -333,3 +333,54 @@ fn adding_a_faulted_root_keeps_the_old_roots_and_publishes_the_healthy_addition(
         Some(blake3_128(b"added\n"))
     );
 }
+
+/// The input limit can trip after D119 has withdrawn a root: here the
+/// healthy addition's walk fits the budget and reconciling it does not, so
+/// the run falls back to a full rewalk. The fallback must still withdraw and
+/// report the faulted root rather than publish as if it had never been asked
+/// for.
+#[test]
+fn a_withdrawn_root_is_reported_when_reconciling_falls_back_to_a_full_rewalk() {
+    let tmp = Tmp::new("d119-fallback");
+    let old = root(&tmp, "old");
+    fs::write(old.join("kept.txt"), b"kept\n").unwrap();
+    index(
+        &tmp.cat(),
+        std::slice::from_ref(&old),
+        Refresh::All,
+        &options(),
+    )
+    .unwrap();
+    let good = root(&tmp, "good");
+    for n in 0..64 {
+        fs::write(good.join(format!("f{n}")), b"").unwrap();
+    }
+    let bad = root(&tmp, "bad");
+    fs::write(bad.join("hidden.txt"), b"hidden\n").unwrap();
+    fault(&bad);
+    let mut session = open_or_create(&tmp.cat(), &options()).unwrap();
+    // Observing the 64 files charges about 70 records and reconciling them
+    // about 400: 200 trips the limit after `protect` has withdrawn `bad`.
+    session.set_input_limits(ferret_catalog::InputLimits {
+        records: 200,
+        owned_bytes: usize::MAX,
+    });
+
+    let add = [good.clone(), bad.clone()];
+    let report = session_change(
+        &mut session,
+        RootChange {
+            add: &add,
+            remove: &[],
+        },
+        Refresh::Only(&add),
+        &options(),
+    )
+    .unwrap();
+    drop(session);
+    assert!(report.input_fallback);
+    assert_withdrawn(&report, &bad);
+    let catalog = open(&tmp);
+    assert_eq!(roots(&catalog), [good.clone(), old.clone()]);
+    assert!(!names(&catalog).iter().any(|p| p.starts_with(&bad)));
+}
