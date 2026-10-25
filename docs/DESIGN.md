@@ -875,7 +875,8 @@ sequence under the publication lock, including reader opens; catalog publication
 preserves the latest matching content view under that same lock. Status reports
 `merge_running` beside the writer's `current_operation` and `writer_busy`.
 
-Crawl owns one nonblocking rustix inotify instance and compact physical-identity,
+Crawl owns one rustix inotify instance (blocking in ferretd's intake thread)
+and compact physical-identity,
 parent/name locators, independent of catalog ids. It arms through observed handles
 before listing; a separate thread drains during refresh/compaction. A 200 ms
 trailing/1 s maximum debounce pairs unique move cookies, bounded at 100,000 scopes
