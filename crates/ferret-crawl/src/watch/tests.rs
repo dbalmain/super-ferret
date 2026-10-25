@@ -706,3 +706,39 @@ fn a_self_linked_policy_input_is_a_bounded_failure() {
         .contains_key(&looped);
     assert!(failed, "an unresolvable input is a recorded failure");
 }
+
+/// A policy input that links through a symlink being replaced dangles for a
+/// moment (remove, then link again). A refresh in that gap once recorded the
+/// input as a watch failure and left the root polling, so the new link was
+/// not seen until the backstop. It is an absent input: the link's return
+/// refreshes the root, and nothing is recorded as failed.
+#[test]
+fn a_dangling_policy_link_is_watched_where_its_target_will_appear() {
+    let tree = Tree::new("policy-dangling-link", 100, 1 << 20);
+    let root = tree.path.join("root");
+    let outside = tree.path.join("outside");
+    fs::create_dir_all(outside.join("policy")).unwrap();
+    fs::write(outside.join("policy/ignore"), b"old\n").unwrap();
+    std::os::unix::fs::symlink(outside.join("link/ignore"), root.join(".ferretignore")).unwrap();
+    tree.watch.reconcile(&tree.writer.view());
+    let parent = fs::File::open(&root).unwrap_or_else(|error| panic!("parent: {error:?}"));
+    use std::os::fd::AsFd;
+    tree.watch
+        .policy_input(&root, parent.as_fd(), OsStr::new(".ferretignore"));
+    let failed = tree
+        .watch
+        .state
+        .lock()
+        .unwrap_or_else(|error| panic!("state: {error:?}"))
+        .failures
+        .contains_key(&root);
+    assert!(!failed, "a dangling policy link is absent, not failed");
+    tree.watch.reconcile(&tree.writer.view());
+    tree.watch.drain().unwrap();
+    std::os::unix::fs::symlink(outside.join("policy"), outside.join("link")).unwrap();
+    tree.watch.drain().unwrap();
+    let burst = tree.due();
+    assert!(
+        matches!(&burst.request(&tree.writer.view()).scopes[0], RefreshScope::Root(path) if path == &root)
+    );
+}

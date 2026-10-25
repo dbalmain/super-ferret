@@ -80,6 +80,26 @@ fn input_key(proc: &Path, name: &OsStr) -> PathBuf {
         .unwrap_or_else(|_| proc.to_owned())
         .join(name)
 }
+/// Canonicalizes `path`'s longest existing prefix and appends the missing
+/// rest, so a dangling link's target is watched where it would appear. Only a
+/// missing component is tolerated: a loop or a denial is still an error.
+fn canonical_or_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut prefix = path;
+    loop {
+        match std::fs::canonicalize(prefix) {
+            Ok(base) => return Ok(missing.iter().rev().fold(base, |p, name| p.join(name))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (prefix.parent(), prefix.file_name()) else {
+                    return Err(error);
+                };
+                missing.push(name);
+                prefix = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 /// The shared root and its current epoch. The root is interned on first use.
 fn root_epoch(s: &mut State, root: &Path) -> (Arc<Path>, u64) {
     if let Some((root, &epoch)) = s.policy_epochs.get_key_value(root) {
@@ -115,6 +135,10 @@ impl Watch {
     /// Registers one actual policy consultation, including a missing input.
     /// The root is refreshed through the production policy/retention seam.
     pub fn policy_path(&self, root: &Path, path: &Path) {
+        self.path_input(root, path, 0);
+    }
+    /// `hops` counts the symlinks followed to reach `path`; see [`MAX_HOPS`].
+    fn path_input(&self, root: &Path, path: &Path, hops: u32) {
         let mut candidate = path.to_owned();
         loop {
             let Some(parent) = candidate.parent() else {
@@ -124,8 +148,8 @@ impl Watch {
             match open_parent(parent) {
                 Ok(fd) => {
                     if let Some(name) = candidate.file_name() {
-                        self.policy_input(root, fd.as_fd(), name);
-                        self.policy_ancestors(root, path);
+                        self.input(root, fd.as_fd(), name, hops);
+                        self.ancestors(root, path, hops);
                     }
                     return;
                 }
@@ -154,11 +178,8 @@ impl Watch {
         }
     }
     /// Changing an ancestor symlink changes the policy namespace even when
-    /// the followed file and its watched physical parent do not move.
-    fn policy_ancestors(&self, root: &Path, path: &Path) {
-        self.ancestors(root, path, 0);
-    }
-    /// `hops` counts the symlinks followed to reach `path`; see [`MAX_HOPS`].
+    /// the followed file and its watched physical parent do not move. `hops`
+    /// counts the symlinks followed to reach `path`; see [`MAX_HOPS`].
     fn ancestors(&self, root: &Path, path: &Path, hops: u32) {
         let mut prefix = PathBuf::new();
         for component in path.components() {
@@ -300,8 +321,12 @@ impl Watch {
                     // canonicalizing first would lose a
                     // symlinked parent that can be retargeted.
                     self.ancestors(root, &target, hops + 1);
-                    match std::fs::canonicalize(&target) {
-                        Ok(target) if target != key => self.policy_path(root, &target),
+                    // A dangling link is an absent input, not a failure: its
+                    // target can be missing for a moment while a link on the
+                    // way is replaced, and watching where it would appear sees
+                    // it come back.
+                    match canonical_or_missing(&target) {
+                        Ok(target) if target != key => self.path_input(root, &target, hops + 1),
                         _ => failure(
                             &mut self
                                 .state

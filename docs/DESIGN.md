@@ -901,6 +901,8 @@ gitdir/commondir metadata and the global ferret ignore file. Input-parent watche
 catch saves, creation, replacement and ancestor symlink changes. Only complete
 unprotected root observations retire old inputs. Global ferret rules and the
 reserved config entry share those parent watches. Unwatchable inputs poll.
+A dangling policy symlink is an absent input, watched where its target would
+appear, not an unwatchable one.
 `fstatfs` classifies NFS, CIFS/SMB/SMB2, 9P and FUSE as
 polling-dependent, even after watch installation; classification failure also
 polls. Remote/userspace writes may not emit local notifications.
