@@ -34,10 +34,12 @@
 //! An index whose high water exceeds the catalog's `next_doc` was built
 //! against DocIds the catalog has not published, and is discarded.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use crate::regular;
 use crate::segment::Info;
 
 const MAGIC: [u8; 8] = *b"ferretix";
@@ -215,22 +217,19 @@ impl Manifest {
     /// format: the caller discards the index and rebuilds it through
     /// coverage, since every byte of it is derived from the catalog.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let body = bytes.len().checked_sub(16)?;
-        if bytes.len() < HEAD + 16
-            || bytes[..8] != MAGIC
-            || checksum(&bytes[..body]) != bytes[body..]
-            || u32_at(bytes, 8) != FORMAT_VERSION
-            || bytes[84..88] != [0; 4]
-        {
+        // `declared_len` checks the head's fixed fields and is at least
+        // HEAD + 16, so equal lengths leave a whole head and digest.
+        if declared_len(bytes)? != bytes.len() as u64 {
+            return None;
+        }
+        let body = bytes.len() - 16;
+        if checksum(&bytes[..body]) != bytes[body..] {
             return None;
         }
         let mut incarnation = [0; 16];
         incarnation.copy_from_slice(&bytes[16..32]);
         let (count, unreadable) = (u32_at(bytes, 56) as usize, u32_at(bytes, 60) as usize);
         let head = HEAD;
-        if body != head + count.checked_mul(ENTRY)? + unreadable.checked_mul(4)? {
-            return None;
-        }
         let mut manifest = Self {
             tokenizer_version: u32_at(bytes, 12),
             trigram_version: u32_at(bytes, 80),
@@ -291,30 +290,88 @@ impl Manifest {
     }
 
     /// Reads `dir`'s manifest: `Ok(None)` when there is none or it does not
-    /// decode.
+    /// decode. Something other than a regular file at the name does not
+    /// decode, and is never waited on (`crate::regular`).
     pub fn read(dir: &Path) -> io::Result<Option<Self>> {
-        match fs::read(dir.join(FILE)) {
-            Ok(bytes) => Ok(Self::decode(&bytes)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        let file = match regular::open(&dir.join(FILE)) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound || regular::is_not_regular(&error) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let len = file.metadata()?.len();
+        Self::read_from(&file, len)
+    }
+
+    /// Reads a manifest that was `len` bytes when it was opened: the fixed
+    /// head first, then the rest only when the head's own counts declare
+    /// exactly `len` bytes, so a malformed file costs one head read and no
+    /// allocation of its size. A file that shrank or grew since is
+    /// `Ok(None)`, as one that does not decode.
+    fn read_from(source: &impl FileExt, len: u64) -> io::Result<Option<Self>> {
+        let mut head = [0; HEAD];
+        if len < head.len() as u64 || !read_exact(source, &mut head, 0)? {
+            return Ok(None);
         }
+        if declared_len(&head) != Some(len) {
+            return Ok(None);
+        }
+        let size = usize::try_from(len).map_err(io::Error::other)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        bytes.extend_from_slice(&head);
+        bytes.resize(size, 0);
+        if !read_exact(source, &mut bytes[HEAD..], HEAD as u64)?
+            || source.read_at(&mut [0], len)? != 0
+        {
+            return Ok(None);
+        }
+        Ok(Self::decode(&bytes))
     }
 
     /// Replaces `dir`'s manifest: write a temporary, fsync it, rename it
     /// over the old one, fsync the directory.
     pub(crate) fn publish(&self, dir: &Path) -> io::Result<()> {
         let temp = dir.join(TEMP);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp)?;
+        let mut file = regular::replace(&temp)?;
         file.write_all(&self.encode())?;
         file.sync_all()?;
         crate::store::hit(crate::store::Point::ManifestSynced)?;
         fs::rename(&temp, dir.join(FILE))?;
         crate::store::hit(crate::store::Point::ManifestRenamed)?;
         File::open(dir)?.sync_all()
+    }
+}
+
+/// The whole manifest's length that the head at the start of `bytes`
+/// declares; `None` for a short head or a wrong magic, format version or
+/// reserved field.
+fn declared_len(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < HEAD
+        || bytes[..8] != MAGIC
+        || u32_at(bytes, 8) != FORMAT_VERSION
+        || bytes[84..88] != [0; 4]
+    {
+        return None;
+    }
+    let count = u64::from(u32_at(bytes, 56));
+    let unreadable = u64::from(u32_at(bytes, 60));
+    (HEAD as u64 + 16)
+        .checked_add(count.checked_mul(ENTRY as u64)?)?
+        .checked_add(unreadable.checked_mul(4)?)
+}
+
+/// Fills `buf` from `source` at `offset`; `false` when the file ends first.
+fn read_exact(source: &impl FileExt, buf: &mut [u8], offset: u64) -> io::Result<bool> {
+    match source.read_exact_at(buf, offset) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -424,5 +481,211 @@ mod tests {
             break_it(&mut manifest);
             assert_eq!(Manifest::decode(&manifest.encode()), None, "case {i}");
         }
+    }
+
+    // ── reading from a file ──
+
+    /// A scratch directory, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ferret-index-manifest-{}-{name}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        /// Writes `bytes` as the manifest and opens it.
+        fn manifest(&self, bytes: &[u8]) -> Counting {
+            fs::write(self.0.join(FILE), bytes).unwrap();
+            Counting {
+                file: File::open(self.0.join(FILE)).unwrap(),
+                read: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file that counts the bytes read through it.
+    struct Counting {
+        file: File,
+        read: std::cell::Cell<u64>,
+    }
+
+    impl Counting {
+        fn len(&self) -> u64 {
+            self.file.metadata().unwrap().len()
+        }
+
+        /// What [`Manifest::read`] does with the file, and the bytes it read.
+        fn read(&self) -> (Option<Manifest>, u64) {
+            self.read_as(self.len())
+        }
+
+        /// As `read`, with `len` as the length `fstat` reported.
+        fn read_as(&self, len: u64) -> (Option<Manifest>, u64) {
+            self.read.set(0);
+            let manifest = Manifest::read_from(self, len).unwrap();
+            (manifest, self.read.get())
+        }
+    }
+
+    impl FileExt for Counting {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            let n = self.file.read_at(buf, offset)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+
+        fn write_at(&self, _: &[u8], _: u64) -> io::Result<usize> {
+            unreachable!("a manifest read never writes")
+        }
+    }
+
+    /// A manifest with `segments` single-document segments and as many
+    /// unreadable documents.
+    fn large(segments: u32) -> Manifest {
+        let entry = sample().segments[0];
+        Manifest {
+            frontier: segments * 2,
+            high_water: segments * 2,
+            next_number: u64::from(segments),
+            segments: (0..segments)
+                .map(|i| SegmentEntry {
+                    number: u64::from(i),
+                    first: i * 2,
+                    last: i * 2 + 1,
+                    ..entry
+                })
+                .collect(),
+            unreadable: (0..segments).map(|i| i * 2).collect(),
+            ..sample()
+        }
+    }
+
+    /// Writes the head's counts and reseals the digest, so only the framing
+    /// is wrong.
+    fn with_counts(mut bytes: Vec<u8>, segments: u32, unreadable: u32) -> Vec<u8> {
+        bytes[56..60].copy_from_slice(&segments.to_le_bytes());
+        bytes[60..64].copy_from_slice(&unreadable.to_le_bytes());
+        let body = bytes.len() - 16;
+        let sum = checksum(&bytes[..body]);
+        bytes[body..].copy_from_slice(&sum);
+        bytes
+    }
+
+    #[test]
+    fn declared_length_is_the_encoders_length() {
+        for manifest in [Manifest::empty([1; 16]), sample(), large(1000)] {
+            let bytes = manifest.encode();
+            assert_eq!(
+                bytes.len() as u64,
+                HEAD as u64
+                    + manifest.segments.len() as u64 * ENTRY as u64
+                    + manifest.unreadable.len() as u64 * 4
+                    + 16
+            );
+            assert_eq!(declared_len(&bytes), Some(bytes.len() as u64));
+        }
+    }
+
+    #[test]
+    fn valid_manifests_round_trip_through_a_file() {
+        let dir = Scratch::new("round-trip");
+        for manifest in [Manifest::empty([1; 16]), sample(), large(20_000)] {
+            let bytes = manifest.encode();
+            let file = dir.manifest(&bytes);
+            assert_eq!(file.read(), (Some(manifest.clone()), bytes.len() as u64));
+            assert_eq!(Manifest::read(&dir.0).unwrap(), Some(manifest));
+        }
+    }
+
+    /// The reviewer's probe: 32 MiB of zeros used to be read whole before
+    /// the magic was checked.
+    #[test]
+    fn a_large_zero_filled_manifest_is_refused_after_its_head() {
+        let dir = Scratch::new("zeros");
+        let file = dir.manifest(&vec![0; 32 << 20]);
+        let (manifest, read) = file.read();
+        assert_eq!(manifest, None);
+        assert!(read <= HEAD as u64, "read {read} bytes");
+        assert_eq!(Manifest::read(&dir.0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_bad_head_is_refused_after_reading_only_the_head() {
+        let dir = Scratch::new("bad-head");
+        let good = large(100).encode();
+        let mut padded = good.clone();
+        padded.push(0);
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        for (name, at) in [("magic", 0), ("version", 8), ("reserved", 85)] {
+            let mut bytes = good.clone();
+            bytes[at] ^= 0x40;
+            cases.push((name, bytes));
+        }
+        cases.push((
+            "segment count overflow",
+            with_counts(good.clone(), u32::MAX, 100),
+        ));
+        cases.push((
+            "unreadable count overflow",
+            with_counts(good.clone(), 100, u32::MAX),
+        ));
+        cases.push(("one segment short", with_counts(good.clone(), 99, 100)));
+        cases.push(("one byte long", padded));
+        for (name, bytes) in cases {
+            let (manifest, read) = dir.manifest(&bytes).read();
+            assert_eq!(manifest, None, "{name}");
+            assert!(read <= HEAD as u64, "{name}: read {read} bytes");
+        }
+        for len in [0, 1, HEAD - 1, HEAD, HEAD + 15] {
+            let (manifest, read) = dir.manifest(&good[..len]).read();
+            assert_eq!(manifest, None, "{len} bytes");
+            assert!(read <= HEAD as u64, "{len} bytes: read {read}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_that_changed_length_after_fstat_is_refused() {
+        let dir = Scratch::new("changed");
+        let bytes = sample().encode();
+        let len = bytes.len() as u64;
+        let file = dir.manifest(&bytes);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(dir.0.join(FILE))
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        assert_eq!(file.read_as(len).0, None, "truncated");
+        let file = dir.manifest(&bytes);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(dir.0.join(FILE))
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        assert_eq!(file.read_as(len).0, None, "grown");
+    }
+
+    #[test]
+    fn a_failed_checksum_is_still_refused() {
+        let dir = Scratch::new("checksum");
+        let mut bytes = large(100).encode();
+        let at = HEAD + 3 * ENTRY + 5;
+        bytes[at] ^= 1;
+        let (manifest, read) = dir.manifest(&bytes).read();
+        assert_eq!(manifest, None);
+        assert_eq!(read, bytes.len() as u64);
     }
 }

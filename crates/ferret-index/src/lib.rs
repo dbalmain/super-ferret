@@ -28,6 +28,7 @@ pub mod live;
 pub mod manifest;
 pub mod merge;
 pub mod postings;
+mod regular;
 pub mod segment;
 pub mod store;
 

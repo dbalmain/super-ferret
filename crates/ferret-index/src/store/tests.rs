@@ -1430,7 +1430,7 @@ fn a_merge_still_checks_each_input_chunk() {
     .sum();
     let head = fs::metadata(&path).unwrap().len() - sections;
     let at = head + blocks + postings / 2;
-    let file = OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
@@ -1449,4 +1449,167 @@ fn a_merge_still_checks_each_input_chunk() {
         ),
         "{error:?}"
     );
+}
+
+// ── special files at index names ──
+
+/// Runs `body` in a child process, this test binary filtered to test
+/// `store::tests::{name}` and killed after 20 s, so an open that blocks on a
+/// FIFO fails the test instead of hanging the suite. In the child, runs it.
+fn bounded(name: &str, body: impl FnOnce()) {
+    const CHILD: &str = "FERRET_INDEX_SPECIAL_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        body();
+        return;
+    }
+    let output = std::process::Command::new("timeout")
+        .args(["--signal=KILL", "20"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            &format!("store::tests::{name}"),
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{name}: {} (killed means an open blocked)\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// How a special file replaces a name.
+#[derive(Clone, Copy, Debug)]
+enum Special {
+    Fifo,
+    SymlinkToFifo,
+}
+
+const SPECIALS: [Special; 2] = [Special::Fifo, Special::SymlinkToFifo];
+
+/// Puts `special` at `path`, removing what was there.
+fn put_special(path: &Path, special: Special) {
+    let _ = fs::remove_file(path);
+    let fifo = match special {
+        Special::Fifo => path.to_owned(),
+        Special::SymlinkToFifo => path.with_extension("fifo-target"),
+    };
+    let _ = fs::remove_file(&fifo);
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo {}", fifo.display());
+    if fifo != path {
+        std::os::unix::fs::symlink(&fifo, path).unwrap();
+    }
+}
+
+/// A built index of 80 documents in one segment pair.
+fn built(name: &str) -> (Dir, Corpus, Catalog) {
+    let dir = Dir::new(name);
+    let corpus = Corpus::new(3, 80);
+    let catalog = Catalog::new(80, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    (dir, corpus, catalog)
+}
+
+/// A FIFO manifest is one that does not decode: readers see no index, and
+/// a writer starts over and publishes over it.
+#[test]
+fn a_special_manifest_reads_as_none_and_is_rebuilt() {
+    bounded("a_special_manifest_reads_as_none_and_is_rebuilt", || {
+        for special in SPECIALS {
+            let (dir, corpus, catalog) = built(&format!("special-manifest-{special:?}"));
+            put_special(&dir.0.join(manifest::FILE), special);
+            assert_eq!(Manifest::read(&dir.0).unwrap(), None, "{special:?}");
+            assert!(View::open(&dir.0, &catalog.view()).unwrap().is_none());
+            let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+            follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+            assert_eq!(raw(&writer.view()), catalog.truth(&corpus), "{special:?}");
+        }
+    });
+}
+
+/// A FIFO under a segment's name is refused as a segment that is not one:
+/// readers get the segment error, and a writer discards and rebuilds.
+#[test]
+fn a_special_segment_is_not_a_segment() {
+    bounded("a_special_segment_is_not_a_segment", || {
+        for special in SPECIALS {
+            for tri in [false, true] {
+                let (dir, corpus, catalog) = built(&format!("special-segment-{special:?}-{tri}"));
+                let entry = Manifest::read(&dir.0).unwrap().unwrap().segments[0];
+                let name = if tri {
+                    entry.trigram_file_name()
+                } else {
+                    entry.file_name()
+                };
+                put_special(&dir.0.join(name), special);
+                let opened = View::open(&dir.0, &catalog.view()).err();
+                assert!(
+                    matches!(opened, Some(Error::Segment(ReadError::NotASegment))),
+                    "{special:?} {tri}: {opened:?}"
+                );
+                let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+                follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+                assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+            }
+        }
+    });
+}
+
+/// Temporary names taken by FIFOs after the writer opened (which clears
+/// them) are replaced, so the next follow publishes instead of blocking.
+#[test]
+fn special_temporaries_after_open_are_replaced() {
+    bounded("special_temporaries_after_open_are_replaced", || {
+        for special in SPECIALS {
+            let dir = Dir::new(&format!("special-temporaries-{special:?}"));
+            let corpus = Corpus::new(4, 120);
+            let first = Catalog::new(60, &[]);
+            let mut writer = IndexWriter::open(&dir.0, &first.view()).unwrap();
+            follow_all(&mut writer, &first, &corpus, &Budget::unbounded()).unwrap();
+            let next = writer.view().manifest().next_number;
+            for name in [
+                "manifest.tmp".to_owned(),
+                format!("tmp-{next}.seg"),
+                format!("tmp-{next}.tri"),
+            ] {
+                put_special(&dir.0.join(name), special);
+            }
+            let all = Catalog::new(120, &[]);
+            follow_all(&mut writer, &all, &corpus, &Budget::unbounded()).unwrap();
+            assert_eq!(raw(&writer.view()), all.truth(&corpus), "{special:?}");
+            let published = Manifest::read(&dir.0).unwrap().unwrap();
+            assert_eq!(published.frontier, 120, "{special:?}");
+        }
+    });
+}
+
+/// The positive control: the manifest and segments reached through
+/// symlinks to regular files open as before.
+#[test]
+fn symlinked_regular_index_files_still_open() {
+    let (dir, corpus, catalog) = built("symlinked");
+    let real = dir.0.join("real");
+    fs::create_dir(&real).unwrap();
+    let entry = Manifest::read(&dir.0).unwrap().unwrap().segments[0];
+    for name in [
+        manifest::FILE.to_owned(),
+        entry.file_name(),
+        entry.trigram_file_name(),
+    ] {
+        fs::rename(dir.0.join(&name), real.join(&name)).unwrap();
+        std::os::unix::fs::symlink(real.join(&name), dir.0.join(&name)).unwrap();
+    }
+    let view = View::open(&dir.0, &catalog.view()).unwrap().unwrap();
+    assert_eq!(raw(&view), catalog.truth(&corpus));
 }

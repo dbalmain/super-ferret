@@ -28,7 +28,7 @@
 //! liveness hides and a merge purges.
 
 use std::cell::RefCell;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -38,6 +38,7 @@ use ferret_text::{Scratch, TERM_VERSION, TRIGRAM_VERSION, cap, tokenize_terms};
 use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
 use crate::merge;
+use crate::regular;
 use crate::segment::{
     CHUNK, Hit, Inverter, ReadAt, ReadError, Segment, Sizes, TrigramInverter, WriteError, Writer,
 };
@@ -868,11 +869,7 @@ impl IndexWriter {
             last,
             budget.cancelled,
             |file, tri| {
-                let postings = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&scratch)?;
+                let postings = regular::replace(&scratch)?;
                 let writer = if tri {
                     Writer::keyed_spilling(
                         first,
@@ -942,11 +939,7 @@ impl IndexWriter {
             }
             let extension = if tri { "tri" } else { "seg" };
             let temp = dir.join(format!("tmp-{number}.{extension}"));
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
+            let file = regular::replace(&temp)?;
             let sizes = fill(&file, tri)?;
             file.sync_all()?;
             let segment = Segment::open(file)?;
@@ -1081,7 +1074,15 @@ fn open_pairs(dir: &Path, manifest: &Manifest, threads: usize) -> Result<PairedS
             } else {
                 entry.file_name()
             };
-            let file = File::open(dir.join(name))?;
+            // A special file under a segment's name is refused, as a
+            // regular file of the wrong shape is, without waiting on it.
+            let file = regular::open(&dir.join(name)).map_err(|e| {
+                if regular::is_not_regular(&e) {
+                    Error::Segment(ReadError::NotASegment)
+                } else {
+                    Error::Io(e)
+                }
+            })?;
             let bytes = file.metadata()?.len();
             let segment = Segment::open(file)?;
             let matches = if tri {
