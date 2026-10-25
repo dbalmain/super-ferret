@@ -416,7 +416,8 @@ ancestor within the configured root; `.gitignore` and `.git/info/exclude` inside
 a work tree that starts at or below the configured root (a `.git` file
 contributes exclude from its gitdir, or from that gitdir's `commondir` when it
 has one; a symlinked `.git` contributes none, and a symlinked `.gitignore` is
-disregarded, as git does); the user's global ignore file
+disregarded, as git does; a gitdir or common directory that no longer exists
+contributes none and is not a fault, as in rg, D26); the user's global ignore file
 (`$XDG_CONFIG_HOME/ferret/ignore`), which setup seeds once with the defaults
 (`node_modules/`, `target/`, `.venv/`, …) and which is the user's to edit from
 then on. A size cap and a binary check sit beside the patterns. `!pat` in a

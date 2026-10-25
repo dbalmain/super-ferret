@@ -1450,6 +1450,17 @@ repeated identical denials publish no generation. Other typed coverage faults
 now follow M5's checked subtree retention (or block without a valid anchor),
 including EACCES from an ignore-file read.
 
+**Amendment (2026-10-25, stale work trees):** a `.git` file whose gitdir, or
+the directory its `commondir` names, does not exist (`ENOENT`) is a known
+state, not a coverage fault: the repository was moved or pruned, as after
+removing a main checkout whose worktrees stayed behind. The directory is still
+a work tree for `.gitignore`, contributes no exclude rules and records no work
+tree, which is what rg does with no error. Three stale worktrees under `~/w`
+had kept a 74 GB root from ever publishing. Every other gitdir failure (EACCES,
+EIO, a path through a file, an unreadable or empty `commondir`) still faults:
+those leave exclude rules unknown, not absent. The crawl already registers the
+missing path as a policy input, so the gitdir reappearing refreshes the root.
+
 ## D27 — `InoId` and `NameId`: stable, or renumbered each snapshot
 
 **Question:** When an entry is deleted, what happens to its dense ids?

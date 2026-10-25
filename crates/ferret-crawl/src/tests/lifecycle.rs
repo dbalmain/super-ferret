@@ -646,9 +646,11 @@ fn a_child_whose_listing_fails_is_a_list_fault_on_its_own_token() {
 
 /// A `.git` file whose gitdir or common directory cannot be opened, or whose
 /// `commondir` is empty, is a `ProbeGit` fault on `.git`: the work tree's
-/// exclude rules and its record are unknown, not absent.
+/// exclude rules and its record are unknown, not absent. One that does not
+/// exist is a stale work tree, a known state: no fault and no record (D26).
+/// A path through a file (`ENOTDIR`) is not that state, and still faults.
 #[test]
-fn a_gitfile_that_leads_nowhere_is_a_probe_fault() {
+fn a_gitfile_that_leads_nowhere_is_a_probe_fault_unless_it_is_stale() {
     let tree = Scratch::new("fault-gitfile");
     let root = tree.path.clone();
     write(&root.join("dangling/.git"), "gitdir: ../gitdirs/missing\n");
@@ -657,18 +659,20 @@ fn a_gitfile_that_leads_nowhere_is_a_probe_fault() {
     write(&root.join("gitdirs/empty/commondir"), "");
     write(&root.join("blank/.git"), "gitdir: ../gitdirs/empty\n");
     write(&root.join("garbage/.git"), "not a pointer\n");
+    write(
+        &root.join("through/.git"),
+        "gitdir: ../gitdirs/empty/commondir/x\n",
+    );
 
     let merged = run(&root, Vec::new(), 1, &Hooks::default());
-    let not_found = io::ErrorKind::NotFound;
     let invalid = io::ErrorKind::InvalidData;
-    assert_eq!(
-        merged.io_at("dangling/.git"),
-        [(IoOp::ProbeGit, child("dangling", ".git"), not_found)]
-    );
-    assert_eq!(
-        merged.io_at("far/.git"),
-        [(IoOp::ProbeGit, child("far", ".git"), not_found)]
-    );
+    for rel in ["dangling/.git", "far/.git"] {
+        assert!(
+            merged.io_at(rel).is_empty(),
+            "{rel}: {:?}",
+            merged.io_at(rel)
+        );
+    }
     assert_eq!(
         merged.io_at("blank/.git"),
         [(IoOp::ProbeGit, child("blank", ".git"), invalid)]
@@ -677,7 +681,15 @@ fn a_gitfile_that_leads_nowhere_is_a_probe_fault() {
         merged.io_at("garbage/.git"),
         [(IoOp::ProbeGit, child("garbage", ".git"), invalid)]
     );
-    for rel in ["dangling", "far", "blank", "garbage"] {
+    assert_eq!(
+        merged.io_at("through/.git"),
+        [(
+            IoOp::ProbeGit,
+            child("through", ".git"),
+            io::ErrorKind::NotADirectory
+        )]
+    );
+    for rel in ["dangling", "far", "blank", "garbage", "through"] {
         assert_eq!(merged.entered(rel), Some(&None), "{rel}");
     }
 }

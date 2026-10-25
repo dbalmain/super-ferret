@@ -973,6 +973,82 @@ fn a_missing_root_blocks_publication() {
     assert!(Catalog::open(&tmp.cat()).unwrap().is_none());
 }
 
+/// A `.git` file whose gitdir, or whose `commondir`'s directory, no longer
+/// exists is a stale work tree, a known state rather than a fault (D26): the
+/// tree publishes, its `.gitignore` still applies, the missing repository
+/// contributes no exclude, and no work-tree record is written. A linked work
+/// tree's own gitdir exclude is not a fallback for its missing common
+/// directory, as rg agrees.
+#[test]
+fn a_stale_gitfile_publishes_as_a_work_tree_without_a_record() {
+    let tmp = Tmp::new("stale-gitdir");
+    let gone = tmp.base.join("gone/.git/worktrees/x");
+    tmp.write(
+        "wt/.git",
+        format!("gitdir: {}\n", gone.display()).as_bytes(),
+    );
+    tmp.write("wt/.gitignore", b"ignored.txt\n");
+    tmp.write("wt/ignored.txt", b"hit\n");
+    tmp.write("wt/kept.txt", b"hit\n");
+    let gitdir = tmp.base.join("gitdirs/linked");
+    fs::create_dir_all(gitdir.join("info")).unwrap();
+    fs::write(gitdir.join("commondir"), "../absent\n").unwrap();
+    fs::write(gitdir.join("info/exclude"), "own.txt\n").unwrap();
+    tmp.write("far/.git", b"gitdir: ../../gitdirs/linked\n");
+    tmp.write("far/.gitignore", b"ignored.txt\n");
+    tmp.write("far/ignored.txt", b"hit\n");
+    tmp.write("far/own.txt", b"hit\n");
+
+    let report = run(&tmp, &[tmp.tree()], Refresh::All, 1);
+    assert!(
+        report.coverage_faults.is_empty(),
+        "{:?}",
+        report.coverage_faults
+    );
+    let (catalog, rows) = published(&tmp);
+    for dir in ["wt", "far"] {
+        assert!(
+            !rows.contains_key(&tmp.at(&format!("{dir}/ignored.txt"))),
+            "{dir}"
+        );
+        assert!(catalog.work_tree(rows[&tmp.at(dir)].ino).is_none(), "{dir}");
+    }
+    assert_eq!(rows[&tmp.at("wt/kept.txt")].state, ContentState::Hashed);
+    assert_eq!(rows[&tmp.at("far/own.txt")].state, ContentState::Hashed);
+    assert_eq!(catalog.work_trees().count(), 0);
+}
+
+/// The discriminating case for the stale gitdir: one that exists but cannot
+/// be opened leaves the work tree's exclude rules unknown, so it is still a
+/// `ProbeGit` fault, and with nothing old to retain it blocks publication.
+#[test]
+fn an_unopenable_gitdir_still_blocks_publication() {
+    let tmp = Tmp::new("shut-gitdir");
+    let gitdir = tmp.base.join("shut");
+    fs::create_dir_all(gitdir.join("info")).unwrap();
+    fs::write(gitdir.join("info/exclude"), "secret.txt\n").unwrap();
+    tmp.write(
+        "wt/.git",
+        format!("gitdir: {}\n", gitdir.display()).as_bytes(),
+    );
+    tmp.write("wt/secret.txt", b"hit\n");
+    chmod(&gitdir, 0o000);
+    if fs::read_dir(&gitdir).is_ok() {
+        eprintln!("skipped: mode 000 does not deny this user (root?)");
+        return;
+    }
+
+    let error = index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options(1)).unwrap_err();
+    let IndexError::Coverage { faults, .. } = error else {
+        panic!("expected a coverage fault, got {error}");
+    };
+    assert_eq!(faults.len(), 1, "{faults:?}");
+    assert_eq!(faults[0].op, IoOp::ProbeGit);
+    assert_eq!(faults[0].path, Path::new("wt/.git"));
+    assert_eq!(faults[0].error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(Catalog::open(&tmp.cat()).unwrap().is_none());
+}
+
 #[test]
 fn the_cache_hands_out_one_claim_per_inode() {
     use crate::observe::{Cache, Lookup, Observation};

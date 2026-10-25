@@ -138,9 +138,12 @@ pub enum WorkTreeKind {
 /// read (D22). A symlinked `.git`, a `.git` file that names no readable gitdir,
 /// or a gitdir whose `commondir` cannot be read or is empty still makes the
 /// directory a work tree for ignore rules, and reports no `WorkTree`. Each of
-/// those except the symlink is also an [`IoOp::ProbeGit`] fault on `.git`, a
-/// missing gitdir included: the work tree's exclude rules and record are
-/// unknown, not absent.
+/// those except the symlink is also an [`IoOp::ProbeGit`] fault on `.git`: the
+/// work tree's exclude rules and record are unknown, not absent. A gitdir, or
+/// the directory its `commondir` names, that does not exist (`ENOENT`) is the
+/// exception: a stale work tree whose repository was moved or pruned is a
+/// known state, with no exclude rules and no record, and raises no fault, as
+/// rg reports none (D26).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkTree<'a> {
     /// Main, linked or submodule.
@@ -2032,11 +2035,14 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         } else {
             openat(base, path, flags, Mode::empty())
         };
-        // A missing gitdir or common directory is a fault like any other: the
-        // `.git` file says a work tree starts here, and its exclude rules and
-        // work-tree record are lost without it.
+        // A gitdir or common directory that does not exist is a known state:
+        // the repository was moved or pruned, so there are no exclude rules
+        // and no work-tree record to lose. `policy_path` above already
+        // watches where it would appear. Any other failure leaves them
+        // unknown, and is a fault.
         match opened {
             Ok(fd) => Some(fd),
+            Err(Errno::NOENT) => None,
             Err(error) => {
                 self.fail_at_git(io::Error::from(error), token);
                 None
@@ -2048,7 +2054,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// second value; otherwise the directory `commondir` names and its text.
     /// `None`, after a [`IoOp::ProbeGit`] fault, when that file cannot be
     /// read, is not a regular file, names nothing, or names a directory that
-    /// cannot be opened: a linked work tree's own directory is not where
+    /// cannot be opened; `None` without a fault when the directory it names
+    /// does not exist. A linked work tree's own directory is not where
     /// exclude lives, so it is not a fallback. Only a missing `commondir`
     /// means the gitdir is the common directory.
     fn common_dir(

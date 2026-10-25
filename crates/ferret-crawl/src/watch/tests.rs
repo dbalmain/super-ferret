@@ -383,6 +383,28 @@ fn unreliable_filesystem_magic_keeps_successfully_watched_roots_in_the_poll_set(
     );
 }
 
+/// A stale work tree's gitdir is missing several components deep. The crawl
+/// registers it as a policy input, so the repository coming back, which starts
+/// with its first missing directory, refreshes the root that ignored it.
+#[test]
+fn a_missing_gitdir_reappearing_refreshes_its_root() {
+    let tree = Tree::new("policy-missing-gitdir", 100, 1 << 20);
+    let root = tree.path.join("root");
+    tree.watch.reconcile(&tree.writer.view());
+    let outside = tree.path.join("outside");
+    fs::create_dir(&outside).unwrap();
+    tree.watch
+        .policy_path(&root, &outside.join("gone/.git/worktrees/x"));
+    tree.watch.reconcile(&tree.writer.view());
+    tree.watch.drain().unwrap();
+    fs::create_dir_all(outside.join("gone/.git/worktrees/x")).unwrap();
+    tree.watch.drain().unwrap();
+    let burst = tree.due();
+    assert!(
+        matches!(&burst.request(&tree.writer.view()).scopes[0], RefreshScope::Root(path) if path == &root)
+    );
+}
+
 #[test]
 fn a_complete_root_retires_old_policy_inputs_but_partial_work_keeps_them() {
     let tree = Tree::new("policy-retirement", 100, 1 << 20);
