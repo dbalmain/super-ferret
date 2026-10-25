@@ -1,5 +1,8 @@
-//! Neutral checked-reader outcomes. Hosts retain their filesystem brackets;
-//! retry policy belongs here so grep and document search use the same rules.
+//! Neutral checked-reader outcomes. Hosts retain their filesystem brackets
+//! and reset their own output per attempt; [`retry_read`] owns the retry
+//! policy, and grep is its caller. Document search reads through the same
+//! checked reader but adapts its outcomes to the [`Reader`](crate::Reader)
+//! boundary, where anything but a stable read is a miss, without retrying.
 
 use std::io;
 
@@ -51,27 +54,6 @@ pub enum ReadOutcome {
 /// One checked observation; partial failed bytes are never cacheable.
 pub type CheckedReader<'a> = dyn FnMut(NameId, ReadRequest<'_>) -> ReadOutcome + 'a;
 
-/// Reads stable bytes, retrying a changed observation once. Every attempt
-/// replaces `bytes`; failures clear partial data before returning to a caller.
-pub fn read_bytes(
-    reader: &mut CheckedReader<'_>,
-    name: NameId,
-    bytes: &mut Vec<u8>,
-    stopped: &dyn Fn() -> bool,
-) -> ReadOutcome {
-    let outcome = retry_read(
-        || {
-            bytes.clear();
-            reader(name, ReadRequest::Bytes(bytes, stopped))
-        },
-        stopped,
-    );
-    if !matches!(outcome, ReadOutcome::Stable(_)) {
-        bytes.clear();
-    }
-    outcome
-}
-
 /// Retry one changed observation, checking cancellation before every attempt
 /// and before accepting a stable result. The consumer resets its output for
 /// each attempt; a failed attempt must never publish partial results.
@@ -95,78 +77,86 @@ pub fn retry_read(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
-    #[test]
-    fn retries_once_and_discards_partial_failed_bytes() {
+    fn fault() -> ReadOutcome {
+        ReadOutcome::Failed(ReadFault::Io(
+            ReadOperation::Read,
+            io::ErrorKind::PermissionDenied.into(),
+        ))
+    }
+
+    /// Runs `retry_read` over a scripted sequence of attempt outcomes and
+    /// returns its result with the number of attempts it made.
+    fn run(mut script: Vec<ReadOutcome>, stopped: &dyn Fn() -> bool) -> (ReadOutcome, usize) {
+        script.reverse();
         let mut attempts = 0;
-        let mut reader = |_, request: ReadRequest<'_>| {
-            attempts += 1;
-            let ReadRequest::Bytes(bytes, _) = request else {
-                panic!("bytes request")
-            };
-            assert!(bytes.is_empty());
-            bytes.extend_from_slice(b"fresh");
-            if attempts == 1 {
-                ReadOutcome::RetryChanged
-            } else {
-                ReadOutcome::Stable(ReadVersion::Current)
-            }
-        };
-        let mut bytes = Vec::new();
-        assert!(matches!(
-            read_bytes(&mut reader, NameId(0), &mut bytes, &|| false),
-            ReadOutcome::Stable(ReadVersion::Current)
-        ));
-        assert_eq!(bytes, b"fresh");
+        let outcome = retry_read(
+            || {
+                attempts += 1;
+                script.pop().expect("no more attempts than scripted")
+            },
+            stopped,
+        );
+        (outcome, attempts)
+    }
+
+    #[test]
+    fn retries_one_changed_observation_and_fails_a_second() {
+        let stable = || ReadOutcome::Stable(ReadVersion::Current);
+        let (outcome, attempts) = run(vec![ReadOutcome::RetryChanged, stable()], &|| false);
+        assert!(matches!(outcome, ReadOutcome::Stable(ReadVersion::Current)));
+        assert_eq!(attempts, 2);
+        let script = vec![ReadOutcome::RetryChanged, ReadOutcome::RetryChanged];
+        let (outcome, attempts) = run(script, &|| false);
+        assert!(matches!(outcome, ReadOutcome::Failed(ReadFault::Unstable)));
         assert_eq!(attempts, 2);
     }
 
     #[test]
-    fn repeated_instability_and_faults_never_return_bytes() {
-        for fail in [false, true] {
-            let mut attempts = 0;
-            let mut reader = |_, request: ReadRequest<'_>| {
-                attempts += 1;
-                let ReadRequest::Bytes(bytes, _) = request else {
-                    panic!("bytes request")
-                };
-                bytes.extend_from_slice(b"partial");
-                if fail {
-                    ReadOutcome::Failed(ReadFault::Io(
-                        ReadOperation::Read,
-                        io::ErrorKind::PermissionDenied.into(),
-                    ))
-                } else {
-                    ReadOutcome::RetryChanged
-                }
-            };
-            let mut bytes = Vec::new();
-            assert!(matches!(
-                read_bytes(&mut reader, NameId(0), &mut bytes, &|| false),
-                ReadOutcome::Failed(_)
-            ));
-            assert!(bytes.is_empty());
-            assert_eq!(attempts, if fail { 1 } else { 2 });
-        }
+    fn faults_and_vanished_files_are_not_retried() {
+        let (outcome, attempts) = run(vec![fault()], &|| false);
+        assert!(matches!(outcome, ReadOutcome::Failed(ReadFault::Io(..))));
+        assert_eq!(attempts, 1);
+        let (outcome, attempts) = run(vec![ReadOutcome::Vanished], &|| false);
+        assert!(matches!(outcome, ReadOutcome::Vanished));
+        assert_eq!(attempts, 1);
     }
 
     #[test]
-    fn vanished_and_cancelled_are_distinct_and_do_not_retry() {
-        for cancelled in [false, true] {
-            let mut attempts = 0;
-            let mut reader = |_, _: ReadRequest<'_>| {
+    fn cancellation_is_checked_before_each_attempt_and_before_acceptance() {
+        let (outcome, attempts) = run(vec![], &|| true);
+        assert!(matches!(outcome, ReadOutcome::Cancelled));
+        assert_eq!(attempts, 0);
+
+        // Stopped while the stable attempt ran: its result is not accepted.
+        let stop = Cell::new(false);
+        let mut attempts = 0;
+        let outcome = retry_read(
+            || {
                 attempts += 1;
-                ReadOutcome::Vanished
-            };
-            let mut bytes = b"old".to_vec();
-            let outcome = read_bytes(&mut reader, NameId(0), &mut bytes, &|| cancelled);
-            assert!(matches!(
-                (cancelled, outcome),
-                (true, ReadOutcome::Cancelled) | (false, ReadOutcome::Vanished)
-            ));
-            assert!(bytes.is_empty());
-            assert_eq!(attempts, usize::from(!cancelled));
-        }
+                stop.set(true);
+                ReadOutcome::Stable(ReadVersion::Current)
+            },
+            &|| stop.get(),
+        );
+        assert!(matches!(outcome, ReadOutcome::Cancelled));
+        assert_eq!(attempts, 1);
+
+        // Stopped after a changed observation: no second attempt.
+        let stop = Cell::new(false);
+        let mut attempts = 0;
+        let outcome = retry_read(
+            || {
+                attempts += 1;
+                stop.set(true);
+                ReadOutcome::RetryChanged
+            },
+            &|| stop.get(),
+        );
+        assert!(matches!(outcome, ReadOutcome::Cancelled));
+        assert_eq!(attempts, 1);
     }
 }
