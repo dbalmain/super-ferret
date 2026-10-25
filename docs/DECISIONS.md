@@ -6909,3 +6909,17 @@ Context:
 
 > Dave: agreed, C then B. Keep 1 h meanwhile; measure on the three machines.
 > (2026-10-26)
+
+Measured 2026-10-26 with the deployed build (184cca3) on a scratch index of
+`~/w` (`FERRET_NO_DAEMON=1`, private `FERRET_INDEX`/`XDG_STATE_HOME`), warm
+cache, GNU time for wall-clock and peak RSS:
+
+| Host | Entries | First index | Re-walk | Re-walk at nice 19 on one CPU |
+| --- | --- | --- | --- | --- |
+| msa2 (32 CPUs) | 7,693 dirs, 56,941 files | 6.13 s, 112 MiB, 889 MiB read | 0.08 s, 18 MiB, 0 read | 0.25 s, 14 MiB |
+| geekom (22 CPUs) | 6,377 dirs, 33,159 files | 3.44 s, 101 MiB, 531 MiB read | 0.05 s, 17 MiB, 0 read | 0.10 s, 12 MiB |
+| p16s | — | fails: stale worktree gitdirs (fixed on main by ef5dced) | — | — |
+
+A re-walk of `~/w` costs a quarter of a second and under 20 MiB, so by the
+fact above the hourly walk is free here: **outcome A, keep 1 h.** p16s is
+measured after the next deploy. Cold-cache cost is not measured.
