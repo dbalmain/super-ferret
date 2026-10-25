@@ -6802,3 +6802,42 @@ unchanged.
 means nothing was published" — then C.
 
 > Dave (2026-10-25, in chat): B.
+
+## D120 — A file edited through a hard link outside every root
+
+**Question:** When a file inside a watched root gains a hard link outside every
+root and is then rewritten in place through that outside name, should the
+daemon catch the change within minutes, or is the hourly full backstop the
+accepted bound?
+
+Context:
+
+- Reproduced by Sol's round-2 review (2026-10-25) on a debug build: a
+  single-link file under a watched root, then `ln` to a name outside all
+  roots, then an in-place rewrite through that name. Linux reports the write
+  to the outside name's parent directory, which nothing watches. Several
+  poll intervals passed with no refresh; status showed `polling_roots=[]`,
+  `watch_uncovered=false`; the new term was not found, the old one was.
+- The watcher already polls roots holding files *last seen* with more than
+  one link (`watch/aliases.rs` ~25). A file seen with one link has no record,
+  so a later outside link is invisible until the hourly full backstop
+  (`writer.rs` ~297).
+- Editors that save by writing a new file and renaming it break the link, so
+  the rewrite lands on a new inode outside the root and the indexed file is
+  unchanged. Only in-place writers (`>>`, `dd conv=notrunc`, some IDEs,
+  databases) hit this.
+- Not a publication or D73 snapshot violation: results are stale, not wrong
+  about what the index holds.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Accept the hourly backstop; document the bound; say that `watch_uncovered=false` cannot rule out a later outside link | Up to an hour stale in this rare case. A doc change only (~30 min). | No added background I/O. |
+| B. Re-walk every fully watched root on the 5-minute poll, with the existing adaptive spacing | Background crawl duty rises for every root: ~/w is 1.8 s per walk (negligible), a `/nix/store`-sized root is ~60 s per walk, so spacing must stretch it. Changes the D116 resource tradeoff. 3–5 h plus measurement. | This case is bounded at ~5 min wherever the walk is cheap. |
+| C. Scale the full backstop by each root's measured walk cost (e.g. keep background walking under ~1% of wall-clock) | Same build as B plus a per-root cost record and a cap; still an hour or more for huge roots. 4–6 h. | Cheap roots (most of `~/w`) refresh every few minutes; expensive ones keep today's cost. One knob instead of two intervals. |
+
+**Recommendation: A** now, because the trigger is a rare combination (an
+outside hard link *and* an in-place writer), and the fix costs background
+I/O on every root to catch it. C is the shape to build if it ever matters.
+
+**Fact that would change it:** a real workflow of yours that edits files
+under `~/w` in place through links outside it — then C.
