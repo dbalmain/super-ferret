@@ -326,18 +326,7 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
         .int("exit", exit as u8)
         .int("total_us", total.as_micros() as i128)
         .opt_int("peak_rss_kb", peak_rss_kb());
-    let report = match &result {
-        Ok(report) => Some(report),
-        Err(IndexError::Coverage { faults, report }) => {
-            object.int("coverage_faults", faults.len() as u64);
-            Some(&**report)
-        }
-        Err(IndexError::Undurable { report, .. }) => Some(&**report),
-        Err(_) => None,
-    };
-    if let Some(report) = report {
-        log_report(&mut object, report);
-    }
+    log_result(&mut object, &result);
     object.end();
     context.log(&line);
     exit
@@ -447,7 +436,26 @@ fn append_warning(output: &mut String, message: &str) {
     let _ = writeln!(output, "ferret: warning: {message}");
 }
 
-pub(crate) fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
+/// Adds an index run's result to its query-log line: the report whenever one
+/// survives the error, so a partial or undurable run logs its failed roots.
+/// The local and daemon hosts both call this, so their lines cannot drift.
+pub(crate) fn log_result(
+    object: &mut crate::json::Object<'_>,
+    result: &Result<Report, IndexError>,
+) {
+    let report = match result {
+        Ok(report) => report,
+        Err(IndexError::Coverage { faults, report }) => {
+            object.int("coverage_faults", faults.len() as u64);
+            &**report
+        }
+        Err(IndexError::Undurable { report, .. }) => &**report,
+        Err(_) => return,
+    };
+    log_report(object, report);
+}
+
+fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
     let c = &report.counts;
     object
         .int("refreshed", report.refreshed.len() as u64)

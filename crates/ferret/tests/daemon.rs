@@ -800,6 +800,47 @@ fn routed_index_publishes_healthy_roots_and_names_the_failed_one() {
 }
 
 #[test]
+// D119 through the daemon when the publication is visible but undurable (the
+// catalog's debug `ManifestRename` seam, armed in the daemon after it loaded
+// the existing index). The withdrawn root keeps the run partial, and the
+// query-log line the daemon sends back carries the report, failed root and
+// all, as the local logger's does.
+#[cfg(debug_assertions)]
+fn routed_undurable_partial_index_logs_the_withdrawn_root() {
+    let tree = Tree::new();
+    tree.start(&[("FERRET_CATALOG_TEST_FAIL", "ManifestRename")]);
+    let (good, bad) = (tree.base.join("good"), tree.base.join("bad"));
+    fs::create_dir_all(&good).unwrap();
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(good.join("seen.txt"), b"healthy\n").unwrap();
+    fs::write(bad.join("hidden.txt"), b"uncertain\n").unwrap();
+    symlink(".ferretignore", bad.join(".ferretignore")).unwrap();
+
+    let output = tree.run(&["index", "good", "bad"]);
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "{message}\n{}",
+        tree.evidence()
+    );
+    // Only the daemon has the seam armed, so this proves the run was routed.
+    assert!(
+        message.contains("injected failure at ManifestRename"),
+        "{message}"
+    );
+    let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
+    let line = log
+        .lines()
+        .rev()
+        .find(|line| line.contains(r#""cmd":"index""#))
+        .unwrap_or_else(|| panic!("no index line in {log}"));
+    assert!(line.contains(r#""outcome":"partial""#), "{line}");
+    assert!(line.contains(r#""exit":4,"#), "{line}");
+    assert!(line.contains(r#""failed_roots":1,"#), "{line}");
+}
+
+#[test]
 fn routed_index_commands_bypass_background_politeness_but_keep_admission() {
     let tree = Tree::new();
     let proc = tree.base.join("signals/proc");

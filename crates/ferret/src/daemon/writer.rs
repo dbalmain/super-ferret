@@ -910,9 +910,7 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
         .str("outcome", rendered.outcome)
         .int("exit", exit)
         .int("total_us", started.elapsed().as_micros() as i128);
-    if let Ok(report) = &reply.result {
-        crate::index::log_report(&mut object, report);
-    }
+    crate::index::log_result(&mut object, &reply.result);
     object.end();
     emit_to(destination, &request.id, "log", |o| {
         o.bytes("bytes", &log);
