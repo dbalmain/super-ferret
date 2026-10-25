@@ -2734,3 +2734,75 @@ fn an_answer_from_an_old_index_says_so() {
     assert_eq!(paths(&silenced), [file]);
     assert!(!stderr(&silenced).contains(notice), "{}", stderr(&silenced));
 }
+
+#[test]
+// D119 through a publication that is visible but undurable: the manifest is
+// renamed into place and the step after it fails (the catalog's debug
+// `ManifestRename` seam). The withdrawn root still makes the run partial, exit
+// 4 with its retry line, beside the durability warning. A complete run that
+// fails the same way keeps exit 0 with the warning.
+fn an_undurable_partial_publication_still_reports_the_withdrawn_root() {
+    let env = Env::new("partial-undurable");
+    env.seed_ignore_file();
+    let good = env.write("good/seen.txt", b"healthy\n");
+    let hidden = env.write("bad/hidden.txt", b"uncertain\n");
+    let (good, bad) = (good.parent().unwrap(), hidden.parent().unwrap());
+    std::os::unix::fs::symlink(".ferretignore", bad.join(".ferretignore")).unwrap();
+    let warning = "ferret: warning: ";
+    let injected = "injected failure at ManifestRename";
+
+    let output = env
+        .command(&[os("index"), good.as_os_str(), bad.as_os_str()])
+        .env("FERRET_CATALOG_TEST_FAIL", "ManifestRename")
+        .output()
+        .unwrap();
+    let message = stderr(&output);
+    assert_eq!(code(&output), 4, "{message}");
+    assert!(
+        message
+            .lines()
+            .any(|l| l.starts_with(warning) && l.contains(injected)),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("ferret: not indexed: {}: ", bad.display())),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("retry with `ferret index {}`", bad.display())),
+        "{message}"
+    );
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains(&format!("failed  {}\n", bad.display())),
+        "{report}"
+    );
+    let line = env.log_lines().pop().unwrap();
+    assert!(line.contains(r#""outcome":"partial""#), "{line}");
+    assert!(line.contains(r#""exit":4,"#), "{line}");
+    assert!(line.contains(r#""failed_roots":1,"#), "{line}");
+    // Published: readers see the healthy root and not the withdrawn one.
+    assert_eq!(
+        paths(&env.run(&[os("roots"), os("list")])),
+        [good.to_owned()]
+    );
+    assert_eq!(code(&env.run(&[os("search"), os("hidden.txt")])), 1);
+
+    // The control: nothing withdrawn, so the established policy holds.
+    fs::remove_file(bad.join(".ferretignore")).unwrap();
+    let output = env
+        .command(&[os("index"), bad.as_os_str()])
+        .env("FERRET_CATALOG_TEST_FAIL", "ManifestRename")
+        .output()
+        .unwrap();
+    let message = stderr(&output);
+    assert_eq!(code(&output), 0, "{message}");
+    assert!(message.contains(injected), "{message}");
+    assert!(!message.contains("not indexed"), "{message}");
+    let line = env.log_lines().pop().unwrap();
+    assert!(line.contains(r#""outcome":"undurable""#), "{line}");
+    assert_eq!(
+        paths(&env.run(&[os("search"), os("hidden.txt")])),
+        std::slice::from_ref(&hidden)
+    );
+}

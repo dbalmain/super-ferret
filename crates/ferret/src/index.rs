@@ -332,6 +332,7 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
             object.int("coverage_faults", faults.len() as u64);
             Some(&**report)
         }
+        Err(IndexError::Undurable { report, .. }) => Some(&**report),
         Err(_) => None,
     };
     if let Some(report) = report {
@@ -390,6 +391,18 @@ pub(crate) fn render(result: &Result<Report, IndexError>) -> Rendered {
             }
             diagnostics.push_str(&text);
             (Exit::Error, "coverage")
+        }
+        Err(IndexError::Undurable { error, report }) => {
+            // Published, so the report stands beside the durability warning:
+            // a withdrawn root (D119) still makes the run partial.
+            append_warning(&mut diagnostics, &error.to_string());
+            failed_roots(report, &mut diagnostics);
+            stdout = report_text(report);
+            if report.failed_roots.is_empty() {
+                (Exit::Ok, "undurable")
+            } else {
+                (Exit::Partial, "partial")
+            }
         }
         Err(IndexError::Update(e)) if e.published() => {
             append_warning(&mut diagnostics, &e.to_string());

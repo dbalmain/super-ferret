@@ -6824,7 +6824,10 @@ ferretd exits 3; nothing returns 4. stderr gives each withdrawn root as
 faults; stdout adds a `failed  ROOT` line; the query log adds outcome
 `partial` and a `failed_roots` count. `index` has no `--json`. The daemon
 renders the same way and the client maps 4. The report's walk counts still
-include the withdrawn roots' walks.
+include the withdrawn roots' walks. A publication that becomes visible and
+then fails to be made durable (`IndexError::Undurable`) keeps its report, so
+a withdrawn root still exits 4 with its retry line, beside the durability
+warning; with nothing withdrawn it exits 0 with the warning, as before.
 
 Building the daemon test found a separate crash: a self-linked
 `.ferretignore` in an added root sent the watch's policy-input registration

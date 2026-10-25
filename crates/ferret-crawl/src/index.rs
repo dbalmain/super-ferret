@@ -161,6 +161,17 @@ pub enum IndexError {
     /// An incomplete observation has no typed protection result. An owned
     /// caller can transfer its session to an explicit checkpoint fallback.
     NeedsCheckpoint { report: Box<Report> },
+    /// The new generation is visible to readers, but a later step of its
+    /// publication failed, so it may not survive a crash. `error` is the
+    /// [`IndexError::Commit`] or [`IndexError::Update`] that says so.
+    /// `report` is the run's report up to publication: its D119
+    /// `failed_roots` were withdrawn from what readers now see, while
+    /// `published` and the content faults, read back from the published
+    /// catalog, are absent.
+    Undurable {
+        error: Box<IndexError>,
+        report: Box<Report>,
+    },
 }
 
 impl fmt::Display for IndexError {
@@ -200,6 +211,7 @@ impl fmt::Display for IndexError {
                 f,
                 "incomplete directory coverage requires checkpoint fallback"
             ),
+            Self::Undurable { error, .. } => error.fmt(f),
         }
     }
 }
@@ -552,7 +564,7 @@ fn run<T>(
                     let changed = !changes.records.is_empty();
                     let catalog = session
                         .commit(&changes, options.sniffer)
-                        .map_err(update_error)?;
+                        .map_err(|e| undurable(update_error(e), &mut report))?;
                     let (faulted, aliases) =
                         reporting_ids(&session, previous.generation(), &changes);
                     let result = after(&catalog);
@@ -568,7 +580,9 @@ fn run<T>(
                         txn.keep(root.as_os_str().as_bytes())
                             .map_err(IndexError::Keep)?;
                     }
-                    let (catalog, result) = txn.commit_then(after).map_err(IndexError::Commit)?;
+                    let (catalog, result) = txn
+                        .commit_then(after)
+                        .map_err(|e| undurable(IndexError::Commit(e), &mut report))?;
                     (catalog, true, None, None, result)
                 }
             };
@@ -608,7 +622,9 @@ fn run<T>(
                 txn.keep(root.as_os_str().as_bytes())
                     .map_err(IndexError::Keep)?;
             }
-            let (catalog, result) = txn.commit_then(after).map_err(IndexError::Commit)?;
+            let (catalog, result) = txn
+                .commit_then(after)
+                .map_err(|e| undurable(IndexError::Commit(e), &mut report))?;
             report.commit_time += started.elapsed().saturating_sub(after_time.get());
             finish_report(&mut report, &catalog, &plan, true, None, None);
             Ok((report, result))
@@ -693,7 +709,7 @@ pub(crate) fn recrawl_scoped(
     let changed = !changes.records.is_empty();
     let catalog = session
         .commit(&changes, options.sniffer)
-        .map_err(update_error)?;
+        .map_err(|e| undurable(update_error(e), &mut report))?;
     let (faulted, aliases) = reporting_ids(session, previous.generation(), &changes);
     report.commit_time += started.elapsed();
     finish_report(
@@ -2119,12 +2135,31 @@ fn full_rewalk(
     let started = Instant::now();
     let catalog = session
         .rebuild_checkpoint(batches, options.sniffer, fingerprint(options))
-        .map_err(update_error)?;
+        .map_err(|e| undurable(update_error(e), &mut report))?;
     report.commit_time += started.elapsed();
     report.input_usage = usage;
     report.input_fallback = true;
     finish_report(&mut report, &catalog, &plan, true, None, None);
     Ok(report)
+}
+
+/// A publication error that left the new generation visible takes the run's
+/// report with it ([`IndexError::Undurable`]), so the roots D119 withdrew
+/// from that generation are still reported. Any other error is returned as
+/// it is: nothing was published, and the report would describe nothing.
+fn undurable(error: IndexError, report: &mut Report) -> IndexError {
+    let published = match &error {
+        IndexError::Commit(e) => e.published(),
+        IndexError::Update(e) => e.published(),
+        _ => false,
+    };
+    if !published {
+        return error;
+    }
+    IndexError::Undurable {
+        error: Box::new(error),
+        report: Box::new(std::mem::take(report)),
+    }
 }
 
 fn update_error(error: ferret_catalog::log::Error) -> IndexError {

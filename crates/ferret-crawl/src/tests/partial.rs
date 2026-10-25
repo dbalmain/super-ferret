@@ -384,3 +384,94 @@ fn a_withdrawn_root_is_reported_when_reconciling_falls_back_to_a_full_rewalk() {
     assert_eq!(roots(&catalog), [good.clone(), old.clone()]);
     assert!(!names(&catalog).iter().any(|p| p.starts_with(&bad)));
 }
+
+/// How [`a_withdrawal_survives_an_undurable_publication`] publishes: an
+/// initial checkpoint with no catalog, a log commit through `index_change`
+/// over an existing empty catalog, or a resident session's recrawl.
+const UNDURABLE_CHILD: &str = "FERRET_UNDURABLE_CHILD";
+
+/// D119 withdraws `bad`, then the new generation is renamed into place and the
+/// step after the rename fails (the catalog's `ManifestRename` seam, through
+/// `$FERRET_CATALOG_TEST_FAIL`; its `DirectorySync` seam also fires on the
+/// ancestor syncs every writer begins with, so it cannot single out this
+/// one). The generation is visible without `bad`, so the error must still
+/// carry the withdrawal: a caller that saw only the durability error would
+/// report a complete run. The failure is injected by environment, so each case
+/// runs in a child of this test.
+#[test]
+fn a_withdrawal_survives_an_undurable_publication() {
+    if let Some(how) = std::env::var_os(UNDURABLE_CHILD) {
+        let base = PathBuf::from(std::env::var_os("FERRET_UNDURABLE_BASE").unwrap());
+        let (cat, good, bad) = (base.join("cat"), base.join("good"), base.join("bad"));
+        let add = [good, bad.clone()];
+        let change = RootChange {
+            add: &add,
+            remove: &[],
+        };
+        let result = match how.to_str().unwrap() {
+            "checkpoint" | "existing" => {
+                index_change(&cat, change, Refresh::Only(&add), &options())
+            }
+            "session" => {
+                let mut session = open_or_create(&cat, &options()).unwrap();
+                session_change(&mut session, change, Refresh::Only(&add), &options())
+            }
+            other => panic!("unknown case {other}"),
+        };
+        let error = result.unwrap_err();
+        let IndexError::Undurable { error, report } = error else {
+            panic!("expected an undurable publication, got {error:?}");
+        };
+        assert!(
+            matches!(&*error, IndexError::Commit(e) if e.published())
+                || matches!(&*error, IndexError::Update(e) if e.published()),
+            "{error:?}"
+        );
+        let failed: Vec<_> = report.failed_roots.iter().map(|f| &f.root).collect();
+        assert_eq!(failed, [&bad]);
+        assert!(
+            report.failed_roots[0]
+                .faults
+                .iter()
+                .all(|f| f.op == IoOp::ReadIgnore)
+        );
+        // libtest swallows a passing test's stdout, so the parent checks a
+        // file.
+        fs::write(base.join(".checked"), b"1").unwrap();
+        return;
+    }
+
+    for how in ["checkpoint", "existing", "session"] {
+        let tmp = Tmp::new(&format!("d119-undurable-{how}"));
+        let good = root(&tmp, "good");
+        let bad = root(&tmp, "bad");
+        fs::write(good.join("seen.txt"), b"healthy\n").unwrap();
+        fs::write(bad.join("hidden.txt"), b"uncertain\n").unwrap();
+        fault(&bad);
+        if how != "checkpoint" {
+            // Created before the failure is armed: creating it publishes.
+            drop(open_or_create(&tmp.cat(), &options()).unwrap());
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("tests::partial::a_withdrawal_survives_an_undurable_publication")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(UNDURABLE_CHILD, how)
+            .env("FERRET_UNDURABLE_BASE", &tmp.base)
+            .env("FERRET_CATALOG_TEST_FAIL", "ManifestRename")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && tmp.base.join(".checked").exists(),
+            "{how}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The failure came after the rename: readers see the healthy root,
+        // and the withdrawn one nowhere.
+        let catalog = open(&tmp);
+        assert_eq!(roots(&catalog), std::slice::from_ref(&good));
+        assert!(!names(&catalog).iter().any(|p| p.starts_with(&bad)));
+    }
+}

@@ -743,7 +743,9 @@ fn run_explicit(
             .error = Some(error.to_string());
         if matches!(
             error,
-            ferret_crawl::IndexError::Update(_) | ferret_crawl::IndexError::Commit(_)
+            ferret_crawl::IndexError::Update(_)
+                | ferret_crawl::IndexError::Commit(_)
+                | ferret_crawl::IndexError::Undurable { .. }
         ) && let Some(w) = watch
         {
             w.backstop(RefreshReason::Backstop);

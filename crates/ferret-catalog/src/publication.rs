@@ -22,6 +22,9 @@ pub(crate) enum Point {
     RecoveryDirectorySync,
 }
 
+/// Debug builds also fail the point that `$FERRET_CATALOG_TEST_FAIL` names
+/// (`ManifestRename`, say) on every visit, so another crate's test, or the
+/// CLI, can drive a real publication failure in a child process.
 pub(crate) fn hit(point: Point) -> io::Result<()> {
     #[cfg(test)]
     {
@@ -33,7 +36,13 @@ pub(crate) fn hit(point: Point) -> io::Result<()> {
             return Err(io::Error::other(format!("injected stop after {point:?}")));
         }
     }
-    #[cfg(not(test))]
+    #[cfg(debug_assertions)]
+    if std::env::var_os("FERRET_CATALOG_TEST_FAIL")
+        .is_some_and(|name| name.to_str() == Some(&format!("{point:?}")))
+    {
+        return Err(io::Error::other(format!("injected failure at {point:?}")));
+    }
+    #[cfg(not(any(test, debug_assertions)))]
     let _ = point;
     Ok(())
 }

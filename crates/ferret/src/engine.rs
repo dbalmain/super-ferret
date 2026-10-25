@@ -262,7 +262,9 @@ impl Engine {
     ) -> Result<(), ferret_crawl::IndexError> {
         if matches!(
             error,
-            ferret_crawl::IndexError::Update(_) | ferret_crawl::IndexError::Commit(_)
+            ferret_crawl::IndexError::Update(_)
+                | ferret_crawl::IndexError::Commit(_)
+                | ferret_crawl::IndexError::Undurable { .. }
         ) {
             let view = writer.recover().map_err(ferret_crawl::IndexError::Update)?;
             self.select(view);
