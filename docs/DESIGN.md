@@ -44,16 +44,16 @@ ferret-text    → (std only)
 ferret-bench   → anything; nothing depends on it
 ```
 
-| Crate            | Owns                                                                                                                           | Knows nothing about            |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
-| `ferret-policy`  | `DirRules::decide(path, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global (D13); the defaults setup writes | the catalog, the index         |
-| `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing                                                          | query, index formats           |
-| `ferret-catalog` | names, inodes, documents, storage, name dictionary and catalog row postings (D54, S1b)                                        | content tokens and document postings |
-| `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                         | files, ids                     |
-| `ferret-index`   | segments over doc ids; each structure is a `Source` of the candidate seam                                                      | files, paths, inodes           |
-| `ferret-verify`  | re-reading a file and matching a query atom against its bytes                                                                  | how candidates were found      |
-| `ferret-query`   | query syntax, planning, execution, result rows                                                                                 | any structure's on-disk format |
-| `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                              | —                              |
+| Crate            | Owns                                                                                                                                   | Knows nothing about                  |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `ferret-policy`  | `DirRules::decide(path, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global (D13); the defaults setup writes         | the catalog, the index               |
+| `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing; the stat/read bracket around reading a document                 | query, index formats                 |
+| `ferret-catalog` | names, inodes, documents, storage, name dictionary and catalog row postings (D54, S1b)                                                 | content tokens and document postings |
+| `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                                 | files, ids                           |
+| `ferret-index`   | segments over doc ids; each structure is a `Source` of the candidate seam                                                              | source/document files, paths, inodes |
+| `ferret-verify`  | matching a query atom against bytes a host has read (the crawl bracket, adapted by `ferret`); GNU find regex dialects                  | how candidates were found            |
+| `ferret-query`   | query syntax, planning, execution, result rows; find's parser, walk and actions; grep's argv, line records and verification scheduling | any structure's on-disk format       |
+| `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                                      | —                                    |
 
 Grep M1 (2026-10-16) adds no dependency edge: query’s `line_grep` owns
 rg argv parsing, candidate selection and line records; verify owns its resolved

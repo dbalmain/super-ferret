@@ -14,10 +14,13 @@
 //!   bounded backreference matching and fallible budget reporting.
 //! - [`toolchain`]: the ledger for the scanner's AVX2 arm (D11).
 //!
-//! A file whose `(size, mtime)` no longer matches the catalog is reported as
-//! stale, never matched against (from S3, when content is verified).
+//! Matching only: this crate opens no files. The crawl brackets each read and
+//! `ferret` adapts that observation to query outcomes; a file whose `(size,
+//! mtime)` differs from the catalog but read stably is matched, path-locally,
+//! on the bytes read, while one that changed during the read is retried or
+//! reported and never matched.
 //!
-//! Knows nothing about how candidates were found.
+//! Knows nothing about how candidates were found or how bytes were read.
 
 mod dialect;
 pub mod matcher;
