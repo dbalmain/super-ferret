@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ferret_catalog::Catalog;
-use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
+use ferret_catalog::{Catalog, Generation};
+use ferret_query::find::{Effects, Outcome, OutputBuffer, Plan, Unsupported, WalkError};
 
 use crate::cli::{self, Exit};
 use crate::config_file::Contents;
-use crate::engine::Engine;
+use crate::engine::{Engine, QuerySession};
 use crate::find_json::{self, FrameOutput};
 use crate::protocol::ChildStdin;
 use crate::xdg::Dirs;
@@ -23,22 +23,51 @@ use crate::xdg::Dirs;
 pub(crate) const PERMISSION_WARNING: &str =
     "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form";
 
-/// The catalog a find plan walks: the full engine, whose name index serves
-/// a plain `-name` listing, or for an action plan, which never reads that
-/// index, the bare catalog with only the sections the plan reads (D56 A
-/// still runs actions here; D78's resident open is skipped for them).
-enum FindCatalog {
-    Engine(Box<Engine>),
+/// The source a prepared find walks, and the catalog view a JSON `begin`
+/// names. A plain listing pins the full engine, whose name index serves
+/// `-name`; an action plan, which never reads that index, walks the bare
+/// catalog with only the sections it reads (D56 A still runs actions here;
+/// D78's resident open is skipped for them); `Live` walks the unrestricted
+/// tree and selects no view.
+pub(crate) enum FindSource {
+    Pinned(Box<QuerySession>),
     Sections(Box<Catalog>),
+    Live,
 }
 
-/// Resolves the catalog a find plan should walk through: `None` for a live,
-/// unindexed walk (`-I`, a configured `find_no_ignore`, or an information
-/// plan), `Some` for a catalog-backed walk, or an error message (without a
-/// `find: ` prefix) describing why neither is available.
-fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<FindCatalog>, String> {
+impl FindSource {
+    /// The catalog view this source selected, if any.
+    pub(crate) fn generation(&self) -> Option<Generation> {
+        match self {
+            Self::Pinned(session) => Some(session.generation()),
+            Self::Sections(catalog) => Some(catalog.generation()),
+            Self::Live => None,
+        }
+    }
+
+    pub(crate) fn run<E: Effects + Clone + Send>(
+        self,
+        plan: &Plan,
+        effects: E,
+        workers: usize,
+    ) -> Result<Outcome, Unsupported> {
+        match self {
+            Self::Pinned(session) => session.find(plan, effects, workers),
+            Self::Sections(catalog) => {
+                plan.run_parallel(plan.parallel_catalog_source(*catalog), effects, workers)
+            }
+            Self::Live => plan.run_parallel(plan.live_source(), effects, workers),
+        }
+    }
+}
+
+/// Resolves the source a find plan should walk: `Live` for an unindexed walk
+/// (`-I`, a configured `find_no_ignore`, or an information plan), a catalog
+/// source otherwise, or an error message (without a `find: ` prefix)
+/// describing why neither is available.
+fn resolve_source(plan: &Plan, index: Option<&Path>) -> Result<FindSource, String> {
     if plan.no_ignore() || plan.is_information() {
-        return Ok(None);
+        return Ok(FindSource::Live);
     }
     let dirs = Dirs::from_env();
     let config = Dirs::config_from_env().ok().map(|dir| dir.join("config"));
@@ -51,7 +80,7 @@ fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<FindCatal
         }
     };
     if no_ignore {
-        return Ok(None);
+        return Ok(FindSource::Live);
     }
     let index = index
         .map(Path::to_owned)
@@ -64,10 +93,10 @@ fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<FindCatal
     let Some(index) = index else {
         return Err("cannot locate index; set --index or FERRET_INDEX, or use -I".to_owned());
     };
-    open_catalog(plan, &index).map(Some)
+    open_catalog(plan, &index)
 }
 
-fn open_catalog(plan: &Plan, index: &Path) -> Result<FindCatalog, String> {
+fn open_catalog(plan: &Plan, index: &Path) -> Result<FindSource, String> {
     let missing = || {
         format!(
             "no index in {}; run ferret index DIR or use -I",
@@ -78,10 +107,10 @@ fn open_catalog(plan: &Plan, index: &Path) -> Result<FindCatalog, String> {
         let failed = |error| format!("{}: {error}; re-index or use -I", index.display());
         let catalog = Catalog::open(index).map_err(failed)?.ok_or_else(missing)?;
         catalog.load(&plan.catalog_sections()).map_err(failed)?;
-        return Ok(FindCatalog::Sections(Box::new(catalog)));
+        return Ok(FindSource::Sections(Box::new(catalog)));
     }
     match Engine::open(index) {
-        Ok(Some(engine)) => Ok(FindCatalog::Engine(Box::new(engine))),
+        Ok(Some(engine)) => Ok(FindSource::Pinned(Box::new(engine.pin()))),
         Ok(None) => Err(missing()),
         Err(error) => Err(format!(
             "cannot open index in {}: {error}; re-index or use -I",
@@ -139,8 +168,8 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     if let Some(exit) = remote(args, index, &plan, false, now) {
         return exit;
     }
-    let catalog = match resolve_catalog(&plan, index) {
-        Ok(catalog) => catalog,
+    let source = match resolve_source(&plan, index) {
+        Ok(source) => source,
         Err(message) => {
             cli::error(&format!("find: {message}"));
             return Exit::NoMatch;
@@ -151,16 +180,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     }
     let mut effects = Output::stdout();
     let workers = ferret_crawl::default_workers();
-    let result = match catalog {
-        Some(FindCatalog::Engine(engine)) => engine.pin().find(&plan, effects.clone(), workers),
-        Some(FindCatalog::Sections(catalog)) => plan.run_parallel(
-            plan.parallel_catalog_source(*catalog),
-            effects.clone(),
-            workers,
-        ),
-        None => plan.run_parallel(plan.live_source(), effects.clone(), workers),
-    };
-    let outcome = match result {
+    let outcome = match source.run(&plan, effects.clone(), workers) {
         Ok(outcome) => outcome,
         Err(error) => {
             cli::error(&format!(
@@ -186,116 +206,53 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
 }
 
 /// Runs `ferret --json find ARGS...`: the CLI's own structured-output host.
-/// Emits the same tagged begin/stdout/stderr/diagnostic/end events as a batch
-/// find block (`crate::batch`), under the fixed id `"find"` — there is only
-/// ever one find request in this process, so no id negotiation is needed.
-/// The child's stdin inherits the caller's, as the raw CLI does;
-/// `-ok`/`-okdir` still refuse outside a terminal (`FrameOutput::confirm`
-/// checks that itself). There is no protocol caller here to withhold
+/// Emits the same framed block as a batch or socket find
+/// ([`find_json::run_block`]) under the fixed id `"find"` — there is only ever
+/// one find request in this process, so no id negotiation is needed. The
+/// child's stdin inherits the caller's, as the raw CLI does; `-ok`/`-okdir`
+/// still refuse outside a terminal (`FrameOutput::confirm` checks that
+/// itself). There is no protocol caller here to withhold
 /// `local-effects`/`interactive` from, so `find_json::refusal`'s capability
 /// gate does not apply; this host runs every action the plan asks for. The
 /// process exit status is find's native status (`Exit::Ok`/`Exit::NoMatch`);
 /// parse and resolution failures are reported as a `diagnostic` plus an `end`
-/// with the message, matching batch's shape, rather than a bare stderr line.
+/// with the message, after a `begin` whose generation is null because no view
+/// was selected.
 pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     const ID: &str = "find";
     let started = std::time::Instant::now();
     let now = std::time::SystemTime::now();
-    let end = |status: i128, error: Option<&str>| {
-        find_json::emit(ID, "end", |o| {
-            o.int("exit", status)
-                .bool("cancelled", false)
-                .int("elapsed_us", started.elapsed().as_micros() as i128);
-            if let Some(error) = error {
-                o.str("error", error);
+    let (plan, source) = match Plan::parse_started(args, now) {
+        Err(error) => (
+            Err(find_json::Failure::new("parse", error.to_string())),
+            FindSource::Live,
+        ),
+        // The block reports the unsupported feature; nothing is routed or
+        // opened for a plan that cannot run.
+        Ok(plan) if plan.unsupported().is_some() => (Ok(plan), FindSource::Live),
+        Ok(plan) => {
+            if let Some(exit) = remote(args, index, &plan, true, now) {
+                return exit;
             }
-        })
-    };
-    let output_error = |error: io::Error| {
-        cli::error(&format!("find: writing stdout: {error}"));
-        Exit::NoMatch
-    };
-    let plan = match Plan::parse_started(args, now) {
-        Ok(plan) => plan,
-        Err(error) => {
-            if let Err(error) = find_json::emit(ID, "begin", |o| find_json::generation(o, None)) {
-                return output_error(error);
+            match resolve_source(&plan, index) {
+                Ok(source) => (Ok(plan), source),
+                Err(message) => (
+                    Err(find_json::Failure::new("resolve", message)),
+                    FindSource::Live,
+                ),
             }
-            if let Err(error) = find_json::diagnostic(ID, "parse", "error", None) {
-                return output_error(error);
-            }
-            if let Err(error) = end(1, Some(&error.to_string())) {
-                return output_error(error);
-            }
-            return Exit::NoMatch;
         }
     };
-    if let Some(feature) = plan.unsupported() {
-        if let Err(error) = find_json::emit(ID, "begin", |o| find_json::generation(o, None)) {
-            return output_error(error);
-        }
-        let message = feature.to_string_lossy();
-        if let Err(error) = find_json::diagnostic(ID, &message, "error", None) {
-            return output_error(error);
-        }
-        if let Err(error) = end(1, Some(&message)) {
-            return output_error(error);
-        }
-        return Exit::NoMatch;
-    }
-    if let Some(exit) = remote(args, index, &plan, true, now) {
-        return exit;
-    }
-    if let Err(error) = find_json::emit(ID, "begin", |o| find_json::generation(o, None)) {
-        return output_error(error);
-    }
-    let catalog = match resolve_catalog(&plan, index) {
-        Ok(catalog) => catalog,
-        Err(message) => {
-            if let Err(error) = find_json::diagnostic(ID, "resolve", "error", None) {
-                return output_error(error);
-            }
-            if let Err(error) = end(1, Some(&message)) {
-                return output_error(error);
-            }
-            return Exit::NoMatch;
-        }
-    };
-    if plan.permission_warning()
-        && let Err(error) = find_json::diagnostic(ID, "permission", "warning", None)
-    {
-        return output_error(error);
-    }
     let host = FrameOutput::new(ID, ChildStdin::Inherit).with_warning_stderr();
     let workers = ferret_crawl::default_workers();
-    let result = match catalog {
-        Some(FindCatalog::Engine(engine)) => engine.pin().find(&plan, host.clone(), workers),
-        Some(FindCatalog::Sections(catalog)) => plan.run_parallel(
-            plan.parallel_catalog_source(*catalog),
-            host.clone(),
-            workers,
-        ),
-        None => plan.run_parallel(plan.live_source(), host.clone(), workers),
-    };
-    let status = match result {
-        Ok(outcome) => i128::from(outcome.errors != 0),
+    match find_json::run_block(host, source, plan, workers, started) {
+        Ok(0) => Exit::Ok,
+        Ok(_) => Exit::NoMatch,
         Err(error) => {
-            if let Err(error) = find_json::diagnostic(ID, "runtime", "error", None) {
-                return output_error(error);
-            }
-            if let Err(error) = end(1, Some(&error.to_string())) {
-                return output_error(error);
-            }
-            return Exit::NoMatch;
+            cli::error(&format!("find: writing stdout: {error}"));
+            Exit::NoMatch
         }
-    };
-    if let Err(error) = host.check_transport() {
-        return output_error(error);
     }
-    if let Err(error) = end(status, None) {
-        return output_error(error);
-    }
-    if status == 0 { Exit::Ok } else { Exit::NoMatch }
 }
 
 #[derive(Clone)]
@@ -481,12 +438,12 @@ mod tests {
         };
 
         match open_catalog(&plan(&["-exec", "true", "{}", "+"]), &index) {
-            Ok(FindCatalog::Sections(catalog)) => assert!(catalog.resident_names().is_none()),
+            Ok(FindSource::Sections(catalog)) => assert!(catalog.resident_names().is_none()),
             _ => panic!("an action plan opened the engine"),
         }
         assert!(matches!(
             open_catalog(&plan(&["-name", "one"]), &index),
-            Ok(FindCatalog::Engine(_))
+            Ok(FindSource::Pinned(_))
         ));
         let _ = std::fs::remove_dir_all(directory);
     }

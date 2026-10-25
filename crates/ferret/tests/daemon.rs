@@ -1393,6 +1393,38 @@ fn structured_read_only_find_attaches_and_keeps_its_tagged_codec() {
     assert_eq!(tree.sockets().len(), 1);
 }
 
+/// Local fallback and the daemon frame one JSON find through the same block,
+/// so both name the catalog view they walked. Only timings and the worker
+/// grant may differ.
+#[test]
+fn json_find_names_the_same_generation_locally_and_through_the_daemon() {
+    fn normalised(stdout: &[u8]) -> String {
+        let mut text = String::from_utf8(stdout.to_vec()).unwrap();
+        for key in ["\"elapsed_us\":", "\"workers\":"] {
+            while let Some(at) = text.find(key) {
+                let digits = text[at + key.len()..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap();
+                text.replace_range(at..at + key.len() + digits, "");
+            }
+        }
+        text
+    }
+    let tree = Tree::new();
+    tree.start(&[]);
+    let args = ["--json", "find", "src", "-maxdepth", "0"];
+    let daemon = tree.run(&args);
+    let local = tree.local(&args);
+    assert_eq!(local.status.code(), Some(0));
+    assert_eq!(daemon.status.code(), local.status.code());
+    let local_text = normalised(&local.stdout);
+    assert!(
+        local_text.starts_with("{\"id\":\"find\",\"event\":\"begin\",\"generation\":{"),
+        "{local_text}"
+    );
+    assert_eq!(normalised(&daemon.stdout), local_text);
+}
+
 #[test]
 fn drain_on_active_connection_finishes_the_query_before_exit() {
     let tree = Tree::new();

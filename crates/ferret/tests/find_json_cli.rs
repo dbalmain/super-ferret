@@ -233,3 +233,40 @@ fn closed_pipe() -> Stdio {
     drop(reader);
     writer.into()
 }
+
+/// `begin` names the catalog view the prepared find selected: none for a
+/// failed parse, an index that cannot be found, or a live walk; the same
+/// published view for a pinned listing and a bare-catalog action plan.
+#[test]
+fn json_find_begin_names_the_selected_view() {
+    fn begin(output: &Output) -> String {
+        let text = String::from_utf8(output.stdout.clone()).unwrap();
+        text.lines().next().unwrap().to_owned()
+    }
+    const NULL: &str = r#"{"id":"find","event":"begin","generation":null}"#;
+    let tree = Tree::new("generation");
+    let parse = tree.json(&["d", "-no-such-test"]);
+    assert_eq!(parse.status.code(), Some(1));
+    assert_eq!(begin(&parse), NULL);
+    assert!(String::from_utf8_lossy(&parse.stdout).contains("\"code\":\"parse\""));
+    let missing = tree.json(&["d", "-maxdepth", "0"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(begin(&missing), NULL);
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("\"code\":\"resolve\""));
+
+    let mut index = fixture::command(FERRET, &tree.0);
+    assert!(index.args(["index", "d"]).status().unwrap().success());
+    let live = tree.json(&["-I", "d", "-maxdepth", "0"]);
+    assert_eq!(live.status.code(), Some(0));
+    assert_eq!(begin(&live), NULL);
+    let listing = tree.json(&["d", "-maxdepth", "0"]);
+    let action = tree.json(&["d", "-maxdepth", "0", "-exec", "true", ";"]);
+    assert_eq!(listing.status.code(), Some(0));
+    assert_eq!(action.status.code(), Some(0));
+    assert!(
+        begin(&listing).starts_with(r#"{"id":"find","event":"begin","generation":{"incarnation":"#),
+        "{}",
+        begin(&listing)
+    );
+    assert_eq!(begin(&action), begin(&listing));
+}

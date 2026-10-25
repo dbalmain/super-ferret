@@ -1,5 +1,6 @@
-//! JSON find effects for the batch host. Stdout uses the
-//! evaluator's transaction gate; stderr streams independently during capture.
+//! JSON find framing and effects, shared by the CLI's `--json find` and the
+//! batch/socket host. Stdout uses the evaluator's transaction gate; stderr
+//! streams independently during capture.
 
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -9,9 +10,11 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError, mark_output_failure};
 
+use crate::find::FindSource;
 use crate::json::Object;
 use crate::protocol::{ChildStdin, Request};
 use crate::transport::Destination;
@@ -67,6 +70,90 @@ pub(crate) fn refusal(plan: &Plan, request: &Request, protocol_stdin: bool) -> O
         return Some(Refusal::ChildStdinRequired);
     }
     None
+}
+
+/// Why a find block ends before its walk: the diagnostic code it reports, if
+/// any, and the end event's `error`.
+pub(crate) struct Failure {
+    code: Option<String>,
+    error: String,
+}
+
+impl Failure {
+    pub(crate) fn new(code: &str, error: String) -> Self {
+        Self {
+            code: Some(code.to_owned()),
+            error,
+        }
+    }
+    /// A capability refusal ends the block with its code and no diagnostic.
+    pub(crate) fn refused(refusal: Refusal) -> Self {
+        Self {
+            code: None,
+            error: refusal.code().to_owned(),
+        }
+    }
+}
+
+/// Runs one framed find block on `host`'s destination and returns find's
+/// native status: `begin` naming the generation `source` selected, then
+/// diagnostics and output frames, then `end`. Shared by the CLI's `--json
+/// find` and the batch/socket runner so the hosts cannot describe one find
+/// differently. Authority stays with the caller: it parsed and gated the
+/// plan, chose the source, and built `host` with its child stdin. A failed
+/// `plan` still gets its begin/end block; nothing is written after a
+/// transport failure.
+pub(crate) fn run_block(
+    host: FrameOutput<'_>,
+    source: FindSource,
+    plan: Result<Plan, Failure>,
+    workers: usize,
+    started: Instant,
+) -> io::Result<u8> {
+    let destination = host.destination.clone();
+    let id = host.id;
+    emit_to(&destination, id, "begin", |o| {
+        generation(o, source.generation());
+    })?;
+    let end = |status: u8, error: Option<&str>| {
+        emit_to(&destination, id, "end", |o| {
+            o.int("exit", status)
+                .bool("cancelled", destination.cancelled())
+                .int("elapsed_us", started.elapsed().as_micros() as i128)
+                .int("workers", workers as u64);
+            if let Some(error) = error {
+                o.str("error", error);
+            }
+        })
+    };
+    let failure = match plan {
+        Err(failure) => failure,
+        Ok(plan) => {
+            if plan.permission_warning() {
+                diagnostic_to(&destination, id, "permission", "warning", None)?;
+            }
+            if let Some(feature) = plan.unsupported() {
+                let feature = feature.to_string_lossy();
+                Failure::new(&feature, feature.to_string())
+            } else {
+                match source.run(&plan, host.clone(), workers) {
+                    Ok(outcome) => {
+                        host.check_transport()?;
+                        let status = u8::from(outcome.errors != 0);
+                        end(status, None)?;
+                        return Ok(status);
+                    }
+                    Err(error) => Failure::new("runtime", error.to_string()),
+                }
+            }
+        }
+    };
+    if let Some(code) = &failure.code {
+        diagnostic_to(&destination, id, code, "error", None)?;
+    }
+    host.check_transport()?;
+    end(1, Some(&failure.error))?;
+    Ok(1)
 }
 
 #[derive(Clone)]
@@ -409,13 +496,7 @@ fn base64(bytes: &[u8]) -> String {
     crate::json::encode_base64(&mut out, bytes);
     String::from_utf8(out).unwrap_or_default()
 }
-/// Writes one tagged event line: `{"id":ID,"event":NAME,...fill...}`. Shared
-/// by batch's per-request begin/end framing and the CLI's `--json find`
-/// host, so both encode the same event shape through one writer.
-pub(crate) fn emit(id: &str, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
-    emit_to(&Destination::Stdout, id, name, fill)
-}
-
+/// Writes one tagged event line: `{"id":ID,"event":NAME,...fill...}`.
 pub(crate) fn emit_to(
     destination: &Destination,
     id: &str,
@@ -431,8 +512,7 @@ pub(crate) fn emit_to(
 }
 
 /// Writes a `"generation"` field: an object for a pinned engine, else null.
-/// Shared between batch's `begin`/`status`/`reload` events and the CLI's
-/// `--json find` host.
+/// Shared by find's `begin` and batch's `status`/`reload` events.
 pub(crate) fn generation(object: &mut Object<'_>, value: Option<ferret_catalog::Generation>) {
     if let Some(value) = value {
         object.object("generation", |o| {
@@ -447,15 +527,6 @@ pub(crate) fn generation(object: &mut Object<'_>, value: Option<ferret_catalog::
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-pub(crate) fn diagnostic(
-    id: &str,
-    code: &str,
-    severity: &str,
-    path: Option<&[u8]>,
-) -> io::Result<()> {
-    diagnostic_to(&Destination::Stdout, id, code, severity, path)
 }
 
 pub(crate) fn diagnostic_to(

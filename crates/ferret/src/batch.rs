@@ -13,7 +13,8 @@ use ferret_query::{Query, Row};
 
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
-use crate::find_json::{FrameOutput, RawStdout, diagnostic_to, generation};
+use crate::find::FindSource;
+use crate::find_json::{Failure, FrameOutput, RawStdout, generation};
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
 use crate::search::{self, Run, Summary, json_row};
@@ -403,9 +404,6 @@ pub(crate) fn find_request(
     let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns)
     });
-    event_to(destination, request, "begin", |o| {
-        generation(o, session.as_ref().map(QuerySession::generation))
-    })?;
     let cwd = request
         .cwd
         .as_deref()
@@ -417,8 +415,15 @@ pub(crate) fn find_request(
         .cloned()
         .map(OsString::from_vec)
         .collect();
-    let parsed = Plan::parse_at(&args, &cwd, now);
-    let mut status = 1u8;
+    // The batch host's own authority: a plan the request's capabilities or
+    // stdin do not permit ends the block refused.
+    let plan = match Plan::parse_at(&args, &cwd, now) {
+        Ok(plan) => match crate::find_json::refusal(&plan, request, protocol_stdin) {
+            Some(refusal) => Err(Failure::refused(refusal)),
+            None => Ok(plan),
+        },
+        Err(error) => Err(Failure::new("parse", error.to_string())),
+    };
     let host = FrameOutput::new(
         &request.id,
         request.child_stdin.unwrap_or(protocol::ChildStdin::Null),
@@ -431,67 +436,10 @@ pub(crate) fn find_request(
             .iter()
             .any(|capability| capability == "test-find-panic"),
     );
-    let mut query_error = None;
-    match parsed {
-        Ok(plan) => {
-            if let Some(error) = crate::find_json::refusal(&plan, request, protocol_stdin) {
-                event_to(destination, request, "end", |o| {
-                    o.int("exit", 1)
-                        .bool("cancelled", destination.cancelled())
-                        .str("error", error.code())
-                        .int("elapsed_us", started.elapsed().as_micros() as i128)
-                        .int("workers", workers as u64);
-                })?;
-                return Ok(());
-            }
-            if plan.permission_warning() {
-                diagnostic_to(destination, &request.id, "permission", "warning", None)?;
-            }
-            if let Some(feature) = plan.unsupported() {
-                diagnostic_to(
-                    destination,
-                    &request.id,
-                    &feature.to_string_lossy(),
-                    "error",
-                    None,
-                )?;
-                event_to(destination, request, "end", |o| {
-                    o.int("exit", 1)
-                        .bool("cancelled", destination.cancelled())
-                        .str("error", &feature.to_string_lossy())
-                        .int("elapsed_us", started.elapsed().as_micros() as i128)
-                        .int("workers", workers as u64);
-                })?;
-                return Ok(());
-            }
-            let result = if let Some(session) = session {
-                session.find(&plan, host.clone(), workers)
-            } else {
-                plan.run_parallel(plan.live_source(), host.clone(), workers)
-            };
-            match result {
-                Ok(outcome) => status = if outcome.errors == 0 { 0 } else { 1 },
-                Err(error) => {
-                    diagnostic_to(destination, &request.id, "runtime", "error", None)?;
-                    query_error = Some(error.to_string());
-                }
-            }
-        }
-        Err(error) => {
-            diagnostic_to(destination, &request.id, "parse", "error", None)?;
-            query_error = Some(error.to_string());
-        }
-    }
-    host.check_transport()?;
-    event_to(destination, request, "end", |o| {
-        o.int("exit", status)
-            .bool("cancelled", destination.cancelled())
-            .int("elapsed_us", started.elapsed().as_micros() as i128)
-            .int("workers", workers as u64);
-        if let Some(error) = query_error.as_deref() {
-            o.str("error", error);
-        }
-    })
+    let source = session.map_or(FindSource::Live, |session| {
+        FindSource::Pinned(Box::new(session))
+    });
+    crate::find_json::run_block(host, source, plan, workers, started).map(drop)
 }
 
 fn event(id: &Request, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
