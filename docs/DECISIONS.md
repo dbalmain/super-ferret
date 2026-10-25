@@ -6872,3 +6872,40 @@ I/O on every root to catch it. C is the shape to build if it ever matters.
 
 **Fact that would change it:** a real workflow of yours that edits files
 under `~/w` in place through links outside it — then C.
+
+> Dave: A. Exceedingly rare; waiting for a full walk is fine. (2026-10-26)
+> The interval of that full walk is D121.
+
+## D121 — How often should the full backstop walk run?
+
+**Question:** The daemon re-walks every root once an hour (`FERRET_BACKSTOP_MS`,
+default 3,600,000). Should it stay hourly, become daily, or be chosen from a
+measurement of what one walk costs?
+
+Context:
+
+- The walk stats every entry and compares `(size, mtime, ctime)` with the
+  catalog; unchanged files are not opened. It runs at nice 19 through the
+  paced writer.
+- DESIGN's re-run figures: about 2 GiB peak at 10M entries (old generation
+  plus new batches, ~120 B per entry). Nothing measures a backstop on a real
+  machine: the daemon does not log its own refreshes.
+- The same walk is the only bound for other changes inotify never reports:
+  D120's outside hard link, permission changes without an event (LSM, group
+  membership, FUSE), a mount appearing, EACCES-opaque directories. Lengthening
+  it delays all of them.
+- The interval is an environment variable only, not a config value.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep 1 h | Up to 24 walks a day, each with its memory peak | Unreported changes appear within the hour |
+| B. Default to daily, as a config value | Those changes wait up to a day | ~1/24 of the walk cost; tunable per machine |
+| C. Measure first (wall-clock, peak RSS, bytes read on each machine), then pick | One measured walk per machine | The interval rests on a number |
+
+**Recommendation: C, then B** unless the walk is cheap.
+
+**Fact that would change it:** a walk on `~/w` of a few seconds and well under
+100 MB makes A free; minutes or several hundred MB means B.
+
+> Dave: agreed, C then B. Keep 1 h meanwhile; measure on the three machines.
+> (2026-10-26)
