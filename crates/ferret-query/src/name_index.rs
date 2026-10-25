@@ -169,7 +169,7 @@ impl NameIndex {
             out.delta.entry(edge.bytes.to_vec()).or_default().push(id);
             *out.scope_changes.entry(edge.parent).or_default() += 1;
         }
-        out.propagate_scope_changes(catalog);
+        out.propagate_scope_changes(catalog, &checkpoint);
         out.live_scopes = out
             .base
             .live_scopes
@@ -193,18 +193,29 @@ impl NameIndex {
         }
     }
 
-    fn propagate_scope_changes(&mut self, catalog: &Catalog) {
+    /// Adds each directory's change to its ancestors'. A directory the view
+    /// deleted still holds the change for its deleted checkpoint children,
+    /// and its own name is deleted too, so it climbs by its checkpoint
+    /// edge: where the base counted those rows.
+    fn propagate_scope_changes(&mut self, catalog: &Catalog, checkpoint: &Catalog) {
         let mut pending = std::mem::take(&mut self.scope_changes);
         while let Some((&dir, &change)) = pending.last_key_value() {
             pending.pop_last();
             *self.scope_changes.entry(dir).or_default() += change;
-            if let Some(edge) = catalog.dir_name(dir) {
-                let parent = catalog.name(edge).parent;
-                // Reparented directories make both affected ancestor chains
-                // unknown; their approximate counts are never used to plan.
-                if parent < dir {
-                    *pending.entry(parent).or_default() += change;
-                }
+            let parent = if catalog.is_live_inode(dir) {
+                catalog.dir_name(dir).map(|edge| catalog.name(edge).parent)
+            } else {
+                (dir.0 < checkpoint.base_dir_count())
+                    .then(|| checkpoint.dir_name(dir))
+                    .flatten()
+                    .map(|edge| checkpoint.name(edge).parent)
+            };
+            // Reparented directories make both affected ancestor chains
+            // unknown; their approximate counts are never used to plan.
+            if let Some(parent) = parent
+                && parent < dir
+            {
+                *pending.entry(parent).or_default() += change;
             }
         }
     }

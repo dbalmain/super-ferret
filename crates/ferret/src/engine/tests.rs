@@ -762,3 +762,44 @@ fn an_overtaken_merge_admission_cannot_reconcile_newer_content_backwards() {
     let content = engine.content.lock().unwrap();
     assert!(Arc::ptr_eq(&content.as_ref().unwrap().view(), &newer));
 }
+
+/// Removing a directory the checkpoint holds, children and a nested
+/// directory with it, leaves it dead in the overlay with its own name
+/// deleted. Adopting that view, after the refresh and again on a cold open,
+/// must climb from it by its checkpoint edge rather than ask the view for
+/// its deleted name.
+#[test]
+fn a_removed_checkpoint_directory_publishes_and_reopens() {
+    let tree = Tree::with_files(300);
+    fs::create_dir(tree.0.join("root/d2/nested")).unwrap();
+    fs::write(tree.0.join("root/d2/nested/inner.txt"), b"alpha inner").unwrap();
+    let engine = tree.compacted_engine();
+    let checkpoint = engine.pin().generation().checkpoint;
+    let removed = inode_named(engine.pin().catalog(), b"d2");
+    assert_eq!(text_files(&engine.pin()), 301);
+
+    fs::remove_dir_all(tree.0.join("root/d2")).unwrap();
+    tree.refresh(&engine);
+    let after = engine.pin();
+    assert_eq!(after.generation().checkpoint, checkpoint, "compacted");
+    assert!(!after.catalog().is_live_inode(removed));
+    assert_eq!(text_files(&after), 200);
+    drop((after, engine));
+
+    let reopened = Engine::open(&tree.0.join("index")).unwrap().unwrap();
+    assert_eq!(reopened.pin().generation().checkpoint, checkpoint);
+    assert_eq!(text_files(&reopened.pin()), 200);
+}
+
+/// Rows a name search for `.txt` finds through the session's name index.
+fn text_files(session: &QuerySession) -> usize {
+    let query = Query::from_args([b".txt".as_slice()], SystemTime::now()).unwrap();
+    let mut rows = 0;
+    session
+        .search(&query, |_| {
+            rows += 1;
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    rows
+}
