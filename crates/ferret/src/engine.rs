@@ -171,10 +171,11 @@ impl Engine {
     }
 
     /// Published log budget of the resident writer. `None` when this engine
-    /// has no writer. A caller that already holds the daemon engine mutex
-    /// may call this: the writer thread does not take that mutex while it
-    /// holds this one. A commit between [`Engine::pin`] and this read moves
-    /// the budget ahead of that pin.
+    /// has no writer. This waits for the writer lock, which a refresh, index
+    /// or follow holds for its whole operation, so never call it while
+    /// holding a lock queries need (the daemon's engine selection, say). A
+    /// commit between [`Engine::pin`] and this read moves the budget ahead of
+    /// that pin.
     pub(crate) fn log_budget(&self) -> Option<ferret_catalog::BudgetUsage> {
         self.writer
             .lock()

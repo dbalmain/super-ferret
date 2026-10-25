@@ -3543,6 +3543,74 @@ fn fatal_accept_error_joins_the_merge_before_removing_the_socket() {
     drop(writer);
 }
 
+/// Text stats reads the writer's log budget, which waits for a whole follow.
+/// That wait must not hold engine selection: a query on an open connection
+/// and a new connection's hello still run on the old pin (D32). The follow
+/// gate holds the writer lock, and the stats marker says the request has
+/// reached the budget read, so the checks below race nothing.
+#[test]
+#[cfg(debug_assertions)]
+fn text_stats_waiting_on_the_writer_does_not_block_queries_or_hello() {
+    let tree = Tree::new();
+    // More uncovered documents than the follow gate's ten checks, so the
+    // startup follow parks at the gate holding the writer lock.
+    for i in 0..24 {
+        fs::write(
+            tree.base.join(format!("src/burst-{i}.txt")),
+            format!("needle unique{i} words"),
+        )
+        .unwrap();
+    }
+    let indexed = tree.local(&["index", "src"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    fs::remove_dir_all(tree.base.join("index/index")).unwrap();
+    let gate = tree.base.join("content-gate");
+    fs::create_dir_all(&gate).unwrap();
+    fs::write(gate.join("follow"), b"hold").unwrap();
+    let reached = tree.base.join("stats-reached");
+    tree.start(&[
+        ("FERRET_BACKSTOP_MS", "3600000"),
+        ("FERRET_POLL_MS", "300000"),
+        ("FERRET_CONTENT_TEST_GATE", gate.to_str().unwrap()),
+        (
+            "FERRET_DAEMON_TEST_STATS_REACHED",
+            reached.to_str().unwrap(),
+        ),
+    ]);
+    wait(|| gate.join("follow.reached").exists());
+    let (mut query, _) = tree.connect();
+    let (mut stats, _) = tree.connect();
+    // Owned, not scoped: if the checks below fail, Tree's Drop must still
+    // be able to kill the daemon that this read is waiting on.
+    stats.get_ref().set_read_timeout(Some(BOUND * 6)).unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    let stats = std::thread::spawn(move || {
+        let output = block(
+            &mut stats,
+            b"{\"id\":\"t\",\"op\":\"status\",\"args\":[\"--stats-text\"]}\n",
+        );
+        let _ = done.send(());
+        output
+    });
+    wait(|| reached.exists());
+    // Each read is bounded by BOUND: a selection held behind the writer
+    // turns into a timeout here rather than a hang.
+    let found = block(
+        &mut query,
+        b"{\"id\":\"q\",\"op\":\"search\",\"args\":[\"main\"]}\n",
+    );
+    assert!(found.contains("main.rs"), "{found}");
+    let (_, hello) = tree.connect();
+    assert!(hello.contains("\"state\":\"ready\""), "{hello}");
+    assert!(
+        finished.try_recv().is_err(),
+        "stats finished while the follow still held the writer"
+    );
+    fs::remove_file(gate.join("follow")).unwrap();
+    let report = stats.join().unwrap();
+    assert!(report.contains("\"report\":"), "{report}");
+}
+
 #[test]
 #[cfg(debug_assertions)]
 fn transient_accept_errors_do_not_stop_the_daemon() {

@@ -803,8 +803,8 @@ request cannot consume another admitted request's share. Each request retains
 its own capture budget and streaming owner.
 
 Search, default find and covered directory grep connect to the daemon,
-spawning it on first use. `status` and `stats --json` connect without
-spawning; text `stats` stays local. Unavailable background operation or
+spawning it on first use. `status` and `stats` (text or `--json`) connect
+without spawning, else answer locally. Unavailable background operation or
 `FERRET_NO_DAEMON` uses the same engine in process. Such an answer from a
 catalog whose `current` was renamed into place over 60 s ago prints one stderr
 warning that it may miss later changes; `FERRET_STALE_NOTICE=0` silences it

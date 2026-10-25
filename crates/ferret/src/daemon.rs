@@ -857,6 +857,10 @@ fn runtime_status(request: &Request) -> u8 {
 /// is the resident writer's, read after the pin: a commit in between can
 /// move that line ahead of the census. The optional path is the client's
 /// index display, so the header matches a local `ferret stats`.
+///
+/// The budget read waits for any writer operation in progress, which can be
+/// a long refresh or follow. It runs on a clone of the selected engine with
+/// the selection mutex released, so only this request waits (D32).
 fn stats_report(host: &Host, request: &Request, session: &QuerySession) -> Option<String> {
     if request
         .args
@@ -865,16 +869,21 @@ fn stats_report(host: &Host, request: &Request, session: &QuerySession) -> Optio
     {
         return None;
     }
-    let usage = {
-        let loaded = host
-            .engine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Loaded::Ready(engine) = &*loaded else {
-            return None;
-        };
-        engine.log_budget()?
+    let engine = match &*host
+        .engine
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Loaded::Ready(engine) => engine.clone(),
+        Loaded::Loading | Loaded::Failed(_) => return None,
     };
+    // Lets a test hold the writer and know this request has reached the
+    // budget read before it checks that other requests still run.
+    #[cfg(debug_assertions)]
+    if let Some(reached) = std::env::var_os("FERRET_DAEMON_TEST_STATS_REACHED") {
+        let _ = fs::write(reached, b"reached");
+    }
+    let usage = engine.log_budget()?;
     let shown = request
         .args
         .get(1)
