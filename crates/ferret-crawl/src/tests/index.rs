@@ -1540,6 +1540,21 @@ fn effective_content_faults_use_live_names_and_graph_roots() {
 }
 
 #[test]
+fn lowering_priority_never_raises_an_already_nicer_thread() {
+    std::thread::spawn(|| {
+        let tid = Some(rustix::thread::gettid());
+        rustix::process::setpriority_process(tid, 10).unwrap();
+        // Unprivileged, setting 5 here would fail with EACCES.
+        crate::lower_thread_to(5).unwrap();
+        assert_eq!(rustix::process::getpriority_process(tid).unwrap(), 10);
+        crate::lower_thread_to(15).unwrap();
+        assert_eq!(rustix::process::getpriority_process(tid).unwrap(), 15);
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
 fn index_workers_lower_their_own_nice_without_lowering_query_threads() {
     fn priority() -> (i32, u32) {
         let tid = rustix::thread::gettid().as_raw_nonzero().get();

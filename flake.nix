@@ -51,6 +51,11 @@
         install -m755 ${./contrib/agents/rg} $out/bin/rg
         install -m755 ${./contrib/agents/ferret-shadow} $out/bin/ferret-shadow
         patchShebangs $out/bin
+        # The launcher runs these before the shadow's PATH exists, and rg
+        # itself should see the caller's PATH, so name them directly.
+        substituteInPlace $out/bin/rg \
+          --replace-fail 'readlink -f' '${pkgs.coreutils}/bin/readlink -f' \
+          --replace-fail 'exec setsid' 'exec ${pkgs.util-linux}/bin/setsid'
         wrapProgram $out/bin/rg --set-default FERRET_REAL_RG ${pkgs.ripgrep}/bin/rg
         wrapProgram $out/bin/ferret-shadow \
           --set-default FERRET_BIN ${ferret}/bin/ferret \

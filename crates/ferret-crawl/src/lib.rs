@@ -52,10 +52,16 @@ pub fn lower_index_priority() -> std::io::Result<()> {
         .and_then(|value| value.parse::<i32>().ok())
         .filter(|nice| (0..=19).contains(nice))
         .unwrap_or(19);
-    if nice == 0 {
+    lower_thread_to(nice)
+}
+/// Never raises priority: a thread already nicer than `nice` keeps its own,
+/// since an unprivileged raise fails with EACCES and would end the caller.
+fn lower_thread_to(nice: i32) -> std::io::Result<()> {
+    let tid = Some(rustix::thread::gettid());
+    if nice <= rustix::process::getpriority_process(tid)? {
         return Ok(());
     }
-    rustix::process::setpriority_process(Some(rustix::thread::gettid()), nice).map_err(Into::into)
+    rustix::process::setpriority_process(tid, nice).map_err(Into::into)
 }
 /// Additional checkpoint space available to this uid, excluding reserved
 /// blocks.
