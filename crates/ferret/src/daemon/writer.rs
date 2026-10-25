@@ -136,7 +136,7 @@ pub(super) fn start(
             let error = match result {
                 Ok(Ok(())) => return,
                 Ok(Err(error)) => error.to_string(),
-                Err(_) => "writer panicked; restart ferretd to recover".into(),
+                Err(_) => "writer panicked".into(),
             };
             let mut loaded = host
                 .engine

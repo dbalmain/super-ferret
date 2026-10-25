@@ -47,9 +47,9 @@ pub(super) fn turn(
     state: &mut State,
 ) -> io::Result<Duration> {
     if let Some(merge) = state.merge.take_if(|merge| merge.is_finished()) {
-        merge.join().map_err(|_| {
-            io::Error::other("content merge panicked; restart ferretd to recover")
-        })??;
+        merge
+            .join()
+            .map_err(|_| io::Error::other("content merge panicked"))??;
     }
     let started = Instant::now();
     let should_interrupt = || {
