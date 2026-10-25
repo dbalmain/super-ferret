@@ -34,6 +34,8 @@ impl Tree {
                 .unwrap()
                 .as_nanos()
         ));
+        // Never silently share a fixture if its clock-based name collides.
+        fs::create_dir(&base).unwrap_or_else(|error| panic!("reserve fixture {base:?}: {error}"));
         fs::create_dir_all(base.join("src/nested")).unwrap();
         fs::create_dir_all(base.join("home/runtime")).unwrap();
         fs::set_permissions(base.join("home/runtime"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -50,7 +52,7 @@ impl Tree {
             children: Mutex::new(Vec::new()),
         };
         let indexed = tree.local(&["index", "src"]);
-        assert!(indexed.status.success(), "{indexed:?}");
+        assert!(indexed.status.success(), "{indexed:?}\n{}", tree.evidence());
         tree
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -79,6 +81,74 @@ impl Tree {
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
             .collect()
+    }
+    fn evidence(&self) -> String {
+        let lock = fs::metadata(self.base.join("index/lock"));
+        let locks = fs::read_to_string("/proc/locks").unwrap_or_default();
+        let locks: Vec<_> = locks
+            .lines()
+            .filter(|line| {
+                lock.as_ref()
+                    .is_ok_and(|metadata| line.contains(&format!(":{} ", metadata.ino())))
+            })
+            .collect();
+        let logs: Vec<_> = fs::read_dir(self.base.join("home/runtime/ferret"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .chain(std::iter::once(self.base.join("daemon.log")))
+            .chain(std::iter::once(
+                self.base.join("home/state/ferret/log.jsonl"),
+            ))
+            .map(|path| {
+                let contents = fs::read_to_string(&path);
+                (path, contents)
+            })
+            .collect();
+        let children: Vec<_> = self
+            .children
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .map(|child| (child.id(), child.try_wait()))
+            .collect();
+        format!(
+            "base={:?}, lock={lock:?}, holders={locks:?}, sockets={:?}, daemons={:?}, children={children:?}, logs={logs:?}",
+            self.base,
+            self.sockets(),
+            fixture_daemons(&self.base),
+        )
+    }
+    #[track_caller]
+    fn stream(&self) -> UnixStream {
+        let until = Instant::now() + BOUND;
+        let mut last = String::from("no socket");
+        loop {
+            let sockets = self.sockets();
+            assert!(sockets.len() <= 1, "{}", self.evidence());
+            if let Some(socket) = sockets.first() {
+                match UnixStream::connect(socket) {
+                    Ok(stream) => return stream,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        last = format!("{socket:?}: {error}");
+                    }
+                    Err(error) => panic!("connect {socket:?}: {error}; {}", self.evidence()),
+                }
+            }
+            assert!(
+                Instant::now() < until,
+                "connect deadline: {last}; {}",
+                self.evidence()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     #[track_caller]
     fn socket(&self) -> PathBuf {
@@ -115,29 +185,27 @@ impl Tree {
         cmd.env_remove("FERRET_NO_DAEMON")
             .env("FERRET_DAEMON_IDLE_MS", "30000")
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.base.join("daemon.log"))
+                    .unwrap(),
+            );
         for (name, value) in extra {
             cmd.env(name, value);
         }
         let child = cmd.spawn().unwrap();
         let pid = child.id();
         self.children.lock().unwrap().push(child);
-        let socket = self.socket();
+        // The pathname appears at bind, before listen. Wait for an actual
+        // connection even when a test needs to observe the loading hello.
+        let stream = self.stream();
         if !extra
             .iter()
             .any(|(name, _)| *name == "FERRET_DAEMON_IDLE_MS")
         {
-            // The socket file appears at bind, a moment before listen.
-            let mut stream = None;
-            wait(|| match UnixStream::connect(&socket) {
-                Ok(connected) => {
-                    stream = Some(connected);
-                    true
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => false,
-                Err(error) => panic!("{error}"),
-            });
-            ready(stream.unwrap());
+            ready(stream);
         }
         pid
     }
@@ -158,7 +226,7 @@ impl Tree {
     }
     #[track_caller]
     fn connect(&self) -> (BufReader<UnixStream>, String) {
-        ready(UnixStream::connect(self.socket()).unwrap())
+        ready(self.stream())
     }
     fn try_wait(&self, pid: u32) -> Option<std::process::ExitStatus> {
         self.children
@@ -419,21 +487,31 @@ fn concurrent_first_use_has_one_host_and_all_clients_answer() {
 #[cfg(debug_assertions)]
 fn cold_first_use_answers_locally_while_one_daemon_loads() {
     let tree = Tree::new();
+    let gate = tree.base.join("loading");
+    fs::write(&gate, b"hold").unwrap();
     let first = tree
         .command(&["search", "main"])
-        .env("FERRET_DAEMON_LOAD_DELAY_MS", "5000")
+        .env("FERRET_DAEMON_TEST_LOAD_GATE", &gate)
         .output()
         .unwrap();
-    assert!(first.status.success());
-    assert_eq!(first.stdout, tree.local(&["search", "main"]).stdout);
+    assert!(first.status.success(), "{first:?}\n{}", tree.evidence());
+    let local = tree.local(&["search", "main"]);
+    assert!(local.status.success(), "{local:?}\n{}", tree.evidence());
+    assert_eq!(first.stdout, local.stdout, "{first:?}; {local:?}");
     wait(|| fixture_daemons(&tree.base).len() == 1 && tree.sockets().len() == 1);
 
-    let mut reader = BufReader::new(UnixStream::connect(tree.socket()).unwrap());
+    let mut reader = BufReader::new(tree.stream());
     reader
         .get_ref()
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    assert!(line(&mut reader).contains("\"state\":\"loading\""));
+    let hello = line(&mut reader);
+    assert!(
+        hello.contains("\"state\":\"loading\""),
+        "{hello}; {}",
+        tree.evidence()
+    );
+    fs::remove_file(gate).unwrap();
     let hello = loop {
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
@@ -444,7 +522,7 @@ fn cold_first_use_answers_locally_while_one_daemon_loads() {
     };
     assert!(number(&hello, "pid").is_some());
     let second = tree.run(&["search", "main"]);
-    assert!(second.status.success());
+    assert!(second.status.success(), "{second:?}\n{}", tree.evidence());
     assert_eq!(second.stdout, first.stdout);
     let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
     assert!(log.contains("\"host\":\"socket\""), "{log}");
@@ -1405,6 +1483,9 @@ fn battery_paused_startup_drains_without_a_writer_command() {
 /// User plus system CPU ticks consumed by a process, from /proc.
 fn cpu_ticks(pid: u32) -> u64 {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat_ticks(&stat)
+}
+fn stat_ticks(stat: &str) -> u64 {
     let fields: Vec<_> = stat
         .rsplit_once(')')
         .unwrap()
@@ -1412,6 +1493,21 @@ fn cpu_ticks(pid: u32) -> u64 {
         .split_whitespace()
         .collect();
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+fn task_cpu(pid: u32) -> Vec<(String, u64, String)> {
+    fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let wait = fs::read_to_string(entry.path().join("wchan")).unwrap_or_default();
+            Some((
+                stat.split_once(')').unwrap().0.to_owned(),
+                stat_ticks(&stat),
+                wait,
+            ))
+        })
+        .collect()
 }
 
 #[test]
@@ -1428,7 +1524,7 @@ fn loading_blocks_expired_idle_deadline_without_spinning() {
         ],
     );
     let ticks = || cpu_ticks(pid);
-    let mut loading = BufReader::new(UnixStream::connect(tree.socket()).unwrap());
+    let mut loading = BufReader::new(tree.stream());
     loading.get_ref().set_read_timeout(Some(BOUND)).unwrap();
     assert!(line(&mut loading).contains("\"state\":\"loading\""));
     drop(loading);
@@ -1662,13 +1758,45 @@ fn draining_writer_waits_for_a_message_past_expired_background_deadlines() {
         .get_mut()
         .write_all(b"{\"op\":\"drain\"}\n")
         .unwrap();
+    // An idle control connection closes only after drain has been processed.
+    let mut end = String::new();
+    assert_eq!(
+        control.read_line(&mut end).unwrap(),
+        0,
+        "{end}; {}",
+        tree.evidence()
+    );
     std::thread::sleep(Duration::from_millis(200));
-    let before = cpu_ticks(pid);
+    let tasks_before = task_cpu(pid);
+    assert!(
+        tasks_before
+            .iter()
+            .any(|(task, _, _)| task.ends_with("(ferret-writer")),
+        "{tasks_before:?}"
+    );
+    let started = Instant::now();
     std::thread::sleep(Duration::from_millis(500));
-    let consumed = cpu_ticks(pid) - before;
+    let tasks_after = task_cpu(pid);
+    // The query can still be rendering its next large frame under load.
+    // Count the writer and its named intake, excluding that unrelated CPU.
+    let consumed: u64 = tasks_after
+        .iter()
+        .filter(|(task, _, _)| task.ends_with("(ferret-writer"))
+        .map(|(task, ticks, _)| {
+            ticks.saturating_sub(
+                tasks_before
+                    .iter()
+                    .find(|(before, _, _)| before == task)
+                    .map_or(0, |(_, ticks, _)| *ticks),
+            )
+        })
+        .sum();
     assert!(
         consumed <= 2,
-        "draining daemon consumed {consumed} CPU ticks"
+        "draining daemon consumed {consumed} CPU ticks in {:?}; before={tasks_before:?}; after={:?}; {}",
+        started.elapsed(),
+        tasks_after,
+        tree.evidence()
     );
     loop {
         if line(&mut active).contains("\"event\":\"end\"") {
@@ -2603,10 +2731,12 @@ fn socket_log(tree: &Tree) -> String {
 fn directory_grep_starts_one_daemon_and_answers_first_locally() {
     for args in [&["grep", "main", "src"][..], &["grep", "--files", "src"]] {
         let tree = Tree::new();
+        let gate = tree.base.join("loading");
+        fs::write(&gate, b"hold").unwrap();
         assert!(tree.sockets().is_empty());
         let first = tree
             .command(args)
-            .env("FERRET_DAEMON_LOAD_DELAY_MS", "5000")
+            .env("FERRET_DAEMON_TEST_LOAD_GATE", &gate)
             .output()
             .unwrap();
         let local = tree.local(args);
@@ -2614,14 +2744,20 @@ fn directory_grep_starts_one_daemon_and_answers_first_locally() {
         assert_eq!(first.stdout, local.stdout);
         assert_eq!(first.stderr, local.stderr);
         wait(|| fixture_daemons(&tree.base).len() == 1 && tree.sockets().len() == 1);
-        let stream = UnixStream::connect(tree.socket()).unwrap();
+        let stream = tree.stream();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut peer = BufReader::new(stream);
         // The first query has already completed while the server cannot yet
         // execute any query: its output necessarily came from the local host.
-        assert!(line(&mut peer).contains("\"state\":\"loading\""));
+        let hello = line(&mut peer);
+        assert!(
+            hello.contains("\"state\":\"loading\""),
+            "{hello}; {}",
+            tree.evidence()
+        );
+        fs::remove_file(gate).unwrap();
         loop {
             if line(&mut peer).contains("\"state\":\"ready\"") {
                 break;
@@ -3302,8 +3438,7 @@ fn task_names(pid: u32) -> Vec<String> {
 }
 
 fn ready_within(tree: &Tree, bound: Duration) -> String {
-    let socket = tree.socket();
-    let stream = UnixStream::connect(&socket).unwrap();
+    let stream = tree.stream();
     stream.set_read_timeout(Some(bound)).unwrap();
     stream.set_write_timeout(Some(bound)).unwrap();
     let mut reader = BufReader::new(stream);

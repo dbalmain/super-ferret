@@ -184,6 +184,21 @@ fn serve(
     let loading = Operation::start(host, "loading");
     #[cfg(debug_assertions)]
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
+    // First-use tests must observe loading before releasing it, regardless
+    // of how long their local query takes to run under CPU contention.
+    #[cfg(debug_assertions)]
+    if let Some(gate) = std::env::var_os("FERRET_DAEMON_TEST_LOAD_GATE").map(PathBuf::from) {
+        while gate.exists()
+            && !host.stop.load(Ordering::Acquire)
+            && !host
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .draining
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     // A daemon started before the first `ferret index` publishes an empty
     // catalog, holding the lock until its session owns it.
     let session = ferret_crawl::open_or_create(&host.index, &IndexOptions::default())
