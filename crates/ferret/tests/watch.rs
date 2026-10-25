@@ -700,6 +700,37 @@ fn ignore_read_denial_retains_old_children_until_recovery() {
 }
 
 #[test]
+fn a_burst_in_one_root_keeps_another_roots_retention_and_its_poll() {
+    let mut tree = Tree::new();
+    write(tree.path("outside/kept.txt"), "kept");
+    tree.success(tree.local(&["index", "outside"]));
+    // Long enough that the burst below is not coalesced with a poll, which
+    // would observe the retained root and hide the defect.
+    tree.start(&[("FERRET_POLL_MS", "1500")]);
+    fs::rename(tree.path("outside"), tree.path("aside"))
+        .unwrap_or_else(|error| panic!("move root aside: {error:?}"));
+    wait(|| tree.status().contains("\"fault_retained\":true"));
+    // Start just after a poll's refresh, so the next poll is a period away.
+    let polled = number(&tree.status(), "refreshes");
+    wait(|| number(&tree.status(), "refreshes") > polled);
+    // A healthy burst in `src` reports no fault and observes only `src`.
+    write(tree.path("src/right/burst.txt"), "burst");
+    wait(|| tree.run(&["search", "burst.txt"]).status.success());
+    let status = tree.status();
+    assert!(status.contains("\"fault_retained\":true"), "{status}");
+    // The retained root is still polled: refreshes keep coming with no
+    // further notifications.
+    let after_burst = number(&status, "refreshes");
+    wait(|| number(&tree.status(), "refreshes") >= after_burst + 2);
+    assert!(tree.run(&["search", "kept.txt"]).status.success());
+    fs::rename(tree.path("aside"), tree.path("outside"))
+        .unwrap_or_else(|error| panic!("restore root: {error:?}"));
+    wait(|| tree.status().contains("\"fault_retained\":false"));
+    let recovered = tree.status();
+    assert_eq!(number(&recovered, "protected_scopes"), 0, "{recovered}");
+}
+
+#[test]
 fn explicit_index_and_root_commands_publish_before_reply_with_one_lock() {
     let mut tree = Tree::new();
     tree.start(&[]);

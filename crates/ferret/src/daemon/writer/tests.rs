@@ -252,3 +252,93 @@ fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complet
 fn daemon_writer_command_ignores_battery_pause() {
     deferred_writer(Blocked::Battery);
 }
+
+/// The roots polling retries, read from the catalog each real index run
+/// publishes. Every step indexes only some roots, so a scoped report must
+/// neither clear nor invent another root's retention.
+#[test]
+fn retained_roots_follow_the_catalog_across_scoped_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    use ferret_crawl::RootChange;
+
+    let fixture =
+        Tree(std::env::temp_dir().join(format!("ferret-writer-retained-{}", std::process::id())));
+    let (a, b, index) = (
+        fixture.0.join("a"),
+        fixture.0.join("b"),
+        fixture.0.join("index"),
+    );
+    for dir in [a.join("deep/inner"), b.clone()] {
+        fs::create_dir_all(dir).unwrap_or_else(|e| panic!("fixture: {e}"));
+    }
+    let rules = a.join("deep/.ferretignore");
+    fs::write(&rules, b"").unwrap_or_else(|e| panic!("fixture: {e}"));
+    fs::write(b.join("b.txt"), b"b").unwrap_or_else(|e| panic!("fixture: {e}"));
+    let run = |change: RootChange<'_>, refresh: Refresh<'_>| {
+        ferret_crawl::index_change(&index, change, refresh, &IndexOptions::default())
+            .unwrap_or_else(|e| panic!("index: {e}"));
+        let catalog = ferret_catalog::Catalog::open(&index)
+            .unwrap_or_else(|e| panic!("open: {e}"))
+            .unwrap_or_else(|| panic!("no catalog"));
+        catalog.load_all().unwrap_or_else(|e| panic!("load: {e}"));
+        super::retained_roots(&catalog)
+    };
+    let add = |roots: &[PathBuf]| {
+        run(
+            RootChange {
+                add: roots,
+                remove: &[],
+            },
+            Refresh::All,
+        )
+    };
+    let only = |root: &PathBuf| {
+        run(
+            RootChange::default(),
+            Refresh::Only(std::slice::from_ref(root)),
+        )
+    };
+    let retained = |roots: &[&PathBuf]| roots.iter().map(|&r| r.clone()).collect();
+    let deny = |mode| {
+        fs::set_permissions(&rules, fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|e| panic!("chmod: {e}"));
+    };
+
+    assert_eq!(add(&[a.clone(), b.clone()]), retained(&[]));
+    // An unreadable rules file retains `a/deep`, below the root.
+    deny(0o000);
+    assert_eq!(only(&a), retained(&[&a]));
+    // A complete run of another root leaves `a` retained.
+    fs::write(b.join("new.txt"), b"new").unwrap_or_else(|e| panic!("fixture: {e}"));
+    assert_eq!(only(&b), retained(&[&a]));
+    // A complete run of `a` itself that still faults keeps it.
+    assert_eq!(only(&a), retained(&[&a]));
+    // Repair, then a run of `a` clears only `a`'s marker.
+    deny(0o600);
+    assert_eq!(only(&a), retained(&[]));
+    // A root removed from configuration takes its retention with it.
+    deny(0o000);
+    assert_eq!(only(&a), retained(&[&a]));
+    let removed = run(
+        RootChange {
+            add: &[],
+            remove: std::slice::from_ref(&a),
+        },
+        Refresh::Only(&[]),
+    );
+    deny(0o600);
+    assert_eq!(removed, retained(&[]));
+}
+
+/// A client's send can fail after the failed writer reset the count to zero.
+#[test]
+fn a_late_pending_release_cannot_wrap_the_count() {
+    let pending = AtomicUsize::new(0);
+    super::release_pending(&pending);
+    assert_eq!(pending.load(Ordering::Acquire), 0);
+    pending.store(2, Ordering::Release);
+    super::release_pending(&pending);
+    assert_eq!(pending.load(Ordering::Acquire), 1);
+}

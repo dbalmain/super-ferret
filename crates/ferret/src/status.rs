@@ -40,7 +40,10 @@ pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
         .dir_ids()
         .filter(|&id| catalog.entry_count(id).is_none() && catalog.retained_at(id).is_none())
         .count();
+    // Status reads protection from the published catalog, as polling does,
+    // never from the last report, which covers only the scopes it observed.
     o.int("protected_scopes", protected as u64)
+        .bool("fault_retained", protected != 0)
         .int("opaque_directories", opaque as u64)
         .int("catalog_bytes", catalog.bytes_read())
         .int(
@@ -108,13 +111,6 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
         let session = engine.pin();
         crate::find_json::generation(&mut o, Some(session.generation()));
         catalog_fields(&mut o, &session);
-        o.bool(
-            "fault_retained",
-            session
-                .catalog()
-                .dir_ids()
-                .any(|id| session.catalog().retained_at(id).is_some()),
-        );
         o.integers("pinned_internal_epochs", engine.pinned_epochs());
         if census {
             crate::stats::json_fields(&mut o, &session);

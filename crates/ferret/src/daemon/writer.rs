@@ -3,6 +3,7 @@
 //! on another thread while the producer publishes. Queries use Engine's
 //! immutable pins and never enter this queue.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -62,7 +63,6 @@ pub(super) struct Status {
     pub watch: Option<Arc<Watch>>,
     pub last_refresh: Option<u64>,
     pub last_backstop: Option<u64>,
-    pub fault_retained: bool,
     pub refreshes: u64,
     pub last_reason: Option<RefreshReason>,
     pub operation: Option<&'static str>,
@@ -72,7 +72,6 @@ pub(super) struct Status {
     pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
     pub blocked: Option<ferret_catalog::bulk::Blocked>,
     pub fallback_backstop: bool,
-    pub retained_roots: std::collections::BTreeSet<PathBuf>,
 }
 struct Operation<'a>(&'a Host);
 impl<'a> Operation<'a> {
@@ -384,7 +383,7 @@ fn serve(
                 // watch adoption and the unpaced content follow finish before
                 // the next command begins.
                 let _ = command.reply.send(reply);
-                host.writer_pending.fetch_sub(1, Ordering::AcqRel);
+                release_pending(&host.writer_pending);
                 release_freed_memory();
                 content_due = Instant::now();
                 continue;
@@ -415,17 +414,11 @@ fn serve(
         if Instant::now() >= poll_due {
             if let Some(w) = &watch {
                 let pin = engine.pin();
-                let roots = w.polling_roots(pin.catalog());
-                let retained = host
-                    .writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retained_roots
-                    .clone();
-                let scopes = roots
+                let scopes = w
+                    .polling_roots(pin.catalog())
                     .into_iter()
-                    .chain(retained)
-                    .collect::<std::collections::BTreeSet<_>>();
+                    .chain(retained_roots(pin.catalog()))
+                    .collect::<BTreeSet<_>>();
                 w.scoped_roots(scopes.into_iter().collect());
             } else {
                 initial = true;
@@ -561,15 +554,6 @@ fn serve(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .last_reason = Some(reason);
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retained_roots = report
-                    .report
-                    .coverage_faults
-                    .iter()
-                    .map(|fault| fault.root.clone())
-                    .collect();
                 if let Some(w) = &watch {
                     w.adopt_aliases(&report.view);
                     if burst.as_ref().is_none_or(|b| b.reconcile_watches()) {
@@ -705,14 +689,6 @@ fn run_explicit(
     if let Ok(report) = &result {
         global_inputs(watch, engine, context);
         successful(host, report, false);
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retained_roots = report
-            .coverage_faults
-            .iter()
-            .map(|fault| fault.root.clone())
-            .collect();
         if let Some(w) = watch {
             w.adopt_aliases(engine.pin().catalog());
             w.reconcile(engine.pin().catalog());
@@ -766,6 +742,38 @@ fn run_explicit(
         arm_fallback,
     }
 }
+/// Roots whose effective catalog still holds a retained directory (D26's
+/// S1+ checked retention), which polling retries until a refresh repairs them.
+/// The catalog is the authority: a report names only the faults in the scopes
+/// it observed, so it can neither add nor clear another root's protection, and
+/// the markers survive a daemon restart. One pass over the directories, taken
+/// once per poll interval rather than per burst.
+fn retained_roots(catalog: &ferret_catalog::Catalog) -> BTreeSet<PathBuf> {
+    let names = catalog.name_reader();
+    let mut tops = BTreeSet::new();
+    for dir in catalog.dir_ids() {
+        if catalog.retained_at(dir).is_none() {
+            continue;
+        }
+        let mut at = dir;
+        while let Some(name) = catalog.dir_name(at) {
+            at = names.edge(name).0;
+        }
+        tops.insert(at);
+    }
+    catalog
+        .roots()
+        .filter(|(id, _)| tops.contains(id))
+        .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
+        .collect()
+}
+/// A client's failed send can follow the failed writer's reset to zero, so
+/// the count saturates rather than wrapping into a permanently busy host.
+fn release_pending(pending: &std::sync::atomic::AtomicUsize) {
+    let _ = pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        Some(n.saturating_sub(1))
+    });
+}
 fn global_inputs(watch: Option<&Arc<Watch>>, engine: &Engine, context: &crate::cli::Context) {
     if let (Some(w), Some(dirs)) = (watch, &context.dirs) {
         let pin = engine.pin();
@@ -787,7 +795,6 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     if backstop {
         status.last_backstop = status.last_refresh;
     }
-    status.fault_retained = !report.coverage_faults.is_empty();
     status.error = None;
     status.blocked = None;
     status.fallback_backstop = false;
@@ -815,7 +822,7 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
         })))
         .is_err()
     {
-        host.writer_pending.fetch_sub(1, Ordering::AcqRel);
+        release_pending(&host.writer_pending);
         emit_to(destination, &request.id, "begin", |o| {
             o.null("generation");
         })?;
@@ -833,7 +840,8 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
             return emit_to(destination, &request.id, "end", |o| {
                 o.int("exit", 3).str("error", "WriterUnavailable").str(
                     "message",
-                    "writer failed; inspect ferret status --json and restart ferretd",
+                    "writer failed; retry the command, and if ferretd is still running, \
+                     inspect ferret status --json and restart it",
                 );
             });
         }
@@ -958,8 +966,7 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
             "writer_commands",
             host.writer_pending.load(Ordering::Acquire) as u64,
         )
-        .bool("writer_busy", host.writer_running.load(Ordering::Acquire))
-        .bool("fault_retained", s.fault_retained);
+        .bool("writer_busy", host.writer_running.load(Ordering::Acquire));
     if let Some(scheduler) = &s.scheduler {
         let c = scheduler.status();
         o.object("controller", |o| {
