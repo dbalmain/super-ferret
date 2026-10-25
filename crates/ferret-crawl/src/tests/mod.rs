@@ -8,6 +8,7 @@ mod golden;
 mod index;
 mod lifecycle;
 mod parallel;
+mod partial;
 mod race;
 mod reconcile;
 mod refresh;

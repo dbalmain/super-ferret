@@ -520,19 +520,27 @@ file, probing git, `readlink`, a root's lstat — keep the old rows of the
 faulted scope while healthy observations elsewhere publish (S1+ M5,
 `ferret-crawl/src/coverage.rs`). Each scope is checked against the old
 generation: a directory, a file edge, or a new unreadable child left opaque.
-The run publishes nothing and leaves the old generation only when a fault has
-no checked anchor there (a new root's, say), the old generation moved under
-the run, or a policy or sniffer change would need retention. The global ignore
-file is read before the walk: missing is the defaults, unreadable fails the
-run. An entry that vanished before its `lstat` is a deletion; a content
-fault — open, stat or read failing, the bracket moving, aliases disagreeing —
-publishes the file with content state failed and no document, and it is re-read
-next run. The build is the authority on which inodes fault, since only it sees
-every name's observation; the report lists every name, under a refreshed root,
-of an inode it published as a fault. Those paths are resolved from the new
-catalog, not held through the walk. That pass is timed as the report's
-`fault_time`, outside `commit_time`: 52 ms at 10M with no faults, 289 ms with
-8,142.
+A fault with no checked anchor is a new root's: the first index, or a root
+added to an existing one. When that root is disjoint from every other
+configured root, it alone is withdrawn (D119): its observations are
+discarded, it is not configured, and the healthy roots publish, so
+`ferret index ROOT` adds it once repaired. Content it shares with a healthy
+root through a hard link publishes through that root's name; content only it
+names publishes nowhere. The command exits 4 and names each withdrawn root
+with its faults. The run publishes nothing and leaves the old generation when
+every refreshed root was withdrawn, when the unanchored root overlaps another
+(it changes which rules govern the other's subtree, D34), when the old
+generation moved under the run, or when a policy or sniffer change would need
+retention. The global ignore file is read before the walk: missing is the
+defaults, unreadable fails the run. An entry that vanished before its `lstat` is
+a deletion; a content fault — open, stat or read failing, the bracket moving,
+aliases disagreeing — publishes the file with content state failed and no
+document, and it is re-read next run. The build is the authority on which inodes
+fault, since only it sees every name's observation; the report lists every name,
+under a refreshed root, of an inode it published as a fault. Those paths are
+resolved from the new catalog, not held through the walk. That pass is timed as
+the report's `fault_time`, outside `commit_time`: 52 ms at 10M with no faults,
+289 ms with 8,142.
 
 `ferret_crawl::index_change` is the same run given a change to the root set
 (roots to add, roots to remove) rather than the whole set. It applies the change
@@ -753,7 +761,8 @@ The log is `$XDG_STATE_HOME/ferret/log.jsonl` (mode 0600), one JSON line per
 
 An index line records:
 
-- the outcome and the exit status;
+- the outcome and the exit status, with `failed_roots` counting roots D119
+  withdrew (outcome `partial`, exit 4);
 - the walk, hash, commit and content-fault-pass times, and the peak RSS;
 - the crawl's counts and the published generation's counts.
 

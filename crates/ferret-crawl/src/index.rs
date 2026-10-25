@@ -17,9 +17,11 @@
 //!
 //! A coverage fault protects a checked old edge or directory subtree. New
 //! observations in that scope are discarded after all workers finish; other
-//! trustworthy scopes can publish. Missing anchors, changed global versions
-//! and uncertain root boundaries block the transaction. Content faults publish
-//! valid namespace/stat observations as Fault/no-document and retry next run.
+//! trustworthy scopes can publish. A missing anchor withdraws a new root that
+//! is disjoint from the others (D119); otherwise missing anchors, changed
+//! global versions and uncertain root boundaries block the transaction. Content
+//! faults publish valid namespace/stat observations as Fault/no-document and
+//! retry next run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -306,6 +308,10 @@ pub struct Report {
     pub coverage_faults: Vec<CoverageFault>,
     /// Outermost retained edges/subtrees and new opaque directory scopes.
     pub protected_scopes: usize,
+    /// Roots withdrawn from this run (D119), sorted: neither published nor
+    /// configured. Nonempty means the run published only part of what was
+    /// asked. `refreshed` excludes them; `counts` still include their walks.
+    pub failed_roots: Vec<FailedRoot>,
     /// Walking and hashing, over every refreshed root.
     pub walk_time: Duration,
     /// Of the walk, time the workers spent sniffing and hashing file
@@ -330,6 +336,18 @@ pub struct Report {
     pub input_fallback: bool,
     /// The published generation's shape, when one was published.
     pub published: Option<Published>,
+}
+
+/// A root withdrawn from a run (D119): new to the catalog, disjoint from every
+/// other configured root, and with a coverage fault that nothing old can
+/// anchor. Its uncertain observations are discarded and it is not configured,
+/// so `ferret index ROOT` adds it afresh once the fault is repaired.
+#[derive(Debug)]
+pub struct FailedRoot {
+    /// The root, as the catalog would have stored it.
+    pub root: PathBuf,
+    /// Its faults, every one of them on this root's walk.
+    pub faults: Vec<CoverageFault>,
 }
 
 /// The shape of a published generation.
@@ -365,9 +383,11 @@ impl Published {
 ///   because its kept copy stopped at the old inner roots (D34).
 ///
 /// The writer lock is held through publication. Typed coverage faults retain
-/// checked old scopes while trustworthy observations elsewhere publish. An
-/// unresolvable scope or an incompatible version/root transition publishes
-/// nothing ([`IndexError::Coverage`]).
+/// checked old scopes while trustworthy observations elsewhere publish. A new
+/// disjoint root whose faults have no anchor is withdrawn and listed in
+/// [`Report::failed_roots`] (D119). Any other unresolvable scope, a run that
+/// withdrew every refreshed root, or an incompatible version/root transition
+/// publishes nothing ([`IndexError::Coverage`]).
 pub fn index(
     catalog_dir: &Path,
     roots: &[PathBuf],
@@ -567,14 +587,15 @@ fn run<T>(
             let mut txn =
                 Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
             let roots = roots(txn.previous())?;
-            let plan = Plan::new(
+            let mut plan = Plan::new(
                 txn.previous(),
                 &roots,
                 refresh,
                 options.sniffer,
                 fingerprint(options),
             )?;
-            let (batches, mut report) = observe(Source::Checkpoint(&txn), &plan, options)?;
+            let (observed, mut report) = observe(Source::Checkpoint(&txn), &plan, options)?;
+            let batches = initial(&txn, &mut plan, observed, &mut report)?;
             let started = Instant::now();
             txn.set_policy(fingerprint(options));
             for batch in batches {
@@ -695,31 +716,21 @@ fn observe_reconcile(
 ) -> Result<Reconciled, IndexError> {
     let budget = std::sync::Arc::new(ferret_catalog::InputBudget::new(session.input_limits()));
     let source = Source::Bounded(session, options.sniffer, &budget);
-    let (mut batches, mut report) = observe(source, plan, options)?;
+    let (mut walked, mut report) = observe(source, plan, options)?;
     loop {
         let started = Instant::now();
-        let Some(protection) =
-            crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots)
-        else {
-            return Err(IndexError::Coverage {
-                faults: std::mem::take(&mut report.coverage_faults),
-                report: Box::new(report),
-            });
-        };
+        let protection = protect(session, plan, &mut walked, &mut report)?;
         if !protection.is_empty()
             && (session.view().policy() != fingerprint(options)
                 || session.view().sniffer_version() != options.sniffer)
         {
-            return Err(IndexError::Coverage {
-                faults: std::mem::take(&mut report.coverage_faults),
-                report: Box::new(report),
-            });
+            return Err(unpublished(report, Vec::new()));
         }
         report.protected_scopes =
             protection.directories.len() + protection.edges.len() + protection.opaque.len();
         let changes = crate::reconcile::with_budget(
             session,
-            &batches,
+            &walked.batches,
             &plan.refresh,
             &plan.dropped,
             fingerprint(options),
@@ -731,7 +742,7 @@ fn observe_reconcile(
         report.input_usage = budget.usage();
         let Some(ref final_changes) = changes else {
             return Ok(Reconciled {
-                batches,
+                batches: walked.batches,
                 report,
                 changes: None,
             });
@@ -768,7 +779,7 @@ fn observe_reconcile(
             .collect();
         if missing.is_empty() {
             return Ok(Reconciled {
-                batches,
+                batches: walked.batches,
                 report,
                 changes,
             });
@@ -818,13 +829,15 @@ fn observe_reconcile(
             // Re-observe the expanded final scopes together: duplicate root
             // token graphs from a second partial pass cannot be reconciled.
             let (fresh, fresh_report) = observe(source, plan, options)?;
-            batches = fresh;
+            walked = fresh;
+            let failed = std::mem::take(&mut report.failed_roots);
             report = fresh_report;
+            report.failed_roots = failed;
             continue;
         }
         if extra.is_empty() {
             return Ok(Reconciled {
-                batches,
+                batches: walked.batches,
                 report,
                 changes,
             });
@@ -841,7 +854,8 @@ fn observe_reconcile(
             selections: BTreeMap::new(),
         };
         let (more, mut extra_report) = observe(source, &added, options)?;
-        batches.extend(more);
+        walked.batches.extend(more.batches);
+        walked.owners.extend(more.owners);
         report.counts.add(&extra_report.counts);
         report.walk_time += extra_report.walk_time;
         report.hash_time += extra_report.hash_time;
@@ -856,6 +870,45 @@ fn observe_reconcile(
             .append(&mut extra_report.coverage_faults);
         report.refreshed.clone_from(&plan.refresh);
         report.kept.clone_from(&plan.keep);
+    }
+}
+
+/// Resolves a bounded observation's faults to protection. When some fault has
+/// no anchor, first withdraws each new disjoint root whose own faults cannot be
+/// anchored (D119), then resolves what remains; a run left with no refreshed
+/// root, or still unresolvable, publishes nothing.
+fn protect(
+    session: &WriterSession,
+    plan: &mut Plan,
+    observed: &mut Observed,
+    report: &mut Report,
+) -> Result<crate::coverage::Protection, IndexError> {
+    let resolve = |plan: &Plan, observed: &Observed, faults: &[CoverageFault]| {
+        crate::coverage::resolve(session, &observed.batches, faults, &plan.roots)
+    };
+    if let Some(protection) = resolve(plan, observed, &report.coverage_faults) {
+        return Ok(protection);
+    }
+    let previous = configured_roots(Some(&session.view()));
+    let configured = plan.roots.clone();
+    let failed = withdraw(
+        plan,
+        &previous,
+        observed,
+        &mut report.coverage_faults,
+        |batches, faults| crate::coverage::resolve(session, batches, faults, &configured).is_none(),
+    );
+    let protection = if failed.is_empty() || plan.refresh.is_empty() {
+        None
+    } else {
+        resolve(plan, observed, &report.coverage_faults)
+    };
+    match protection {
+        Some(protection) => {
+            withdrawn(report, plan, failed);
+            Ok(protection)
+        }
+        None => Err(unpublished(std::mem::take(report), failed)),
     }
 }
 
@@ -906,11 +959,18 @@ impl Source<'_> {
     }
 }
 
+/// One observation of a plan's refreshed roots: the batches, and the root each
+/// batch came from. A root's batches are contiguous.
+struct Observed {
+    batches: Vec<ferret_catalog::Batch>,
+    owners: Vec<PathBuf>,
+}
+
 fn observe(
     source: Source<'_>,
     plan: &Plan,
     options: &IndexOptions,
-) -> Result<(Vec<ferret_catalog::Batch>, Report), IndexError> {
+) -> Result<(Observed, Report), IndexError> {
     let mut report = Report {
         refreshed: plan.refresh.clone(),
         kept: plan.keep.clone(),
@@ -921,6 +981,7 @@ fn observe(
     let cache = Cache::new();
     let mut faults = Vec::new();
     let mut batches = Vec::new();
+    let mut owners = Vec::new();
     for root in &plan.refresh {
         let bulk_read = matches!(source, Source::Rebuild(..))
             || plan.selections.get(root).is_none_or(|s| s.whole_root());
@@ -1003,6 +1064,7 @@ fn observe(
             report.content_faults.append(&mut output.content_faults);
             report.pattern_errors.append(&mut output.pattern_errors);
             batches.push(output.batch);
+            owners.push(root.clone());
         }
         report.observation_rows_peak = report.observation_rows_peak.max(observation_rows);
         report.observation_bytes_peak = report.observation_bytes_peak.max(observation_bytes);
@@ -1018,25 +1080,128 @@ fn observe(
             report: Box::new(report),
         });
     }
-    if !faults.is_empty()
-        && let Source::Checkpoint(txn) = source
-    {
-        // D26 directory EACCES is opaque even for an initial root. Every
-        // other initial fault still lacks a trustworthy retention anchor.
-        if faults.iter().all(crate::coverage::directory_denied)
-            && let Some(opaque) = crate::coverage::opaque_checkpoint(txn, &batches, &faults)
-        {
-            batches = opaque;
-            faults.clear();
-        } else {
-            return Err(IndexError::Coverage {
-                faults,
-                report: Box::new(report),
-            });
-        }
-    }
     report.coverage_faults = faults;
-    Ok((batches, report))
+    Ok((Observed { batches, owners }, report))
+}
+
+/// Settles an initial checkpoint's faults. D26 directory EACCES is opaque even
+/// for an initial root; every other initial fault lacks a trustworthy
+/// retention anchor, so its root is withdrawn where D119 allows and the run
+/// publishes nothing otherwise.
+fn initial(
+    txn: &Transaction,
+    plan: &mut Plan,
+    mut observed: Observed,
+    report: &mut Report,
+) -> Result<Vec<ferret_catalog::Batch>, IndexError> {
+    if report.coverage_faults.is_empty() {
+        return Ok(observed.batches);
+    }
+    let previous = configured_roots(txn.previous());
+    let failed = withdraw(
+        plan,
+        &previous,
+        &mut observed,
+        &mut report.coverage_faults,
+        |_, faults| !faults.iter().all(crate::coverage::directory_denied),
+    );
+    let faults = &mut report.coverage_faults;
+    let settled = if faults.is_empty() {
+        Some(observed.batches)
+    } else if faults.iter().all(crate::coverage::directory_denied) {
+        crate::coverage::opaque_checkpoint(txn, &observed.batches, faults)
+    } else {
+        None
+    };
+    match settled {
+        Some(batches) if failed.is_empty() || !plan.refresh.is_empty() => {
+            faults.clear();
+            withdrawn(report, plan, failed);
+            Ok(batches)
+        }
+        _ => Err(unpublished(std::mem::take(report), failed)),
+    }
+}
+
+/// The roots `catalog` holds; none without one.
+fn configured_roots(catalog: Option<&Catalog>) -> Vec<PathBuf> {
+    catalog
+        .map(|c| {
+            c.roots()
+                .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// D119: withdraws from this run each refreshed root that the previous
+/// generation lacks, that is disjoint from every other configured root, and
+/// whose own batches and faults `unusable` rejects. Its observations and
+/// faults leave the run and it leaves the plan's roots, so no generation
+/// records it. Overlapping roots stay atomic: a nested root changes which
+/// rules govern its outer root's subtree (D34), so its failure is not its own.
+fn withdraw(
+    plan: &mut Plan,
+    previous: &[PathBuf],
+    observed: &mut Observed,
+    faults: &mut Vec<CoverageFault>,
+    mut unusable: impl FnMut(&[ferret_catalog::Batch], &[CoverageFault]) -> bool,
+) -> Vec<FailedRoot> {
+    let candidates: Vec<PathBuf> = plan
+        .refresh
+        .iter()
+        .filter(|root| !previous.contains(root))
+        .filter(|root| {
+            plan.roots
+                .iter()
+                .all(|other| !strictly_inside(other, root) && !strictly_inside(root, other))
+        })
+        .filter(|root| faults.iter().any(|f| f.root == **root))
+        .cloned()
+        .collect();
+    let mut failed = Vec::new();
+    for root in candidates {
+        let first = observed.owners.iter().position(|o| *o == root);
+        let count = observed.owners.iter().filter(|o| **o == root).count();
+        let range = first.map_or(0..0, |first| first..first + count);
+        debug_assert!(observed.owners[range.clone()].iter().all(|o| *o == root));
+        let (own, rest): (Vec<_>, Vec<_>) = std::mem::take(faults)
+            .into_iter()
+            .partition(|f| f.root == root);
+        *faults = rest;
+        if !unusable(&observed.batches[range.clone()], &own) {
+            faults.extend(own);
+            continue;
+        }
+        observed.batches.drain(range.clone());
+        observed.owners.drain(range);
+        plan.roots.retain(|r| *r != root);
+        plan.refresh.retain(|r| *r != root);
+        plan.selections.remove(&root);
+        failed.push(FailedRoot { root, faults: own });
+    }
+    failed
+}
+
+/// Records withdrawn roots in a report that will publish.
+fn withdrawn(report: &mut Report, plan: &Plan, failed: Vec<FailedRoot>) {
+    report.refreshed.clone_from(&plan.refresh);
+    report.failed_roots.extend(failed);
+    report.failed_roots.sort_by(|a, b| a.root.cmp(&b.root));
+}
+
+/// The atomic refusal when withdrawing roots cannot leave a publishable run:
+/// every fault is reported, the withdrawn roots' included.
+fn unpublished(mut report: Report, failed: Vec<FailedRoot>) -> IndexError {
+    let mut faults = std::mem::take(&mut report.coverage_faults);
+    let earlier = std::mem::take(&mut report.failed_roots);
+    for root in earlier.into_iter().chain(failed) {
+        faults.extend(root.faults);
+    }
+    IndexError::Coverage {
+        faults,
+        report: Box::new(report),
+    }
 }
 
 // Changes contain epoch-scoped ids. A checkpoint remaps them; reporting must
@@ -1887,14 +2052,14 @@ fn full_rewalk(
 ) -> Result<Report, IndexError> {
     session.admit_full_rewalk().map_err(update_error)?;
     let old = session.view();
-    let plan = Plan::new(
+    let mut plan = Plan::new(
         Some(&old),
         roots,
         Refresh::All,
         options.sniffer,
         fingerprint(options),
     )?;
-    let (batches, mut report) = observe(
+    let (mut observed, mut report) = observe(
         Source::Rebuild(
             session,
             options.sniffer,
@@ -1908,9 +2073,13 @@ fn full_rewalk(
         &plan,
         options,
     )?;
+    if !report.coverage_faults.is_empty() {
+        // Resolved twice only on a faulted rebuild, to find D119 roots.
+        protect(session, &mut plan, &mut observed, &mut report)?;
+    }
     let (rebuilt, scopes) = crate::reconcile::checkpoint_batches(
         session,
-        batches,
+        observed.batches,
         &report.coverage_faults,
         &plan.roots,
         options.sniffer,
@@ -1920,10 +2089,7 @@ fn full_rewalk(
     report.input_fallback = true;
     report.protected_scopes = scopes;
     let Some(batches) = rebuilt else {
-        return Err(IndexError::Coverage {
-            faults: std::mem::take(&mut report.coverage_faults),
-            report: Box::new(report),
-        });
+        return Err(unpublished(report, Vec::new()));
     };
     drop(old);
     let started = Instant::now();

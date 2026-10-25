@@ -620,6 +620,90 @@ fn an_unreadable_directory_publishes_its_row_and_other_changes() {
 }
 
 #[test]
+// D119: one new root whose rules are unknown (its `.ferretignore` loops) no
+// longer blocks a disjoint healthy root. The healthy root publishes, the run
+// exits 4, stderr names the failed root and its fault, and the failed root is
+// neither configured nor searchable until a later `ferret index` adds it.
+fn a_faulted_new_root_is_not_added_and_the_healthy_one_publishes() {
+    for reversed in [false, true] {
+        let env = Env::new(&format!("partial-{reversed}"));
+        env.seed_ignore_file();
+        let good = env.write("good/seen.txt", b"healthy\n");
+        let hidden = env.write("bad/hidden.txt", b"uncertain\n");
+        let (good, bad) = (good.parent().unwrap(), hidden.parent().unwrap());
+        std::os::unix::fs::symlink(".ferretignore", bad.join(".ferretignore")).unwrap();
+        let mut args = vec![os("index"), good.as_os_str(), bad.as_os_str()];
+        if reversed {
+            args[1..].reverse();
+        }
+
+        let output = env.run(&args);
+        assert_eq!(code(&output), 4, "{}", stderr(&output));
+        let message = stderr(&output);
+        assert!(
+            message.contains(&format!("ferret: not indexed: {}: ", bad.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "  {}: ReadIgnore: ",
+                bad.join(".ferretignore").display()
+            )),
+            "{message}"
+        );
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            report.contains(&format!("indexed {}\n", good.display())),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("failed  {}\n", bad.display())),
+            "{report}"
+        );
+        let line = env.log_lines().pop().unwrap();
+        assert!(line.contains(r#""outcome":"partial""#), "{line}");
+        assert!(line.contains(r#""exit":4,"#), "{line}");
+        assert!(line.contains(r#""failed_roots":1,"#), "{line}");
+
+        assert_eq!(
+            paths(&env.run(&[os("roots"), os("list")])),
+            [good.to_owned()]
+        );
+        assert_eq!(
+            paths(&env.run(&[os("search"), os("seen.txt")])),
+            [good.join("seen.txt")]
+        );
+        assert_eq!(code(&env.run(&[os("search"), os("hidden.txt")])), 1);
+
+        fs::remove_file(bad.join(".ferretignore")).unwrap();
+        let retried = env.run(&[os("index"), bad.as_os_str()]);
+        assert_eq!(code(&retried), 0, "{}", stderr(&retried));
+        assert_eq!(
+            paths(&env.run(&[os("search"), os("hidden.txt")])),
+            std::slice::from_ref(&hidden)
+        );
+    }
+}
+
+#[test]
+// D119 leaves an all-failed run as it was: nothing published, exit 3.
+fn a_first_index_whose_only_root_faults_publishes_nothing() {
+    let env = Env::new("partial-all-failed");
+    env.seed_ignore_file();
+    let hidden = env.write("bad/hidden.txt", b"uncertain\n");
+    let bad = hidden.parent().unwrap();
+    std::os::unix::fs::symlink(".ferretignore", bad.join(".ferretignore")).unwrap();
+    let output = env.run(&[os("index"), bad.as_os_str()]);
+    assert_eq!(code(&output), 3, "{}", stderr(&output));
+    assert!(stderr(&output).contains("nothing published"));
+    assert!(
+        ferret_catalog::Catalog::open(&env.index())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 // D26 A′: an ignore file that exists but cannot be read leaves the rules
 // unknown. It once fell back to the defaults and published, so a user's
 // exclusion (here `private/`) silently lapsed.

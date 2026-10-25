@@ -33,7 +33,8 @@
 //! atom that is not UTF-8. See [`json`].
 //!
 //! **Exit statuses** are stable ([`cli::Exit`]): 0 success, 1 `search` matched
-//! nothing, 2 usage error, 3 runtime error. Find uses GNU's convention: 0
+//! nothing, 2 usage error, 3 runtime error, 4 `index` published only some of
+//! its roots. Find uses GNU's convention: 0
 //! success (including no matches), 1 invalid syntax or execution error.
 
 pub mod args;

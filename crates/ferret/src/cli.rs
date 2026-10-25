@@ -27,6 +27,10 @@ pub enum Exit {
     /// The command could not do its job: no index, an I/O error, another
     /// index run holding the lock, or a walk fault that published nothing.
     Error = 3,
+    /// `index` published some roots and withdrew others whose walk faulted,
+    /// with nothing old to fall back on (D119). The withdrawn roots are not
+    /// configured; stderr names each, and `ferret index DIR` retries it.
+    Partial = 4,
 }
 
 impl From<Exit> for ExitCode {
@@ -66,7 +70,9 @@ ferret: search files by name, metadata and content.
 
 usage:
   ferret index [DIR...]         add each DIR as a root and index it;
-                                with none, re-index every root
+                                with none, re-index every root;
+                                exit 4: some new roots faulted and were not
+                                added, the rest were published
   ferret roots list             print the roots, one per line
   ferret roots remove DIR...    stop indexing DIR (roots inside it stay)
   ferret find [-I|--no-ignore] [-P] [PATH...] [EXPRESSION]

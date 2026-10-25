@@ -6803,6 +6803,34 @@ means nothing was published" — then C.
 
 > Dave (2026-10-25, in chat): B.
 
+**Implemented (2026-10-25, wt/partial-publish).** A refreshed root is
+withdrawn when the previous generation lacks it, it is disjoint from every
+other configured root, and its own faults cannot be resolved alone: any fault
+but directory EACCES on the initial checkpoint, or `coverage::resolve`
+returning none on the log path and the full-rewalk fallback. Its batches and
+faults leave the run and it leaves the plan's roots, so no generation records
+it; the report lists it in `failed_roots`. Shared hard-linked content
+publishes through the healthy name, since an alias records the stored
+observation in its own batch; content only the withdrawn root names publishes
+nowhere. Everything else stays atomic, as before: a run whose refreshed roots
+were all withdrawn, a nested or enclosing root, an old generation that moved,
+a policy or sniffer change with protection, and an unreadable global ignore
+file (read before the walk).
+
+Exit status 4 is new (`Exit::Partial`). 0–3 are taken (3 already means
+"nothing published", which stays true), grep keeps rg's 0–2, find GNU's 0–1,
+ferretd exits 3; nothing returns 4. stderr gives each withdrawn root as
+`ferret: not indexed: ROOT: …; retry with ferret index ROOT` followed by its
+faults; stdout adds a `failed  ROOT` line; the query log adds outcome
+`partial` and a `failed_roots` count. `index` has no `--json`. The daemon
+renders the same way and the client maps 4. The report's walk counts still
+include the withdrawn roots' walks.
+
+Building the daemon test found a separate crash: a self-linked
+`.ferretignore` in an added root sent the watch's policy-input registration
+into unbounded recursion and aborted ferretd. It now follows at most 40 links
+(MAXSYMLINKS) and records the input as a failure.
+
 ## D120 — A file edited through a hard link outside every root
 
 **Question:** When a file inside a watched root gains a hard link outside every

@@ -414,11 +414,27 @@ fn unknown_context_and_unanchored_new_root_faults_block_publication() {
     let _hook = Hook::set(&other, |point, _| {
         (point == IoPoint::Root).then(|| (IoOp::OpenDir, std::io::Error::from_raw_os_error(2)))
     });
+    // Only the unanchored new root is refreshed: nothing healthy is left to
+    // publish, so the run stays atomic (D119).
+    let roots = [tmp.tree(), other.clone()];
     assert!(matches!(
-        recrawl(&mut session, &[tmp.tree(), other], Refresh::All, &opts),
+        recrawl(
+            &mut session,
+            &roots,
+            Refresh::Only(std::slice::from_ref(&other)),
+            &opts
+        ),
         Err(crate::IndexError::Coverage { .. })
     ));
     assert_eq!(session.view().generation(), before);
+    // With a healthy disjoint root refreshed too, the new root is withdrawn
+    // and never configured, rather than blocking the healthy one.
+    let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    assert_eq!(report.refreshed, [tmp.tree()]);
+    assert_eq!(report.failed_roots.len(), 1);
+    assert_eq!(report.failed_roots[0].root, other);
+    let configured: Vec<_> = session.view().roots().map(|(_, p)| p.to_vec()).collect();
+    assert_eq!(configured, [tmp.tree().as_os_str().as_bytes().to_vec()]);
 }
 
 #[test]

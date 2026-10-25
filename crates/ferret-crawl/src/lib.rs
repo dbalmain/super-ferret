@@ -23,8 +23,9 @@ pub mod watch;
 
 pub use content::Documents;
 pub use index::{
-    Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report,
-    RootChange, index, index_change, index_change_then, open_or_create, recrawl, session_change,
+    Counts, CoverageContext, CoverageFault, FailedRoot, IndexError, IndexOptions, Published,
+    Refresh, Report, RootChange, index, index_change, index_change_then, open_or_create, recrawl,
+    session_change,
 };
 pub use observe::ContentFault;
 pub use refresh::{

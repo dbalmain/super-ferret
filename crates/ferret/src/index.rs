@@ -309,8 +309,11 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
     let exit = if let Err(error) = content {
         crate::cli::error(&format!("content index: {error}"));
         Exit::Error
-    } else if rendered.exit == Exit::Ok {
-        print("the report", rendered.stdout.as_bytes())
+    } else if matches!(rendered.exit, Exit::Ok | Exit::Partial) {
+        match print("the report", rendered.stdout.as_bytes()) {
+            Exit::Ok => rendered.exit,
+            failed => failed,
+        }
     } else {
         rendered.exit
     };
@@ -353,17 +356,15 @@ pub(crate) fn render(result: &Result<Report, IndexError>) -> Rendered {
         Ok(report) => {
             content_faults(report, &mut diagnostics);
             coverage_faults(report, &mut diagnostics);
-            (
-                {
-                    stdout = report_text(report);
-                    Exit::Ok
-                },
-                if report.published.is_some() {
-                    "published"
-                } else {
-                    "unchanged"
-                },
-            )
+            failed_roots(report, &mut diagnostics);
+            stdout = report_text(report);
+            if !report.failed_roots.is_empty() {
+                (Exit::Partial, "partial")
+            } else if report.published.is_some() {
+                (Exit::Ok, "published")
+            } else {
+                (Exit::Ok, "unchanged")
+            }
         }
         Err(IndexError::Coverage { faults, report }) => {
             content_faults(report, &mut diagnostics);
@@ -444,6 +445,7 @@ pub(crate) fn log_report(object: &mut crate::json::Object<'_>, report: &Report) 
             "retained_coverage_faults",
             report.coverage_faults.len() as u64,
         )
+        .int("failed_roots", report.failed_roots.len() as u64)
         .int("walk_us", report.walk_time.as_micros() as i128)
         .int("hash_us", report.hash_time.as_micros() as i128)
         .int("commit_us", report.commit_time.as_micros() as i128)
@@ -488,6 +490,8 @@ fn report_text(report: &Report) -> String {
     list("indexed", &report.refreshed);
     list("kept   ", &report.kept);
     list("dropped", &report.dropped);
+    let failed: Vec<PathBuf> = report.failed_roots.iter().map(|f| f.root.clone()).collect();
+    list("failed ", &failed);
     let c = &report.counts;
     let _ = writeln!(
         text,
@@ -539,6 +543,32 @@ fn coverage_faults(report: &Report, diagnostics: &mut String) {
         );
     }
     diagnostics.push_str(&text);
+}
+
+/// A withdrawn root (D119) is an error naming the root and its faults: it was
+/// not added, while the run published the other roots.
+fn failed_roots(report: &Report, diagnostics: &mut String) {
+    for failed in &report.failed_roots {
+        append_error(
+            diagnostics,
+            &format!(
+                "not indexed: {}: {} directory or entry could not be read, so the walk may have \
+                 missed entries; the root was not added and the other roots were published; \
+                 retry with `ferret index {}`",
+                failed.root.display(),
+                failed.faults.len(),
+                failed.root.display(),
+            ),
+        );
+        let mut text = String::new();
+        for fault in failed.faults.iter().take(SHOWN) {
+            let _ = writeln!(text, "  {fault}");
+        }
+        if failed.faults.len() > SHOWN {
+            let _ = writeln!(text, "  … and {} more", failed.faults.len() - SHOWN);
+        }
+        diagnostics.push_str(&text);
+    }
 }
 
 /// Content faults are warnings: the file is indexed without its content and

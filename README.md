@@ -13,7 +13,10 @@ its code.
   and the answer
 - [Research](docs/research/) — the 2026-09 survey and measured baseline
 
-`ferret index DIR` adds an indexed root. `ferret find [PATH...] [EXPRESSION]`
+`ferret index DIR` adds an indexed root. It exits 0 on success and 3 when it
+published nothing; 4 means some new roots could not be fully read and were not
+added, while the rest were published, and stderr names each with its fault.
+`ferret find [PATH...] [EXPRESSION]`
 then takes GNU find syntax and answers from the index: ignored paths do not
 exist to it. While ferretd is running the index follows the tree; otherwise
 find sees it as of the last `ferret index`.

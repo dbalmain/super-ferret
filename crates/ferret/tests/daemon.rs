@@ -748,6 +748,59 @@ fn unchanged_queries_do_not_reopen_and_real_index_publication_is_adopted() {
 }
 
 #[test]
+// D119 through the daemon's explicit-index path: the routed command surfaces
+// the partial status, the failed root and its fault exactly as a local run.
+fn routed_index_publishes_healthy_roots_and_names_the_failed_one() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let (mut reader, _) = tree.connect();
+    let refreshes = |reader: &mut BufReader<UnixStream>| {
+        number(
+            &block(reader, b"{\"id\":\"s\",\"op\":\"status\"}\n"),
+            "refreshes",
+        )
+    };
+    let before = refreshes(&mut reader);
+    let (good, bad) = (tree.base.join("good"), tree.base.join("bad"));
+    fs::create_dir_all(&good).unwrap();
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(good.join("seen.txt"), b"healthy\n").unwrap();
+    fs::write(bad.join("hidden.txt"), b"uncertain\n").unwrap();
+    symlink(".ferretignore", bad.join(".ferretignore")).unwrap();
+
+    let output = tree.run(&["index", "good", "bad"]);
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "{message}\n{}",
+        tree.evidence()
+    );
+    assert!(
+        message.contains(&format!("ferret: not indexed: {}: ", bad.display())),
+        "{message}"
+    );
+    assert!(message.contains(": ReadIgnore: "), "{message}");
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains(&format!("failed  {}\n", bad.display())),
+        "{report}"
+    );
+    assert_ne!(refreshes(&mut reader), before, "the command was routed");
+    let roots = tree.run(&["roots", "list"]);
+    let roots = String::from_utf8_lossy(&roots.stdout);
+    assert!(roots.contains(&format!("{}\n", good.display())), "{roots}");
+    assert!(!roots.contains(&format!("{}\n", bad.display())), "{roots}");
+    assert!(tree.run(&["search", "seen.txt"]).status.success());
+    assert_eq!(tree.run(&["search", "hidden.txt"]).status.code(), Some(1));
+
+    fs::remove_file(bad.join(".ferretignore")).unwrap();
+    let retried = tree.run(&["index", "bad"]);
+    assert!(retried.status.success(), "{retried:?}");
+    assert!(tree.run(&["search", "hidden.txt"]).status.success());
+}
+
+#[test]
 fn routed_index_commands_bypass_background_politeness_but_keep_admission() {
     let tree = Tree::new();
     let proc = tree.base.join("signals/proc");

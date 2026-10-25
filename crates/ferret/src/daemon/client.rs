@@ -433,6 +433,7 @@ fn status(value: u64) -> io::Result<Exit> {
         1 => Ok(Exit::NoMatch),
         2 => Ok(Exit::Usage),
         3 => Ok(Exit::Error),
+        4 => Ok(Exit::Partial),
         _ => Err(io::Error::other("invalid native status")),
     }
 }
