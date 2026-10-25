@@ -881,7 +881,11 @@ boundaries conservatively refresh roots. Watch failures
 and a configurable cap (default seven eighths of the kernel limit) report gaps.
 Startup/hourly backstops and five-minute polling of the actual uncovered,
 retained, relocated, unproven-link and network/FUSE roots use the same serial
-producer. M5b maps every proven rooted occurrence onto a shared physical watch;
+producer. Retained means a catalog `retained_at` marker; EACCES-opaque
+directories are not polled. A chmod reaches them through the parent's
+`IN_ATTRIB`, but a permission change that raises no event (LSM policy, group
+membership, FUSE, a mount appearing) waits for the hourly backstop. M5b maps
+every proven rooted occurrence onto a shared physical watch;
 notifications refresh every locator, and S1+ promotes kept shared aliases. Sparse
 hard-link proofs count physical parent/name pairs against `nlink`, preserving
 polling for names outside observed roots. Watches and policy inputs share the
