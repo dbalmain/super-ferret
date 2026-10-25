@@ -24,6 +24,7 @@ use ferret_crawl::{IndexError, IndexOptions, Refresh, Report, RootChange, index_
 use ferret_policy::DEFAULT_IGNORE;
 
 use crate::cli::{Context, Exit, error, note, print, warn};
+use crate::config_file::{self, Contents};
 use crate::setup::{self, Written};
 
 /// At most this many faults of each kind are printed; the rest are counted.
@@ -210,9 +211,10 @@ fn ask_for_root() -> Option<Result<PathBuf, String>> {
 /// The global ignore file's text, seeded with the defaults on first use
 /// (`setup`). A file that is missing even after setup (no config directory,
 /// or one setup could not write) is the defaults, which is what setup would
-/// have written. A file that exists and cannot be read, or a symlink whose
-/// target is gone, is an error: the
-/// user's rules are unknown, so the run must not publish (D26 A′).
+/// have written. A file that exists and cannot be read, anything there that
+/// is not a regular file (a FIFO, say), or a symlink whose target is gone, is
+/// an error: the user's rules are unknown, so the run must not publish (D26
+/// A′).
 pub(crate) fn global_ignore(context: &Context) -> Result<String, String> {
     let Some(dirs) = &context.dirs else {
         warn("no config directory; using the default ignore rules");
@@ -229,29 +231,29 @@ pub(crate) fn global_ignore(context: &Context) -> Result<String, String> {
         Ok(Written::Kept) => {}
         Err(e) => warn(&format!("{}: {e}", path.display())),
     }
-    match fs::read(&path) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+    // Not a plain `fs::read`: a FIFO there, which setup has just warned
+    // about, would block the run (and the daemon's writer) forever.
+    let unreadable = |e: io::Error| {
+        format!(
+            "nothing published: the ignore file {} cannot be read ({e}), so the rules to apply \
+             are unknown; the previous index is unchanged",
+            path.display()
+        )
+    };
+    match config_file::read(&path) {
+        Ok(Contents::Bytes(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
         // Only an absent destination means "no rules file". A dangling
-        // symlink also reads as NotFound, but the user's rules are behind it.
-        Err(e) if e.kind() == io::ErrorKind::NotFound && !exists(&path) => {
+        // symlink is an error from `read`: the user's rules are behind it.
+        Ok(Contents::Missing) => {
             warn(&format!(
-                "{}: {e}; using the default ignore rules",
+                "{}: no such file; using the default ignore rules",
                 path.display()
             ));
             Ok(DEFAULT_IGNORE.to_owned())
         }
-        Err(e) => Err(format!(
-            "nothing published: the ignore file {} cannot be read ({e}), so the rules to apply \
-             are unknown; the previous index is unchanged",
-            path.display()
-        )),
+        Ok(Contents::NotRegular) => Err(unreadable(config_file::not_regular())),
+        Err(e) => Err(unreadable(e)),
     }
-}
-
-/// Whether anything, even a dangling symlink, is at `path`. An error other
-/// than NotFound counts as present, so it fails rather than defaulting.
-fn exists(path: &Path) -> bool {
-    !matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
 }
 
 /// One index run: publish, report, log.

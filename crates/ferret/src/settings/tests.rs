@@ -137,6 +137,26 @@ fn reading_a_missing_file_is_none_and_bytes_that_are_not_utf8_fail() {
     ));
 }
 
+/// A FIFO named `settings`, which once blocked a search opening it, is an
+/// unusable file, read on a thread with a deadline so a regression fails.
+#[test]
+fn a_fifo_settings_file_is_an_error_not_a_hang() {
+    let index = scratch("fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(index.join(FILE))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(Settings::read(&index).map_err(|e| e.to_string()));
+    });
+    let read = finished
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("reading a FIFO blocked");
+    assert_eq!(read, Err("not a regular file".to_owned()));
+}
+
 /// The first write creates the file and leaves no temporary behind; a
 /// second keeps whatever is there, such as a hand edit.
 #[test]

@@ -14,6 +14,7 @@ use ferret_catalog::Catalog;
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
 use crate::cli::{self, Exit};
+use crate::config_file::Contents;
 use crate::engine::Engine;
 use crate::find_json::{self, FrameOutput};
 use crate::protocol::ChildStdin;
@@ -383,9 +384,18 @@ impl Effects for Output {
 }
 
 // A single boolean needs no general configuration parser or new dependency.
+// A dangling symlink is no file, as it always was; a FIFO must not block.
 fn read_config(path: &Path) -> io::Result<bool> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => parse_config(&text),
+    match crate::config_file::read(path) {
+        Ok(Contents::Bytes(bytes)) => match String::from_utf8(bytes) {
+            Ok(text) => parse_config(&text),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )),
+        },
+        Ok(Contents::Missing) => Ok(false),
+        Ok(Contents::NotRegular) => Err(crate::config_file::not_regular()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }

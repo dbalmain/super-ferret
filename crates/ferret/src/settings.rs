@@ -19,6 +19,8 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::Path;
+
+use crate::config_file::Contents;
 use std::sync::atomic::AtomicU64;
 
 /// The settings file's name inside the index directory.
@@ -70,13 +72,18 @@ impl Settings {
     /// Reads `index`'s settings file. `Ok(None)` when there is none, as in
     /// an index created before the file existed.
     pub fn read(index: &Path) -> Result<Option<Self>, ReadError> {
-        match fs::read_to_string(index.join(FILE)) {
-            Ok(text) => Self::parse(&text).map(Some),
+        // Hand-editable, so not a plain read: a FIFO there would block.
+        match crate::config_file::read(&index.join(FILE)) {
+            Ok(Contents::Bytes(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => Self::parse(&text).map(Some),
+                Err(_) => Err(ReadError::Parse {
+                    line: 0,
+                    reason: "not UTF-8".into(),
+                }),
+            },
+            Ok(Contents::Missing) => Ok(None),
+            Ok(Contents::NotRegular) => Err(ReadError::Io(crate::config_file::not_regular())),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(ReadError::Parse {
-                line: 0,
-                reason: "not UTF-8".into(),
-            }),
             Err(e) => Err(ReadError::Io(e)),
         }
     }

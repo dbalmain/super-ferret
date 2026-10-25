@@ -3,17 +3,12 @@
 //! ferret-policy owns rule decisions; ferret-crawl owns scoped input reads.
 
 use super::*;
+use crate::config_file::Contents;
 use ferret_catalog::{Catalog, Section};
 use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry};
 use ferret_query::find::Entry;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Component;
 use std::sync::Arc;
-
-// Linux open flags, as in the other std-only CLI filesystem hosts. Opening
-// non-regular global ignore entries must not block on a FIFO.
-const NONBLOCK: i32 = 0x800;
 
 #[derive(Clone)]
 pub(super) struct Anchors {
@@ -388,15 +383,15 @@ fn failed_scope(path: &Path) -> io::Result<PathBuf> {
 fn global() -> Result<Arc<str>, String> {
     let text = if let Ok(dirs) = Dirs::from_env() {
         let path = dirs.ignore_file();
-        match read_global(&path).map_err(|e| format!("{}: {e}", path.display()))? {
-            Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            None if fs::symlink_metadata(&path).is_ok() => {
+        match crate::config_file::read(&path).map_err(|e| format!("{}: {e}", path.display()))? {
+            Contents::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Contents::NotRegular => {
                 return Err(format!(
                     "{}: global ignore is not a regular file",
                     path.display()
                 ));
             }
-            None => ferret_policy::DEFAULT_IGNORE.to_owned(),
+            Contents::Missing => ferret_policy::DEFAULT_IGNORE.to_owned(),
         }
     } else {
         ferret_policy::DEFAULT_IGNORE.to_owned()
@@ -733,38 +728,13 @@ fn excludes_file(line: &[u8]) -> Option<&[u8]> {
     Some(value.strip_suffix(b"\"").unwrap_or(value))
 }
 
-// Global configuration is not a scoped crawl input: it has no 1 MiB limit
-// and a dangling link is an error. Queries must not create configuration.
+// git's configuration and excludes file: anything but a regular file reads as
+// absent, and so does any error (see `git_global_excludes`).
 fn read_global(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e)
-            if e.kind() == io::ErrorKind::NotFound
-                && fs::symlink_metadata(path)
-                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
-        {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    if !file.metadata()?.is_file() {
-        return Ok(None);
+    match crate::config_file::read(path)? {
+        Contents::Bytes(bytes) => Ok(Some(bytes)),
+        Contents::Missing | Contents::NotRegular => Ok(None),
     }
-    let mut bytes = Vec::new();
-    let mut chunk = [0; 8192];
-    loop {
-        let n = file.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        bytes.try_reserve(n).map_err(io::Error::other)?;
-        bytes.extend_from_slice(&chunk[..n]);
-    }
-    Ok(Some(bytes))
 }
 
 #[cfg(test)]

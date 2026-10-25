@@ -63,8 +63,29 @@ impl Env {
 
     /// `ferret --index INDEX ARGS...` in this environment, to adjust.
     fn command(&self, args: &[&OsStr]) -> Command {
-        let home = self.base.join("home");
         let mut command = Command::new(env!("CARGO_BIN_EXE_ferret"));
+        self.configure(&mut command, args);
+        command
+    }
+
+    /// [`Env::run`] killed after 10 s, for a run that a regression could
+    /// block forever: the test then fails instead of hanging the suite.
+    fn run_bounded(&self, args: &[&OsStr]) -> Output {
+        self.bounded(args).output().unwrap()
+    }
+
+    /// [`Env::command`] under `timeout`, as for [`Env::run_bounded`].
+    fn bounded(&self, args: &[&OsStr]) -> Command {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--signal=KILL", "10s"])
+            .arg(env!("CARGO_BIN_EXE_ferret"));
+        self.configure(&mut command, args);
+        command
+    }
+
+    fn configure(&self, command: &mut Command, args: &[&OsStr]) {
+        let home = self.base.join("home");
         command
             .arg("--index")
             .arg(self.index())
@@ -78,7 +99,6 @@ impl Env {
             .env("XDG_CACHE_HOME", home.join("cache"))
             .env_remove("FERRET_INDEX")
             .stdin(Stdio::null());
-        command
     }
 
     fn ignore_file(&self) -> PathBuf {
@@ -670,6 +690,70 @@ fn a_dangling_ignore_symlink_publishes_nothing_and_fails() {
         .unwrap(),
         before
     );
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
+}
+
+#[test]
+// A FIFO at the ignore file's path, or a symlink to one, once blocked the run
+// forever opening it: setup warned that it is not a file, then a plain read
+// waited for a writer. It is not a regular file, so the rules are unknown
+// (D26 A′): the run fails at once and publishes nothing.
+fn a_fifo_ignore_file_fails_promptly_and_publishes_nothing() {
+    for linked in [false, true] {
+        let env = Env::new(if linked {
+            "ignore-fifo-link"
+        } else {
+            "ignore-fifo"
+        });
+        env.write("ok.txt", b"ok\n");
+        env.seed_ignore_file();
+        assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+        let snapshot = || {
+            fs::read(
+                ferret_catalog::Catalog::snapshot_path(&env.index())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let before = snapshot();
+
+        env.write("new.txt", b"new\n");
+        fs::remove_file(env.ignore_file()).unwrap();
+        let fifo = if linked {
+            env.base.join("fifo")
+        } else {
+            env.ignore_file()
+        };
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        if linked {
+            std::os::unix::fs::symlink(&fifo, env.ignore_file()).unwrap();
+        }
+        let output = env.run_bounded(&[os("index")]);
+
+        let message = stderr(&output);
+        assert_eq!(code(&output), 3, "linked {linked}: {message}");
+        assert!(message.contains("nothing published"), "{message}");
+        assert!(message.contains("not a regular file"), "{message}");
+        assert_eq!(snapshot(), before, "linked {linked}");
+        assert_eq!(code(&env.run(&[os("search"), os("new")])), 1);
+    }
+}
+
+#[test]
+// A symlink to a regular ignore file is the user's rules, followed.
+fn a_symlinked_ignore_file_applies_its_rules() {
+    let env = Env::new("ignore-symlink");
+    env.write("ok.txt", b"ok\n");
+    env.write("private/secret.txt", b"s\n");
+    let rules = env.base.join("rules");
+    fs::write(&rules, "private/\n").unwrap();
+    fs::create_dir_all(env.ignore_file().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&rules, env.ignore_file()).unwrap();
+    let output = env.run_bounded(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(code(&env.run(&[os("search"), os("ok")])), 0);
     assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
 }
 
@@ -1508,6 +1592,20 @@ fn catalog_find_refuses_unresolved_starts_and_config_can_select_live_mode() {
     fs::write(env.base.join("home/config/ferret/config"), b"invalid\n").unwrap();
     assert_eq!(code(&run(&["find", "."])), 1);
     assert_eq!(code(&run(&["find", "-I", "."])), 0);
+    // A FIFO there once blocked find forever opening it; it is an error now.
+    fs::remove_file(env.base.join("home/config/ferret/config")).unwrap();
+    let made = Command::new("mkfifo")
+        .arg(env.base.join("home/config/ferret/config"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let output = env
+        .bounded(&[os("find"), os(".")])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(stderr(&output).contains("not a regular file"));
 }
 
 #[test]

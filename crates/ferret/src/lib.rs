@@ -18,6 +18,8 @@
 //!   [`setup`] writes the files a new install starts with.
 //! - [`settings`]: the index's settings file, written when the index is created
 //!   (D77).
+//! - `config_file`: reads a user's configuration file without blocking on a
+//!   FIFO or other special file.
 //! - [`protocol`]: the shared bounded reader for batch requests, socket
 //!   envelopes and events.
 //!
@@ -38,6 +40,7 @@ pub mod args;
 pub(crate) mod batch;
 pub mod cli;
 mod config;
+mod config_file;
 pub mod daemon;
 pub mod engine;
 pub mod find;
