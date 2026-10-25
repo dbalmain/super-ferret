@@ -6763,3 +6763,40 @@ ferret's answer. A mismatch is re-run once after a pause; one that then
 agrees is index lag, not a wrong answer. Commands with side effects (`--pre`
 for rg; `-exec`, `-delete`, `-ok`, `-fprint` for find) are never shadowed.
 After the switch the roles reverse, with rg shadowing ferret on a sample.
+
+## D119 — One unreadable root blocks a first index of healthy roots
+
+**Question:** When the first `ferret index A B` finds a coverage fault under
+B that has no anchor, should the whole command publish nothing (today), or
+should it publish A and report B as failed?
+
+Context:
+
+- Reproduced 2026-10-25 on main: `ferret index GOOD BAD`, where `BAD` holds a
+  self-looping `.ferretignore` symlink, exits 3 with "nothing published" and
+  ReadIgnore/ELOOP; `ferret search` then reports no index. `ferret index GOOD`
+  alone succeeds.
+- This is D26's S1+ amendment working as written: a fault with no anchor in a
+  previous generation blocks publication (`ferret-crawl/src/index.rs` ~1021,
+  ~701; `coverage.rs` ~425). Once an index exists, faults under an existing
+  root are retained and the rest publishes; only the first index and newly
+  added roots have no anchor.
+- It bit in practice: p16s has no index tonight because stale worktrees under
+  `~/w/tfa` faulted (fixed separately as ef5dced, which makes a missing gitdir
+  a known state). B's rules here are genuinely unknown, so treating them as
+  empty would be wrong; the question is only what happens to A.
+- Raised by Sol's architecture review of 184cca3.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep invocation-wide atomicity | A first index of many roots fails on any one bad root; the user must find and drop it, then rerun. Every nonzero `index` still guarantees nothing was published. | No change. Simple contract for scripts. |
+| B. Publish the fully observed disjoint roots; report each failed root; exit nonzero (partial success) | A failed `index` can now have published something, and the configured roots become the healthy subset, so the failed roots must be named for the user to retry. Overlapping roots and global-policy failures stay atomic. About 4–8 h: group observations by root through coverage classification, build one checkpoint from the healthy groups. | `ferret index ~/w` style first runs work despite one bad corner. Matches what an existing index already does for faults under existing roots. |
+| C. B, but only behind an explicit flag (`--partial`) | Same build as B plus a flag; the default stays surprising on first use. | Scripts keep A's guarantee; humans and agents opt in. |
+
+**Recommendation: B**, scoped to explicitly supplied disjoint roots (first
+index and newly added roots), with a distinct exit status for partial
+success and an all-failed run still publishing nothing. On-disk format
+unchanged.
+
+**Fact that would change it:** a caller that relies on "nonzero `index`
+means nothing was published" — then C.
