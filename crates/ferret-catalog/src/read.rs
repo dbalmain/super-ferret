@@ -37,6 +37,7 @@ use crate::generation::Manifest;
 use crate::log::{Family, Record};
 use crate::overlay::{self, Overlay};
 use crate::packed::{self, Blocked};
+use crate::regular::{self, Access};
 use crate::{
     ContentState, DecodeError, DocId, Generation, Handle, Hash, InoId, NameId, RetryFromCurrent,
 };
@@ -265,22 +266,22 @@ enum Source {
 }
 
 pub(crate) fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
-    let file = match File::open(dir.join("current")) {
+    let file = match open_state(&dir.join("current"), DecodeError::Corrupt("manifest")) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
             // Legacy snapshots remain explicitly refused; only import reads v3.
-            match File::open(dir.join(FILE)) {
+            match open_state(&dir.join(FILE), DecodeError::NotACatalog) {
                 Ok(file) => {
                     let mut head = [0; 12];
                     file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
                     return Err(OpenError::Decode(DecodeError::Version(u32_at(&head, 8))));
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(OpenError::Io(e)),
+                Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
             return Ok(None);
         }
-        Err(e) => return Err(OpenError::Io(e)),
+        Err(e) => return Err(e),
     };
     if file.metadata().map_err(OpenError::Io)?.len() != crate::generation::MANIFEST_LEN as u64 {
         return Err(OpenError::Decode(DecodeError::Corrupt("manifest")));
@@ -290,6 +291,19 @@ pub(crate) fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
     Manifest::decode(&bytes)
         .map(Some)
         .map_err(OpenError::Decode)
+}
+
+/// Opens a published state file for reading without blocking on a special
+/// file ([`crate::regular`]). Something other than a regular file at the name
+/// is `not_regular`, the error a wrong regular file there would decode to.
+pub(crate) fn open_state(path: &Path, not_regular: DecodeError) -> Result<File, OpenError> {
+    regular::open(path, Access::Read).map_err(|e| {
+        if regular::is_not_regular(&e) {
+            OpenError::Decode(not_regular)
+        } else {
+            OpenError::Io(e)
+        }
+    })
 }
 
 impl Catalog {

@@ -4,7 +4,7 @@ mod records;
 pub use records::Record;
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::format::{NONE, u32_at, u64_at};
 use crate::generation::{Manifest, checksum};
 use crate::publication::{self, Point};
+use crate::read::open_state;
+use crate::regular::{self, Access};
 use crate::{Catalog, DecodeError, Generation, OpenError, RetryFromCurrent};
 
 pub(crate) const HEADER: u64 = 64;
@@ -102,16 +104,17 @@ impl Published {
                 hook(dir);
             }
             let pair = (|| {
-                let snapshot =
-                    File::open(dir.join(format!("snapshot.{}", manifest.generation.checkpoint)))
-                        .map_err(io_error)?;
+                let snapshot = open_state(
+                    &dir.join(format!("snapshot.{}", manifest.generation.checkpoint)),
+                    DecodeError::Corrupt("snapshot"),
+                )?;
                 let file = if manifest.log_end == 0 {
                     None
                 } else {
-                    Some(
-                        File::open(dir.join(format!("changes.{}", manifest.generation.checkpoint)))
-                            .map_err(io_error)?,
-                    )
+                    Some(open_state(
+                        &dir.join(format!("changes.{}", manifest.generation.checkpoint)),
+                        DecodeError::Corrupt("change log"),
+                    )?)
                 };
                 let checkpoint = Catalog::open_checkpoint(snapshot, &manifest)?;
                 let log = Log::open(file, &manifest, checkpoint.manifest().counters).map_err(
@@ -444,12 +447,8 @@ impl Writer {
             current.name_references();
             let path = dir.join(format!("changes.{}", manifest.generation.checkpoint));
             if manifest.log_end == 0 {
-                let file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&path)
-                    .map_err(Error::Io)?;
+                let file = regular::open(&path, Access::Create).map_err(Error::Io)?;
+                file.set_len(0).map_err(Error::Io)?;
                 (&file)
                     .write_all(&header(manifest.generation))
                     .map_err(Error::Io)?;
@@ -459,11 +458,7 @@ impl Writer {
                 manifest.log_end = HEADER;
                 publish_manifest(dir, &manifest)?;
             }
-            let log = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .map_err(Error::Io)?;
+            let log = regular::open(&path, Access::Update).map_err(Error::Io)?;
             budget.usage.log_bytes = manifest.log_end;
             Ok((log, manifest, current, budget))
         })();
@@ -533,13 +528,7 @@ impl Writer {
                 .ok_or(Error::Invalid(DecodeError::Corrupt("checkpoint exhausted")))?;
         }
         let temp = self.dir.join("catalog.tmp");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp)
-            .map_err(Error::Io)?;
+        let file = regular::replace(&temp).map_err(Error::Io)?;
         crate::bulk::writes(
             self.bulk
                 .as_ref()
@@ -565,11 +554,11 @@ impl Writer {
             other => Error::Io(io::Error::other(other)),
         })?;
         manifest.log_end = HEADER;
-        self.log = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.dir.join(format!("changes.{}", generation.checkpoint)))
-            .map_err(Error::Undurable)?;
+        self.log = regular::open(
+            &self.dir.join(format!("changes.{}", generation.checkpoint)),
+            Access::Update,
+        )
+        .map_err(Error::Undurable)?;
         self.manifest = manifest;
         self.current = current.into_resident().map_err(Error::Previous)?;
         self.budget =
@@ -613,14 +602,13 @@ impl Writer {
         };
         self.manifest = current.manifest();
         self.manifest.log_end = HEADER;
-        self.log = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(
-                self.dir
-                    .join(format!("changes.{}", current.generation().checkpoint)),
-            )
-            .map_err(Error::Undurable)?;
+        self.log = regular::open(
+            &self
+                .dir
+                .join(format!("changes.{}", current.generation().checkpoint)),
+            Access::Update,
+        )
+        .map_err(Error::Undurable)?;
         self.budget = crate::budget::Budget::empty(current.inode_count(), current.name_count());
         self.current = current.into_resident().map_err(Error::Previous)?;
         self.poisoned = false;
@@ -834,12 +822,7 @@ pub(crate) fn encode(
 
 fn publish_manifest(dir: &Path, m: &Manifest) -> Result<(), Error> {
     let temp = dir.join("current.tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)
-        .map_err(Error::Io)?;
+    let mut file = regular::replace(&temp).map_err(Error::Io)?;
     file.write_all(&m.encode()).map_err(Error::Io)?;
     publication::sync(&file, Point::ManifestSync).map_err(Error::Io)?;
     fs::rename(&temp, dir.join("current")).map_err(Error::Io)?;
@@ -856,10 +839,11 @@ fn publish_manifest(dir: &Path, m: &Manifest) -> Result<(), Error> {
 pub(crate) fn recover(dir: &Path, pinned: &Published) -> Result<(), OpenError> {
     pinned.log.load_all()?;
     if pinned.manifest.log_end != 0 {
-        let file = OpenOptions::new()
-            .write(true)
-            .open(dir.join(format!("changes.{}", pinned.manifest.generation.checkpoint)))
-            .map_err(io_error)?;
+        let file = regular::open(
+            &dir.join(format!("changes.{}", pinned.manifest.generation.checkpoint)),
+            Access::Update,
+        )
+        .map_err(io_error)?;
         if file.metadata().map_err(io_error)?.len() > pinned.manifest.log_end {
             file.set_len(pinned.manifest.log_end).map_err(io_error)?;
             publication::sync(&file, Point::RecoverySync).map_err(io_error)?;

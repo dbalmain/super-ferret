@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -40,6 +40,7 @@ use crate::batch::{Batch, Content, Stat};
 use crate::build::{self, BuildError, Known};
 use crate::publication::{self, Point};
 use crate::read::{self, Catalog, Kind, OpenError};
+use crate::regular;
 use crate::{ContentState, DecodeError, Generation, Hash, InoId};
 
 const TEMP: &str = "catalog.tmp";
@@ -378,7 +379,7 @@ impl Transaction {
                 "import requires v3",
             )));
         }
-        let bytes = fs::read(dir.join(read::FILE)).map_err(CommitError::Write)?;
+        let bytes = regular::read(&dir.join(read::FILE)).map_err(CommitError::Write)?;
         let mut generation = Generation::fresh().map_err(CommitError::Write)?;
         while ["snapshot", "changes"].iter().any(|prefix| {
             dir.join(format!("{prefix}.{}", generation.checkpoint))
@@ -393,16 +394,10 @@ impl Transaction {
                 )))?;
         }
         let temp = dir.join(TEMP);
-        let out = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp)
-            .map_err(CommitError::Write)?;
+        let out = regular::replace(&temp).map_err(CommitError::Write)?;
         crate::migrate::write(&bytes, &out, generation, policy)?;
         publication::sync(&out, Point::SnapshotSync).map_err(CommitError::Write)?;
-        let catalog = Catalog::from_bytes(fs::read(&temp).map_err(CommitError::Write)?)
+        let catalog = Catalog::from_bytes(regular::read(&temp).map_err(CommitError::Write)?)
             .map_err(CommitError::Encode)?;
         publish(dir, &temp, &catalog)?;
         let _ = fs::remove_file(dir.join(read::FILE));
@@ -532,7 +527,7 @@ impl Transaction {
             build::write(plan, batches, out, generation, self.policy)
         })
         .map_err(CommitError::Write)
-        .and_then(|()| fs::read(&temp).map_err(CommitError::Write))
+        .and_then(|()| regular::read(&temp).map_err(CommitError::Write))
         .and_then(|bytes| Catalog::from_bytes(bytes).map_err(CommitError::Encode))
         .and_then(|catalog| {
             publish(&self.dir, &temp, &catalog)?;
@@ -578,12 +573,7 @@ fn identity(old: &Catalog, id: u32) -> (u64, u64) {
 }
 
 fn write_synced(path: &Path, write: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
+    let file = regular::replace(path)?;
     write(&file)?;
     publication::sync(&file, Point::SnapshotSync)
 }
@@ -592,12 +582,7 @@ pub(crate) fn publish(dir: &Path, temp: &Path, catalog: &Catalog) -> Result<(), 
     let snapshot = dir.join(format!("snapshot.{}", catalog.generation().checkpoint));
     publication::rename(temp, &snapshot, Point::SnapshotRename).map_err(CommitError::Write)?;
     let log_temp = dir.join("changes.tmp");
-    let mut log = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&log_temp)
-        .map_err(CommitError::Write)?;
+    let mut log = regular::replace(&log_temp).map_err(CommitError::Write)?;
     log.write_all(&crate::log::header(catalog.generation()))
         .map_err(CommitError::Write)?;
     publication::sync(&log, Point::HeaderSync).map_err(CommitError::Write)?;
@@ -615,12 +600,7 @@ pub(crate) fn publish(dir: &Path, temp: &Path, catalog: &Catalog) -> Result<(), 
     let manifest_temp = dir.join("current.tmp");
     let mut manifest = catalog.manifest();
     manifest.log_end = crate::log::HEADER;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&manifest_temp)
-        .map_err(CommitError::Write)?;
+    let mut file = regular::replace(&manifest_temp).map_err(CommitError::Write)?;
     file.write_all(&manifest.encode())
         .map_err(CommitError::Write)?;
     publication::sync(&file, Point::ManifestSync).map_err(CommitError::Write)?;

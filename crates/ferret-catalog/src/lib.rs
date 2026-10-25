@@ -32,6 +32,7 @@ mod overlay;
 mod packed;
 mod publication;
 pub mod read;
+mod regular;
 mod resident_names;
 mod session;
 pub mod transaction;

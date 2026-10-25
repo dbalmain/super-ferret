@@ -1,7 +1,9 @@
 //! The common advisory writer lock, including early-return release.
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io;
 use std::path::Path;
+
+use crate::regular::{self, Access};
 
 pub(crate) struct Lock(std::sync::Arc<Held>);
 struct Held(File);
@@ -11,12 +13,7 @@ pub(crate) enum Error {
 }
 impl Lock {
     pub(crate) fn open(dir: &Path) -> Result<Self, Error> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("lock"))
-            .map_err(Error::Io)?;
+        let file = regular::open(&dir.join("lock"), Access::Create).map_err(Error::Io)?;
         match file.try_lock() {
             Ok(()) => Ok(Self(std::sync::Arc::new(Held(file)))),
             Err(TryLockError::WouldBlock) => Err(Error::Locked),
