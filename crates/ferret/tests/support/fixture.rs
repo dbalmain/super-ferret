@@ -22,10 +22,12 @@ fn isolate(command: &mut Command, base: &Path) {
     // pressure or battery. These are real procfs-shaped inputs to the
     // production Signals reader, not a policy bypass. Transition tests
     // inject the trait.
+    // One directory serves every test process, so none is left behind per
+    // run. Each file is renamed into place, so a concurrent process reads
+    // either the previous copy or this one, never a partial write.
     static SIGNALS: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let signals = SIGNALS.get_or_init(|| {
-        let path =
-            std::env::temp_dir().join(format!("ferret-fixture-signals-{}", std::process::id()));
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fixture-signals");
         std::fs::create_dir_all(path.join("proc/pressure"))
             .unwrap_or_else(|e| panic!("signal fixture: {e}"));
         std::fs::create_dir_all(path.join("power"))
@@ -36,7 +38,10 @@ fn isolate(command: &mut Command, base: &Path) {
             ("meminfo", "MemAvailable: 1073741824 kB\n"),
             ("loadavg", "0.00 0.00 0.00 1/100 1\n"),
         ] {
-            std::fs::write(path.join("proc").join(file), value)
+            let target = path.join("proc").join(file);
+            let partial = target.with_extension(format!("{}.partial", std::process::id()));
+            std::fs::write(&partial, value)
+                .and_then(|()| std::fs::rename(&partial, &target))
                 .unwrap_or_else(|e| panic!("signal fixture: {e}"));
         }
         path

@@ -80,6 +80,7 @@ impl Tree {
             .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
             .collect()
     }
+    #[track_caller]
     fn socket(&self) -> PathBuf {
         wait(|| self.sockets().len() == 1);
         self.sockets().pop().unwrap()
@@ -155,6 +156,7 @@ impl Tree {
         listener.set_nonblocking(true).unwrap();
         (listener, hello, socket)
     }
+    #[track_caller]
     fn connect(&self) -> (BufReader<UnixStream>, String) {
         ready(UnixStream::connect(self.socket()).unwrap())
     }
@@ -231,6 +233,7 @@ fn terminate_fixture_daemons(base: &std::path::Path) {
         let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
     }
 }
+#[track_caller]
 fn wait(mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + BOUND;
     while !condition() {
@@ -3095,6 +3098,7 @@ fn release_spawned(tree: &Tree) {
     }
 }
 
+#[track_caller]
 fn assert_index_owner(tree: &Tree) {
     let (_, hello) = tree.connect();
     let meta = fs::metadata(tree.base.join("index")).unwrap();
