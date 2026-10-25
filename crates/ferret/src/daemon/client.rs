@@ -764,47 +764,22 @@ fn query(
         }
     };
     if let Some(context) = context.filter(|_| op == "search") {
-        let mut line = Vec::new();
-        let mut object = crate::log::line(&mut line, "search", now);
-        object
-            .byte_strings("query", args.iter().map(|a| a.as_bytes()))
-            .str("host", "socket")
-            .opt_int("limit", limit)
-            .int("exit", exit as u8)
-            .int("rows", rows)
-            .int("total_us", started.elapsed().as_micros() as i128);
-        object.opt_int("first_row_us", first_row);
-        if let Some(summary) = summary {
-            object
-                .str("plan", field_text(&summary, "plan").unwrap_or(""))
-                .str("strategy", field_text(&summary, "strategy").unwrap_or(""))
-                .int(
-                    "server_us",
-                    field_number(&summary, "elapsed_us").unwrap_or(0),
-                )
-                .int(
-                    "bytes_read",
-                    field_number(&summary, "bytes_read").unwrap_or(0),
-                );
-            if let (Some(names), Some(inodes)) = (
-                field_number(&summary, "names"),
-                field_number(&summary, "inodes"),
-            ) {
-                object.int("names", names).int("inodes", inodes);
+        let run = crate::search::Run {
+            limit,
+            exit: exit as u8,
+            rows,
+            first_row_us: first_row,
+            total_us: started.elapsed().as_micros() as i128,
+        };
+        let line = crate::search::log_line(now, args.iter().map(|a| a.as_bytes()), &run, |o| {
+            o.str("host", "socket");
+            if let Some(end) = &summary {
+                o.int("server_us", field_number(end, "elapsed_us").unwrap_or(0));
+                crate::search::copy_summary(o, end);
+            } else {
+                o.str("error", "transport");
             }
-            if let Some(stats) = summary.field("stats") {
-                object.object("stats", |o| {
-                    o.int("candidates", field_number(stats, "candidates").unwrap_or(0))
-                        .int("rows", field_number(stats, "rows").unwrap_or(0));
-                });
-            }
-            if let Some(error) = field_text(&summary, "error") {
-                object.str("error", error);
-            }
-        } else {
-            object.str("error", "transport");
-        }
-        object.end();
+        });
         context.log(&line);
     }
     Some(exit)

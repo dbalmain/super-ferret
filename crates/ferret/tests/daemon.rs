@@ -430,6 +430,98 @@ fn native_search_and_find_bytes_and_status_match_local() {
     assert_eq!(number(&status, "engine_opens"), Some(1));
 }
 
+/// The value of top-level `key` in a one-line JSON object, as written: a
+/// string, number or balanced object. Enough for the query log: braces
+/// appear only inside its strings, and in the `content` object, none do.
+fn json_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let start = line.find(&format!("\"{key}\":"))? + key.len() + 3;
+    let rest = &line[start..];
+    let end = if rest.starts_with('{') {
+        let mut depth = 0;
+        rest.char_indices()
+            .find(|&(_, c)| {
+                depth += match c {
+                    '{' => 1,
+                    '}' => -1,
+                    _ => 0,
+                };
+                depth == 0
+            })?
+            .0
+            + 1
+    } else if let Some(text) = rest.strip_prefix('"') {
+        let mut escaped = false;
+        text.char_indices()
+            .find(|&(_, c)| {
+                let close = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                close
+            })?
+            .0
+            + 2
+    } else {
+        rest.find([',', '}'])?
+    };
+    Some(&rest[..end])
+}
+
+/// `object` without the integer fields named in `keys`.
+fn without(object: &str, keys: &[&str]) -> String {
+    let mut object = object.to_owned();
+    for key in keys {
+        let field = format!("\"{key}\":");
+        let start = object
+            .find(&field)
+            .unwrap_or_else(|| panic!("{key} in {object}"));
+        let digits = object[start + field.len()..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap();
+        let mut end = start + field.len() + digits;
+        if object[end..].starts_with(',') {
+            end += 1;
+        }
+        object.replace_range(start..end, "");
+    }
+    object
+}
+
+#[test]
+// One exact-content query, run locally and through the daemon, logs one line
+// on each originating host, and both lines carry the same plan, counts and
+// `content` report. Timings and the verification thread count are each
+// host's own.
+fn socket_search_log_carries_the_local_content_report() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let args = ["search", "text:main"];
+    let local = tree.local(&args);
+    let remote = tree.run(&args);
+    assert_eq!(local.status.code(), Some(0), "{local:?}");
+    assert_eq!(remote.stdout, local.stdout);
+    assert_eq!(remote.status.code(), local.status.code());
+
+    let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
+    let searches: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains(r#""cmd":"search""#))
+        .collect();
+    let [local, socket] = searches[..] else {
+        panic!("one line per query: {log}");
+    };
+    assert_eq!(json_value(local, "host"), None, "{local}");
+    assert_eq!(json_value(socket, "host"), Some(r#""socket""#), "{socket}");
+    for key in ["plan", "strategy", "stats", "names", "inodes"] {
+        assert_eq!(json_value(socket, key), json_value(local, key), "{key}");
+    }
+    let content = |line| {
+        let content = json_value(line, "content").unwrap_or_else(|| panic!("content: {line}"));
+        without(content, &["verification_us", "regex_us", "verify_threads"])
+    };
+    let expected = content(local);
+    assert!(expected.contains(r#""driver":"#), "{expected}");
+    assert_eq!(content(socket), expected);
+}
+
 #[test]
 fn concurrent_first_use_has_one_host_and_all_clients_answer() {
     let tree = Tree::new();

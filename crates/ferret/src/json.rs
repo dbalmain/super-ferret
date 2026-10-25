@@ -13,6 +13,8 @@
 
 use std::fmt::Write as _;
 
+use crate::protocol::Value;
+
 /// One JSON object being written into `out`. [`Object::end`] closes it.
 pub struct Object<'a> {
     out: &'a mut Vec<u8>,
@@ -203,6 +205,14 @@ impl<'a> Object<'a> {
         }
     }
 
+    /// `"key":value`, a value read by [`crate::protocol`] written back as
+    /// it was: how a host copies fields another host encoded.
+    pub(crate) fn value(&mut self, key: &str, value: &Value) -> &mut Self {
+        self.key(key);
+        write_value(self.out, value);
+        self
+    }
+
     /// `"key":{…}`, filled in by `fill`.
     pub fn object(&mut self, key: &str, fill: impl FnOnce(&mut Object<'_>)) -> &mut Self {
         self.key(key);
@@ -215,6 +225,33 @@ impl<'a> Object<'a> {
     /// Closes the object.
     pub fn end(self) {
         self.out.push(b'}');
+    }
+}
+
+fn write_value(out: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(true) => out.extend_from_slice(b"true"),
+        Value::Bool(false) => out.extend_from_slice(b"false"),
+        Value::Num(number) => out.extend_from_slice(number.literal().as_bytes()),
+        Value::Str(text) => string(out, text),
+        Value::Arr(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i != 0 {
+                    out.push(b',');
+                }
+                write_value(out, item);
+            }
+            out.push(b']');
+        }
+        Value::Obj(fields) => {
+            let mut object = Object::new(out);
+            for (key, value) in fields {
+                object.value(key, value);
+            }
+            object.end();
+        }
     }
 }
 
@@ -295,6 +332,25 @@ mod tests {
         let mut out = Vec::new();
         encode_base64(&mut out, &[0xff, 0xfe, 0x00]);
         assert_eq!(out, b"//4A");
+    }
+
+    #[test]
+    // A copied value is written back as it was read, numbers by their
+    // literal text, so a field one host encoded reaches another unchanged.
+    fn parsed_values_are_written_back_exactly() {
+        let line = r#"{"n":[0,-1,2.50,1e-3,18446744073709551616],"s":"a\"b","o":{"t":true,"f":false,"z":null}}"#;
+        let value = crate::protocol::parse_object(line.as_bytes()).unwrap();
+        let Value::Obj(fields) = &value else {
+            unreachable!()
+        };
+        assert_eq!(
+            object(|o| {
+                for (key, value) in fields {
+                    o.value(key, value);
+                }
+            }),
+            line
+        );
     }
 
     #[test]

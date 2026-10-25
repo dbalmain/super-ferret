@@ -16,7 +16,7 @@ use crate::engine::{Engine, QuerySession};
 use crate::find_json::{FrameOutput, RawStdout, diagnostic_to, generation};
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
-use crate::search::json_row;
+use crate::search::{self, Run, Summary, json_row};
 use crate::transport::Destination;
 use crate::xdg::Dirs;
 
@@ -237,11 +237,8 @@ pub(crate) fn search_request(
     let mut first_row = None;
     let mut stats = None;
     let mut bytes_read = 0u64;
-    let mut plan_text = String::new();
-    let mut strategy = String::new();
-    if let Ok(query) = parsed {
-        plan_text = query.explain();
-        strategy = format!("{:?}", query.strategy());
+    let mut refused = None;
+    if let Ok(query) = &parsed {
         if let Some(session) = session.as_ref() {
             let catalog = session.catalog();
             bytes_read = catalog.bytes_read();
@@ -263,7 +260,7 @@ pub(crate) fn search_request(
                 .then_some(ferret_query::UNCOVERED_BOUND);
                 let threads = workers.unwrap_or_else(|| session.search_threads());
                 session.search_content_threads(
-                    &query,
+                    query,
                     bound,
                     threads,
                     destination.cancellation(),
@@ -330,9 +327,7 @@ pub(crate) fn search_request(
                     status = if rows == 0 { 1 } else { 0 };
                 }
                 Err(error @ ferret_query::RunError::ScanRequired { .. }) => {
-                    if let Ok(plan) = session.explain_content(&query) {
-                        plan_text.push_str(&format!("; content: {}", plan.describe()));
-                    }
+                    refused = session.explain_content(query).ok();
                     query_error = Some(error.to_string());
                 }
                 Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
@@ -348,59 +343,48 @@ pub(crate) fn search_request(
         }
     } else {
         status = 2;
-        if let Err(error) = parsed {
+        if let Err(error) = &parsed {
             query_error = Some(error.to_string());
         }
     }
-    if let Some(estimate) = stats.as_ref().and_then(|stats| stats.name_plan) {
-        plan_text = format!(
-            "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
-            estimate.plan, estimate.hits, estimate.scope_rows
-        );
-        strategy = format!("{:?}", estimate.plan);
-    }
-    if let Some(content) = stats.as_ref().and_then(|stats| stats.content.as_ref()) {
-        plan_text.push_str(&format!("; content: {}", content.describe()));
-    }
     let elapsed = started.elapsed().as_micros() as i128;
-    let log = SearchLog {
-        status,
-        rows,
-        elapsed,
-        first_row,
+    let summary = Summary {
+        plan: parsed.as_ref().map_or_else(
+            |_| search::Plan::default(),
+            |query| search::Plan::new(query, stats.as_ref(), refused.as_ref()),
+        ),
         bytes_read,
-        plan: &plan_text,
-        strategy: &strategy,
-        stats: stats.clone(),
+        size: session.as_ref().map(|session| {
+            (
+                session.catalog().name_count(),
+                session.catalog().inode_count(),
+            )
+        }),
+        stats: stats.as_ref(),
         error: query_error.as_deref(),
     };
-    log_search(dirs, request, now, &log);
+    if let Some(dirs) = dirs {
+        let run = Run {
+            limit: request.limit,
+            exit: status,
+            rows,
+            first_row_us: first_row,
+            total_us: elapsed,
+        };
+        let line =
+            crate::search::log_line(now, request.args.iter().map(Vec::as_slice), &run, |o| {
+                summary.fields(o);
+            });
+        let _ = crate::log::append(&dirs.state, &line);
+    }
     event_to(destination, request, "end", |o| {
         o.int("exit", status)
             .int("rows", rows)
             .bool("read_error", read_error)
             .bool("cancelled", destination.cancelled())
             .int("elapsed_us", elapsed)
-            .str("plan", &plan_text)
-            .str("strategy", &strategy);
-        o.opt_int("first_row_us", first_row)
-            .int("bytes_read", bytes_read);
-        if let Some(session) = session.as_ref() {
-            o.int("names", session.catalog().name_count())
-                .int("inodes", session.catalog().inode_count());
-        }
-        if let Some(stats) = &stats {
-            o.object("stats", |o| {
-                o.int("candidates", stats.candidates)
-                    .int("rows", stats.rows);
-            });
-            if let Some(content) = &stats.content {
-                crate::search::log_content(o, content);
-            }
-        }
-        if let Some(error) = query_error.as_deref() {
-            o.str("error", error);
-        }
+            .opt_int("first_row_us", first_row);
+        summary.fields(o);
         if let Some(workers) = workers {
             o.int("workers", workers as u64);
         }
@@ -547,59 +531,6 @@ fn send(line: &[u8]) -> io::Result<()> {
     out.write_all(b"\n")?;
     out.flush()
 }
-struct SearchLog<'a> {
-    status: u8,
-    rows: u64,
-    elapsed: i128,
-    first_row: Option<i128>,
-    bytes_read: u64,
-    plan: &'a str,
-    strategy: &'a str,
-    stats: Option<ferret_query::Stats>,
-    error: Option<&'a str>,
-}
-
-fn log_search(dirs: Option<&Dirs>, request: &Request, at: SystemTime, log: &SearchLog<'_>) {
-    let SearchLog {
-        status,
-        rows,
-        elapsed,
-        first_row,
-        bytes_read,
-        plan,
-        strategy,
-        stats,
-        error,
-    } = log;
-    if let Some(dirs) = dirs {
-        let mut line = Vec::new();
-        let mut o = crate::log::line(&mut line, "search", at);
-        o.byte_strings("query", request.args.iter().map(Vec::as_slice))
-            .str("plan", plan)
-            .str("strategy", strategy)
-            .opt_int("limit", request.limit)
-            .int("exit", *status)
-            .int("rows", *rows)
-            .opt_int("first_row_us", *first_row)
-            .int("total_us", *elapsed)
-            .int("bytes_read", *bytes_read);
-        if let Some(stats) = stats {
-            o.object("stats", |o| {
-                o.int("candidates", stats.candidates)
-                    .int("rows", stats.rows);
-            });
-            if let Some(content) = &stats.content {
-                crate::search::log_content(&mut o, content);
-            }
-        }
-        if let Some(error) = error {
-            o.str("error", error);
-        }
-        o.end();
-        let _ = crate::log::append(&dirs.state, &line);
-    }
-}
-
 /// Grep shares find's byte frames and the connection's cancellation flag.
 pub(crate) fn grep_request(
     request: &Request,

@@ -413,21 +413,26 @@ pub(crate) enum Value {
     Obj(Vec<(String, Value)>),
 }
 
-/// A JSON number, kept unevaluated beyond its grammar shape; callers convert
-/// to the type their field needs (here, only `as_u64`).
+/// A JSON number, kept as its literal text; callers convert to the type
+/// their field needs (here, only `as_u64`), and a copied value is written
+/// back exactly as it was read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Num {
-    negative: bool,
-    integer: String,
-    has_frac_or_exp: bool,
+    literal: String,
 }
 
 impl Num {
+    /// The value, when the literal is a non-negative integer without a
+    /// fraction or exponent that fits.
     pub(crate) fn as_u64(&self) -> Option<u64> {
-        if self.negative || self.has_frac_or_exp {
+        if !self.literal.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        self.integer.parse().ok()
+        self.literal.parse().ok()
+    }
+    /// The number as it appeared in the input; always valid JSON.
+    pub(crate) fn literal(&self) -> &str {
+        &self.literal
     }
 }
 
@@ -650,13 +655,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_number(&mut self) -> Result<Num, RequestErrorKind> {
-        let negative = if self.peek() == Some(b'-') {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
             self.pos += 1;
-            true
-        } else {
-            false
-        };
-        let int_start = self.pos;
+        }
         match self.peek() {
             Some(b'0') => {
                 self.pos += 1;
@@ -668,17 +670,7 @@ impl<'a> Parser<'a> {
             }
             _ => return Err(RequestErrorKind::InvalidJson),
         }
-        // All bytes in this range are ASCII digits by construction above, so
-        // a byte-by-byte cast to `char` is exact and needs no fallible
-        // UTF-8 decode.
-        let integer: String = self.input[int_start..self.pos]
-            .iter()
-            .map(|&b| b as char)
-            .collect();
-
-        let mut has_frac_or_exp = false;
         if self.peek() == Some(b'.') {
-            has_frac_or_exp = true;
             self.pos += 1;
             if !matches!(self.peek(), Some(b'0'..=b'9')) {
                 return Err(RequestErrorKind::InvalidJson);
@@ -688,7 +680,6 @@ impl<'a> Parser<'a> {
             }
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
-            has_frac_or_exp = true;
             self.pos += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
@@ -700,11 +691,14 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
             }
         }
-        Ok(Num {
-            negative,
-            integer,
-            has_frac_or_exp,
-        })
+        // Every byte in this range is an ASCII digit, sign, point or
+        // exponent mark by construction above, so a byte-by-byte cast to
+        // `char` is exact and needs no fallible UTF-8 decode.
+        let literal = self.input[start..self.pos]
+            .iter()
+            .map(|&b| b as char)
+            .collect();
+        Ok(Num { literal })
     }
 }
 
