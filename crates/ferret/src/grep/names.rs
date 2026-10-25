@@ -157,13 +157,7 @@ fn execute_routed(
 }
 
 fn selection(plan: &Names) -> Result<GrepSelection, String> {
-    let mut selection = GrepSelection::default().with_hidden(plan.hidden);
-    for glob in &plan.globs {
-        selection
-            .push(glob)
-            .map_err(|error| format!("glob {glob:?}: {error}"))?;
-    }
-    Ok(selection)
+    super::preflight::selection(plan.hidden, &plan.globs)
 }
 
 /// Lists against the request's resident pin without loading catalog sections

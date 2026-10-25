@@ -15,6 +15,7 @@ mod json;
 mod live;
 mod names;
 mod output;
+mod preflight;
 mod presentation;
 pub(crate) mod remote;
 mod sources;
@@ -123,26 +124,11 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     }
     let tty = presentation::resolve(&mut plan.presentation);
     plan.line_number = plan.presentation.numbers.unwrap_or(tty || plan.json);
-    // In colour rg's notice counts a multiline group's matches, which the
-    // rendered lines do not keep.
-    if plan.max_columns.is_some()
-        && plan.output == Output::Lines
-        && !plan.quiet
-        && plan.multiline
-        && plan.presentation.color.enabled()
-        && !plan.json
-    {
-        return failure("-M with -U in colour is not supported; use rg for this command");
-    }
-    let mut selection = GrepSelection::default().with_hidden(plan.hidden);
-    for glob in &plan.globs {
-        if let Err(error) = selection.push(glob) {
-            return failure(&format!("glob {glob:?}: {error}"));
-        }
-    }
-    if plan.max_count == Some(0) {
-        return Exit::NoMatch;
-    }
+    let selection = match preflight::prepare(&plan) {
+        Ok(preflight::Prepared::Search(selection)) => selection,
+        Ok(preflight::Prepared::NoMatch) => return Exit::NoMatch,
+        Err(error) => return failure(&error),
+    };
     let inputs = if plan.stdin_patterns && plan.paths.is_empty() {
         resolve_inputs(&[PathBuf::from(".")], false)
     } else {

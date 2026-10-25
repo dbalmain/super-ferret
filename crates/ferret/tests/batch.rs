@@ -813,3 +813,41 @@ fn delete_needs_local_effects_but_no_child_stdin_while_exec_still_needs_both() {
     assert!(!marker.exists(), "-exec must not run without child_stdin");
     assert!(!tree.0.join("src/MARKER").exists());
 }
+
+// The protocol host refuses what the CLI refuses: `-M` with `-U` in colour
+// ends with the CLI's status and diagnostic bytes and no result bytes.
+#[test]
+fn protocol_grep_refuses_the_cli_refused_colour_multiline_omission() {
+    let tree = Tree::new();
+    let args = ["-U", "-M", "3", "--color=always", "main", "src"];
+    let cli = fixture::command(FERRET, &tree.0)
+        .env("FERRET_INDEX", tree.0.join("index"))
+        .arg("grep")
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(cli.status.code(), Some(2), "{cli:?}");
+    assert!(cli.stdout.is_empty(), "{cli:?}");
+    let argv = args
+        .iter()
+        .map(|arg| format!("{arg:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(
+        r#"{{"id":"g","op":"grep","args":[{argv}],"cwd":"{}","grep":{{"color":true,"heading":false,"numbers":false,"tty":false,"threads":1,"pattern_files":[],"temp_dir":"/tmp"}}}}"#,
+        tree.0.display()
+    );
+    let output = tree.run(format!("{line}\n").as_bytes());
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(
+        text.contains("\"id\":\"g\",\"event\":\"end\",\"exit\":2"),
+        "{text}"
+    );
+    assert_eq!(decoded_frames(&output.stdout, "stdout"), b"", "{text}");
+    assert_eq!(
+        decoded_frames(&output.stdout, "stderr"),
+        cli.stderr,
+        "{text}"
+    );
+}

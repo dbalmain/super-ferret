@@ -165,6 +165,13 @@ pub(crate) fn serve(
     plan.spill_dir = Some(Arc::from(Path::new(std::ffi::OsStr::from_bytes(
         &options.temp_dir,
     ))));
+    // Before operands, as in the local host: a refused combination or `-m0`
+    // never depends on the operands or the pin.
+    let selection = match super::preflight::prepare(&plan) {
+        Ok(super::preflight::Prepared::Search(selection)) => selection,
+        Ok(super::preflight::Prepared::NoMatch) => return Ok(Exit::NoMatch),
+        Err(error) => return Ok(runtime.failure(&error)),
+    };
     let paths = if plan.paths.is_empty() {
         vec![PathBuf::from(".")]
     } else {
@@ -188,15 +195,6 @@ pub(crate) fn serve(
     runtime.descriptors = Some(Arc::new(line_grep::IoBudget::for_request(
         threads, requests,
     )));
-    let mut selection = GrepSelection::default().with_hidden(plan.hidden);
-    for glob in &plan.globs {
-        if let Err(error) = selection.push(glob) {
-            return Ok(runtime.failure(&format!("glob {glob:?}: {error}")));
-        }
-    }
-    if plan.max_count == Some(0) {
-        return Ok(Exit::NoMatch);
-    }
     // Same block buffer as in-process content, but a per-group flush would
     // emit one socket frame per file. `commit` still flushes a failed publish.
     runtime.defer_stdout = block_stdout(&plan) && !options.tty;
