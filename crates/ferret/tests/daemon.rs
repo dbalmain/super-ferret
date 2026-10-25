@@ -3611,6 +3611,105 @@ fn text_stats_waiting_on_the_writer_does_not_block_queries_or_hello() {
     assert!(report.contains("\"report\":"), "{report}");
 }
 
+/// A writer that stops after the engine is ready takes the host down with it
+/// rather than leaving a daemon that answers `ready` from a frozen catalog.
+/// The background follow is held at its gate while the content manifest's
+/// temporary name is made a directory, so its publication fails with EISDIR.
+/// A queued `index` releases the gate and must get an error, an idle
+/// connection must close, and the catalog lock and socket must go. Once the
+/// obstruction is removed, the next `index` sees a file added afterwards.
+#[test]
+#[cfg(debug_assertions)]
+fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
+    let tree = Tree::new();
+    let gate = tree.base.join("content-gate");
+    fs::create_dir_all(&gate).unwrap();
+    fs::write(gate.join("follow"), b"hold").unwrap();
+    let pid = tree.start(&[
+        ("FERRET_DAEMON_IDLE_MS", "0"),
+        ("FERRET_BACKSTOP_MS", "3600000"),
+        ("FERRET_POLL_MS", "300000"),
+        ("FERRET_CONTENT_TEST_GATE", gate.to_str().unwrap()),
+    ]);
+    ready_within(&tree, Duration::from_secs(60));
+    let (mut idle, _) = tree.connect();
+    for i in 0..20 {
+        fs::write(
+            tree.base.join(format!("src/follow-{i}.txt")),
+            format!("followed{i}\n"),
+        )
+        .unwrap();
+    }
+    let held_by = Instant::now() + Duration::from_secs(60);
+    while !gate.join("follow.reached").exists() {
+        assert!(tree.try_wait(pid).is_none(), "{}", tree.evidence());
+        assert!(
+            Instant::now() < held_by,
+            "follow did not reach the gate; {}",
+            tree.evidence()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::create_dir(tree.base.join("index/index/manifest.tmp")).unwrap();
+    let (mut queued, _) = tree.connect();
+    queued
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let src = tree.base.join("src");
+    let reply = block(
+        &mut queued,
+        format!(
+            "{{\"id\":\"q\",\"op\":\"index\",\"args\":[\"\",\"{}\"]}}\n",
+            src.display()
+        )
+        .as_bytes(),
+    );
+    assert!(
+        reply.contains("\"exit\":3") && reply.contains("WriterUnavailable"),
+        "{reply}"
+    );
+    let exited = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = tree.try_wait(pid) {
+            break status;
+        }
+        assert!(
+            Instant::now() < exited,
+            "a daemon whose writer stopped kept running; {}",
+            tree.evidence()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(3), "{status}; {}", tree.evidence());
+    let mut rest = String::new();
+    assert_eq!(idle.read_line(&mut rest).unwrap(), 0, "{rest}");
+    assert!(tree.sockets().is_empty(), "{}", tree.evidence());
+    let log = fs::read_to_string(tree.base.join("daemon.log")).unwrap();
+    assert!(
+        log.contains("writer stopped") && log.contains("Is a directory"),
+        "{log}"
+    );
+    drop(
+        ferret_catalog::WriterSession::open(&tree.base.join("index"))
+            .unwrap_or_else(|error| panic!("catalog lock survived the writer: {error}")),
+    );
+    fs::remove_dir(tree.base.join("index/index/manifest.tmp")).unwrap();
+    fs::write(src.join("laterfile.txt"), b"later\n").unwrap();
+    let indexed = tree.run(&["index", "src"]);
+    assert!(
+        indexed.status.success(),
+        "{}; {}",
+        String::from_utf8_lossy(&indexed.stderr),
+        tree.evidence()
+    );
+    let found = tree.run(&["search", "laterfile"]);
+    assert!(
+        String::from_utf8_lossy(&found.stdout).contains("laterfile.txt"),
+        "{found:?}"
+    );
+}
+
 #[test]
 #[cfg(debug_assertions)]
 fn transient_accept_errors_do_not_stop_the_daemon() {

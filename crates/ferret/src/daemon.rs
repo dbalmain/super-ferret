@@ -68,6 +68,9 @@ struct Host {
     writer_status: Mutex<writer::Status>,
     writer_running: AtomicBool,
     writer_pending: AtomicUsize,
+    /// The writer service ended after the engine was ready. The host drains
+    /// and exits rather than serve a catalog nothing refreshes.
+    writer_failed: AtomicBool,
     stop: AtomicBool,
 }
 enum ServerEvent {
@@ -272,6 +275,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         writer_status: Mutex::new(writer::Status::default()),
         writer_running: AtomicBool::new(false),
         writer_pending: AtomicUsize::new(0),
+        writer_failed: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         permits: Permits::new(ferret_crawl::default_workers()),
     });
@@ -287,6 +291,12 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .draining;
         let clients = host.clients.load(Ordering::Acquire);
+        // A dead writer's pending count can be stale, so a failed writer
+        // waits only for connections, which its drain has already woken.
+        if host.writer_failed.load(Ordering::Acquire) && clients == 0 {
+            exit_error = Some(io::Error::other("writer stopped"));
+            break;
+        }
         let busy = writer::busy(&host);
         if clients != 0 {
             idle_since = Instant::now();

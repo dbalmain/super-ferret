@@ -143,7 +143,8 @@ pub(super) fn start(
                 .engine
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(*loaded, Loaded::Loading) {
+            let loading = matches!(*loaded, Loaded::Loading);
+            if loading {
                 *loaded = Loaded::Failed(error.clone());
             }
             drop(loaded);
@@ -151,9 +152,20 @@ pub(super) fn start(
             host.writer_status
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .error = Some(error);
+                .error = Some(error.clone());
             host.writer_pending.store(0, Ordering::Release);
-            super::wake_listener(&host);
+            if loading {
+                super::wake_listener(&host);
+                return;
+            }
+            // A ready engine would otherwise keep answering from a catalog
+            // nothing refreshes, while holding the catalog lock a replacement
+            // needs. A poisoned index writer is not retried: the host leaves
+            // through drain, so the next client runs in process or starts a
+            // fresh daemon (D110).
+            crate::cli::error(&format!("daemon: writer stopped: {error}"));
+            host.writer_failed.store(true, Ordering::Release);
+            super::drain(&host);
         })
 }
 /// Returns heap freed by a rewalk or a command to the kernel. glibc keeps it

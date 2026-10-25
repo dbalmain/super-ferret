@@ -843,6 +843,12 @@ the client exits 3 and is told to run `ferret index` again. The catalog
 change is already published. Writer teardown cancels and joins the merge
 before releasing the catalog lock, then removes the socket (D110).
 A fatal accept error and a dead accept thread leave through that teardown.
+So does a writer that stops with an error once the engine is ready, such as
+a content publication that fails: the daemon logs the cause, drains (queued
+writer commands get `WriterUnavailable`, idle connections close) and exits 3,
+rather than answer `ready` from a catalog nothing refreshes. A poisoned index
+writer is never retried; the next client runs in process or starts a fresh
+daemon. A writer that fails while loading still reports `failed` instead.
 ECONNABORTED, EINTR, EPROTO, EMFILE, ENFILE, ENOBUFS and ENOMEM are logged
 once per streak and retried; EMFILE and ENFILE pause briefly so a full
 descriptor table cannot spin the listener.
