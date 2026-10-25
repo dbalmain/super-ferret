@@ -52,6 +52,10 @@ pub fn lower_index_priority() -> std::io::Result<()> {
         .and_then(|value| value.parse::<i32>().ok())
         .filter(|nice| (0..=19).contains(nice))
         .unwrap_or(19);
+    // Not left to lower_thread_to: an inherited nice can be negative.
+    if nice == 0 {
+        return Ok(());
+    }
     lower_thread_to(nice)
 }
 /// Never raises priority: a thread already nicer than `nice` keeps its own,
