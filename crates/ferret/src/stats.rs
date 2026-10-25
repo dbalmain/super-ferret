@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use ferret_catalog::{BudgetUsage, Catalog, ContentState, Kind, NameId, Target};
+use ferret_catalog::{BudgetUsage, Catalog, CompactionLimits, ContentState, Kind, NameId, Target};
 
 use crate::cli::{Context, Exit, error};
 use crate::index::bytes;
@@ -50,23 +50,31 @@ pub fn run(context: &Context) -> Exit {
 pub(crate) fn text(index: &Path, usage: &BudgetUsage, catalog: &Catalog) -> String {
     let mut text = String::new();
     let _ = writeln!(text, "index {}", index.display());
+    budget(&mut text, usage, CompactionLimits::default());
+    report(catalog, &mut Census::of(catalog), &mut text);
+    text
+}
+
+/// The log budget lines: usage against the limits that request compaction,
+/// read from the type the writer applies rather than restated here.
+fn budget(out: &mut String, usage: &BudgetUsage, limits: CompactionLimits) {
     let _ = writeln!(
-        text,
-        "log {} bytes / 67108864, {} records / 500000, {} transactions",
-        usage.log_bytes, usage.records, usage.transactions
+        out,
+        "log {} bytes / {}, {} records / {}, {} transactions",
+        usage.log_bytes, limits.log_bytes, usage.records, limits.records, usage.transactions
     );
     let _ = writeln!(
-        text,
-        "dirty inodes {}/{}, names {}/{} (1%); dead base inodes {}, names {} (5%)",
+        out,
+        "dirty inodes {}/{}, names {}/{} ({}%); dead base inodes {}, names {} ({}%)",
         usage.dirty_inodes,
         usage.base_inodes,
         usage.dirty_names,
         usage.base_names,
+        limits.dirty_percent,
         usage.dead_inodes,
-        usage.dead_names
+        usage.dead_names,
+        limits.dead_percent
     );
-    report(catalog, &mut Census::of(catalog), &mut text);
-    text
 }
 
 /// Buckets `0`, `1`, `2–3`, `4–7`, …: bucket `i > 0` holds `2^(i-1)` up to
@@ -481,4 +489,51 @@ pub(crate) fn json_fields(o: &mut crate::json::Object<'_>, session: &crate::engi
                 names.term_build_time().map(|d| d.as_micros() as i128),
             );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage() -> BudgetUsage {
+        BudgetUsage {
+            log_bytes: 10,
+            records: 2,
+            transactions: 1,
+            base_inodes: 7,
+            base_names: 8,
+            dirty_inodes: 3,
+            dirty_names: 4,
+            dead_inodes: 5,
+            dead_names: 6,
+        }
+    }
+
+    #[test]
+    fn budget_lines_render_the_default_limits_unchanged() {
+        let mut out = String::new();
+        budget(&mut out, &usage(), CompactionLimits::default());
+        assert_eq!(
+            out,
+            "log 10 bytes / 67108864, 2 records / 500000, 1 transactions\n\
+             dirty inodes 3/7, names 4/8 (1%); dead base inodes 5, names 6 (5%)\n"
+        );
+    }
+
+    #[test]
+    fn budget_lines_render_the_limits_they_are_given() {
+        let limits = CompactionLimits {
+            log_bytes: 4096,
+            records: 9,
+            dirty_percent: 11,
+            dead_percent: 13,
+        };
+        let mut out = String::new();
+        budget(&mut out, &usage(), limits);
+        assert_eq!(
+            out,
+            "log 10 bytes / 4096, 2 records / 9, 1 transactions\n\
+             dirty inodes 3/7, names 4/8 (11%); dead base inodes 5, names 6 (13%)\n"
+        );
+    }
 }
