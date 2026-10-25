@@ -627,19 +627,51 @@ fn admit<'a>(host: &'a Host, cancelled: &AtomicBool) -> Option<QueryPermit<'a>> 
         drop(state);
     }
 }
+/// Selects the ready engine and pins its current generation, after checking
+/// that the index directory is still the one this host serves.
+///
+/// The identity check stats the index directory, which can be slow. It runs
+/// on a clone of the selected engine with the selection mutex released, so
+/// only this request waits (D32). Selection never leaves `Ready`, and
+/// admission and drain do not consult the engine, so the clone admits
+/// nothing the held guard would have refused.
 fn pin(host: &Host) -> io::Result<QuerySession> {
-    let mut state = host
+    let engine = match &*host
         .engine
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Loaded::Ready(engine) = &mut *state else {
-        return Err(io::Error::other("engine is not ready"));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        Loaded::Ready(engine) => engine.clone(),
+        Loaded::Loading | Loaded::Failed(_) => {
+            return Err(io::Error::other("engine is not ready"));
+        }
     };
+    #[cfg(debug_assertions)]
+    identity_checkpoint();
     let identity = fs::metadata(&host.index)?;
     if format!("{:x}-{:x}", identity.dev(), identity.ino()) != host.identity {
         return Err(io::Error::other("index directory identity changed"));
     }
     Ok(engine.pin())
+}
+/// Holds one selection at the identity check, for a test that needs a request
+/// parked there. `FERRET_DAEMON_TEST_PIN_GATE` names a directory; the first
+/// selection to rename its `hold` file to `held` writes `reached` and waits
+/// until the test removes `held`. Every other selection passes straight
+/// through, so the test can drive a second request past the parked one.
+#[cfg(debug_assertions)]
+fn identity_checkpoint() {
+    let Some(gate) = std::env::var_os("FERRET_DAEMON_TEST_PIN_GATE").map(PathBuf::from) else {
+        return;
+    };
+    let held = gate.join("held");
+    if fs::rename(gate.join("hold"), &held).is_err() {
+        return;
+    }
+    let _ = fs::write(gate.join("reached"), b"reached");
+    while held.exists() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 struct ConnectionRegistration<'a>(&'a Host, usize);
 impl Drop for ConnectionRegistration<'_> {

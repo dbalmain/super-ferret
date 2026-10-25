@@ -3763,6 +3763,50 @@ fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
     );
 }
 
+/// The index-directory identity check stats the filesystem, which can be
+/// slow. Engine selection must not wait behind it: with one request parked
+/// at the check, a query on another open connection still completes (D32).
+/// The parked request then sees the directory replaced and still refuses.
+#[test]
+#[cfg(debug_assertions)]
+fn slow_identity_check_does_not_block_other_selections() {
+    let tree = Tree::new();
+    let gate = tree.base.join("pin-gate");
+    fs::create_dir(&gate).unwrap();
+    tree.start(&[("FERRET_DAEMON_TEST_PIN_GATE", gate.to_str().unwrap())]);
+    // Both hellos select before the gate is armed, so neither parks.
+    let (mut parked, _) = tree.connect();
+    let (mut query, _) = tree.connect();
+    fs::write(gate.join("hold"), b"hold").unwrap();
+    // Owned, not scoped: if the checks below fail, Tree's Drop must still
+    // be able to kill the daemon that this read is waiting on.
+    parked.get_ref().set_read_timeout(Some(BOUND * 6)).unwrap();
+    let parked = std::thread::spawn(move || {
+        block(
+            &mut parked,
+            b"{\"id\":\"p\",\"op\":\"search\",\"args\":[\"main\"]}\n",
+        )
+    });
+    wait(|| gate.join("reached").exists());
+    // Bounded by BOUND: a selection held behind the parked stat turns into
+    // a timeout here rather than a hang.
+    let found = block(
+        &mut query,
+        b"{\"id\":\"q\",\"op\":\"search\",\"args\":[\"main\"]}\n",
+    );
+    assert!(found.contains("main.rs"), "{found}");
+    assert!(!parked.is_finished(), "the parked request did not wait");
+    let index = tree.base.join("index");
+    fs::rename(&index, tree.base.join("index-aside")).unwrap();
+    fs::create_dir(&index).unwrap();
+    fs::remove_file(gate.join("held")).unwrap();
+    let refused = parked.join().unwrap();
+    assert!(
+        refused.contains("index directory identity changed") && !refused.contains("main.rs"),
+        "{refused}"
+    );
+}
+
 #[test]
 #[cfg(debug_assertions)]
 fn transient_accept_errors_do_not_stop_the_daemon() {
