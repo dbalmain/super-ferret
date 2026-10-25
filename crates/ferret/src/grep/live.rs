@@ -16,6 +16,10 @@ pub(super) struct Anchors {
     uncovered: Arc<[PathBuf]>,
     fallback: bool,
     faults: Arc<[(PathBuf, io::Error)]>,
+    /// The first configured root whose destination cannot be established:
+    /// an unreadable component or a link loop may hide an alias to any
+    /// scope, so it is relevant to every walked operand.
+    unknown: Option<Arc<str>>,
     global: Arc<str>,
     git_global: Arc<ferret_policy::GrepIgnore>,
     index: Arc<Path>,
@@ -37,44 +41,53 @@ impl Anchors {
         catalog.load(&[Section::Roots]).map_err(|e| e.to_string())?;
         #[cfg(test)]
         OPENED.with_borrow_mut(|opened| *opened = Some(catalog.clone()));
-        Self::from_paths(
+        let anchors = Self::from_paths(
             index,
             global,
             catalog.roots().map(|(_, path)| path.to_vec()),
-        )
+        );
+        // `--live` needs every anchor's destination before it walks.
+        match anchors.unknown {
+            Some(unknown) => Err(unknown.to_string()),
+            None => Ok(anchors),
+        }
     }
     fn from_paths(
         index: &Path,
         global: Arc<str>,
         paths: impl IntoIterator<Item = Vec<u8>>,
-    ) -> Result<Self, String> {
+    ) -> Self {
         let mut roots = Vec::new();
         let mut faults = Vec::new();
+        let mut unknown = None;
         for root in paths {
             let path = Path::new(std::ffi::OsStr::from_bytes(&root));
             match fs::canonicalize(path) {
                 Ok(root) => roots.push(root),
                 // Stored roots retain symlink spellings. Even failed anchors
                 // need the same namespace as canonicalized operands.
-                Err(error) => faults.push((
-                    failed_scope(path).map_err(|e| {
-                        format!("cannot resolve policy root {}: {e}", path.display())
-                    })?,
-                    error,
-                )),
+                Err(error) => match failed_scope(path) {
+                    Ok(scope) => faults.push((scope, error)),
+                    Err(e) => {
+                        unknown.get_or_insert_with(|| {
+                            format!("cannot resolve policy root {}: {e}", path.display()).into()
+                        });
+                    }
+                },
             }
         }
         roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
         roots.dedup();
-        Ok(Self {
+        Self {
             roots: roots.into(),
             uncovered: Arc::default(),
             fallback: false,
             faults: faults.into(),
+            unknown,
             global,
             git_global: Arc::default(),
             index: index.to_owned().into(),
-        })
+        }
     }
     /// Resolves coverage before either the engine or the daemon is opened.
     pub fn routing(index: Option<&Path>, inputs: &[Input]) -> Result<Self, String> {
@@ -96,7 +109,10 @@ impl Anchors {
                 .collect(),
             crossed: std::cell::Cell::new(false),
         };
-        let mut anchors = Self::from_paths(&index, "".into(), paths)?;
+        // A root whose destination is unknown can only add coverage, so an
+        // operand a resolved root covers keeps its snapshot; it is relevant
+        // only to the uncovered operands `validate` checks before walking.
+        let mut anchors = Self::from_paths(&index, "".into(), paths);
         anchors.fallback = true;
         let mut uncovered = Vec::new();
         for input in inputs {
@@ -139,6 +155,9 @@ impl Anchors {
     }
     pub fn validate(&self, path: &Path) -> io::Result<PathBuf> {
         let current = fs::canonicalize(path)?;
+        if let Some(unknown) = &self.unknown {
+            return Err(io::Error::other(unknown.to_string()));
+        }
         if let Some((root, error)) = self
             .faults
             .iter()

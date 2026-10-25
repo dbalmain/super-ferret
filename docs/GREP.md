@@ -368,6 +368,13 @@ the failure as relevant, with empty stdout and exit 2. This deliberately fails
 closed even for an otherwise healthy operand whose independence cannot be
 established; it supersedes round 1's inaccessible-unrelated-root exception.
 
+**Architecture review correction (2026-10-25):** that unknown destination
+fails closed for `--live` and for walked (uncovered) operands only. Indexed
+routing defers it: an unknown root can only add coverage, so an operand that
+a resolved root covers keeps its snapshot. Operands at or below the failed
+spelling still fail to resolve, and a nested root's loop surfaces as a read
+fault on its snapshot files.
+
 Nested configured roots reset policy when reached or explicitly selected;
 they do not revive an ancestor already pruned by policy or grep filters. This
 matches the indexed source on an unchanged tree. Explicit ignored starts retain

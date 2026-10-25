@@ -3485,6 +3485,94 @@ fn m6_live_symlink_loop_on_anchor_path_fails_closed() {
     }
 }
 
+// A root whose destination is unknown can only add coverage. Indexed grep
+// of a disjoint healthy root keeps its snapshot in either catalog order,
+// while the looping root's own operands, uncovered walks and `--live`
+// (which needs every anchor) still fail closed.
+#[test]
+fn indexed_grep_of_a_healthy_root_survives_an_unrelated_root_loop() {
+    for order in ["ab", "ba"] {
+        let fixture = Fixture::new(&format!("indexed-unrelated-loop-{order}"));
+        let (a, b) = (fixture.base.join("a"), fixture.base.join("b"));
+        let elsewhere = fixture.base.join("elsewhere");
+        for dir in [&a, &b.join("sub"), &elsewhere] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(a.join("f000.txt"), b"initial\n").unwrap();
+        fs::write(b.join("sub/f001.txt"), b"initial\n").unwrap();
+        fs::write(elsewhere.join("f002.txt"), b"initial\n").unwrap();
+        let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+        let roots = if order == "ab" { [a, b] } else { [b, a] };
+        let indexed = fixture.ferret(&["index", roots[0], roots[1]], None);
+        assert!(indexed.status.success(), "{indexed:?}");
+        fs::rename(b, fixture.base.join("b-aside")).unwrap();
+        symlink(b, b).unwrap();
+        for (args, expected) in [
+            (
+                vec!["grep", "initial", a],
+                format!("{a}/f000.txt:initial\n"),
+            ),
+            (vec!["grep", "--files", a], format!("{a}/f000.txt\n")),
+        ] {
+            let output = fixture.ferret(&args, None);
+            assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+            assert_eq!(output.stdout, expected.as_bytes(), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        }
+        let inside = format!("{b}/sub");
+        let elsewhere = elsewhere.to_str().unwrap();
+        for (args, diagnostic) in [
+            (vec!["grep", "initial", b], "symbolic links"),
+            (vec!["grep", "--files", &inside], "symbolic links"),
+            (vec!["grep", "initial", &inside], "symbolic links"),
+            (vec!["grep", "initial", elsewhere], "40 symlink expansions"),
+            (
+                vec!["grep", "initial", a, elsewhere],
+                "40 symlink expansions",
+            ),
+            (
+                vec!["grep", "--live", "initial", a],
+                "40 symlink expansions",
+            ),
+        ] {
+            let output = fixture.ferret(&args, None);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+                "{args:?}: {output:?}"
+            );
+            if args.last() != Some(&elsewhere) {
+                assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+            }
+        }
+    }
+}
+
+// A nested root that becomes a loop is not unrelated to its parent: the
+// snapshot still names its files, and reading them reports the loop.
+#[test]
+fn indexed_grep_reports_a_nested_root_loop() {
+    let fixture = Fixture::new("indexed-nested-loop");
+    let a = fixture.base.join("a");
+    fs::create_dir_all(a.join("inner")).unwrap();
+    fs::write(a.join("f000.txt"), b"initial\n").unwrap();
+    fs::write(a.join("inner/f001.txt"), b"initial\n").unwrap();
+    let inner = a.join("inner");
+    let (a, inner) = (a.to_str().unwrap(), inner.to_str().unwrap());
+    let indexed = fixture.ferret(&["index", a, inner], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    fs::rename(inner, fixture.base.join("inner-aside")).unwrap();
+    symlink(inner, inner).unwrap();
+    for args in [vec!["grep", "initial", a], vec!["grep", "initial", inner]] {
+        let output = fixture.ferret(&args, None);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("symbolic links"),
+            "{args:?}: {output:?}"
+        );
+    }
+}
+
 // M7: these are owned observations, including every multiline example in
 // GREP.md. Raw assertions below also pin the examples independently of rg.
 differential! {
