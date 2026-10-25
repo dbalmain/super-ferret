@@ -61,15 +61,24 @@ impl FindSource {
     }
 }
 
-/// Resolves the source a find plan should walk: `Live` for an unindexed walk
-/// (`-I`, a configured `find_no_ignore`, or an information plan), a catalog
-/// source otherwise, or an error message (without a `find: ` prefix)
-/// describing why neither is available.
-fn resolve_source(plan: &Plan, index: Option<&Path>) -> Result<FindSource, String> {
+/// Where a supported find plan runs, resolved once per invocation: daemon
+/// routing and the local fallback read this one value, so they see the same
+/// config and index precedence. Never cached across invocations; a later
+/// command must see config edits.
+enum Route {
+    /// An unindexed walk: `-I`, a configured `find_no_ignore`, or an
+    /// information plan.
+    Live,
+    Indexed(PathBuf),
+}
+
+/// Resolves a plan's route, or an error message (without a `find: ` prefix)
+/// saying why neither is available. Explicit `-I` and information plans never
+/// read config.
+fn route(plan: &Plan, index: Option<&Path>) -> Result<Route, String> {
     if plan.no_ignore() || plan.is_information() {
-        return Ok(FindSource::Live);
+        return Ok(Route::Live);
     }
-    let dirs = Dirs::from_env();
     let config = Dirs::config_from_env().ok().map(|dir| dir.join("config"));
     let no_ignore = match config.as_deref().map(read_config).transpose() {
         Ok(value) => value.unwrap_or(false),
@@ -80,20 +89,34 @@ fn resolve_source(plan: &Plan, index: Option<&Path>) -> Result<FindSource, Strin
         }
     };
     if no_ignore {
-        return Ok(FindSource::Live);
+        return Ok(Route::Live);
     }
-    let index = index
+    index_path(index, std::env::var_os("FERRET_INDEX"), || {
+        Dirs::from_env().ok().map(|dirs| dirs.data)
+    })
+    .map(Route::Indexed)
+    .ok_or_else(|| "cannot locate index; set --index or FERRET_INDEX, or use -I".to_owned())
+}
+
+/// Index precedence: `--index`, then a nonempty `FERRET_INDEX`, then the XDG
+/// data directory.
+fn index_path(
+    explicit: Option<&Path>,
+    env: Option<OsString>,
+    data: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    explicit
         .map(Path::to_owned)
-        .or_else(|| {
-            std::env::var_os("FERRET_INDEX")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| dirs.as_ref().ok().map(|dirs| dirs.data.clone()));
-    let Some(index) = index else {
-        return Err("cannot locate index; set --index or FERRET_INDEX, or use -I".to_owned());
-    };
-    open_catalog(plan, &index)
+        .or_else(|| env.filter(|value| !value.is_empty()).map(PathBuf::from))
+        .or_else(data)
+}
+
+/// Opens the source a resolved route walks.
+fn open_source(plan: &Plan, route: Route) -> Result<FindSource, String> {
+    match route {
+        Route::Live => Ok(FindSource::Live),
+        Route::Indexed(index) => open_catalog(plan, &index),
+    }
 }
 
 fn open_catalog(plan: &Plan, index: &Path) -> Result<FindSource, String> {
@@ -119,31 +142,42 @@ fn open_catalog(plan: &Plan, index: &Path) -> Result<FindSource, String> {
     }
 }
 
-// Routing must precede engine open, but follow the same plan/config checks as
-// local execution. Effects, information and configured live walks stay local.
+// Routing must precede engine open. Effects stay local; so do live routes.
 fn remote(
     args: &[OsString],
-    index: Option<&Path>,
+    route: &Route,
     plan: &Plan,
     json: bool,
     now: std::time::SystemTime,
 ) -> Option<Exit> {
-    if plan.has_side_effects() || plan.no_ignore() || plan.is_information() {
-        return None;
+    match route {
+        Route::Indexed(index) if !plan.has_side_effects() => {
+            crate::daemon::find(index, args, json, now)
+        }
+        _ => None,
     }
-    let config = Dirs::config_from_env().ok()?.join("config");
-    if read_config(&config).ok()? {
-        return None;
+}
+
+/// A supported plan after routing: answered by the daemon, or to run here.
+enum Prepared {
+    Answered(Exit),
+    Local(FindSource),
+}
+
+/// Resolves the plan's route once, offers an indexed read-only plan to the
+/// daemon, and otherwise opens the local source from that same route.
+fn prepare(
+    args: &[OsString],
+    plan: &Plan,
+    index: Option<&Path>,
+    json: bool,
+    now: std::time::SystemTime,
+) -> Result<Prepared, String> {
+    let route = route(plan, index)?;
+    if let Some(exit) = remote(args, &route, plan, json, now) {
+        return Ok(Prepared::Answered(exit));
     }
-    let index = index
-        .map(Path::to_owned)
-        .or_else(|| {
-            std::env::var_os("FERRET_INDEX")
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| Dirs::from_env().ok().map(|dirs| dirs.data))?;
-    crate::daemon::find(&index, args, json, now)
+    open_source(plan, route).map(Prepared::Local)
 }
 
 /// Runs a find command. Find errors and usage errors both exit 1; no matches
@@ -165,11 +199,9 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
         ));
         return Exit::NoMatch;
     }
-    if let Some(exit) = remote(args, index, &plan, false, now) {
-        return exit;
-    }
-    let source = match resolve_source(&plan, index) {
-        Ok(source) => source,
+    let source = match prepare(args, &plan, index, false, now) {
+        Ok(Prepared::Answered(exit)) => return exit,
+        Ok(Prepared::Local(source)) => source,
         Err(message) => {
             cli::error(&format!("find: {message}"));
             return Exit::NoMatch;
@@ -230,18 +262,14 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
         // The block reports the unsupported feature; nothing is routed or
         // opened for a plan that cannot run.
         Ok(plan) if plan.unsupported().is_some() => (Ok(plan), FindSource::Live),
-        Ok(plan) => {
-            if let Some(exit) = remote(args, index, &plan, true, now) {
-                return exit;
-            }
-            match resolve_source(&plan, index) {
-                Ok(source) => (Ok(plan), source),
-                Err(message) => (
-                    Err(find_json::Failure::new("resolve", message)),
-                    FindSource::Live,
-                ),
-            }
-        }
+        Ok(plan) => match prepare(args, &plan, index, true, now) {
+            Ok(Prepared::Answered(exit)) => return exit,
+            Ok(Prepared::Local(source)) => (Ok(plan), source),
+            Err(message) => (
+                Err(find_json::Failure::new("resolve", message)),
+                FindSource::Live,
+            ),
+        },
     };
     let host = FrameOutput::new(ID, ChildStdin::Inherit).with_warning_stderr();
     let workers = ferret_crawl::default_workers();
@@ -446,6 +474,31 @@ mod tests {
             Ok(FindSource::Pinned(_))
         ));
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn index_precedence_is_explicit_then_nonempty_env_then_data() {
+        // (--index, FERRET_INDEX, XDG data, chosen); "-" is absent.
+        let cases = [
+            ("/explicit", "/env", "/data", "/explicit"),
+            ("-", "/env", "/data", "/env"),
+            ("-", "", "/data", "/data"),
+            ("-", "-", "/data", "/data"),
+            ("-", "", "-", "-"),
+            ("/explicit", "-", "-", "/explicit"),
+        ];
+        let given = |value: &'static str| (value != "-").then_some(value);
+        for (explicit, env, data, expected) in cases {
+            assert_eq!(
+                index_path(
+                    given(explicit).map(Path::new),
+                    given(env).map(OsString::from),
+                    || given(data).map(PathBuf::from),
+                ),
+                given(expected).map(PathBuf::from),
+                "{explicit} {env} {data}"
+            );
+        }
     }
 
     #[test]
