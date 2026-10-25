@@ -964,7 +964,7 @@ impl Source<'_> {
 }
 
 /// One observation of a plan's refreshed roots: the batches, and the root each
-/// batch came from. A root's batches are contiguous.
+/// batch came from.
 struct Observed {
     batches: Vec<ferret_catalog::Batch>,
     owners: Vec<PathBuf>,
@@ -1165,20 +1165,40 @@ fn withdraw(
         .collect();
     let mut failed = Vec::new();
     for root in candidates {
-        let first = observed.owners.iter().position(|o| *o == root);
-        let count = observed.owners.iter().filter(|o| **o == root).count();
-        let range = first.map_or(0..0, |first| first..first + count);
-        debug_assert!(observed.owners[range.clone()].iter().all(|o| *o == root));
+        // Selected by owner, not by position, so another root's batches can
+        // never leave with this one's. A root that stays gets its batches back
+        // in their places.
+        let mine: Vec<bool> = observed.owners.iter().map(|o| *o == root).collect();
+        let (mut own_batches, mut rest_batches) = (Vec::new(), Vec::new());
+        for (batch, &own) in std::mem::take(&mut observed.batches).into_iter().zip(&mine) {
+            if own {
+                own_batches.push(batch);
+            } else {
+                rest_batches.push(batch);
+            }
+        }
         let (own, rest): (Vec<_>, Vec<_>) = std::mem::take(faults)
             .into_iter()
             .partition(|f| f.root == root);
         *faults = rest;
-        if !unusable(&observed.batches[range.clone()], &own) {
+        if !unusable(&own_batches, &own) {
+            let (mut own_batches, mut rest_batches) =
+                (own_batches.into_iter(), rest_batches.into_iter());
+            observed.batches = mine
+                .iter()
+                .filter_map(|&own| {
+                    if own {
+                        own_batches.next()
+                    } else {
+                        rest_batches.next()
+                    }
+                })
+                .collect();
             faults.extend(own);
             continue;
         }
-        observed.batches.drain(range.clone());
-        observed.owners.drain(range);
+        observed.batches = rest_batches;
+        observed.owners.retain(|o| *o != root);
         plan.roots.retain(|r| *r != root);
         plan.refresh.retain(|r| *r != root);
         plan.selections.remove(&root);
