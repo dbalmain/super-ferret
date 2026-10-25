@@ -893,8 +893,12 @@ membership, FUSE, a mount appearing) waits for the hourly backstop. M5b maps
 every proven rooted occurrence onto a shared physical watch;
 notifications refresh every locator, and S1+ promotes kept shared aliases. Sparse
 hard-link proofs count physical parent/name pairs against `nlink`, preserving
-polling for names outside observed roots. Watches and policy inputs share the
-physical identity map and cap.
+polling for names outside observed roots. Only a file already seen with more
+than one link has such a record: a file indexed with one link that later gains
+a name outside every root, and is then rewritten in place through it, waits
+for the hourly backstop, and `watch_uncovered=false` cannot rule that out
+(D120 A; D121 measured a `~/w` re-walk at 0.1 s). Watches and policy inputs
+share the physical identity map and cap.
 
 Crawl's actual policy-read callbacks supply dependencies, including absent files,
 gitdir/commondir metadata and the global ferret ignore file. Input-parent watches
