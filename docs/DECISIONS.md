@@ -6918,8 +6918,12 @@ cache, GNU time for wall-clock and peak RSS:
 | --- | --- | --- | --- | --- |
 | msa2 (32 CPUs) | 7,693 dirs, 56,941 files | 6.13 s, 112 MiB, 889 MiB read | 0.08 s, 18 MiB, 0 read | 0.25 s, 14 MiB |
 | geekom (22 CPUs) | 6,377 dirs, 33,159 files | 3.44 s, 101 MiB, 531 MiB read | 0.05 s, 17 MiB, 0 read | 0.10 s, 12 MiB |
-| p16s | — | fails: stale worktree gitdirs (fixed on main by ef5dced) | — | — |
+| p16s (16 CPUs) | 36,193 dirs, 189,730 files | 89.4 s, 250 MiB, 3.6 GiB read | 0.24 s, 74 MiB, 0 read | 1.16 s, 59 MiB |
 
-A re-walk of `~/w` costs a quarter of a second and under 20 MiB, so by the
-fact above the hourly walk is free here: **outcome A, keep 1 h.** p16s is
-measured after the next deploy. Cold-cache cost is not measured.
+p16s was measured later the same day with the build at 61411b0, once ef5dced
+had unblocked its first index; its `~/w` is three times msa2's.
+
+A re-walk of `~/w` costs at most a quarter of a second, and at most 74 MiB on
+the largest tree; throttled to one CPU at nice 19 it is still under 1.2 s. By
+the fact above the hourly walk is free here: **outcome A, keep 1 h.**
+Cold-cache cost is not measured.
