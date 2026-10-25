@@ -19,6 +19,9 @@ The dev shell supplies the pinned GNU findutils 4.11.0 differential oracle via
 Python (`FERRET_PYTHON`) drives grep's real-pty differential tests using its
 standard-library `os.openpty`; it is test tooling only.
 
+Every environment variable and debug seam, and who may rely on it, is listed
+in [docs/ENV.md](docs/ENV.md); add a row when you add one.
+
 Formatting needs nightly rustfmt because `rustfmt.toml` wraps comments; the
 flake pins it, and the build stays on stable. Plain `cargo fmt` with stable
 rustfmt warns about the unstable options and leaves comments unwrapped. Add
