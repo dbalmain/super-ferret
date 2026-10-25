@@ -1391,7 +1391,8 @@ Design and build slices: [S1B.md](S1B.md) (M0, 2026-10-05).
 
 M0 specifies the shared library engine in `ferret`, batch JSON lines first,
 D54's interned BFS names/postings/terms, then socket clients, watches/backstops
-and scheduling/budget validation. D55 remains open; D56 (find action hosting)
+and scheduling/budget validation. D55 was then open (since answered D + F, not
+yet built); D56 (find action hosting)
 and D57 (socket encoding and the proposed JSON-parser edge) are open briefs.
 The cost model distinguishes query resident bytes from writer caches, kernel
 watches and the measured 2.57–2.78 GiB oversized-rebuild path.

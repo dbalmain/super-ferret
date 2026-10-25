@@ -210,9 +210,11 @@ impl Cursor<'_> {                           // And, Or, AndNot, Filter, Maybe, B
 
 ## The catalog (D4, D5)
 
-Six tables. `names` and `inodes` have dense `u32` ids renumbered by each
-snapshot (D27); `docs` holds live documents only, keyed by a `DocId` that is
-never reused (D36); `roots`, `links` and `worktrees` hang off an existing
+Six tables. `names` and `inodes` have `u32` ids that are dense in a checkpoint
+and renumbered by each compaction (D27, D52 B). Between checkpoints they are
+epoch-scoped: the log's births take new ids and its deaths leave holes until
+the next compaction. `docs` holds live documents only, keyed by a `DocId` that
+is never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 `InoId`. Raw inode numbers are data, never keys.
 
 | Table       | Id       | Row                                                                                                                                                                     |
@@ -224,8 +226,11 @@ never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 | `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the strings heap)                                                                                         |
 | `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's `(dev, ino)`) and its path for display                     |
 
-Directories are numbered first, breadth-first from the roots in path order, so
-their `InoId`s are `0..dirs` and a parent's id is always below its child's; the
+In a checkpoint, directories are numbered first, breadth-first from the roots
+in path order, so their `InoId`s are `0..dirs` and a parent's id is always
+below its child's. A directory born in the log takes the next epoch id instead,
+so the effective view decides directory membership by kind, not by id range
+(`Catalog::is_directory` in `ferret-catalog/src/read.rs`). The
 snapshot persists each directory's own `NameId` (none for a root) and a bitset
 of traversed directories, retained to exclude structural ancestors from
 `ferret search` (D29). For find these ancestors are ordinary visible directories
@@ -510,9 +515,15 @@ ends, so no root's backlog outlives it), so no worker ever waits on another.
 Faults are typed (D26 A′, amended): EACCES from opening or listing a directory
 publishes its row without children and with an unknown entry count. Other
 coverage faults — listing, opening or reopening a directory, reading an ignore
-file (the global one included: missing is the defaults, unreadable fails the
-run), probing git, `readlink`, a root's lstat — publish nothing and leave the
-old generation; an entry that vanished before its `lstat` is a deletion; a content
+file, probing git, `readlink`, a root's lstat — keep the old rows of the
+faulted scope while healthy observations elsewhere publish (S1+ M5,
+`ferret-crawl/src/coverage.rs`). Each scope is checked against the old
+generation: a directory, a file edge, or a new unreadable child left opaque.
+The run publishes nothing and leaves the old generation only when a fault has
+no checked anchor there (a new root's, say), the old generation moved under
+the run, or a policy or sniffer change would need retention. The global ignore
+file is read before the walk: missing is the defaults, unreadable fails the
+run. An entry that vanished before its `lstat` is a deletion; a content
 fault — open, stat or read failing, the bracket moving, aliases disagreeing —
 publishes the file with content state failed and no document, and it is re-read
 next run. The build is the authority on which inodes fault, since only it sees
@@ -587,9 +598,20 @@ experiments replace it with measurements.
 **Segments.** Immutable files per structure over a doc-id range, committed by a
 manifest rename. S2 ships front-coded dictionary blocks (codec 1).
 
-**Static term dictionary (D65, decided 2026-10-11).** The fully merged index
-keeps terms with df ≥ 2 in **front-coded blocks on disk, routed by a small
-resident FST over block keys** (Lucene's layout; bench arm 4). Each block holds
+**What main ships.** Every writer, merges included, uses codec 1 by default.
+Every term is a dictionary entry, and a df = 1 term inlines its one doc. A
+lookup binary-searches the resident first terms of the 32-term blocks, then
+decodes one block (`ferret-index/src/segment/mod.rs`, `segment/read.rs`).
+There is no block-key FST, and no query expands a prefix, regex or edit
+distance over the dictionary. Codec 2, D65 H's df = 1 fingerprints, is a
+library opt-in that no host selects. D65 slice C keeps codec 1 the only term
+codec (ROADMAP § S3). The D65 paragraphs below give its target design and the
+`term-dict-bench` measurements behind it, not main's behaviour.
+
+**Static term dictionary (D65 target, decided 2026-10-11; not built).** The
+fully merged index would keep terms with df ≥ 2 in **front-coded blocks on
+disk, routed by a small resident FST over block keys** (Lucene's layout; bench
+arm 4). Each block holds
 32 codec-1 entries (term suffix, df, list length) and starts with its full first
 term and postings base. The FST maps the shortest separator between adjacent
 blocks to the block's offset. Rare terms (df = 1) are 32-bit fingerprint
@@ -758,7 +780,10 @@ snapshot-plus-overlay view (D53 A), and pin generations per query. The
 content index is `ferret-index`, under the catalog directory (S2).
 D54 adds resident interned names and row postings in catalog, and a name-term
 index/planner in query using text's tokenizer, retaining BFS. These catalog
-row postings do not change the content-index boundary. D55 remains open.
+row postings do not change the content-index boundary. D55 is answered (D + F
+with an exact per-block max) but not built: the checkpoint still stores mtime
+and ctime as whole-second and nanosecond columns
+(`ferret-catalog/src/format.rs`).
 
 Indexed directory grep (D111 A) uses the same host with an explicit pinned
 session, cwd, stdout writer and stderr sink. Its client sends resolved terminal,
@@ -878,7 +903,9 @@ finds foreground harm with nice 19 plus the limiter.
 ## Not yet designed
 
 Decided inside the slice that needs them, recorded in DECISIONS.md if they
-become Dave's call: the live (unmerged) term dictionary's structure; segment
-file layout and merge policy; catalog snapshot layout detail; multiple devices
-and bind mounts under one root; extraction for PDFs and media metadata (after
-the agent skill); TUI and GUI (much later).
+become Dave's call: the live (unmerged) term dictionary's structure; multiple
+devices and bind mounts under one root; extraction for PDFs and media metadata
+(after the agent skill); TUI and GUI (much later). Segment file layout, merge
+policy and catalog snapshot layout were on this list; they are implemented,
+with their contracts in `ferret-index/src/segment/mod.rs`,
+`ferret-index/src/merge.rs` and `ferret-catalog/src/format.rs`.
