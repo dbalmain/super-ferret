@@ -227,6 +227,10 @@ pub struct Watch {
     fd: OwnedFd,
     config: Config,
     state: Mutex<State>,
+    /// Debug-build fault for the daemon's intake thread: none, panic or a
+    /// persistent read error. See [`Watch::inject_intake_fault`].
+    #[cfg(debug_assertions)]
+    fault: std::sync::atomic::AtomicU8,
 }
 /// Observable intake coverage and pending work, distinct from crawl coverage.
 #[derive(Clone, Debug)]
@@ -289,6 +293,8 @@ impl Watch {
                 serial: 0,
                 running: false,
             }),
+            #[cfg(debug_assertions)]
+            fault: std::sync::atomic::AtomicU8::new(0),
         })
     }
     /// Arms the observed handle before enumeration. A failure is coverage loss,
@@ -481,12 +487,19 @@ impl Watch {
             }
         }
     }
-    /// Runs blocking intake and notifies the writer for each observed event.
-    pub fn run_intake(&self, mut ready: impl FnMut() -> bool) {
+    /// Runs blocking intake and notifies the writer for each observed event,
+    /// returning when `ready` says to stop.
+    ///
+    /// A read error other than EINTR ends intake. A blocking inotify read
+    /// fails only with EINVAL (buffer too small, or a zero-byte read), EFAULT
+    /// or EBADF, and each would repeat on every retry; queue overflow arrives
+    /// as an `IN_Q_OVERFLOW` event, not an error. Retrying would spin, so the
+    /// caller gets the error with a backstop already requested.
+    pub fn run_intake(&self, mut ready: impl FnMut() -> bool) -> Result<(), Errno> {
         let mut buffer = [MaybeUninit::uninit(); 64 << 10];
         let mut reader = inotify::Reader::new(&self.fd, &mut buffer);
         loop {
-            match reader.next() {
+            match self.read_fault().map_or_else(|| reader.next(), Err) {
                 Ok(event) => {
                     self.event(
                         event.wd(),
@@ -495,18 +508,39 @@ impl Watch {
                         event.file_name().map_or(&[], |s| s.to_bytes()),
                     );
                     if !ready() {
-                        return;
+                        return Ok(());
                     }
                 }
                 Err(Errno::INTR) => continue,
-                Err(_) => {
+                Err(error) => {
                     self.backstop(RefreshReason::Overflow);
-                    if !ready() {
-                        return;
-                    }
+                    return Err(error);
                 }
             }
         }
+    }
+    /// Debug-build fault at the intake thread's read: with `panic` intake
+    /// panics, otherwise every read fails with EBADF without blocking. The
+    /// thread may be blocked in the kernel, so the fault takes effect after
+    /// the next event.
+    #[cfg(debug_assertions)]
+    pub fn inject_intake_fault(&self, panic: bool) {
+        self.fault.store(
+            if panic { 1 } else { 2 },
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+    #[cfg(debug_assertions)]
+    fn read_fault(&self) -> Option<Errno> {
+        match self.fault.load(std::sync::atomic::Ordering::Acquire) {
+            1 => panic!("injected intake panic"),
+            2 => Some(Errno::BADF),
+            _ => None,
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    fn read_fault(&self) -> Option<Errno> {
+        None
     }
     fn event(&self, wd: i32, flags: ReadFlags, cookie: u32, name: &[u8]) {
         let mut state = self

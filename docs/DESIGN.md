@@ -863,6 +863,10 @@ writer commands get `WriterUnavailable`, idle connections close) and exits 3,
 rather than answer `ready` from a catalog nothing refreshes. A poisoned index
 writer is never retried; the next client runs in process or starts a fresh
 daemon. A writer that fails while loading still reports `failed` instead.
+Watch intake leaves the same way: a panic on its thread, or any inotify read
+error but EINTR, is logged and drains the host. A blocking inotify read fails
+only with EINVAL, EFAULT or EBADF, each of which would repeat on retry; queue
+overflow arrives as an `IN_Q_OVERFLOW` event, not an error, and backstops.
 ECONNABORTED, EINTR, EPROTO, EMFILE, ENFILE, ENOBUFS and ENOMEM are logged
 once per streak and retried; EMFILE and ENFILE pause briefly so a full
 descriptor table cannot spin the listener.

@@ -68,9 +68,10 @@ struct Host {
     writer_status: Mutex<writer::Status>,
     writer_running: AtomicBool,
     writer_pending: AtomicUsize,
-    /// The writer service ended after the engine was ready. The host drains
-    /// and exits rather than serve a catalog nothing refreshes.
-    writer_failed: AtomicBool,
+    /// Which service thread ended after the engine was ready: the writer or
+    /// watch intake. The host drains and exits rather than serve a catalog
+    /// nothing refreshes. Set through [`fatal`].
+    fatal: Mutex<Option<&'static str>>,
     stop: AtomicBool,
 }
 enum ServerEvent {
@@ -275,7 +276,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         writer_status: Mutex::new(writer::Status::default()),
         writer_running: AtomicBool::new(false),
         writer_pending: AtomicUsize::new(0),
-        writer_failed: AtomicBool::new(false),
+        fatal: Mutex::new(None),
         stop: AtomicBool::new(false),
         permits: Permits::new(ferret_crawl::default_workers()),
     });
@@ -291,10 +292,16 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .draining;
         let clients = host.clients.load(Ordering::Acquire);
-        // A dead writer's pending count can be stale, so a failed writer
+        // A dead writer's pending count can be stale, so a failed service
         // waits only for connections, which its drain has already woken.
-        if host.writer_failed.load(Ordering::Acquire) && clients == 0 {
-            exit_error = Some(io::Error::other("writer stopped"));
+        let fatal = *host
+            .fatal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(service) = fatal
+            && clients == 0
+        {
+            exit_error = Some(io::Error::other(service));
             break;
         }
         let busy = writer::busy(&host);
@@ -686,6 +693,17 @@ fn unregister(host: &Host, id: usize) {
         .connections
         .remove(&id);
 }
+/// A service thread stopped after the engine was ready. Logs the cause and
+/// drains, so the host exits 3 through the ordered teardown (D110) and the
+/// next client starts a fresh daemon.
+fn fatal(host: &Host, service: &'static str, cause: &dyn std::fmt::Display) {
+    crate::cli::error(&format!("daemon: {service}: {cause}"));
+    host.fatal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert(service);
+    drain(host);
+}
 fn drain(host: &Host) {
     // Match the engine -> lifecycle lock order used by cancellation and the
     // loading waiter, so drain cannot be lost between its check and wait.
@@ -951,6 +969,14 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
                 .any(|c| c == "test-watch-overflow")
             {
                 watch.inject_overflow();
+            }
+            for (capability, panic) in [
+                ("test-watch-intake-panic", true),
+                ("test-watch-intake-read-error", false),
+            ] {
+                if request.capabilities.iter().any(|c| c == capability) {
+                    watch.inject_intake_fault(panic);
+                }
             }
             if request.capabilities.iter().any(|c| c == "test-watch-move")
                 && request.args.len() == 4

@@ -138,7 +138,7 @@ fn deferred_writer(reason: Blocked) {
         }),
         writer_running: AtomicBool::new(false),
         writer_pending: AtomicUsize::new(0),
-        writer_failed: AtomicBool::new(false),
+        fatal: std::sync::Mutex::new(None),
         stop: AtomicBool::new(false),
     });
     let writer_host = host.clone();

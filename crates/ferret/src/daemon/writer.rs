@@ -162,10 +162,15 @@ pub(super) fn start(
             // needs. A poisoned index writer is not retried: the host leaves
             // through drain, so the next client runs in process or starts a
             // fresh daemon (D110).
-            crate::cli::error(&format!("daemon: writer stopped: {error}"));
-            host.writer_failed.store(true, Ordering::Release);
-            super::drain(&host);
+            super::fatal(&host, "writer stopped", &error);
         })
+}
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .map_or_else(|| "panicked".to_owned(), |s| format!("panicked: {s}"))
 }
 /// Returns heap freed by a rewalk or a command to the kernel. glibc keeps it
 /// otherwise: after a `/nix/store` rewalk, RSS stayed about 0.5 GB above the
@@ -251,12 +256,25 @@ fn serve(
         let watch = watch.clone();
         let send = host.writer_send.clone();
         let intake_host = host.clone();
-        std::thread::spawn(move || {
-            watch.run_intake(|| {
-                let _ = send.try_send(Message::Intake);
-                !intake_host.stop.load(Ordering::Acquire)
-            })
-        });
+        std::thread::Builder::new()
+            .name("ferret-intake".into())
+            .spawn(move || {
+                // Without intake the catalog would go stale behind a ready
+                // host, refreshed only by the hourly backstop. A panic or a
+                // read error stops the host as a failed writer does.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    watch.run_intake(|| {
+                        let _ = send.try_send(Message::Intake);
+                        !intake_host.stop.load(Ordering::Acquire)
+                    })
+                }));
+                let cause = match ran {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => io::Error::from(error).to_string(),
+                    Err(panic) => panic_message(panic.as_ref()),
+                };
+                super::fatal(&intake_host, "watch intake stopped", &cause);
+            })?;
     }
     let context = crate::cli::Context {
         index: host.index.clone(),

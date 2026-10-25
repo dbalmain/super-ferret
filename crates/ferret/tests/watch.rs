@@ -522,6 +522,66 @@ fn kernel_overflow_and_new_loss_during_a_backstop_converge() {
     assert!(!tree.status().contains("\"last_complete_backstop\":null"));
 }
 
+/// Watch intake that stops takes the host down as a failed writer does: the
+/// cause is logged and the host exits 3 through the ordered teardown, with
+/// its socket gone and the catalog lock free (D110). Otherwise it would keep
+/// answering `ready` from a catalog only the hourly backstop refreshes.
+#[cfg(debug_assertions)]
+fn intake_failure_stops_the_host(capability: &str, cause: &str) {
+    let mut tree = Tree::new();
+    tree.start(&[]);
+    tree.event(&format!(
+        "{{\"id\":\"s\",\"op\":\"status\",\"capabilities\":[\"{capability}\"]}}\n"
+    ));
+    // Intake is blocked in its read; the next event releases the fault.
+    write(tree.path("src/left/wake.txt"), "wake");
+    let path = tree.path("daemon.log");
+    let log = || fs::read_to_string(&path).unwrap_or_default();
+    let until = Instant::now() + BOUND;
+    let status = loop {
+        if let Some(status) = tree
+            .daemon
+            .as_mut()
+            .unwrap_or_else(|| panic!("daemon"))
+            .try_wait()
+            .unwrap_or_else(|error| panic!("try wait: {error:?}"))
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < until,
+            "a host whose intake stopped kept running: {}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let log = log();
+    assert_eq!(status.code(), Some(3), "{status}: {log}");
+    assert!(
+        log.contains("watch intake stopped") && log.contains(cause),
+        "{log}"
+    );
+    assert!(tree.socket().is_none(), "{log}");
+    drop(
+        ferret_catalog::WriterSession::open(&tree.path("index"))
+            .unwrap_or_else(|error| panic!("catalog lock survived intake: {error}")),
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_panicking_intake_stops_the_host() {
+    intake_failure_stops_the_host("test-watch-intake-panic", "injected intake panic");
+}
+
+/// Every non-EINTR inotify read error repeats, so retrying would spin with a
+/// backstop per iteration. The first one stops the host instead.
+#[test]
+#[cfg(debug_assertions)]
+fn a_repeating_intake_read_error_stops_the_host_instead_of_spinning() {
+    intake_failure_stops_the_host("test-watch-intake-read-error", "Bad file descriptor");
+}
+
 #[test]
 fn userspace_bound_collapses_to_a_complete_backstop() {
     let mut tree = Tree::new();

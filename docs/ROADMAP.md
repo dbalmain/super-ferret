@@ -1535,7 +1535,7 @@ Follow-ups, none blocking:
 - an oversized `index`/`roots-remove` reports a catalog-lock error rather
   than "request too large";
 - `run_intake` (`watch.rs`) has no back-off on a repeating read error, which
-  nothing produces today;
+  nothing produces today (since fixed: the first such error stops the host);
 - paced compaction at 10M is unmeasured, because no command forces or routes
   compaction;
 - the event kind could be passed into `Destination::send`;
