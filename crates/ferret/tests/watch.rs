@@ -524,11 +524,27 @@ fn kernel_overflow_and_new_loss_during_a_backstop_converge() {
 fn intake_failure_stops_the_host(capability: &str, cause: &str) {
     let mut tree = Tree::new();
     tree.start(&[]);
+    fail_intake(&tree, capability);
+    stopped_by_intake(&mut tree, cause);
+}
+
+/// Arms the debug intake fault named by `capability`. Intake is blocked in
+/// its read, so an event in a watched directory releases it; the event's
+/// file is removed again, leaving the tree as it was.
+#[cfg(debug_assertions)]
+fn fail_intake(tree: &Tree, capability: &str) {
     tree.event(&format!(
         "{{\"id\":\"s\",\"op\":\"status\",\"capabilities\":[\"{capability}\"]}}\n"
     ));
-    // Intake is blocked in its read; the next event releases the fault.
-    write(tree.path("src/left/wake.txt"), "wake");
+    let wake = tree.path("src/left/wake.txt");
+    write(&wake, "wake");
+    fs::remove_file(&wake).unwrap_or_else(|error| panic!("remove wake: {error:?}"));
+}
+
+/// The host stopped for its intake: exit 3 with the cause logged, its socket
+/// gone and the catalog lock free.
+#[cfg(debug_assertions)]
+fn stopped_by_intake(tree: &mut Tree, cause: &str) {
     let path = tree.path("daemon.log");
     let log = || fs::read_to_string(&path).unwrap_or_default();
     let until = Instant::now() + HANG;
@@ -560,6 +576,7 @@ fn intake_failure_stops_the_host(capability: &str, cause: &str) {
         ferret_catalog::WriterSession::open(&tree.path("index"))
             .unwrap_or_else(|error| panic!("catalog lock survived intake: {error}")),
     );
+    tree.daemon.take();
 }
 
 #[test]
@@ -2111,4 +2128,89 @@ fn slow_bursts_in_watched_directories_do_not_starve_a_poll() {
         "the churn made no bursts: {status}"
     );
     assert!(found, "the poll never ran: {status}");
+}
+
+/// Intake dies while the writer is inside an explicit command, held in that
+/// command's own content follow: the writer is alive and must unwind the
+/// command itself, unlike a failed writer, which drops its reply senders.
+/// The command answers as a drained one does, the host stops for its intake,
+/// the manifest is a clean one, and the next daemon finishes the work.
+#[test]
+#[cfg(debug_assertions)]
+fn intake_failure_during_an_explicit_command_answers_it_and_stops() {
+    let mut tree = Tree::new();
+    unfollowed_burst(&tree);
+    // As in `drain_during_explicit_follow_exits_incomplete`: the background
+    // gate keeps documents uncovered until the command is queued, and the
+    // explicit gate holds the command's follow.
+    let gate = gate(&tree, "follow");
+    fs::write(gate.join("explicit"), b"hold").unwrap_or_else(|e| panic!("gate: {e}"));
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.spawn(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    wait(|| gate.join("follow.reached").exists());
+    let output = std::thread::scope(|scope| {
+        let index = scope.spawn(|| tree.run(&["index", "src"]));
+        wait(|| gate.join("explicit.reached").exists());
+        fail_intake(&tree, "test-watch-intake-read-error");
+        index
+            .join()
+            .unwrap_or_else(|_| panic!("index thread panicked"))
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout {:?}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "ferret: content index: interrupted (daemon stopping); run ferret index again\n"
+    );
+    stopped_by_intake(&mut tree, "Bad file descriptor");
+    manifest_equals_clean(&tree);
+    tree.start(&[]);
+    tree.converges();
+}
+
+/// Intake dies while a streaming merge is held after writing temporary
+/// output, with a client connected: the merge stops as it does for a drain,
+/// leaving its inputs and no temporaries, the host stops for its intake
+/// without waiting for the idle client, and the next daemon finishes the
+/// merge.
+#[test]
+#[cfg(debug_assertions)]
+fn intake_failure_during_a_streaming_merge_keeps_its_inputs_and_stops() {
+    let mut tree = Tree::new();
+    // As in `drain_during_streaming_merge_keeps_inputs_and_restart_finishes_it`.
+    for i in 0..600 {
+        let text = (0..400)
+            .map(|j| format!("word{i}part{j} "))
+            .collect::<String>();
+        write(tree.path(&format!("src/merge-{i}.txt")), &text);
+    }
+    tree.success(tree.local(&["index", "src"]));
+    let gate = gate(&tree, "merge");
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.start(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    for i in 0..240 {
+        fs::remove_file(tree.path(&format!("src/merge-{i}.txt")))
+            .unwrap_or_else(|e| panic!("delete: {e}"));
+    }
+    wait(|| gate.join("merge.reached").exists());
+    // An idle client keeps an idle exit from standing in for the drain.
+    let client = tree.hold();
+    fail_intake(&tree, "test-watch-intake-panic");
+    stopped_by_intake(&mut tree, "injected intake panic");
+    drop(client);
+    assert!(
+        !fs::read_dir(tree.path("index/index"))
+            .unwrap_or_else(|e| panic!("index: {e}"))
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("tmp-"))
+    );
+    manifest_equals_clean(&tree);
+    fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
+    tree.start(&[]);
+    tree.converges();
 }
