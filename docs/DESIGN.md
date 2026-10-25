@@ -385,7 +385,9 @@ find through the catalog API. Search tests special kinds after its existing
 name, metadata and path filters, so rejected path matches need no kind lookup.
 EACCES while opening or
 listing a directory retains its ordinary directory inode, no children and an
-unknown raw entry count. Other coverage faults still prevent publication.
+unknown raw entry count. Other coverage faults are retained or block
+publication as § Policy and crawl describes; a new disjoint root that faults is
+withdrawn and the rest publishes (D119).
 
 The read API for find is `Catalog::entries(dir)` (name id, raw basename, kind and
 `Target::Inode(id)` or `Target::Ignored(kind)`), `contents(target)` (catalogued,
