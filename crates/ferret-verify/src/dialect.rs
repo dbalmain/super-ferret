@@ -82,20 +82,14 @@ impl FindRegex {
     }
 
     /// Matches the entire path. A backreference search that exhausts its step
-    /// budget returns an error; callers executing find should report it.
+    /// budget returns an error, which callers must report: there is
+    /// deliberately no infallible form, since one would turn an unfinished
+    /// search into a false non-match.
     pub fn try_is_match(&self, bytes: &[u8]) -> Result<bool, MatchLimit> {
         match &self.engine {
             Engine::Linear(regex) => Ok(regex.is_match(bytes)),
             Engine::Backtrack(program) => program.is_match(bytes),
         }
-    }
-}
-
-impl Matcher for FindRegex {
-    fn is_match(&self, bytes: &[u8]) -> bool {
-        // The infallible trait treats an unfinished search as a non-match.
-        // Find uses try_is_match so budget exhaustion is never silent there.
-        self.try_is_match(bytes).unwrap_or(false)
     }
 }
 
