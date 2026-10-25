@@ -873,7 +873,9 @@ M6 configuration uses environment keys: `FERRET_INDEX_WORKERS`,
 `FERRET_BATTERY_PAUSE` (0 disables), `FERRET_FULL_MEMORY_BYTES`,
 `FERRET_CHECKPOINT_MEMORY_BYTES`, `FERRET_MEMORY_FLOOR_BYTES`,
 `FERRET_ADDITIONAL_MEMORY_BYTES`, `FERRET_CHECKPOINT_DISK_BYTES`, and
-`FERRET_BULK_BYTES_PER_SECOND` (0 disables pacing). `FERRET_SEARCH_THREADS`,
+`FERRET_BULK_BYTES_PER_SECOND` (0 disables pacing). `FERRET_INDEX_NICE` sets
+the nice background index threads take (default 19; 0 keeps the caller's);
+binary fixtures set 0 so their deadlines do not depend on host load. `FERRET_SEARCH_THREADS`,
 read once by each process that verifies content (`ferret search`, or the
 daemon serving a batch), sets the threads that verify content candidates; it
 defaults to the index's stored physical-core count capped by the available

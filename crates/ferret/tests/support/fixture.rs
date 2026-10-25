@@ -55,6 +55,9 @@ fn isolate(command: &mut Command, base: &Path) {
         .env("FERRET_DAEMON_IDLE_MS", "60000")
         .env("FERRET_SIGNAL_PROC", signals.join("proc"))
         .env("FERRET_SIGNAL_POWER", signals.join("power"))
+        // Background index threads keep normal priority, so deadlines hold
+        // while other work loads the machine. Tests of the nice drop set 19.
+        .env("FERRET_INDEX_NICE", "0")
         .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("LC_ALL", "C")

@@ -41,8 +41,21 @@ mod tests;
 
 /// Lowers the calling Linux index thread alone. Intake must be spawned before
 /// lowering its parent; query and socket threads retain their normal priority.
+///
+/// `FERRET_INDEX_NICE` sets the nice taken, 19 by default; 0 leaves the thread
+/// at its caller's. Test fixtures set 0: at nice 19 a fixture's daemon makes
+/// almost no progress while other work loads the machine, and its deadlines
+/// then measure the load rather than the daemon.
 pub fn lower_index_priority() -> std::io::Result<()> {
-    rustix::process::setpriority_process(Some(rustix::thread::gettid()), 19).map_err(Into::into)
+    let nice = std::env::var("FERRET_INDEX_NICE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|nice| (0..=19).contains(nice))
+        .unwrap_or(19);
+    if nice == 0 {
+        return Ok(());
+    }
+    rustix::process::setpriority_process(Some(rustix::thread::gettid()), nice).map_err(Into::into)
 }
 /// Additional checkpoint space available to this uid, excluding reserved
 /// blocks.

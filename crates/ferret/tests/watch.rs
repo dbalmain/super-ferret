@@ -1479,6 +1479,7 @@ fn queued_command_covers_content_while_background_follow_is_held() {
         ("FERRET_CONTENT_TEST_GATE", gate_text),
         ("FERRET_CRAWL_TEST_GATE", gate_text),
         ("FERRET_INDEX_WORKERS", "4"),
+        ("FERRET_INDEX_NICE", "19"),
     ]);
     wait(|| gate.join("follow.reached").exists());
     write(tree.path("src/urgent.txt"), "urgent");
