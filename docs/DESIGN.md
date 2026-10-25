@@ -10,7 +10,8 @@ revised as the slices land.
 
 A **catalog** records every file and directory under the configured roots as a
 tree of names over inodes, and every distinct file content as a **document**
-with a dense ordinal id (D4, D5). An **index** over documents holds structures
+with an ordinal id, dense when allocated but holed by deletion (D4, D5,
+D36). An **index** over documents holds structures
 that each turn a query atom into a set of _candidate_ documents — postings,
 filters, trigram filters, possibly positions (D6). A **verifier** scans the
 candidates' bytes so every answer is exact. A **planner** composes candidate
