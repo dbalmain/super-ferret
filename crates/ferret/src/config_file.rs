@@ -7,8 +7,11 @@
 //! regular file; checking the path first would race a rename. Unlike a scoped
 //! ignore file read during a crawl (`ferret-crawl`'s walk), there is no size
 //! limit. Symlinks are followed.
+//!
+//! [`open_append`] applies the same rule to a file ferret appends to, the
+//! query log.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -63,6 +66,31 @@ pub(crate) fn read(path: &Path) -> io::Result<Contents> {
         bytes.extend_from_slice(&chunk[..n]);
     }
     Ok(Contents::Bytes(bytes))
+}
+
+/// Opens `path` for appending, creating it with `mode` if it is missing,
+/// and keeps it only when the descriptor that was opened is a regular file.
+/// Anything else is [`not_regular`], including a FIFO that has a reader: it
+/// would open, but a write to it can block. Symlinks are followed.
+///
+/// The descriptor stays `O_NONBLOCK`, which a regular file ignores.
+pub(crate) fn open_append(path: &Path, mode: u32) -> io::Result<File> {
+    let file = match OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(mode)
+        .custom_flags(NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        // A write-only open of a FIFO with no reader, or of a socket.
+        Err(e) if e.raw_os_error() == Some(ENXIO) => return Err(not_regular()),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    Ok(file)
 }
 
 /// Linux `ENXIO`: opening a socket, or a device with nothing behind it.

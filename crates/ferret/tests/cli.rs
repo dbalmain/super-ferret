@@ -1143,6 +1143,65 @@ fn a_held_log_lock_drops_the_line_and_the_command_finishes() {
 }
 
 #[test]
+// A FIFO at the log's path once hung a finished search forever, opening it
+// for append before the bounded lock wait began. The log must be a regular
+// file: a matching and a non-matching search still exit 0 and 1 promptly and
+// warn. A FIFO with a reader would open and take the write, so it is
+// refused too, and the reader sees nothing.
+fn a_fifo_log_drops_the_line_and_the_command_finishes() {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let env = Env::new("log-fifo");
+    env.write("a/f.txt", b"f\n");
+    assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
+    fs::remove_file(env.log()).unwrap();
+    let made = Command::new("mkfifo").arg(env.log()).status().unwrap();
+    assert!(made.success());
+    let search = |pattern: &str, exit: i32| {
+        let output = env.run_bounded(&[os("search"), os(pattern)]);
+        let message = stderr(&output);
+        assert_eq!(code(&output), exit, "{pattern}: {message}");
+        assert!(message.contains("not written"), "{message}");
+        assert!(message.contains("not a regular file"), "{message}");
+    };
+    search("f.txt", 0);
+    search("absent", 1);
+    // Linux `O_NONBLOCK`: a read-only open of a FIFO then returns at once.
+    let mut reader = File::options()
+        .read(true)
+        .custom_flags(0x800)
+        .open(env.log())
+        .unwrap();
+    search("f.txt", 0);
+    let mut read = Vec::new();
+    match reader.read_to_end(&mut read) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => panic!("read the FIFO: {e}"),
+    }
+    assert!(read.is_empty(), "{}", String::from_utf8_lossy(&read));
+}
+
+#[test]
+// A symlink to a regular file is still a log: the line lands in its target.
+fn a_symlinked_log_is_followed() {
+    let env = Env::new("log-symlink");
+    env.write("a/f.txt", b"f\n");
+    assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
+    let target = env.base.join("elsewhere.jsonl");
+    fs::rename(env.log(), &target).unwrap();
+    std::os::unix::fs::symlink(&target, env.log()).unwrap();
+    let output = env.run_bounded(&[os("search"), os("f.txt")]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("not written"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap().lines().count(), 2);
+}
+
+#[test]
 // Lines appended by processes racing for the lock are whole: eight
 // concurrent runs add eight lines, each one complete JSON object.
 fn concurrent_log_lines_are_whole() {

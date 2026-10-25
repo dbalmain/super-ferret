@@ -774,8 +774,11 @@ query atoms are logged as typed, though, so query text may itself contain a path
 is set to 0600 on every append, and each line is written under an exclusive
 `flock`, so concurrent processes never interleave within a line. The lock is
 tried for at most 150 ms, then the line is dropped with a warning, so a stopped
-lock holder cannot hang a finished command. Writing is best-effort: a line that
-cannot be written is a warning, never a failed command.
+lock holder cannot hang a finished command. That bound is on the lock wait
+only, not on the whole append. The file is opened without blocking and must be
+a regular file or a symlink to one; a FIFO, socket or device there drops the
+line with a warning instead of hanging the open or the write. Writing is
+best-effort: a line that cannot be written is a warning, never a failed command.
 
 The CLI's JSON lines write a path that is not UTF-8 as `path` (lossy text) plus
 `path_base64` (the exact bytes). The `ferret` crate doc states this contract.

@@ -26,12 +26,17 @@
 //! stopped (SIGSTOP, a debugger) must not hang a command whose work is done;
 //! the log is best-effort, and finishing the command wins.
 //!
+//! The wait bounds only the lock. The file is opened without blocking and
+//! must be a regular file (or a symlink to one); a FIFO, socket or device
+//! there drops the line with an error rather than hanging on the open or the
+//! write. Writing to a regular file is not itself bounded.
+//!
 //! Best-effort: [`append`] returns the error and the caller only warns. A
 //! command never fails because its log line could not be written.
 
-use std::fs::{DirBuilder, File, OpenOptions, Permissions, TryLockError};
+use std::fs::{DirBuilder, File, Permissions, TryLockError};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -77,11 +82,8 @@ pub fn append(state: &Path, line: &[u8]) -> io::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(state)?;
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path(state))?;
+    // Not a plain open: one of a FIFO blocks before the lock wait starts.
+    let mut file = crate::config_file::open_append(&path(state), 0o600)?;
     // fchmod on the open file, so it is the file written to that is
     // narrowed. Fails, and the line is not written, if another user owns it.
     file.set_permissions(Permissions::from_mode(0o600))?;
