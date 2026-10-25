@@ -682,3 +682,27 @@ fn a_lost_watch_outlasts_a_failed_complete_observation_and_its_repairs() {
     tree.watch.reconcile(&tree.writer.view());
     assert!(tree.watch.polling_roots(&tree.writer.view()).is_empty());
 }
+
+/// A `.ferretignore` that links to itself once recursed without end while
+/// its link chain was watched, overflowing ferretd's command thread. The walk
+/// faults the root (ELOOP), and registering the input must return.
+#[test]
+fn a_self_linked_policy_input_is_a_bounded_failure() {
+    let tree = Tree::new("self-linked-policy", 16, 1 << 20);
+    let looped = tree.path.join("looped");
+    fs::create_dir_all(&looped).unwrap_or_else(|error| panic!("root: {error:?}"));
+    std::os::unix::fs::symlink(".ferretignore", looped.join(".ferretignore"))
+        .unwrap_or_else(|error| panic!("link: {error:?}"));
+    let parent = fs::File::open(&looped).unwrap_or_else(|error| panic!("parent: {error:?}"));
+    use std::os::fd::AsFd;
+    tree.watch
+        .policy_input(&looped, parent.as_fd(), OsStr::new(".ferretignore"));
+    let failed = tree
+        .watch
+        .state
+        .lock()
+        .unwrap_or_else(|error| panic!("state: {error:?}"))
+        .failures
+        .contains_key(&looped);
+    assert!(failed, "an unresolvable input is a recorded failure");
+}

@@ -4,6 +4,11 @@ use std::os::fd::AsFd;
 
 use super::*;
 
+/// Linux's `MAXSYMLINKS`: past this many links, path resolution fails with
+/// `ELOOP`. Following a policy input's link chain for ancestor watches stops
+/// here, so a self-referencing `.ferretignore` cannot recurse without end.
+const MAX_HOPS: u32 = 40;
+
 pub(super) fn unreliable(magic: u64) -> bool {
     // NFS, CIFS/SMB/SMB2, 9P and FUSE: remote or userspace writes need not
     // generate notifications on this client's watched inode.
@@ -151,6 +156,10 @@ impl Watch {
     /// Changing an ancestor symlink changes the policy namespace even when
     /// the followed file and its watched physical parent do not move.
     fn policy_ancestors(&self, root: &Path, path: &Path) {
+        self.ancestors(root, path, 0);
+    }
+    /// `hops` counts the symlinks followed to reach `path`; see [`MAX_HOPS`].
+    fn ancestors(&self, root: &Path, path: &Path, hops: u32) {
         let mut prefix = PathBuf::new();
         for component in path.components() {
             prefix.push(component);
@@ -164,9 +173,12 @@ impl Watch {
             }
             if let Some(parent) = prefix.parent() {
                 match open_parent(parent) {
-                    Ok(fd) => {
-                        self.policy_input(root, fd.as_fd(), prefix.file_name().unwrap_or_default())
-                    }
+                    Ok(fd) => self.input(
+                        root,
+                        fd.as_fd(),
+                        prefix.file_name().unwrap_or_default(),
+                        hops,
+                    ),
                     Err(_) => failure(
                         &mut self
                             .state
@@ -180,6 +192,9 @@ impl Watch {
         }
     }
     pub(crate) fn policy_input(&self, root: &Path, parent: BorrowedFd<'_>, name: &OsStr) {
+        self.input(root, parent, name, 0);
+    }
+    fn input(&self, root: &Path, parent: BorrowedFd<'_>, name: &OsStr, hops: u32) {
         let proc = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
         let Ok(stat) = fstat(parent) else {
             self.gap(root);
@@ -264,6 +279,17 @@ impl Watch {
             // Only a followed symlink needs the input's own path.
             let key = input_key(&proc, name);
             match std::fs::read_link(proc.join(name)) {
+                // A link chain longer than the kernel follows, a cycle
+                // included, cannot resolve: the input is a failure, as when
+                // canonicalizing it fails, not a deeper walk.
+                Ok(_) if hops >= MAX_HOPS => failure(
+                    &mut self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    root,
+                    || key,
+                ),
                 Ok(target) => {
                     let target = if target.is_absolute() {
                         target
@@ -273,7 +299,7 @@ impl Watch {
                     // Keep the link spelling for ancestor watches;
                     // canonicalizing first would lose a
                     // symlinked parent that can be retargeted.
-                    self.policy_ancestors(root, &target);
+                    self.ancestors(root, &target, hops + 1);
                     match std::fs::canonicalize(&target) {
                         Ok(target) if target != key => self.policy_path(root, &target),
                         _ => failure(
