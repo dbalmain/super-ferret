@@ -10,7 +10,9 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use fixture::HANG;
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 const DAEMON: &str = env!("CARGO_BIN_EXE_ferretd");
@@ -33,22 +35,13 @@ const CONTENT: [&str; 14] = [
 ];
 type ContentAnswers = Vec<(Vec<Vec<u8>>, Vec<u8>, Option<i32>)>;
 
-const BOUND: Duration = Duration::from_secs(8);
-
 struct Tree {
     base: PathBuf,
     daemon: Option<Child>,
 }
 impl Tree {
     fn new() -> Self {
-        let base = std::env::temp_dir().join(format!(
-            "ferret-watch-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|error| panic!("clock: {error:?}"))
-                .as_nanos()
-        ));
+        let base = fixture::reserve("ferret-watch");
         for dir in ["src/left/deep", "src/right", "outside", "home/runtime"] {
             fs::create_dir_all(base.join(dir))
                 .unwrap_or_else(|error| panic!("fixture directories: {error:?}"));
@@ -67,7 +60,7 @@ impl Tree {
         cmd.args(args)
             .env_remove("FERRET_NO_DAEMON")
             .env("FERRET_DAEMON_BIN", self.base.join("no-spawn-binary"))
-            .env("FERRET_DAEMON_STARTUP_MS", "2000");
+            .env("FERRET_DAEMON_STARTUP_MS", fixture::hang_ms());
         cmd
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -84,9 +77,10 @@ impl Tree {
     fn success(&self, output: Output) -> Output {
         assert!(
             output.status.success(),
-            "status {:?}: {}",
+            "status {:?}: {}{}",
             output.status,
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr),
+            fixture::lock_refusals(&self.base)
         );
         output
     }
@@ -118,7 +112,7 @@ impl Tree {
             cmd.spawn()
                 .unwrap_or_else(|error| panic!("daemon spawn: {error:?}")),
         );
-        let until = Instant::now() + BOUND;
+        let until = Instant::now() + HANG;
         while self
             .socket()
             .is_none_or(|p| UnixStream::connect(p).is_err())
@@ -163,10 +157,10 @@ impl Tree {
         let stream = UnixStream::connect(self.socket().unwrap_or_else(|| panic!("socket")))
             .unwrap_or_else(|error| panic!("connect: {error:?}"));
         stream
-            .set_read_timeout(Some(BOUND))
+            .set_read_timeout(Some(HANG))
             .unwrap_or_else(|error| panic!("read timeout: {error:?}"));
         stream
-            .set_write_timeout(Some(BOUND))
+            .set_write_timeout(Some(HANG))
             .unwrap_or_else(|error| panic!("write timeout: {error:?}"));
         let mut reader = BufReader::new(stream);
         loop {
@@ -196,7 +190,7 @@ impl Tree {
         let stream = UnixStream::connect(self.socket().unwrap_or_else(|| panic!("socket")))
             .unwrap_or_else(|error| panic!("hold connect: {error:?}"));
         stream
-            .set_read_timeout(Some(BOUND))
+            .set_read_timeout(Some(HANG))
             .unwrap_or_else(|error| panic!("hold timeout: {error:?}"));
         let mut hello = String::new();
         BufReader::new(&stream)
@@ -220,7 +214,7 @@ impl Tree {
         self.event("{\"id\":\"s\",\"op\":\"status\"}\n")
     }
     fn quiet(&self) {
-        let until = Instant::now() + BOUND;
+        let until = Instant::now() + HANG;
         loop {
             let s = self.status();
             if s.contains("\"pending_scopes\":0")
@@ -294,7 +288,7 @@ impl Tree {
     }
     fn converges(&self) {
         let expected = self.oracle();
-        let until = Instant::now() + BOUND;
+        let until = Instant::now() + HANG;
         loop {
             let actual = (
                 records(self.run(&["search", "*"]), b'\n'),
@@ -389,7 +383,7 @@ fn terminate_fixture_daemons(base: &Path) {
     }
 }
 fn wait(mut predicate: impl FnMut() -> bool) {
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     while !predicate() {
         assert!(Instant::now() < until, "deadline exceeded");
         std::thread::sleep(Duration::from_millis(10));
@@ -537,7 +531,7 @@ fn intake_failure_stops_the_host(capability: &str, cause: &str) {
     write(tree.path("src/left/wake.txt"), "wake");
     let path = tree.path("daemon.log");
     let log = || fs::read_to_string(&path).unwrap_or_default();
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     let status = loop {
         if let Some(status) = tree
             .daemon
@@ -822,7 +816,7 @@ fn queued_writer_commands_never_consume_read_query_permits() {
         let stream = UnixStream::connect(tree.socket().unwrap_or_else(|| panic!("socket")))
             .unwrap_or_else(|error| panic!("connect: {error:?}"));
         stream
-            .set_read_timeout(Some(BOUND))
+            .set_read_timeout(Some(HANG))
             .unwrap_or_else(|error| panic!("timeout: {error:?}"));
         let mut reader = BufReader::new(stream);
         let mut hello = String::new();
@@ -877,6 +871,41 @@ fn no_daemon_writer_fails_promptly_with_owner_advice() {
     assert!(tree.run(&["search", "original.txt"]).status.success());
 }
 
+/// The refusal record is what explains an unexpected "another `ferret index`
+/// holds the catalog lock": it must name the holder while it still holds.
+#[test]
+#[cfg(debug_assertions)]
+fn a_refused_catalog_lock_records_who_held_it() {
+    let mut tree = Tree::new();
+    tree.start(&[]);
+    assert_eq!(tree.local(&["index", "src"]).status.code(), Some(3));
+    let pid = tree
+        .daemon
+        .as_ref()
+        .map(Child::id)
+        .unwrap_or_else(|| panic!("daemon"));
+    let refusals = fixture::lock_refusals(&tree.base);
+    let lines: Vec<_> = refusals.lines().collect();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|line| line.starts_with("lock refused: pid ")),
+        "{refusals}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("  /proc/locks: ")
+            && line.contains(&format!(" {pid} "))
+            && line.contains(DAEMON)),
+        "{refusals}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(&format!("  fd {pid}/")) && line.contains(DAEMON)),
+        "{refusals}"
+    );
+}
+
 #[test]
 fn restart_after_kill_mid_burst_rearms_and_backstops() {
     let mut tree = Tree::new();
@@ -925,7 +954,7 @@ fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
         s.contains("\"current_operation\":\"refresh\"") && s.contains("\"writer_busy\":true")
     };
     let mut seen = tree.status();
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     while !refreshing(&seen) {
         assert!(Instant::now() < until, "refresh never began: {seen}");
         std::thread::sleep(Duration::from_millis(10));
@@ -950,7 +979,7 @@ fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
         drop(hold);
         let name = format!("pending-{attempt}.txt");
         write(tree.path(&format!("src/left/deep/{name}")), "pending");
-        let until = Instant::now() + BOUND;
+        let until = Instant::now() + HANG;
         while !tree.exited() {
             assert!(Instant::now() < until, "daemon did not idle out");
             std::thread::sleep(Duration::from_millis(10));
@@ -1308,7 +1337,7 @@ fn unwatchable_external_policy_marks_its_root_for_polling_and_recovers() {
     )
     .unwrap();
     tree.spawn(&[("FERRET_POLL_MS", "100")]);
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     loop {
         let status = tree.status();
         if status.contains("\"fault_retained\":true") {
@@ -1419,7 +1448,7 @@ fn a_slow_query_socket_keeps_its_old_epoch_without_blocking_publication() {
     let stream = UnixStream::connect(tree.socket().unwrap_or_else(|| panic!("socket")))
         .unwrap_or_else(|e| panic!("slow client: {e}"));
     stream
-        .set_read_timeout(Some(BOUND))
+        .set_read_timeout(Some(HANG))
         .unwrap_or_else(|e| panic!("timeout: {e}"));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -1502,8 +1531,7 @@ fn gate(tree: &Tree, phase: &str) -> PathBuf {
 /// uncovered). The explicit-follow gate parks on its own 10th per-document
 /// check, so at least ten documents have to remain ahead of that frontier.
 /// 24 burst files plus `original.txt` is 25 live documents: past that floor
-/// of 18, and still uncovered if the command replies before following. The
-/// daemon's startup walk of this tree stays inside the suite's 8s bound.
+/// of 18, and still uncovered if the command replies before following.
 const BURST_FILES: usize = 24;
 fn unfollowed_burst(tree: &Tree) {
     for i in 0..BURST_FILES {
@@ -1517,7 +1545,7 @@ fn unfollowed_burst(tree: &Tree) {
 }
 fn drain_content(tree: &mut Tree) {
     let _ = tree.event("{\"op\":\"drain\"}\n");
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     loop {
         let done = tree
             .daemon
@@ -1720,7 +1748,7 @@ fn drain_during_explicit_follow_exits_incomplete() {
         String::from_utf8_lossy(&output.stderr),
         "ferret: content index: interrupted (daemon stopping); run ferret index again\n"
     );
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     loop {
         let done = tree
             .daemon

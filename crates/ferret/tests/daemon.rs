@@ -14,11 +14,16 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use fixture::HANG;
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 const DAEMON: &str = env!("CARGO_BIN_EXE_ferretd");
-const BOUND: Duration = Duration::from_secs(5);
+/// The latency claims: a query that falls back "at once", a writer whose wait
+/// is "bounded by the startup deadline". Each is the property under test, so
+/// it stays tight; hang guards use [`fixture::HANG`] instead.
+const PROMPT: Duration = Duration::from_secs(5);
 
 struct Tree {
     base: PathBuf,
@@ -26,16 +31,7 @@ struct Tree {
 }
 impl Tree {
     fn new() -> Self {
-        let base = std::env::temp_dir().join(format!(
-            "ferret-daemon-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        // Never silently share a fixture if its clock-based name collides.
-        fs::create_dir(&base).unwrap_or_else(|error| panic!("reserve fixture {base:?}: {error}"));
+        let base = fixture::reserve("ferret-daemon");
         fs::create_dir_all(base.join("src/nested")).unwrap();
         fs::create_dir_all(base.join("home/runtime")).unwrap();
         fs::set_permissions(base.join("home/runtime"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -60,7 +56,7 @@ impl Tree {
         cmd.args(args)
             .env_remove("FERRET_NO_DAEMON")
             .env("FERRET_DAEMON_BIN", DAEMON)
-            .env("FERRET_DAEMON_STARTUP_MS", "1500")
+            .env("FERRET_DAEMON_STARTUP_MS", fixture::hang_ms())
             .env("FERRET_DAEMON_IDLE_MS", "30000");
         cmd
     }
@@ -115,15 +111,16 @@ impl Tree {
             .map(|child| (child.id(), child.try_wait()))
             .collect();
         format!(
-            "base={:?}, lock={lock:?}, holders={locks:?}, sockets={:?}, daemons={:?}, children={children:?}, logs={logs:?}",
+            "base={:?}, lock={lock:?}, holders={locks:?}, sockets={:?}, daemons={:?}, children={children:?}, logs={logs:?}, refusals:\n{}",
             self.base,
             self.sockets(),
             fixture_daemons(&self.base),
+            fixture::lock_refusals(&self.base),
         )
     }
     #[track_caller]
     fn stream(&self) -> UnixStream {
-        let until = Instant::now() + BOUND;
+        let until = Instant::now() + HANG;
         let mut last = String::from("no socket");
         loop {
             let sockets = self.sockets();
@@ -303,7 +300,7 @@ fn terminate_fixture_daemons(base: &std::path::Path) {
 }
 #[track_caller]
 fn wait(mut condition: impl FnMut() -> bool) {
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     while !condition() {
         assert!(Instant::now() < until, "deadline exceeded");
         std::thread::sleep(Duration::from_millis(10));
@@ -356,8 +353,8 @@ fn status_line(peer: &mut BufReader<UnixStream>) -> String {
     block(peer, b"{\"id\":\"s\",\"op\":\"status\"}\n")
 }
 fn ready(stream: UnixStream) -> (BufReader<UnixStream>, String) {
-    stream.set_read_timeout(Some(BOUND)).unwrap();
-    stream.set_write_timeout(Some(BOUND)).unwrap();
+    stream.set_read_timeout(Some(HANG)).unwrap();
+    stream.set_write_timeout(Some(HANG)).unwrap();
     let mut reader = BufReader::new(stream);
     loop {
         let hello = line(&mut reader);
@@ -501,10 +498,7 @@ fn cold_first_use_answers_locally_while_one_daemon_loads() {
     wait(|| fixture_daemons(&tree.base).len() == 1 && tree.sockets().len() == 1);
 
     let mut reader = BufReader::new(tree.stream());
-    reader
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    reader.get_ref().set_read_timeout(Some(HANG)).unwrap();
     let hello = line(&mut reader);
     assert!(
         hello.contains("\"state\":\"loading\""),
@@ -542,7 +536,12 @@ fn writer_loading_timeout_never_takes_direct_ownership_and_retry_routes_to_owner
     ]);
     let current = fs::read(tree.base.join("index/current")).unwrap();
     fs::write(tree.base.join("src/during-loading.txt"), "x").unwrap();
-    let indexed = tree.run(&["index", "src"]);
+    // The client must give up while the owner is still loading.
+    let indexed = tree
+        .command(&["index", "src"])
+        .env("FERRET_DAEMON_STARTUP_MS", "1500")
+        .output()
+        .unwrap();
     assert_eq!(indexed.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&indexed.stderr).contains("daemon owner did not become ready"));
     assert_eq!(fs::read(tree.base.join("index/current")).unwrap(), current);
@@ -1026,7 +1025,7 @@ fn bounded_output(mut child: Child) -> Output {
             pipe.read_to_end(&mut bytes).unwrap();
             bytes
         });
-        let until = Instant::now() + BOUND;
+        let until = Instant::now() + HANG;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -1145,7 +1144,7 @@ fn socket_loss_after_first_bytes_is_transport_failure_and_never_replays() {
         stdout.read_exact(&mut bytes).unwrap();
         (stdout, bytes)
     });
-    let until = Instant::now() + BOUND;
+    let until = Instant::now() + HANG;
     wait(|| first.is_finished() || Instant::now() >= until);
     assert!(first.is_finished());
     let (stdout, bytes) = first.join().unwrap();
@@ -1578,7 +1577,7 @@ fn loading_blocks_expired_idle_deadline_without_spinning() {
     );
     let ticks = || cpu_ticks(pid);
     let mut loading = BufReader::new(tree.stream());
-    loading.get_ref().set_read_timeout(Some(BOUND)).unwrap();
+    loading.get_ref().set_read_timeout(Some(HANG)).unwrap();
     assert!(line(&mut loading).contains("\"state\":\"loading\""));
     drop(loading);
     std::thread::sleep(Duration::from_millis(200));
@@ -1714,7 +1713,7 @@ fn a_query_falls_back_at_once_and_a_writer_waits_for_a_leaving_owner() {
         .output()
         .unwrap();
     assert!(searched.status.success());
-    assert!(started.elapsed() < BOUND, "a query waited for the owner");
+    assert!(started.elapsed() < PROMPT, "a query waited for the owner");
     assert_eq!(closed.load(Ordering::SeqCst), 1);
 
     fs::write(tree.base.join("src/after-exit.txt"), "x").unwrap();
@@ -1761,7 +1760,7 @@ fn a_writer_times_out_on_an_owner_that_closes_and_never_leaves() {
         String::from_utf8_lossy(&indexed.stderr)
     );
     assert!(
-        (Duration::from_millis(400)..BOUND).contains(&elapsed),
+        (Duration::from_millis(400)..PROMPT).contains(&elapsed),
         "{elapsed:?}"
     );
     assert_eq!(closed.load(Ordering::SeqCst), 1);
@@ -2308,7 +2307,7 @@ fn grep_falls_back_when_a_peer_closes_before_hello_or_refuses_it() {
             fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
             listener.set_nonblocking(true).unwrap();
             let peer = std::thread::spawn(move || {
-                let until = Instant::now() + BOUND;
+                let until = Instant::now() + HANG;
                 loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
@@ -2340,7 +2339,7 @@ fn a_client_accepts_legacy_frames_when_raw_output_is_not_advertised() {
     let (listener, hello, socket) = tree.fake_owner();
     let server = std::thread::spawn(move || {
         let mut stream = accept_peer(&listener);
-        stream.set_read_timeout(Some(BOUND)).unwrap();
+        stream.set_read_timeout(Some(HANG)).unwrap();
         stream
             .write_all(hello.replace(",\"raw-output-v1\"", "").as_bytes())
             .unwrap();
@@ -2798,9 +2797,7 @@ fn directory_grep_starts_one_daemon_and_answers_first_locally() {
         assert_eq!(first.stderr, local.stderr);
         wait(|| fixture_daemons(&tree.base).len() == 1 && tree.sockets().len() == 1);
         let stream = tree.stream();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        stream.set_read_timeout(Some(HANG)).unwrap();
         let mut peer = BufReader::new(stream);
         // The first query has already completed while the server cannot yet
         // execute any query: its output necessarily came from the local host.
@@ -2839,7 +2836,7 @@ fn find_and_grep_refuse_the_same_incompatible_owner_hellos() {
             assert!(hello.contains(from));
             for _ in 0..3 {
                 let mut stream = accept_peer(&listener);
-                stream.set_read_timeout(Some(BOUND)).unwrap();
+                stream.set_read_timeout(Some(HANG)).unwrap();
                 stream
                     .write_all(hello.replace(from, to).as_bytes())
                     .unwrap();
@@ -2921,10 +2918,7 @@ fn stopped_grep_consumer_leaves_a_descriptor_share_for_another_request() {
     // second reader time to fill capture space behind the blocked publisher.
     std::thread::sleep(Duration::from_millis(250));
     let (mut quiet, _) = tree.connect();
-    quiet
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    quiet.get_mut().set_read_timeout(Some(HANG)).unwrap();
     let request = request
         .replace("\"slow\"", "\"quiet\"")
         .replace(r#"["red","dense","dense","src"]"#, r#"["-q","red","src"]"#);
@@ -3054,7 +3048,7 @@ fn only_directory_only_grep_requests_reach_the_daemon() {
         let server = std::thread::scope(|scope| {
             let server = scope.spawn(|| {
                 let mut stream = accept_peer(&listener);
-                stream.set_read_timeout(Some(BOUND)).unwrap();
+                stream.set_read_timeout(Some(HANG)).unwrap();
                 stream.write_all(hello.as_bytes()).unwrap();
                 let mut reader = BufReader::new(stream);
                 let request = line(&mut reader);
@@ -3106,7 +3100,7 @@ fn grep_with_descriptor(tree: &Tree, args: &[&str], local: bool) -> Output {
         .current_dir(&tree.base)
         .env_remove("FERRET_NO_DAEMON")
         .env("FERRET_DAEMON_BIN", DAEMON)
-        .env("FERRET_DAEMON_STARTUP_MS", "1500")
+        .env("FERRET_DAEMON_STARTUP_MS", fixture::hang_ms())
         .env("FERRET_SEARCH_THREADS", "1")
         .args(["-c", r#"exec "$@" 99<fdinput"#, "grep-fd", FERRET, "grep"])
         .args(args);
@@ -3542,11 +3536,11 @@ fn fatal_accept_error_joins_the_merge_before_removing_the_socket() {
         ("FERRET_DAEMON_TEST_ACCEPT_ERROR", hook.to_str().unwrap()),
         ("FERRET_DAEMON_TEST_STOP_DELAY_MS", "3000"),
     ]);
-    ready_within(&tree, Duration::from_secs(60));
+    ready_within(&tree, HANG);
     for i in 0..240 {
         fs::remove_file(tree.base.join(format!("src/merge-{i}.txt"))).unwrap();
     }
-    let merge_by = Instant::now() + Duration::from_secs(60);
+    let merge_by = Instant::now() + HANG;
     while !gate.join("merge.reached").exists() {
         assert!(
             tree.try_wait(pid).is_none(),
@@ -3561,7 +3555,7 @@ fn fatal_accept_error_joins_the_merge_before_removing_the_socket() {
     );
     publish_accept_error(&hook, "EBADF");
     let _ = UnixStream::connect(tree.socket());
-    let observed = Instant::now() + Duration::from_secs(15);
+    let observed = Instant::now() + HANG;
     while tree.try_wait(pid).is_some()
         || tree.sockets().is_empty()
         || task_names(pid).iter().any(|name| name == "ferret-merge")
@@ -3577,7 +3571,7 @@ fn fatal_accept_error_joins_the_merge_before_removing_the_socket() {
         Err(error) => panic!("catalog lock released while the socket was still present: {error}"),
         Ok(_) => panic!("catalog lock released while the socket was still present"),
     }
-    let exited = Instant::now() + Duration::from_secs(10);
+    let exited = Instant::now() + HANG;
     let status = loop {
         if let Some(status) = tree.try_wait(pid) {
             break status;
@@ -3635,7 +3629,7 @@ fn text_stats_waiting_on_the_writer_does_not_block_queries_or_hello() {
     let (mut stats, _) = tree.connect();
     // Owned, not scoped: if the checks below fail, Tree's Drop must still
     // be able to kill the daemon that this read is waiting on.
-    stats.get_ref().set_read_timeout(Some(BOUND * 6)).unwrap();
+    stats.get_ref().set_read_timeout(Some(HANG)).unwrap();
     let (done, finished) = std::sync::mpsc::channel();
     let stats = std::thread::spawn(move || {
         let output = block(
@@ -3646,7 +3640,7 @@ fn text_stats_waiting_on_the_writer_does_not_block_queries_or_hello() {
         output
     });
     wait(|| reached.exists());
-    // Each read is bounded by BOUND: a selection held behind the writer
+    // Each read is bounded by HANG: a selection held behind the writer
     // turns into a timeout here rather than a hang.
     let found = block(
         &mut query,
@@ -3684,7 +3678,7 @@ fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
         ("FERRET_POLL_MS", "300000"),
         ("FERRET_CONTENT_TEST_GATE", gate.to_str().unwrap()),
     ]);
-    ready_within(&tree, Duration::from_secs(60));
+    ready_within(&tree, HANG);
     let (mut idle, _) = tree.connect();
     for i in 0..20 {
         fs::write(
@@ -3693,7 +3687,7 @@ fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
         )
         .unwrap();
     }
-    let held_by = Instant::now() + Duration::from_secs(60);
+    let held_by = Instant::now() + HANG;
     while !gate.join("follow.reached").exists() {
         assert!(tree.try_wait(pid).is_none(), "{}", tree.evidence());
         assert!(
@@ -3705,10 +3699,7 @@ fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
     }
     fs::create_dir(tree.base.join("index/index/manifest.tmp")).unwrap();
     let (mut queued, _) = tree.connect();
-    queued
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
+    queued.get_ref().set_read_timeout(Some(HANG)).unwrap();
     let src = tree.base.join("src");
     let reply = block(
         &mut queued,
@@ -3722,7 +3713,7 @@ fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
         reply.contains("\"exit\":3") && reply.contains("WriterUnavailable"),
         "{reply}"
     );
-    let exited = Instant::now() + Duration::from_secs(30);
+    let exited = Instant::now() + HANG;
     let status = loop {
         if let Some(status) = tree.try_wait(pid) {
             break status;
@@ -3780,7 +3771,7 @@ fn slow_identity_check_does_not_block_other_selections() {
     fs::write(gate.join("hold"), b"hold").unwrap();
     // Owned, not scoped: if the checks below fail, Tree's Drop must still
     // be able to kill the daemon that this read is waiting on.
-    parked.get_ref().set_read_timeout(Some(BOUND * 6)).unwrap();
+    parked.get_ref().set_read_timeout(Some(HANG)).unwrap();
     let parked = std::thread::spawn(move || {
         block(
             &mut parked,
@@ -3788,7 +3779,7 @@ fn slow_identity_check_does_not_block_other_selections() {
         )
     });
     wait(|| gate.join("reached").exists());
-    // Bounded by BOUND: a selection held behind the parked stat turns into
+    // Bounded by HANG: a selection held behind the parked stat turns into
     // a timeout here rather than a hang.
     let found = block(
         &mut query,
@@ -3826,7 +3817,7 @@ fn a_fifo_at_the_manifest_temporary_after_ready_does_not_wedge_follow() {
         ("FERRET_POLL_MS", "300000"),
         ("FERRET_CONTENT_TEST_GATE", gate.to_str().unwrap()),
     ]);
-    ready_within(&tree, Duration::from_secs(60));
+    ready_within(&tree, HANG);
     for i in 0..20 {
         fs::write(
             tree.base.join(format!("src/follow-{i}.txt")),
@@ -3834,7 +3825,7 @@ fn a_fifo_at_the_manifest_temporary_after_ready_does_not_wedge_follow() {
         )
         .unwrap();
     }
-    let held_by = Instant::now() + Duration::from_secs(60);
+    let held_by = Instant::now() + HANG;
     while !gate.join("follow.reached").exists() {
         assert!(tree.try_wait(pid).is_none(), "{}", tree.evidence());
         assert!(
@@ -3848,10 +3839,7 @@ fn a_fifo_at_the_manifest_temporary_after_ready_does_not_wedge_follow() {
     let made = Command::new("mkfifo").arg(&temporary).status().unwrap();
     assert!(made.success());
     let (mut queued, _) = tree.connect();
-    queued
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    queued.get_ref().set_read_timeout(Some(HANG)).unwrap();
     let src = tree.base.join("src");
     let reply = block(
         &mut queued,
@@ -3931,12 +3919,8 @@ fn write_dense(tree: &Tree) {
 }
 
 fn patient(peer: &mut BufReader<UnixStream>) {
-    peer.get_mut()
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    peer.get_mut()
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    peer.get_mut().set_read_timeout(Some(HANG)).unwrap();
+    peer.get_mut().set_write_timeout(Some(HANG)).unwrap();
 }
 
 fn hold_grep(tree: &Tree, id: &str) -> BufReader<UnixStream> {
@@ -3957,7 +3941,7 @@ fn hold_grep(tree: &Tree, id: &str) -> BufReader<UnixStream> {
 }
 
 fn wait_status(peer: &mut BufReader<UnixStream>, mut ready: impl FnMut(&str) -> bool) -> String {
-    let until = Instant::now() + Duration::from_secs(30);
+    let until = Instant::now() + HANG;
     let mut last = String::new();
     while Instant::now() < until {
         last = status_line(peer);
@@ -4004,9 +3988,11 @@ fn worker_pool_lone_find_is_granted_the_full_budget() {
     let end = find_end(&tree);
     assert_eq!(number(&end, "exit"), Some(0), "{end}");
     assert_eq!(number(&end, "workers"), Some(budget), "{end}");
-    let after = status_line(&mut status);
-    assert_eq!(number(&after, "worker_permits"), Some(0), "{after}");
-    assert!(integer_list(&after, "worker_grants").is_empty(), "{after}");
+    // `find_request` writes the end event before the daemon drops the
+    // grant, so the release can trail the reply; a loaded machine shows it.
+    wait_status(&mut status, |line| {
+        number(line, "worker_permits") == Some(0) && integer_list(line, "worker_grants").is_empty()
+    });
 }
 
 #[test]

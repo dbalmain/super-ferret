@@ -8,21 +8,13 @@ mod fixture;
 use std::fs;
 use std::io::Write;
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 
 struct Tree(std::path::PathBuf);
 impl Tree {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ferret-batch-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = fixture::reserve("ferret-batch");
         fs::create_dir_all(path.join("src")).unwrap();
         fs::write(path.join("src/main.rs"), b"fn main() {}\n").unwrap();
         let output = fixture::command(FERRET, &path)
