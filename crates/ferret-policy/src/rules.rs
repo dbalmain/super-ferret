@@ -5,15 +5,18 @@
 //! order (D13):
 //!
 //! 1. `.ferretignore` files, closest directory first;
-//! 2. inside a git work tree only, `.gitignore` files closest first, then
+//! 2. `.rgignore` files, then `.ignore` files, each closest first and in or out
+//!    of a work tree, as rg ranks them (D126);
+//! 3. inside a git work tree only, `.gitignore` files closest first, then
 //!    `.git/info/exclude`;
-//! 3. the user's global ignore file, which setup seeds with
+//! 4. the user's global ignore file, which setup seeds with
 //!    [`DEFAULT_IGNORE`](crate::DEFAULT_IGNORE).
 //!
 //! Within one file the last matching line wins, as in gitignore. So the
 //! files concatenated in reverse, lowest precedence first (global, exclude,
-//! `.gitignore` root to here, `.ferretignore` root to here) and searched for
-//! the last matching line give the same answer (D19). Each directory holds
+//! `.gitignore`, `.ignore`, `.rgignore`, `.ferretignore`, each root to here)
+//! and searched for the last matching line give the same answer (D19). Each
+//! directory holds
 //! that concatenation as one list of *basename* rules: every rule that can
 //! match one of its entries, rewritten to match the entry's name alone.
 //!
@@ -163,70 +166,6 @@ impl DirRules {
         (rules, errors)
     }
 
-    /// Rg's directory rules, without ferret defaults or a content size cap.
-    /// `.gitignore` and exclude apply inside a work tree; `.ignore` and
-    /// `.rgignore` each outrank every git source, including closer
-    /// gitignore files.
-    pub fn grep_root(
-        root: &Path,
-        global: Option<&str>,
-        files: IgnoreFiles<'_>,
-        ignore: Option<&str>,
-        rgignore: Option<&str>,
-    ) -> (Self, Vec<PatternError>) {
-        let (mut rules, mut errors) =
-            Self::root(root, global, files, Config { size_cap: u64::MAX });
-        rules.add_grep_files(root, ignore, rgignore, &mut errors);
-        (rules, errors)
-    }
-
-    /// Enters a directory even when it was explicitly named and ignored.
-    /// The parent's rules continue applying to entries inside it.
-    pub fn grep_enter(
-        &self,
-        name: &OsStr,
-        files: IgnoreFiles<'_>,
-        ignore: Option<&str>,
-        rgignore: Option<&str>,
-    ) -> (Self, Vec<PatternError>) {
-        let (mut rules, mut errors) = self.enter(name, files);
-        let dir = rules.shared.root.join(&rules.path);
-        rules.add_grep_files(&dir, ignore, rgignore, &mut errors);
-        (rules, errors)
-    }
-
-    fn add_grep_files(
-        &mut self,
-        dir: &Path,
-        ignore: Option<&str>,
-        rgignore: Option<&str>,
-        errors: &mut Vec<PatternError>,
-    ) {
-        if ignore.is_none() && rgignore.is_none() {
-            return;
-        }
-        let mut state = (*self.state).clone();
-        for (name, text, layers) in [
-            (".ignore", ignore, &mut state.ignore),
-            (".rgignore", rgignore, &mut state.rgignore),
-        ] {
-            if let Some(text) = text {
-                layers.extend(
-                    Layer::compile(
-                        IgnoreFile::Grep(dir.join(name)),
-                        text,
-                        false,
-                        &self.shared.lists,
-                        errors,
-                    )
-                    .live(),
-                );
-            }
-        }
-        self.list = self.shared.list(&state, Some(&self.list));
-        self.state = Arc::new(state);
-    }
-
     /// Rules for child directory `name`, which [`decide`](Self::decide)
     /// answered [`Decision::Descend`]. `files` are that directory's ignore
     /// files. Returns the patterns that could not be used, as for
@@ -236,6 +175,8 @@ impl DirRules {
         let path = self.path.join(name);
         let stepped = self.state.stepped(name.as_bytes(), files.git_root);
         let adds_files = files.ferretignore.is_some()
+            || files.ignore.is_some()
+            || files.rgignore.is_some()
             || files.git_root
             || (files.gitignore.is_some() && self.state.git.is_some());
         let (state, list) = if stepped.is_none() && !adds_files {
@@ -431,6 +372,15 @@ impl State {
             tree.ignores
                 .extend(Layer::compile(file, text, false, lists, errors).live());
         }
+        for (name, text, layers) in [
+            (".ignore", files.ignore, &mut self.ignore),
+            (".rgignore", files.rgignore, &mut self.rgignore),
+        ] {
+            if let Some(text) = text {
+                let file = IgnoreFile::Dot(dir.join(name));
+                layers.extend(Layer::compile(file, text, false, lists, errors).live());
+            }
+        }
     }
 
     fn layers(&self) -> impl Iterator<Item = &Layer> {
@@ -441,9 +391,9 @@ impl State {
         self.global
             .iter()
             .chain(git)
-            .chain(&self.ferret)
             .chain(&self.ignore)
             .chain(&self.rgignore)
+            .chain(&self.ferret)
     }
 
     /// Every layer's rules for this directory, lowest precedence first.
@@ -959,7 +909,7 @@ mod tests {
             ferretignore: Some("!*.log\nkeep\n"),
             gitignore: Some("*.log\n!keep\n"),
             git_root: true,
-            git_exclude: None,
+            ..IgnoreFiles::default()
         };
         let root = Dir::root(None, files);
         assert_eq!(root.decide("x.log", FILE), Decision::Index);
@@ -997,7 +947,7 @@ mod tests {
             ferretignore: Some("!/target/doc/**\n"),
             gitignore: Some("!*.txt\n"),
             git_root: true,
-            git_exclude: None,
+            ..IgnoreFiles::default()
         };
         let root = Dir::root(Some("target/\n"), files);
         let target = root.traverse("target");
@@ -1078,7 +1028,7 @@ mod tests {
             ferretignore: ferret.then_some("!/target/doc/**\n!*.md\n"),
             gitignore: (!ferret).then_some("!*.md\n"),
             git_root: true,
-            git_exclude: None,
+            ..IgnoreFiles::default()
         };
         let (with_git, _) = root(Some("target/\n"), files(false));
         let (with_ferret, _) = root(Some("target/\n"), files(true));
@@ -1097,7 +1047,7 @@ mod tests {
             ferretignore: Some("!/target/doc/**\n"),
             gitignore: Some("!*.md\n"),
             git_root: true,
-            git_exclude: None,
+            ..IgnoreFiles::default()
         };
         let root = Dir::root(Some("target/\n"), both);
         let git_x = root.enter("x", gitignore("!*.md\n"));

@@ -30,10 +30,12 @@ fn open_parent(parent: &Path) -> Result<OwnedFd, Errno> {
 
 /// The crawl consults a few names in every directory; those cost no
 /// allocation. A followed symlink's ancestors can have any name.
-const NAMES: [&[u8]; 6] = [
+const NAMES: [&[u8]; 8] = [
     b".ferretignore",
     b".git",
     b".gitignore",
+    b".ignore",
+    b".rgignore",
     b"info",
     b"exclude",
     b"commondir",

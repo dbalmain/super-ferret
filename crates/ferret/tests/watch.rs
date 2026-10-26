@@ -1234,6 +1234,22 @@ fn linked_worktree_commondir_changes_are_watched() {
     );
 }
 
+/// `.ignore` and `.rgignore` are policy inputs (D126): creating either
+/// re-decides the directory below it, as editing a `.ferretignore` does.
+#[test]
+fn a_new_dot_ignore_file_re_decides_its_tree() {
+    let mut tree = Tree::new();
+    tree.success(tree.local(&["index"]));
+    tree.start(&[]);
+    // In the parent: only a subtree re-walk reaches `left/original.txt`.
+    write(tree.path("src/.ignore"), "original.txt\n");
+    tree.converges();
+    assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
+    write(tree.path("src/.rgignore"), "!original.txt\n");
+    tree.converges();
+    assert!(tree.run(&["search", "original.txt"]).status.success());
+}
+
 #[test]
 fn ignored_name_churn_preserves_the_full_raw_count_census() {
     let mut tree = Tree::new();

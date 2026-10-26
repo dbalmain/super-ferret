@@ -448,29 +448,11 @@ fn load_query_policy(
         parent.is_some_and(DirRules::in_work_tree),
         (),
     );
-    let ignore = grep
-        .then(|| walker.read_named(fd.as_fd(), ".ignore", ()))
-        .flatten();
-    let rgignore = grep
-        .then(|| walker.read_named(fd.as_fd(), ".rgignore", ()))
-        .flatten();
     let (rules, errors) = if let Some(parent) = parent {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "policy directory has no name")
         })?;
-        if grep {
-            parent.grep_enter(name, loaded.files(), ignore.as_deref(), rgignore.as_deref())
-        } else {
-            parent.enter(name, loaded.files())
-        }
-    } else if grep {
-        DirRules::grep_root(
-            path,
-            global,
-            loaded.files(),
-            ignore.as_deref(),
-            rgignore.as_deref(),
-        )
+        parent.enter(name, loaded.files())
     } else {
         DirRules::root(path, global, loaded.files(), config)
     };
@@ -1125,6 +1107,8 @@ struct Ignores {
     gitignore: Option<String>,
     git_root: bool,
     git_exclude: Option<String>,
+    ignore: Option<String>,
+    rgignore: Option<String>,
     work_tree: Option<FoundWorkTree>,
 }
 
@@ -1135,6 +1119,8 @@ impl Ignores {
             gitignore: self.gitignore.as_deref(),
             git_root: self.git_root,
             git_exclude: self.git_exclude.as_deref(),
+            ignore: self.ignore.as_deref(),
+            rgignore: self.rgignore.as_deref(),
         }
     }
 }
@@ -1724,14 +1710,18 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         in_work_tree: bool,
         token: V::Dir,
     ) -> Ignores {
-        self.visit.policy_input(dir, OsStr::new(".ferretignore"));
-        self.visit.policy_input(dir, OsStr::new(DOT_GIT));
+        for name in [".ferretignore", ".ignore", ".rgignore", DOT_GIT] {
+            self.visit.policy_input(dir, OsStr::new(name));
+        }
         if in_work_tree {
             self.visit.policy_input(dir, OsStr::new(".gitignore"));
         }
-        let ferretignore = listed(".ferretignore")
-            .then(|| self.read_named(dir, ".ferretignore", token))
-            .flatten();
+        let [ferretignore, ignore, rgignore] =
+            [".ferretignore", ".ignore", ".rgignore"].map(|name| {
+                listed(name)
+                    .then(|| self.read_named(dir, name, token))
+                    .flatten()
+            });
         let git = if listed(DOT_GIT) {
             self.probe_git(dir, token)
         } else {
@@ -1762,6 +1752,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             gitignore,
             git_root,
             git_exclude,
+            ignore,
+            rgignore,
             work_tree,
         }
     }

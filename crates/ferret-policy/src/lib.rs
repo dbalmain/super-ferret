@@ -106,6 +106,20 @@ pub struct IgnoreFiles<'a> {
     pub git_root: bool,
     /// Contents of `.git/info/exclude`; read only when `git_root` is true.
     pub git_exclude: Option<&'a str>,
+    /// Contents of `.ignore`, which rg and other search tools read, in or
+    /// out of a work tree.
+    pub ignore: Option<&'a str>,
+    /// Contents of `.rgignore`, rg's own; it outranks `.ignore`.
+    pub rgignore: Option<&'a str>,
+}
+
+/// Whether a file of this name in a directory can change the decisions
+/// below it. A change to one re-decides the directory's whole subtree.
+pub fn is_ignore_file(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b".ferretignore" | b".gitignore" | b".ignore" | b".rgignore"
+    )
 }
 
 /// What a directory entry is, from `lstat`.
@@ -186,8 +200,8 @@ pub enum IgnoreFile {
     GitExclude(PathBuf),
     /// The user's global ignore file.
     Global,
-    /// An rg-specific `.ignore` or `.rgignore`, by absolute path.
-    Grep(PathBuf),
+    /// A `.ignore` or `.rgignore`, by absolute path.
+    Dot(PathBuf),
 }
 
 /// An ignore file the policy could not fully use. Non-fatal: as in git, a bad
@@ -210,7 +224,7 @@ pub enum PatternError {
 impl fmt::Display for IgnoreFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ferret(path) | Self::Git(path) | Self::GitExclude(path) | Self::Grep(path) => {
+            Self::Ferret(path) | Self::Git(path) | Self::GitExclude(path) | Self::Dot(path) => {
                 write!(f, "{}", path.display())
             }
             Self::Global => f.write_str("global ignore file"),
