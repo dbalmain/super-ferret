@@ -215,12 +215,23 @@ impl Watch {
         }
     }
     pub(crate) fn policy_input(&self, root: &Path, parent: BorrowedFd<'_>, name: &OsStr) {
-        self.input(root, parent, name, 0);
+        self.inputs(root, parent, &[name], 0);
+    }
+    /// [`Watch::policy_input`] for several names in one parent: the parent's
+    /// identity and filesystem are read once for all of them, where a
+    /// directory's ignore inputs cost an `fstat` and `fstatfs` each.
+    pub(crate) fn policy_inputs(&self, root: &Path, parent: BorrowedFd<'_>, names: &[&OsStr]) {
+        self.inputs(root, parent, names, 0);
     }
     fn input(&self, root: &Path, parent: BorrowedFd<'_>, name: &OsStr, hops: u32) {
+        self.inputs(root, parent, &[name], hops);
+    }
+    fn inputs(&self, root: &Path, parent: BorrowedFd<'_>, names: &[&OsStr], hops: u32) {
         let proc = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
         let Ok(stat) = fstat(parent) else {
-            self.gap(root);
+            for _ in names {
+                self.gap(root);
+            }
             return;
         };
         let identity = (stat.st_dev, stat.st_ino);
@@ -231,6 +242,12 @@ impl Watch {
                 .unreliable
                 .insert(root.to_owned());
         }
+        for name in names {
+            self.input_of(root, &proc, identity, name, hops);
+        }
+    }
+    /// One input of a parent whose `identity` was just read through `proc`.
+    fn input_of(&self, root: &Path, proc: &Path, identity: (u64, u64), name: &OsStr, hops: u32) {
         let mut s = self
             .state
             .lock()
@@ -255,7 +272,7 @@ impl Watch {
             .identities
             .get(&identity)
             .copied()
-            .map_or_else(|| inotify::add_watch(&self.fd, &proc, mask), Ok);
+            .map_or_else(|| inotify::add_watch(&self.fd, proc, mask), Ok);
         match result {
             Ok(wd)
                 if installed < self.config.watch_cap

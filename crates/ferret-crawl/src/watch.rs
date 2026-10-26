@@ -304,7 +304,10 @@ impl Watch {
             self.gap(root);
             return;
         };
-        let identity = (stat.st_dev, stat.st_ino);
+        self.arm_at(root, relative, fd, (stat.st_dev, stat.st_ino));
+    }
+    /// [`Watch::arm`] for a handle whose `(dev, ino)` its caller has just read.
+    fn arm_at(&self, root: &Path, relative: &Path, fd: BorrowedFd<'_>, identity: (u64, u64)) {
         if relative.as_os_str().is_empty() {
             self.policy_path(root, root);
         }
@@ -447,7 +450,8 @@ impl Watch {
         ) {
             Ok(fd) => {
                 if fstat(&fd).is_ok_and(|s| (s.st_dev, s.st_ino) == (stat.dev, stat.ino)) {
-                    self.arm(root, entry.path, std::os::fd::AsFd::as_fd(&fd));
+                    let identity = (stat.dev, stat.ino);
+                    self.arm_at(root, entry.path, std::os::fd::AsFd::as_fd(&fd), identity);
                 } else {
                     self.gap(root);
                     self.backstop(RefreshReason::Overflow);
