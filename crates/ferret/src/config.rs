@@ -49,3 +49,71 @@ impl Controller {
         config
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Controller;
+
+    /// Names the case a child copy of this test binary checks. Setting the
+    /// environment in-process is unsafe and would race other tests, so each
+    /// case runs in its own process with only that case's values.
+    const MARKER: &str = "FERRET_TEST_CONTROLLER_CASE";
+    const TEST: &str = "config::tests::controller_overrides_are_read_from_the_environment";
+    const BYTES: [&str; 5] = [
+        "FERRET_FULL_MEMORY_BYTES",
+        "FERRET_CHECKPOINT_MEMORY_BYTES",
+        "FERRET_CHECKPOINT_DISK_BYTES",
+        "FERRET_MEMORY_FLOOR_BYTES",
+        "FERRET_ADDITIONAL_MEMORY_BYTES",
+    ];
+
+    fn bytes(c: &Controller) -> [u64; 5] {
+        [
+            c.full_memory,
+            c.checkpoint_memory,
+            c.disk,
+            c.memory_floor,
+            c.additional_memory,
+        ]
+    }
+
+    /// Each override the daemon tests leave unset, through the real
+    /// `Controller::from_env`. Byte sizes parse as `u64`, and anything else
+    /// keeps the default. `FERRET_BATTERY_PAUSE` parses the same way, then
+    /// `0` turns the pause off; a value that does not parse keeps it on.
+    #[test]
+    fn controller_overrides_are_read_from_the_environment() {
+        match std::env::var(MARKER).as_deref() {
+            Err(_) => {
+                let cases: [(&str, [&str; 5], &str); 2] = [
+                    ("set", ["1001", "1002", "1003", "1004", "1005"], "0"),
+                    ("malformed", ["3G", "-1", "", "1e6", " 5"], "off"),
+                ];
+                for (case, values, battery) in cases {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture"])
+                        .envs(BYTES.iter().zip(values))
+                        .env("FERRET_BATTERY_PAUSE", battery)
+                        .env(MARKER, case)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{case}: {output:?}");
+                    // A filter that matched nothing would also exit 0.
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(stdout.contains("1 passed"), "{case}: {stdout}");
+                }
+            }
+            Ok("set") => {
+                let c = Controller::from_env();
+                assert_eq!(bytes(&c), [1001, 1002, 1003, 1004, 1005]);
+                assert!(!c.battery_pause);
+            }
+            Ok("malformed") => {
+                let c = Controller::from_env();
+                assert_eq!(bytes(&c), bytes(&Controller::default()));
+                assert!(c.battery_pause);
+            }
+            Ok(other) => panic!("unknown case {other}"),
+        }
+    }
+}

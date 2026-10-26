@@ -43,18 +43,14 @@ value is ignored and the default applies.
 | `FERRET_WATCH_CAP`               | 7/8 of `max_user_watches`                                        | `ferret` `daemon/writer.rs`                                      | Most inotify watches the daemon installs.                                            | `tests/watch.rs`                                   |
 | `FERRET_INDEX_WORKERS`           | available parallelism, capped (`default_workers`)                | `ferret` `config.rs`                                             | Daemon crawl workers; at least 1.                                                    | `tests/watch.rs`                                   |
 | `FERRET_BULK_BYTES_PER_SECOND`   | 33554432                                                         | `ferret` `config.rs`                                             | Rate limit on the daemon's bulk work.                                                | `tests/daemon.rs`                                  |
-| `FERRET_FULL_MEMORY_BYTES`       | 3221225472                                                       | `ferret` `config.rs`                                             | Available memory a full rewalk needs to be admitted, scaled by catalog size.         | none                                               |
-| `FERRET_CHECKPOINT_MEMORY_BYTES` | 700000000                                                        | `ferret` `config.rs`                                             | Available memory a checkpoint needs to be admitted, scaled by catalog size.          | none                                               |
-| `FERRET_CHECKPOINT_DISK_BYTES`   | 700000000                                                        | `ferret` `config.rs`                                             | Free disk bulk work needs to be admitted, scaled by catalog size.                    | none                                               |
-| `FERRET_MEMORY_FLOOR_BYTES`      | 67108864                                                         | `ferret` `config.rs`                                             | The least memory any bulk admission requires.                                        | none                                               |
-| `FERRET_ADDITIONAL_MEMORY_BYTES` | 0                                                                | `ferret` `config.rs`                                             | Added to every bulk memory requirement.                                              | none                                               |
-| `FERRET_BATTERY_PAUSE`           | 1                                                                | `ferret` `config.rs`                                             | `0` keeps the daemon indexing on battery.                                            | none                                               |
+| `FERRET_FULL_MEMORY_BYTES`       | 3221225472                                                       | `ferret` `config.rs`                                             | Available memory a full rewalk needs to be admitted, scaled by catalog size.         | `config.rs` unit test                              |
+| `FERRET_CHECKPOINT_MEMORY_BYTES` | 700000000                                                        | `ferret` `config.rs`                                             | Available memory a checkpoint needs to be admitted, scaled by catalog size.          | `config.rs` unit test                              |
+| `FERRET_CHECKPOINT_DISK_BYTES`   | 700000000                                                        | `ferret` `config.rs`                                             | Free disk bulk work needs to be admitted, scaled by catalog size.                    | `config.rs` unit test                              |
+| `FERRET_MEMORY_FLOOR_BYTES`      | 67108864                                                         | `ferret` `config.rs`                                             | The least memory any bulk admission requires.                                        | `config.rs` unit test, `tests/watch.rs`            |
+| `FERRET_ADDITIONAL_MEMORY_BYTES` | 0                                                                | `ferret` `config.rs`                                             | Added to every bulk memory requirement.                                              | `config.rs` unit test                              |
+| `FERRET_BATTERY_PAUSE`           | 1                                                                | `ferret` `config.rs`                                             | `0` keeps the daemon indexing on battery.                                            | `config.rs` unit test                              |
 | `FERRET_SIGNAL_PROC`             | `/proc`                                                          | `ferret` `politeness.rs`                                         | Where the daemon reads pressure and load signals.                                    | `tests/daemon.rs`, fixtures                        |
 | `FERRET_SIGNAL_POWER`            | `/sys/class/power_supply`                                        | `ferret` `politeness.rs`                                         | Where the daemon reads battery state.                                                | `tests/daemon.rs`, fixtures                        |
-
-The controller rows marked "none" are read through one parser,
-`Controller::from_env`, that the covered rows share; no test sets these six
-themselves.
 
 Standard variables ferret reads, all in release builds:
 
@@ -103,6 +99,7 @@ child copy of its own binary.
 | Variable                                          | Owning test module                        |
 | ------------------------------------------------- | ----------------------------------------- |
 | `FERRET_TEST_COMPLETION_CHILD`                    | `ferret-query/src/verify.rs`              |
+| `FERRET_TEST_CONTROLLER_CASE`                     | `ferret/src/config.rs`                    |
 | `FERRET_TEST_LATE_SPILL`                          | `ferret/src/grep/groups.rs`               |
 | `FERRET_TEST_STREAM_PANIC`                        | `ferret/src/grep/groups.rs`               |
 | `FERRET_TEST_CAPTURE_LOW_DESCRIPTORS`             | `ferret/src/grep/groups/tests/capture.rs` |
