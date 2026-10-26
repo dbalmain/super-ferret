@@ -865,6 +865,8 @@ fn unsupported_commands_fall_back_to_the_named_rg() {
             "-n --sort path red",
         ),
         (&["--sort", "path", "-e", "--rg"], "--sort path -e --rg"),
+        (&["-Pe", "--rg", "red"], "-Pe --rg red"),
+        (&["--rg", "--pcre2", "--rg", "red"], "--pcre2 --rg red"),
     ] {
         let output = run_with(args, &fallback, None);
         assert_eq!(

@@ -522,9 +522,10 @@ stand-in and the shadow pass `--rg`, and every rg differential test runs with
 it. `-uu` and `--hidden` mean the same in both modes. When the stand-in's
 `FERRET_GREP_FALLBACK` hands a refused command to rg, each argument the
 parser took as `--rg` is dropped, since rg has no such flag; a `--rg` that is
-a pattern, a flag's value or after `--` is kept. After a refused flag the
-parser cannot tell whether rg reads the next argument as its value, so it
-takes a `--rg` there as the flag. The ignore rules below hold in both
+a pattern, a flag's value or after `--` is kept. Parsing stops at the flag
+it refuses, whose grammar only rg knows (`-Pe --rg` makes `--rg` a pattern),
+so every argument after that flag reaches rg unchanged, and rg rejects a
+`--rg` there. The stand-in puts its `--rg` first. The ignore rules below hold in both
 modes; the hidden-name rules, and the uncovered walk's, are `--rg`'s.
 
 **D127 A (2026-10-27):** under `--rg`, indexed grep shows a hidden name that
