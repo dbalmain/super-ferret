@@ -678,6 +678,14 @@ struct Level {
     own: Saved,
 }
 
+impl Level {
+    /// Makes this level own the first `children` of a fresh child stack,
+    /// none of them visited, with their names at the start of its buffer.
+    fn rebase(&mut self, children: usize) {
+        (self.start, self.next, self.end, self.names_start) = (0, 0, children, 0);
+    }
+}
+
 /// What the lent entry holds between fetches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {
@@ -827,8 +835,11 @@ impl LiveWalk {
 
     // Donate siblings already observed by readdir. Ancestor levels remain in
     // the donated walk solely for loop detection and start/device identity.
-    // Its boundary excludes their evaluation; the donor owns their completion.
-    // A loan copies the children up to the level's end, so a whole level is
+    // Its boundary excludes their evaluation; the donor owns their completion,
+    // so the loan carries none of their children. A loan copies only the lent
+    // siblings and their names, rebased to start the borrower's child stack:
+    // it runs under the scheduler's queue lock, and copying the whole stack
+    // there serialised every worker on one wide directory. A whole level is
     // lent only under `Share::Idle`, when each lent sibling has an idle worker.
     pub(super) fn split(&mut self, share: Share) -> Option<(Self, Arc<AtomicUsize>)> {
         let fewest = match share {
@@ -857,9 +868,25 @@ impl LiveWalk {
             Share::Idle(idle) if unvisited <= idle => level.next,
             Share::Half | Share::Idle(_) => level.next + unvisited / 2,
         };
+        let mut names = Vec::new();
+        let children: Vec<Child> = self.children[middle..level.end]
+            .iter()
+            .map(|child| {
+                let start = names.len();
+                names.extend_from_slice(&self.names[child.name.0..child.name.1]);
+                Child {
+                    name: (start, names.len()),
+                    ..*child
+                }
+            })
+            .collect();
         let mut levels: Vec<_> = self.levels[..=index].to_vec();
+        // Ancestors own no children here; the donated level owns them all.
+        for ancestor in &mut levels[..index] {
+            ancestor.rebase(0);
+        }
         let donated = &mut levels[index];
-        donated.next = middle;
+        donated.rebase(children.len());
         donated.pending = None;
         donated.first = None;
         let mut walk = Self::new(Vec::new(), self.options.clone());
@@ -870,8 +897,8 @@ impl LiveWalk {
         walk.root_dev = self.root_dev;
         walk.levels = levels;
         walk.boundary = index + 1;
-        walk.children = self.children[..level.end].to_vec();
-        walk.names = self.names.clone();
+        walk.children = children;
+        walk.names = names;
         walk.cancelled = self.cancelled;
         #[cfg(test)]
         {
