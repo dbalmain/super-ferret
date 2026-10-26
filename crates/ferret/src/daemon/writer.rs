@@ -133,10 +133,8 @@ pub(super) fn start(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 serve(&host, receive, scheduler)
             }));
-            let error = match result {
-                Ok(Ok(())) => return,
-                Ok(Err(error)) => error.to_string(),
-                Err(_) => "writer panicked".into(),
+            let Some(error) = stopped_cause(result) else {
+                return;
             };
             let mut loaded = host
                 .engine
@@ -164,6 +162,15 @@ pub(super) fn start(
             // fresh daemon (D110).
             super::fatal(&host, "writer stopped", &error);
         })
+}
+/// Why the writer thread ended, or None for a clean stop. A panic keeps its
+/// message, so the "writer stopped" line names the cause (D122).
+fn stopped_cause(result: std::thread::Result<io::Result<()>>) -> Option<String> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(panic) => Some(format!("writer {}", panic_message(panic.as_ref()))),
+    }
 }
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     panic

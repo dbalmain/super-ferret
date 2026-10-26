@@ -8,7 +8,7 @@ use std::time::Duration;
 use ferret_catalog::bulk::{Blocked, Clock};
 use ferret_crawl::{IndexError, IndexOptions, Refresh};
 
-use super::{Command, Host, Loaded, Message, Status, serve};
+use super::{Command, Host, Loaded, Message, Status, serve, stopped_cause};
 use crate::config::Controller;
 use crate::daemon::{Lifecycle, ServerEvent};
 use crate::politeness::{Idle, Sample, Signals};
@@ -341,4 +341,18 @@ fn a_late_pending_release_cannot_wrap_the_count() {
     pending.store(2, Ordering::Release);
     super::release_pending(&pending);
     assert_eq!(pending.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_writer_panic_names_its_message_in_the_stopped_cause() {
+    let panicked = std::panic::catch_unwind(|| -> std::io::Result<()> {
+        panic!("dead name {}", 7);
+    });
+    assert_eq!(
+        stopped_cause(panicked).as_deref(),
+        Some("writer panicked: dead name 7")
+    );
+    let failed = Ok(Err(std::io::Error::other("Is a directory")));
+    assert_eq!(stopped_cause(failed).as_deref(), Some("Is a directory"));
+    assert_eq!(stopped_cause(Ok(Ok(()))), None);
 }
