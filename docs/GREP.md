@@ -513,7 +513,9 @@ rg's only under `--rg`. By default hidden names are shown (`--no-hidden` hides
 them), and an uncovered directory walks under D13 with ferret's global ignore
 file, as if it were an index root; nothing above the operand is read. Its
 files are read as rg reads them in both modes: no size cap, rg's binary probe,
-one read (D123), matching indexed grep's live reads of oversized files. `--rg`
+one read (D123), matching indexed grep's live reads of oversized files. The
+files selected match what indexing the operand would select; binary detection
+can differ, since the crawl sniffs 8 KiB where the read probes 64 KiB. `--rg`
 restores the rg-parity rules this section describes: hidden names held unless
 revealed, and uncovered directories under rg's rules from `/`. The agents' `rg`
 stand-in and the shadow pass `--rg`, and every rg differential test runs with

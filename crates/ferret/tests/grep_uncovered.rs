@@ -977,7 +977,9 @@ fn core_excludes_file_is_read_as_rg_reads_it() {
 }
 
 // D128: without `--rg`, an uncovered operand is walked as if it were an index
-// root, so the answer must not change when it is indexed. Each named path
+// root, so the files selected must not change when it is indexed. (Binary
+// detection may: an uncovered read probes 64 KiB for a NUL as rg does, the
+// crawl sniffs 8 KiB.) Each named path
 // discriminates against rg's rules: rg hides the dot file, applies the
 // ancestor `.gitignore`, and ignores ferret's global file. A file over the
 // index size cap is searched, as indexed grep reads such files live.

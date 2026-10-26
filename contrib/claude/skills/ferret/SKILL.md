@@ -33,7 +33,9 @@ ferret roots list
 `ferret grep` takes rg's syntax and prints what rg prints, including `--json`,
 `-l`, `-c`, `-n`, `-g GLOB` and `-U`. Write it as you would write rg. It
 follows ferret's visibility rules, so it lists dot files rg hides; add `--rg`
-for exactly the files rg would search. A flag it does not support (`-t`, `-P`, `--sort` and others) exits 2 with
+for rg's hidden-file and ignore-file rules. Under a root, files ferret's own
+ignore file keeps out of the index stay out either way. A flag it does not
+support (`-P`, `--sort=path` and others) exits 2 with
 `... is not supported; use rg for this command`; then run rg.
 
 ## `ferret search`
