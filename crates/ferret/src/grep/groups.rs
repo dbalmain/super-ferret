@@ -1531,7 +1531,7 @@ impl Filter<'_> {
     ) -> Option<(u64, Job)> {
         let visibility = Visibility {
             selection: self.selection,
-            catalog: self.catalog,
+            revealed: self.catalog.filter(|_| self.traversal.rg),
             cwd: &self.cwd,
             max_depth: self.traversal.max_depth,
             content: true,

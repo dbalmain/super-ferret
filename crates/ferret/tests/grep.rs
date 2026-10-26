@@ -737,6 +737,28 @@ fn only_a_repository_whitelist_reveals_a_hidden_name() {
     );
 }
 
+// D127 reveals only under `--rg`. In ferret mode a `!` line keeps a dot name
+// indexed but does not override hidden selection, so `--no-hidden` hides it
+// both indexed and under `--live`.
+#[test]
+fn a_whitelist_reveals_nothing_without_rg() {
+    let fixture = Fixture::new("whitelist-ferret-mode");
+    fixture.write(".ignore", b"!.env\n");
+    fixture.write(".env", b"lantern\n");
+    fixture.write("visible", b"lantern\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let shows_env = |args: &[&str]| {
+        let output = fixture.ferret(&[&["grep", "--files"], args].concat(), None);
+        assert!(output.status.success(), "{output:?}");
+        let files = String::from_utf8(output.stdout).unwrap();
+        assert!(files.contains("visible\n"), "{files}");
+        files.lines().any(|line| line == ".env")
+    };
+    assert!(!shows_env(&["--no-hidden"]));
+    assert!(!shows_env(&["--no-hidden", "--live"]));
+    assert!(shows_env(&["--rg"]));
+}
+
 #[test]
 fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     let fixture = Fixture::new("spill");

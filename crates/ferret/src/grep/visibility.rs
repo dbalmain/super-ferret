@@ -15,10 +15,11 @@ pub(super) enum Visit {
 
 pub(super) struct Visibility<'a> {
     pub selection: &'a GrepSelection,
-    /// The catalog a covered walk lists, which records the hidden names a
-    /// repository ignore file's `!` line reveals (D127). Needs
-    /// [`Section::Revealed`](ferret_catalog::Section::Revealed).
-    pub catalog: Option<&'a ferret_catalog::Catalog>,
+    /// Under `--rg`, the catalog a covered walk lists, which records the
+    /// hidden names a repository ignore file's `!` line reveals (D127). Needs
+    /// [`Section::Revealed`](ferret_catalog::Section::Revealed). `None` in
+    /// ferret mode, where a `!` line does not override hidden selection.
+    pub revealed: Option<&'a ferret_catalog::Catalog>,
     pub cwd: &'a Path,
     pub max_depth: Option<usize>,
     /// Content search: D13's size and binary rules apply to files.
@@ -58,7 +59,7 @@ impl Visibility<'_> {
         // dot name can be revealed, so others skip the lookup.
         let revealed = !rg
             && entry.name().starts_with(b".")
-            && self.catalog.is_some_and(|catalog| {
+            && self.revealed.is_some_and(|catalog| {
                 entry
                     .catalog_name()
                     .is_some_and(|name| catalog.is_revealed(name))
