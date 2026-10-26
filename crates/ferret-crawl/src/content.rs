@@ -93,9 +93,9 @@ pub fn stream_search_listed_until(
 
 /// [`stream_search_listed_until`] without the changed-during-read check: reads
 /// the opening size once and passes whatever it read, as rg does. For
-/// uncovered rg-mode scans only, which answer for the moment the command ran
-/// rather than for one consistent version (D123); a check would retry once
-/// and then drop a file that is written to throughout, such as a live log.
+/// uncovered rg-mode scans only (D123), which answer for the file as it was
+/// opened; the check would retry, then fail, a file that shrank or was
+/// replaced during the read.
 pub fn stream_listed_once_until(
     directory: BorrowedFd<'_>,
     name: &std::ffi::OsStr,
@@ -108,7 +108,29 @@ pub fn stream_listed_once_until(
         open: OFlags::NOFOLLOW,
         check: AtFlags::SYMLINK_NOFOLLOW,
     };
-    let (mut file, current) = open_named(&named, None, cancelled)?;
+    stream_once(&named, each, cancelled)
+}
+
+/// [`stream_listed_once_until`] for a path, following symlinks: an uncovered
+/// scan under `-L`.
+pub fn stream_file_once_until(
+    path: &std::path::Path,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), ContentFault> {
+    stream_once(
+        &Named::follow(rustix::fs::CWD, path.as_os_str()),
+        each,
+        cancelled,
+    )
+}
+
+fn stream_once(
+    named: &Named<'_>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), ContentFault> {
+    let (mut file, current) = open_named(named, None, cancelled)?;
     pass_extent(&mut file, current.size, each, cancelled)
 }
 

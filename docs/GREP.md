@@ -399,10 +399,11 @@ refuse under the operand rule below.
 **Uncovered scans read once (D123, 2026-10-26):** files walked under a
 directory operand no index root covers are read as rg reads them: opened
 beneath their listed parent without following a symlink, read once up to
-their opening size (to EOF when that is zero), and printed as read. There is
-no closing bracket, name check or retry, so a file rewritten during its read
-prints whatever was read, and a file written to throughout still prints its
-matches rather than failing as changed. Explicit file operands, indexed
+their opening size (to EOF when that is zero), and printed as read; under
+`-L` they are opened by path, following symlinks. There is no closing
+bracket, name check or retry, so a file that shrinks, or whose name is
+replaced, during its read prints whatever was read rather than being
+retried and then reported as changed. Explicit file operands, indexed
 candidates and `--live` keep the bracket above.
 
 **Read-extent clarification (2026-10-17, review R3; corrects review R2):** a

@@ -7011,3 +7011,13 @@ B: uncovered rg-mode scans read each file once and print what was read.
 Indexed reads keep the check, because there it decides whether the bytes
 read are the catalogued version and may be cached against it; `--live` is
 unchanged for now.
+
+**Correction (Astra review of f1216a9..e384dab, 2026-10-26):** the
+paragraph above, and the brief's "never printed torn", overstate the check.
+Its closing fstat already accepted a file that grew or was overwritten at
+the same size, so an appended-to log never failed it, and a same-size
+overwrite could print torn before D123 too. What it rejected was a file
+that shrank, or whose name was unlinked or replaced, during the read: those
+were retried once, then reported as changed with their matches dropped.
+The outcome stands. Built in 9010608; `-L` walks were missed there and are
+covered in the follow-up.

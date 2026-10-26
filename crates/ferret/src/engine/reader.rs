@@ -97,7 +97,13 @@ pub(crate) fn listed(
     };
     let reopened;
     let directory = match parent {
-        Parent::Followed => return direct(path, cap, each, cancelled),
+        Parent::Followed if checked => return direct(path, cap, each, cancelled),
+        Parent::Followed => {
+            return match ferret_crawl::content::stream_file_once_until(path, each, cancelled) {
+                Ok(()) => ReadOutcome::Stable(ReadVersion::Current),
+                Err(error) => fault(error, false),
+            };
+        }
         Parent::Open(directory) => directory.as_fd(),
         &Parent::Closed(dev, ino) => {
             let spelled = path

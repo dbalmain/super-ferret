@@ -442,7 +442,7 @@ pub(super) fn read_file(
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
 ) -> ReadOutcome {
-    read_file_policy(path, listed, plan, each, stopped, false)
+    read_file_policy(path, listed, plan, each, stopped, false, false)
 }
 
 fn read_file_policy(
@@ -452,6 +452,7 @@ fn read_file_policy(
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
     rg: bool,
+    once: bool,
 ) -> ReadOutcome {
     let recursive = listed.is_some();
     let cap = (recursive && !plan.traversal.unrestricted && !rg)
@@ -465,8 +466,7 @@ fn read_file_policy(
     };
     match listed {
         None => engine::reader::direct(path, cap, &mut pass, stopped),
-        // Uncovered rg-mode scans read once, as rg does (D123).
-        Some(parent) => engine::reader::listed(parent, path, !rg, cap, &mut pass, stopped),
+        Some(parent) => engine::reader::listed(parent, path, !once, cap, &mut pass, stopped),
     }
 }
 
@@ -612,8 +612,10 @@ pub(super) enum Job {
     /// An explicit file: display spelling and absolute lookup path.
     Direct(PathBuf, PathBuf),
     /// A walked file and the directory it was listed in, which it is opened
-    /// beneath, never through a symlink.
-    Listed(PathBuf, PathBuf, engine::reader::Parent, bool),
+    /// beneath, never through a symlink; then whether to probe binary as rg
+    /// does, and whether to read it once without the changed-during-read
+    /// check, as an uncovered scan does (D123).
+    Listed(PathBuf, PathBuf, engine::reader::Parent, bool, bool),
     Checked(PathBuf, NameId, u32),
     /// A catalogued file omitted from content indexing: oversized, or binary
     /// under -a. Read through the checked catalog walk, uncached.
@@ -626,7 +628,7 @@ impl Job {
     fn path(&self) -> &Path {
         match self {
             Self::Direct(p, _)
-            | Self::Listed(p, _, _, _)
+            | Self::Listed(p, _, _, _, _)
             | Self::Checked(p, _, _)
             | Self::Unindexed(p, _)
             | Self::Failed(p, _)
@@ -639,7 +641,7 @@ impl Job {
     /// would otherwise keep its directory's descriptor open.
     fn finished(self) -> Self {
         match self {
-            Self::Listed(path, actual, _, _) => Self::Direct(path, actual),
+            Self::Listed(path, actual, _, _, _) => Self::Direct(path, actual),
             job => job,
         }
     }
@@ -820,10 +822,10 @@ fn prepare(
             false,
             target,
         )?,
-        Job::Listed(_, actual, directory, rg) => observe_streaming(
+        Job::Listed(_, actual, directory, rg, once) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file_policy(actual, Some(directory), plan, each, stopped, *rg),
+            &mut |each| read_file_policy(actual, Some(directory), plan, each, stopped, *rg, *once),
             false,
             target,
         )?,
@@ -1610,6 +1612,7 @@ impl Filter<'_> {
                     self.cwd.join(entry.path()),
                     engine::reader::Parent::Followed,
                     true,
+                    rg,
                 ),
             ));
         }
@@ -1635,6 +1638,8 @@ impl Filter<'_> {
                 entry.path().to_owned(),
                 self.cwd.join(entry.path()),
                 parent,
+                rg,
+                // Uncovered scans read once, as rg does (D123).
                 rg,
             ),
         ))
@@ -1850,6 +1855,7 @@ mod tests {
             "display/file".into(),
             actual,
             engine::reader::Parent::Closed(stat.dev(), stat.ino()),
+            false,
             false,
         ));
         let fork = || -> Option<Box<CheckedReader<'_>>> { None };
