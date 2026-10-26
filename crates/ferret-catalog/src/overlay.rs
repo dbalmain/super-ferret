@@ -354,7 +354,8 @@ impl Overlay {
             | Section::Roots
             | Section::Entries
             | Section::Traversed
-            | Section::RetainedAt => self.namespace.get().is_some(),
+            | Section::RetainedAt
+            | Section::Revealed => self.namespace.get().is_some(),
             Section::Links | Section::Specials | Section::WorkTrees => {
                 self.families[Family::Aux as usize].get().is_some()
             }
@@ -845,6 +846,7 @@ impl Overlay {
                     parent,
                     child,
                     name: bytes,
+                    ..
                 } = r.as_ref()
                 {
                     if !live(&self.base, &rows, *parent)

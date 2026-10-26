@@ -1156,6 +1156,7 @@ fn the_deferred_backlog_is_drained_as_inodes_finish() {
             let name = format!("{ino}-{alias}").into_bytes();
             let path = root.join(OsStr::from_bytes(&name));
             let deferred = Deferred {
+                revealed: false,
                 parent,
                 name,
                 stat,
@@ -1563,6 +1564,7 @@ fn effective_content_faults_use_live_names_and_graph_roots() {
                     stat: st(4, 0o040755),
                 },
                 Record::NamePut {
+                    revealed: false,
                     id: edge,
                     parent: r.0,
                     child: id,
@@ -1576,12 +1578,14 @@ fn effective_content_faults_use_live_names_and_graph_roots() {
                     retained_at: None,
                 },
                 Record::NamePut {
+                    revealed: false,
                     id: own.0,
                     parent: id,
                     child: a.0,
                     name: b"a".to_vec(),
                 },
                 Record::NamePut {
+                    revealed: false,
                     id: file.0,
                     parent: a.0,
                     child: child.0,

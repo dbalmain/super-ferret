@@ -47,6 +47,8 @@
 //! doc refs    u32 indexed-inode count per live document, in Docs order
 //! retained at nullable blocked u64 last trustworthy sequence per directory
 //! policy      BLAKE3-128 fingerprint of global rules and eligibility
+//! revealed    u32 per name a repository ignore file's `!` line reveals
+//!             although it is hidden (D127): its NameId, strictly rising
 //! ```
 //!
 //! A column is its dictionary (`u64` values, present only in a dictionary
@@ -123,7 +125,8 @@ pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 /// 1: fixed-width rows (S1). 2: bit-packed columns (S1a).
 /// 3: ignored type tags, collapsed opaque directories and visible specials.
 /// 4: checked checkpoint, incarnation, allocation counters and writer sections.
-pub(crate) const VERSION: u32 = 4;
+/// 5: the revealed-names section and the log's `NamePut` flags (D127).
+pub(crate) const VERSION: u32 = 5;
 /// "No id" in the builder's plan, and in the `u32` ids of fixed-width rows.
 pub(crate) const NONE: u32 = u32::MAX;
 
@@ -189,9 +192,11 @@ pub enum Section {
     RetainedAt,
     /// Writer policy fingerprint (BLAKE3-128).
     Policy,
+    /// Hidden names a repository ignore file's `!` line reveals (D127).
+    Revealed,
 }
 
-pub(crate) const SECTIONS: [Section; 26] = [
+pub(crate) const SECTIONS: [Section; 27] = [
     Section::Names,
     Section::NameHeap,
     Section::DirNames,
@@ -218,6 +223,7 @@ pub(crate) const SECTIONS: [Section; 26] = [
     Section::DocRefs,
     Section::RetainedAt,
     Section::Policy,
+    Section::Revealed,
 ];
 
 /// One bit-packed column. Each lies in one section, in this order; only the
@@ -1021,6 +1027,7 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
         (Section::Links, PAIR_ROW),
         (Section::Specials, PAIR_ROW),
         (Section::WorkTrees, WORK_TREE_ROW),
+        (Section::Revealed, 4),
     ] {
         if !len(section).is_multiple_of(row as u64) {
             return Err(DecodeError::Corrupt(section.label()));
@@ -1169,6 +1176,7 @@ const CHECK_ORDER: [Section; SECTIONS.len()] = [
     Section::DocRefs,
     Section::RetainedAt,
     Section::Policy,
+    Section::Revealed,
 ];
 
 impl Section {
@@ -1236,6 +1244,7 @@ impl Section {
             Section::DocRefs => "document references",
             Section::RetainedAt => "retained at",
             Section::Policy => "policy",
+            Section::Revealed => "revealed",
         }
     }
 }
@@ -1390,6 +1399,16 @@ pub(crate) fn check<'a>(
             }
         }
         Section::Policy => {}
+        Section::Revealed => {
+            let mut last = None;
+            for row in get(section).chunks_exact(4) {
+                let id = u32_at(row, 0);
+                if id as usize >= l.names || last.is_some_and(|last| id <= last) {
+                    return Err(DecodeError::Corrupt("revealed"));
+                }
+                last = Some(id);
+            }
+        }
         Section::Entries
         | Section::Traversed
         | Section::Ino

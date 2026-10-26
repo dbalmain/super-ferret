@@ -116,6 +116,7 @@ fn changes(published: &Published) -> ChangeSet {
                 names: 1,
             },
             Record::NamePut {
+                revealed: false,
                 id: 0,
                 parent: 0,
                 child: 1,

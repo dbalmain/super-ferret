@@ -2392,6 +2392,7 @@ fn stats_effective_depth_census_matches_a_fresh_checkpoint() {
                     stat: st(4, 0o040755),
                 },
                 Record::NamePut {
+                    revealed: false,
                     id: edge,
                     parent: r.0,
                     child: id,
@@ -2405,6 +2406,7 @@ fn stats_effective_depth_census_matches_a_fresh_checkpoint() {
                     retained_at: None,
                 },
                 Record::NamePut {
+                    revealed: false,
                     id: name.0,
                     parent: id,
                     child: a.0,

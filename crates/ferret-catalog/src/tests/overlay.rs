@@ -65,6 +65,7 @@ fn signed_semantic_damage_drives_real_effective_reader_and_writer() {
         (
             "dead parent",
             vec![Record::NamePut {
+                revealed: false,
                 id: 0,
                 parent: 1,
                 child: 1,
@@ -149,6 +150,7 @@ fn birth_fields_and_declared_live_counts_are_checked_before_access() {
                     names: 1,
                 },
                 Record::NamePut {
+                    revealed: false,
                     id: 2,
                     parent: 0,
                     child: 2,
@@ -182,6 +184,7 @@ fn unused_payload_damage_does_not_fail_a_name_or_metadata_query() {
         &s,
         vec![
             Record::NamePut {
+                revealed: false,
                 id: 0,
                 parent: 0,
                 child: 1,
@@ -256,6 +259,7 @@ fn pinned_effective_views_and_keep_survive_later_append_and_epoch_unlink() {
     let c = changes(
         &s,
         vec![Record::NamePut {
+            revealed: false,
             id: 0,
             parent: 0,
             child: 1,
@@ -267,6 +271,7 @@ fn pinned_effective_views_and_keep_survive_later_append_and_epoch_unlink() {
     let old = Catalog::open(&s.path).unwrap().unwrap();
     let mut c = c;
     c.records = vec![Record::NamePut {
+        revealed: false,
         id: 0,
         parent: 0,
         child: 1,
@@ -294,6 +299,7 @@ fn incremental_orphan_and_type_damage_is_rejected_after_a_checked_predecessor() 
         let first = changes(
             &s,
             vec![Record::NamePut {
+                revealed: false,
                 id: 0,
                 parent: 0,
                 child: 1,
@@ -348,6 +354,7 @@ fn same_sequence_key_removals_and_additions_form_one_run() {
         &s,
         vec![
             Record::NamePut {
+                revealed: false,
                 id: 0,
                 parent: 0,
                 child: 1,

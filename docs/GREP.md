@@ -524,6 +524,22 @@ it. `-uu` and `--hidden` mean the same in both modes. When the stand-in's
 dropped, since rg has no such flag. The ignore rules below hold in both
 modes; the hidden-name rules, and the uncovered walk's, are `--rg`'s.
 
+**D127 A (2026-10-27):** under `--rg`, indexed grep shows a hidden name that
+rg shows because the last rule matching it in a `.gitignore`,
+`.git/info/exclude`, `.ignore` or `.rgignore` is a `!` line, for content,
+`-l` and `--files` alike. The crawl decides this from the rules it already
+holds and records it with the name in the catalog (format version 5); a query
+reads no ignore file. A `!` line in `.ferretignore` or ferret's global ignore
+file keeps a name indexed without revealing it, since rg reads neither. A
+revealed hidden directory is entered, and what it holds is listed as rg lists
+it. Adding or removing the `!` line changes only the recorded flag, which the
+next refresh updates like any other ignore-file change (D74 A).
+
+One gap remains: git's global excludes (`core.excludesFile`, D115 B) are read
+only by the live and uncovered walks. The crawl never reads them, so a `!` line
+there does not reveal an indexed hidden name, although rg, and `--rg` over an
+uncovered directory, would show it.
+
 **D74 A (confirmed 2026-10-16):** indexed visibility is D47/D13, with rg hidden/glob filters
 on top. It uses ferret global rules, `.gitignore`/`info/exclude` inside worktrees
 at/below indexed roots, and higher-priority `.ferretignore`. Ignore-file changes
@@ -554,7 +570,8 @@ outside a worktree are absent; `.ferretignore` can override VCS exclusions and
 re-include below a pruned tree. Ferret's symlinked-ignore/gitdir handling and
 lossy non-UTF-8 rule parsing can also change visibility; pin those fixtures
 against rg. Suppress held hidden files unless an explicit start, positive glob
-or `--hidden` permits them. Tracked status is irrelevant; recursive symlinks
+or `--hidden` permits them, or,
+under `--rg`, a repository ignore file reveals them (D127). Tracked status is irrelevant; recursive symlinks
 stay skipped even if ferret's content aliases would otherwise return them.
 
 `--no-ignore`/`-u` uses find's unrestricted live walk, retaining the hidden

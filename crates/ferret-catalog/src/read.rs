@@ -766,7 +766,8 @@ impl Catalog {
                     | Section::Roots
                     | Section::Entries
                     | Section::Traversed
-                    | Section::RetainedAt => o.load_namespace()?,
+                    | Section::RetainedAt
+                    | Section::Revealed => o.load_namespace()?,
                     Section::Links | Section::Specials => {
                         o.load(Family::Aux)?;
                         o.check_aux()?;
@@ -1257,6 +1258,23 @@ impl Catalog {
         }
         let bits = self.section(Section::Traversed);
         bits[dir.0 as usize / 8] >> (dir.0 % 8) & 1 == 1
+    }
+
+    /// Whether a repository ignore file's `!` line reveals this hidden name
+    /// (D127): rg lists it without `--hidden`. A name's overlay row decides,
+    /// as for [`Self::is_traversed`]; then the base's sorted list. Needs
+    /// [`Section::Revealed`].
+    pub fn is_revealed(&self, name: NameId) -> bool {
+        match self.ns_record(overlay::NAME, name.0) {
+            Some(Record::NamePut { revealed, .. }) => *revealed,
+            Some(_) => false,
+            None => self
+                .section(Section::Revealed)
+                .as_chunks::<4>()
+                .0
+                .binary_search_by(|row| u32::from_le_bytes(*row).cmp(&name.0))
+                .is_ok(),
+        }
     }
 
     /// Search suppression is independent of traversal and retained coverage.

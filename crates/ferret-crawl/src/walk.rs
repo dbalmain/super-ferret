@@ -114,6 +114,10 @@ pub struct Decided<'a, D> {
     /// `lstat` of `path`. Present for every decision other than
     /// [`Decision::Skip`].
     pub stat: Option<Stat<'a>>,
+    /// A hidden (dot-named) entry that a `!` line in a repository's ignore
+    /// files reveals, as it does to rg (D127). Never set for
+    /// [`Decision::Skip`] or for a name without a leading dot.
+    pub revealed: bool,
 }
 
 /// How a work tree found at or below the root is attached to its repository.
@@ -1202,6 +1206,10 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         stat: Option<Stat<'_>>,
         kind: FileType,
     ) -> Option<V::Dir> {
+        // Only a dot name can be revealed, so others never ask the rules.
+        let revealed = decision != Decision::Skip
+            && name.as_bytes().starts_with(b".")
+            && here.rules.reveals(name, kind == FileType::Directory);
         self.visit.visit(Event::Decided(Decided {
             parent: here.token,
             parent_fd: here.fd,
@@ -1210,6 +1218,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             decision,
             stat,
             kind: catalog_kind(kind),
+            revealed,
         }))
     }
 

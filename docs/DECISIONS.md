@@ -7159,6 +7159,13 @@ would make A's format change cheaper to fold in there (A after D65).
 
 > Dave: A (2026-10-27). Needed only under D128's `--rg`.
 
+**Implemented (2026-10-27, d127-revealed).** Catalog format 5 adds a revealed
+section and a NamePut flag, kept through refresh and compaction. Only the
+repository bands count: a `!` line in `.ferretignore` or in ferret's global
+ignore file reveals nothing, because rg reads neither. Git's global excludes
+are still not read by the crawl, so a `!` line there reveals nothing indexed
+(GREP.md § Ignore rules and visibility).
+
 ## D128 — Whose visibility rules `ferret grep` follows by default
 
 **Question:** Should `ferret grep` follow ferret's own visibility rules by

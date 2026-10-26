@@ -26,15 +26,27 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::gitignore::{FxHashMap, Gitignore, Match, Pattern, RuleText};
 
+/// Which kind of ignore file a rule came from, lowest precedence first.
+/// Part of a rule's identity: only [`Band::Ferret`] rules whitelist while
+/// traversing an excluded directory, and only [`Band::Repo`] rules are ones
+/// rg also reads (D127).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Band {
+    /// The user's global ignore file, ferret's own.
+    Global,
+    /// `.gitignore`, `.git/info/exclude`, `.ignore` and `.rgignore`.
+    Repo,
+    /// `.ferretignore`.
+    Ferret,
+}
+
 /// One distinct basename rule.
 #[derive(Debug)]
 pub(crate) struct Rule {
     id: usize,
     /// Basename-only. Its line is meaningless: a list renumbers it.
     pattern: Pattern,
-    /// From a `.ferretignore`: part of the rule's identity, because only
-    /// these whitelist while traversing an excluded directory.
-    ferret: bool,
+    band: Band,
 }
 
 /// One directory's rules compiled for matching, lowest precedence first.
@@ -43,6 +55,9 @@ pub(crate) struct List {
     /// The rule ids in order: the list's identity.
     key: Arc<[usize]>,
     index: Gitignore,
+    /// Positions from here on came from a repository's ignore files, not the
+    /// global file. The global file comes first in every list.
+    repo_from: usize,
     /// Positions from here on came from a `.ferretignore`. Ferret files come
     /// last in every list, so one boundary is enough.
     ferret_from: usize,
@@ -51,7 +66,7 @@ pub(crate) struct List {
 /// The rule and list tables of one root.
 #[derive(Debug, Default)]
 pub(crate) struct Lists {
-    rules: Mutex<FxHashMap<(RuleText, bool), Arc<Rule>>>,
+    rules: Mutex<FxHashMap<(RuleText, Band), Arc<Rule>>>,
     lists: Mutex<FxHashMap<Arc<[usize]>, Arc<List>>>,
 }
 
@@ -67,11 +82,9 @@ impl List {
     /// source line is not a position, so each pattern is renumbered by its
     /// place in the list.
     pub(crate) fn compile(rules: &[&Rule]) -> Self {
-        let ferret_from = rules
-            .iter()
-            .position(|rule| rule.ferret)
-            .unwrap_or(rules.len());
-        debug_assert!(rules[ferret_from..].iter().all(|rule| rule.ferret));
+        debug_assert!(rules.is_sorted_by_key(|rule| rule.band));
+        let repo_from = rules.partition_point(|rule| rule.band == Band::Global);
+        let ferret_from = rules.partition_point(|rule| rule.band < Band::Ferret);
         Self {
             key: rules.iter().map(|rule| rule.id).collect(),
             index: Gitignore::from_patterns(
@@ -80,6 +93,7 @@ impl List {
                     .enumerate()
                     .map(|(at, rule)| rule.pattern.renumbered(at)),
             ),
+            repo_from,
             ferret_from,
         }
     }
@@ -95,22 +109,30 @@ impl List {
             .best(name, is_dir)
             .map(|(at, result)| (result == Match::Whitelist, at >= self.ferret_from))
     }
+
+    /// Whether the last rule matching entry `name` among the repository's
+    /// ignore files, the ones rg reads too, is a `!` line. `.ferretignore`
+    /// and the global file are ferret's alone, so a rule of theirs neither
+    /// reveals nor hides here (D127).
+    pub(crate) fn repo_whitelists(&self, name: &[u8], is_dir: bool) -> bool {
+        self.index
+            .best_below(name, is_dir, self.ferret_from)
+            .is_some_and(|(at, result)| at >= self.repo_from && result == Match::Whitelist)
+    }
 }
 
 impl Lists {
     /// The one rule with `pattern`'s text and band. `pattern` must be a
     /// basename pattern.
-    pub(crate) fn rule(&self, pattern: Pattern, ferret: bool) -> Arc<Rule> {
-        let text = (pattern.text(), ferret);
+    pub(crate) fn rule(&self, pattern: Pattern, band: Band) -> Arc<Rule> {
+        let text = (pattern.text(), band);
         let mut rules = self.rules.lock().unwrap_or_else(PoisonError::into_inner);
         let id = rules.len();
-        Arc::clone(rules.entry(text).or_insert_with(|| {
-            Arc::new(Rule {
-                id,
-                pattern,
-                ferret,
-            })
-        }))
+        Arc::clone(
+            rules
+                .entry(text)
+                .or_insert_with(|| Arc::new(Rule { id, pattern, band })),
+        )
     }
 
     /// The one compiled list of `rules`, compiling it on first use. `key`

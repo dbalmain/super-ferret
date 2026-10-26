@@ -178,6 +178,9 @@ impl Plan {
             }
             for id in view.children(dir) {
                 let name = view.name(id);
+                if view.is_revealed(id) {
+                    lens[Section::Revealed as usize] += 4;
+                }
                 blocks[Column::NameParent as usize].push(parent as u64);
                 blocks[Column::NameChild as usize].push(u64::from(self.child(name.target())));
                 blocks[Column::NameOffset as usize].push(offset);
@@ -256,10 +259,17 @@ pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::R
         column(Column::NameOffset)?,
     );
     let mut heap = section(Section::NameHeap);
+    // Names are renumbered in this order, so the new ids rise.
+    let mut revealed = section(Section::Revealed);
+    let mut new_name = 0u32;
     let mut offset = 0;
     for (parent, &dir) in plan.order[..plan.dirs].iter().enumerate() {
         for id in view.children(dir) {
             let name = view.name(id);
+            if view.is_revealed(id) {
+                format::put_u32(&mut revealed, new_name)?;
+            }
+            new_name += 1;
             parents.value(parent as u64)?;
             children.value(u64::from(plan.child(name.target())))?;
             offsets.value(offset)?;
@@ -272,6 +282,7 @@ pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::R
     children.finish()?;
     offsets.finish()?;
     heap.finish()?;
+    revealed.finish()?;
     let (mut names, mut entries, mut retained) = (
         column(Column::DirName)?,
         column(Column::Entries)?,

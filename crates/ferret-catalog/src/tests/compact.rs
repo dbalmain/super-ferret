@@ -66,6 +66,7 @@ fn pinned_unloaded_readers_and_unchanged_sequence_handles_survive_dense_remappin
                 stat: file_stat(5),
             },
             crate::log::Record::NamePut {
+                revealed: false,
                 id: view.next_name().0,
                 parent: view.roots().next().unwrap().0.0,
                 child,
@@ -386,4 +387,115 @@ fn cumulative_bursts_cross_the_record_limit_before_the_triggering_delta_is_appen
             );
         }
     }
+}
+
+/// D127: compaction keeps which names are revealed through renumbering,
+/// whether the snapshot or a later log `NamePut` set the flag last. A birth
+/// that sorts first moves every root child's name id, so a section copied
+/// without remapping would name the wrong entries.
+#[test]
+fn compaction_keeps_revealed_names_through_renumbering() {
+    let s = Scratch::new("compact-revealed");
+    commit(&s.path, |txn| {
+        let mut b = txn.batch();
+        let root = b.root(b"/root", dir_stat(1));
+        let dir = b.revealing(true).dir(root, b".kept", dir_stat(2));
+        b.revealing(true)
+            .file(dir, b".env", file_stat(3), Content::Hashed(hash(1)));
+        b.file(root, b".gains", file_stat(4), Content::Hashed(hash(2)));
+        b.revealing(true)
+            .file(root, b".loses", file_stat(5), Content::Hashed(hash(3)));
+        b.file(root, b".plain", file_stat(6), Content::Hashed(hash(4)));
+        txn.add(b);
+    });
+    let mut session = WriterSession::open(&s.path).unwrap();
+    session.set_compaction_limits(crate::CompactionLimits {
+        log_bytes: u64::MAX,
+        records: u64::MAX,
+        dirty_percent: u32::MAX,
+        dead_percent: u32::MAX,
+    });
+    let view = session.view();
+    let root = view.roots().next().unwrap().0;
+    let flip = |name: &[u8], revealed: bool| {
+        let id = view.lookup(root, name).unwrap();
+        let edge = view.name(id);
+        crate::log::Record::NamePut {
+            id: id.0,
+            parent: edge.parent.0,
+            child: edge.child.0,
+            name: edge.bytes.to_vec(),
+            revealed,
+        }
+    };
+    let child = view.next_inode().0;
+    let doc = view.next_doc().0;
+    let changes = crate::log::ChangeSet {
+        counters: [child + 1, view.next_name().0 + 1, doc + 1],
+        counts: [
+            view.inode_count() + 1,
+            view.name_count() + 1,
+            view.dir_count(),
+            view.doc_count() + 1,
+        ],
+        records: vec![
+            crate::log::Record::LifePut {
+                id: child,
+                kind: crate::Kind::File,
+                flags: 0,
+                names: 1,
+            },
+            crate::log::Record::InodePut {
+                id: child,
+                kind: crate::Kind::File,
+                state: crate::ContentState::Hashed,
+                doc: Some(doc),
+                stat: file_stat(7),
+            },
+            crate::log::Record::NamePut {
+                id: view.next_name().0,
+                parent: root.0,
+                child,
+                name: b".a-first".to_vec(),
+                revealed: true,
+            },
+            crate::log::Record::DocPut {
+                id: doc,
+                references: 1,
+                hash: hash(5),
+            },
+            flip(b".gains", true),
+            flip(b".loses", false),
+        ],
+    };
+    let expected = [
+        "/root/.a-first",
+        "/root/.gains",
+        "/root/.kept",
+        "/root/.kept/.env",
+    ];
+    let revealed = |catalog: &crate::Catalog| {
+        catalog.load_all().unwrap();
+        let mut paths: Vec<String> = catalog
+            .names()
+            .filter(|&(id, _)| catalog.is_revealed(id))
+            .map(|(id, _)| {
+                let mut path = Vec::new();
+                catalog.path(id, &mut path);
+                String::from_utf8(path).unwrap()
+            })
+            .collect();
+        paths.sort();
+        paths
+    };
+    let logged = session.commit(&changes, SNIFFER).unwrap();
+    assert_eq!(revealed(&logged), expected, "read through the log");
+    let before = logged.lookup(root, b".gains").unwrap();
+    let new = session.compact().unwrap();
+    let after = new
+        .lookup(new.roots().next().unwrap().0, b".gains")
+        .unwrap();
+    assert_ne!(before, after, "compaction renumbered the names");
+    assert_eq!(revealed(&new), expected, "compacted");
+    assert_eq!(revealed(&reopen(&s.path)), expected, "reopened");
 }

@@ -651,6 +651,92 @@ fn dot_ignore_files_hide_as_rg_does() {
     fixture.compare(&["--files"], None);
 }
 
+// A `!` line in an ignore file reveals a hidden file to rg, as an explicit
+// start or `--hidden` would; the indexed answer must agree.
+#[test]
+fn an_ignore_whitelist_reveals_a_hidden_file() {
+    let fixture = Fixture::new("whitelist");
+    fixture.write("app/.git/HEAD", b"ref: refs/heads/main\n");
+    fixture.write("app/.gitignore", b".env*\n!.env.example\n");
+    fixture.write("app/.env.example", b"lantern\n");
+    fixture.write("app/.env.local", b"lantern\n");
+    fixture.write("app/.other", b"lantern\n");
+    fixture.write(".ignore", b"!.kept\n");
+    fixture.write(".kept", b"lantern\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let listed = fixture.compare(&["-l", "lantern"], None);
+    assert!(!listed.stdout.is_empty(), "{listed:?}");
+    fixture.compare(&["--files"], None);
+}
+
+// D127: the catalog's revealed flag follows the ignore file. Dropping the
+// whitelist must hide the file on the next index run, and restoring it must
+// show the file again, although the file itself never changed. The file sits
+// below the ignore file's directory, so its own directory is unchanged and
+// the crawl reuses its observation: the flag must be part of that reuse check.
+#[test]
+fn a_reindex_follows_a_whitelist_that_comes_and_goes() {
+    let fixture = Fixture::new("whitelist-refresh");
+    fixture.write("app/.git/HEAD", b"ref: refs/heads/main\n");
+    fixture.write("app/sub/.env.example", b"lantern\n");
+    fixture.write("app/.env.example", b"lantern\n");
+    let listed = |whitelisted: bool| {
+        // No exclusion either way: the file stays indexed, so only its
+        // revealed flag changes. With `.env*` as well, dropping the `!` line
+        // would remove the file from the catalog and never test the flag.
+        let rules: &[u8] = if whitelisted {
+            b"!.env.example\n"
+        } else {
+            b"# no rules\n"
+        };
+        fixture.write("app/.gitignore", rules);
+        assert!(fixture.ferret(&["index", "."], None).status.success());
+        let files = fixture.compare(&["--files"], None);
+        let names = String::from_utf8(fixture.compare(&["-l", "lantern"], None).stdout).unwrap();
+        let files = String::from_utf8(files.stdout).unwrap();
+        for path in ["app/.env.example", "app/sub/.env.example"] {
+            assert_eq!(files.contains(path), whitelisted, "{path}: {files}");
+            assert_eq!(names.contains(path), whitelisted, "{path}: {names}");
+        }
+    };
+    listed(true);
+    listed(false);
+    listed(true);
+}
+
+// rg reads neither `.ferretignore` nor ferret's global ignore file, so a
+// whitelist there keeps a dot name indexed without revealing it. A whitelisted
+// hidden directory is revealed, and rg then lists what it holds.
+#[test]
+fn only_a_repository_whitelist_reveals_a_hidden_name() {
+    let fixture = Fixture::new("whitelist-bands");
+    fixture.write("app/.git/HEAD", b"ref: refs/heads/main\n");
+    fixture.write("app/.gitignore", b"!.github/\n");
+    fixture.write("app/.github/workflow.yml", b"lantern\n");
+    fixture.write("app/.ferretignore", b"!.mine\n");
+    fixture.write("app/.mine", b"lantern\n");
+    fs::write(
+        fixture.base.join("home/config/ferret/ignore"),
+        b"!.global\n",
+    )
+    .unwrap();
+    fixture.write("app/.global", b"lantern\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let files = fixture.compare(&["--files"], None);
+    let files = String::from_utf8(files.stdout).unwrap();
+    assert!(files.contains("workflow.yml"), "{files}");
+    assert!(!files.contains(".mine"), "{files}");
+    assert!(!files.contains(".global"), "{files}");
+    fixture.compare(&["-l", "lantern"], None);
+    // Indexed, though not revealed: --hidden shows both.
+    let hidden = fixture.compare(&["--hidden", "-l", "lantern"], None);
+    let hidden = String::from_utf8(hidden.stdout).unwrap();
+    assert!(
+        hidden.contains(".mine") && hidden.contains(".global"),
+        "{hidden}"
+    );
+}
+
 #[test]
 fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     let fixture = Fixture::new("spill");

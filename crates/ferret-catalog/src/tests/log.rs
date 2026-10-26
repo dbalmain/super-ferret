@@ -27,6 +27,7 @@ fn changes(p: &Published) -> ChangeSet {
                 names: 1,
             },
             Record::NamePut {
+                revealed: false,
                 id: 0,
                 parent: 0,
                 child: 1,
@@ -480,6 +481,7 @@ fn all_record_shapes_round_trip_and_invalid_records_publish_nothing() {
             names: 1,
         },
         Record::NamePut {
+            revealed: false,
             id: 0,
             parent: 0,
             child: 1,
@@ -521,12 +523,14 @@ fn all_record_shapes_round_trip_and_invalid_records_publish_nothing() {
     let end = fs::metadata(log_path(&s)).unwrap().len();
     for record in [
         Record::NamePut {
+            revealed: false,
             id: 0,
             parent: 0,
             child: 1,
             name: b"..".to_vec(),
         },
         Record::NamePut {
+            revealed: false,
             id: 0,
             parent: 0,
             child: 1,
@@ -1009,4 +1013,59 @@ fn open_or_create_publishes_once_and_never_releases_the_lock() {
     assert_eq!(kept.view().generation(), published);
     assert_eq!(kept.view().roots().count(), 1);
     assert_ne!(kept.view().policy(), [9; 16]);
+}
+
+/// D127: a `NamePut`'s revealed flag is bit 0 of its header's byte 1. It
+/// round-trips; any other value there, or that byte set on another record,
+/// is refused when the family loads.
+#[test]
+fn only_a_name_put_carries_the_revealed_flag() {
+    let s = fixture("log-revealed-flag");
+    let p = Published::open(&s.path).unwrap().unwrap();
+    let mut c = changes(&p);
+    for record in &mut c.records {
+        if let Record::NamePut { revealed, .. } = record {
+            *revealed = true;
+        }
+    }
+    Writer::open(&s.path)
+        .unwrap()
+        .commit(p.generation(), &c)
+        .unwrap();
+    let valid = Published::open(&s.path).unwrap().unwrap();
+    valid.log().load(Family::Namespace).unwrap();
+    assert!(
+        valid
+            .log()
+            .records(Family::Namespace)
+            .any(|(_, r)| matches!(r, Record::NamePut { revealed: true, .. }))
+    );
+    let bytes = fs::read(log_path(&s)).unwrap();
+    let tx = 64;
+    let d = tx + 64;
+    let offset = crate::format::u64_at(&bytes, d + 8) as usize + tx;
+    let length = crate::format::u64_at(&bytes, d + 16) as usize;
+    // Walk the namespace family's records to each one's header.
+    let mut headers = Vec::new();
+    let mut at = offset;
+    while at < offset + length {
+        headers.push((at, bytes[at]));
+        at += crate::format::u32_at(&bytes, at + 4) as usize;
+    }
+    let name_put = headers.iter().find(|&&(_, op)| op == 3).unwrap().0;
+    let other = headers.iter().find(|&&(_, op)| op != 3).unwrap().0;
+    assert_eq!(bytes[name_put + 1], 1);
+    for (at, value) in [(name_put + 1, 2u8), (name_put + 1, 0x81), (other + 1, 1)] {
+        let mut bad = bytes.clone();
+        bad[at] = value;
+        let digest = crate::checkpoint_checksum(&bad[offset..offset + length]);
+        bad[d + 24..d + 40].copy_from_slice(&digest);
+        reseal_framing(&mut bad);
+        fs::write(log_path(&s), bad).unwrap();
+        let p = Published::open(&s.path).unwrap().unwrap();
+        assert!(
+            p.log().load(Family::Namespace).is_err(),
+            "flag byte {value} at {at}"
+        );
+    }
 }

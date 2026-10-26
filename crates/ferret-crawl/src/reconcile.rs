@@ -119,6 +119,7 @@ struct Edge {
     parent: u32,
     child: u32,
     name: Vec<u8>,
+    revealed: bool,
 }
 
 struct Final<'a> {
@@ -435,7 +436,7 @@ pub(crate) fn with_budget(
         }
         if !dirs[i].included && (!dirs[i].opaque || dirs[i].denied) {
             if let Some(parent) = parent_id {
-                out.edge(parent, ignored(Kind::Dir), d.name)?;
+                out.edge(parent, ignored(Kind::Dir), d.name, false)?;
             }
             continue;
         }
@@ -491,9 +492,9 @@ pub(crate) fn with_budget(
                     edge.parent.0 == parent && edge.bytes == d.name
                 });
             if let Some(name) = same_edge {
-                out.names.insert(name.0);
+                out.keep(name, d.revealed)?;
             } else {
-                out.edge(parent, id, d.name)?;
+                out.edge(parent, id, d.name, d.revealed)?;
             }
         } else if continuing.is_none() {
             push(
@@ -660,7 +661,7 @@ pub(crate) fn with_budget(
             let parent = dirs[tokens[&f.parent]]
                 .id
                 .ok_or_else(|| invalid("collapsed file parent"))?;
-            out.edge(parent, id, f.name)?;
+            out.edge(parent, id, f.name, f.revealed)?;
         }
         at = end;
     }
@@ -679,7 +680,7 @@ pub(crate) fn with_budget(
                 continue;
             }
             if let Some(parent) = dirs[tokens[&parent]].id {
-                out.edge(parent, ignored(kind), name)?;
+                out.edge(parent, ignored(kind), name, false)?;
             }
         }
     }
@@ -869,14 +870,13 @@ impl Final<'_> {
                 .map(|_| self.old.generation().sequence)
         })
     }
-    fn edge(&mut self, parent: u32, child: u32, name: &[u8]) -> Result<(), Error> {
+    fn edge(&mut self, parent: u32, child: u32, name: &[u8], revealed: bool) -> Result<(), Error> {
         if self.old.is_live_inode(InoId(parent))
             && let Some(id) = self.old.lookup(InoId(parent), name)
         {
             let before = self.old.name(id);
             if before.child.0 == child {
-                self.names.insert(id.0);
-                return Ok(());
+                return self.keep(id, revealed);
             }
         }
         self.budget
@@ -885,8 +885,30 @@ impl Final<'_> {
             parent,
             child,
             name: name.to_vec(),
+            revealed,
         });
         Ok(())
+    }
+    /// Keeps old name `id`. When only its revealed flag changed (D127), as
+    /// when an ignore file's `!` line was added or removed, re-puts it under
+    /// the same id, as a rename does: no reference changes.
+    fn keep(&mut self, id: NameId, revealed: bool) -> Result<(), Error> {
+        self.names.insert(id.0);
+        if self.old.is_revealed(id) == revealed {
+            return Ok(());
+        }
+        let edge = self.old.name(id);
+        push(
+            &self.budget,
+            &mut self.changes.records,
+            Record::NamePut {
+                id: id.0,
+                parent: edge.parent.0,
+                child: edge.child.0,
+                name: edge.bytes.to_vec(),
+                revealed,
+            },
+        )
     }
     fn observe_inode(
         &mut self,
@@ -990,6 +1012,7 @@ impl Final<'_> {
                     parent: edge.parent,
                     child: edge.child,
                     name: edge.name,
+                    revealed: edge.revealed,
                 },
             )?;
         }

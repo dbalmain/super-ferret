@@ -126,11 +126,15 @@ The import keeps that file available until the new manifest is durable.
 M1 uses version 4. Its 96 B header keeps v3's fields at 0..40, adds
 incarnation at 40..56, checkpoint at 56, checkpoint sequence at 64,
 next InoId at 72 and next NameId at 76, and reserves 80..96 as zeros.
-Twenty-six 32 B section entries hold offset, length and BLAKE3-128 checksum.
+Twenty-seven 32 B section entries hold offset, length and BLAKE3-128 checksum.
 Eighteen 16 B column descriptors follow, including nullable-blocked RetainedAt.
-A 16 B checksum over all preceding head bytes ends the 1,232 B head.
+A 16 B checksum over all preceding head bytes ends the 1,264 B head.
 DocRefs stores one u32 per live Docs row, counting indexed inode bindings;
-multiple hard links to one inode count once. Policy holds 16 B. M4 fingerprints
+multiple hard links to one inode count once. Policy holds 16 B. Revealed,
+after Policy, holds the NameIds of hidden entries a repository ignore file's
+`!` line reveals to `grep --rg` (D127), one u32 each, strictly rising and
+below the name count. Version 5 added it and NamePut's flag; a v4 index is
+refused like any other version and rebuilt by `ferret index DIR...`. M4 fingerprints
 its domain/version tag, size cap, global-rule presence and global-rule text with
 BLAKE3-128. A change refreshes every configured root before PolicyPut. Local
 rule bytes are read by the actual refreshed walk. Zero remains unknown for
@@ -201,7 +205,8 @@ Four families keep the reader's dependencies explicit:
 | Docs | live document hash and indexed-inode reference count, death | Docs and writer content lookup |
 
 Each record starts with `opcode:u8, flags:u8, reserved:u16, length:u32` (8 B,
-length includes zero padding). Fixed-width records have an exact length;
+length includes zero padding). Flags are zero except NamePut's bit 0, which
+marks the name revealed (D127); a re-put under the same id changes only it. Fixed-width records have an exact length;
 variable records include a checked byte count. Byte strings are raw Linux
 bytes, never Unicode-normalised. Names exclude NUL, slash, dot and dot-dot;
 names and path strings carry a trailing NUL, counted in the byte length.
@@ -214,7 +219,7 @@ to the same row into its final value.
 | InodePut | id u32; kind/state u8 each; reserved u16; doc u32 or none; stat fields in `batch.rs::Stat` order, 68 B on wire | 88 |
 | LifePut | id u32; kind/flags u8 each; reserved u16; indexed-name count u32; reserved u32 | 24 |
 | InodeDelete | id u32; reserved u32 | 16 |
-| NamePut | id, parent and tagged child u32; string byte count u32; basename plus NUL | `align8(24 + L + 1)` |
+| NamePut | id, parent and tagged child u32; string byte count u32; basename plus NUL; header flag bit 0 revealed | `align8(24 + L + 1)` |
 | NameDelete | id u32; reserved u32 | 16 |
 | DirPut | id, own NameId or none, raw entry count or unknown, flags u32; retained-at sequence u64 | 32 |
 | DocPut | DocId u32; indexed-inode references u32; hash 16 B | 32 |

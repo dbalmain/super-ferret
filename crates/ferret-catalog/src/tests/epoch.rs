@@ -85,7 +85,7 @@ fn every_manifest_truncation_and_single_bit_flip_is_refused_by_open() {
     let path = scratch.path.join("current");
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(bytes.len(), MANIFEST_LEN);
-    assert_eq!(&bytes[..12], b"FERRETCR\x04\0\0\0");
+    assert_eq!(&bytes[..12], b"FERRETCR\x05\0\0\0");
     for len in 0..bytes.len() {
         std::fs::write(&path, &bytes[..len]).unwrap();
         assert!(Catalog::open(&scratch.path).is_err(), "truncated to {len}");

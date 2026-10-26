@@ -2,7 +2,7 @@
 //! loads catalog namespace sections; remote::serve supplies its pinned catalog.
 //! Neither path prepares document identities, postings or content sections.
 
-use ferret_catalog::Catalog;
+use ferret_catalog::{Catalog, Section};
 use ferret_query::line_grep::{Names, Sort};
 use std::cmp::Reverse;
 use std::io::IsTerminal;
@@ -60,6 +60,7 @@ fn open_catalog(index: Option<&Path>) -> Result<Catalog, String> {
         })?;
     catalog
         .load(CatalogSource::sections())
+        .and_then(|()| catalog.load(&[Section::Revealed]))
         .map_err(|error| error.to_string())?;
     #[cfg(test)]
     OPENED.with_borrow_mut(|opened| *opened = Some(catalog.clone()));
@@ -249,6 +250,7 @@ impl Listing<'_> {
                     .following_links(plan.traversal.follow);
                     let visibility = Visibility {
                         selection: &selection,
+                        catalog,
                         cwd,
                         max_depth: plan.traversal.max_depth,
                         content: false,

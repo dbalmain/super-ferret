@@ -1355,7 +1355,10 @@ fn incompatible_context_falls_back_and_format_mismatch_replaces_host() {
     assert!(tree.run(&["search", "main"]).status.success());
     let (_, hello) = tree.connect();
     assert_ne!(number(&hello, "pid"), Some(old_pid));
-    assert_eq!(number(&hello, "format"), Some(4));
+    assert_eq!(
+        number(&hello, "format"),
+        Some(ferret_catalog::FORMAT_VERSION)
+    );
 }
 
 #[test]
@@ -4215,4 +4218,36 @@ fn worker_pool_cancelled_query_returns_its_permits() {
     assert_eq!(number(&released, "worker_permits"), Some(0), "{released}");
     let end = find_end(&tree);
     assert_eq!(number(&end, "workers"), Some(budget), "{end}");
+}
+
+// D127: the daemon's resident catalog answers `--rg` with the revealed names
+// the crawl recorded, as the in-process host does, and its own refreshes keep
+// them current when the `!` line goes and comes back.
+#[test]
+fn daemon_grep_rg_shows_what_a_whitelist_reveals() {
+    let tree = Tree::new();
+    fs::write(tree.base.join("src/.ignore"), b"!.env.example\n").unwrap();
+    fs::write(tree.base.join("src/.env.example"), b"revealed\n").unwrap();
+    fs::write(tree.base.join("src/.env.local"), b"revealed\n").unwrap();
+    let indexed = tree.local(&["index", "src"]);
+    assert!(indexed.status.success(), "{indexed:?}");
+    tree.start(&[]);
+    let lists = [
+        &["grep", "--rg", "--files", "src"][..],
+        &["grep", "--rg", "-l", "revealed", "src"],
+    ];
+    for args in lists {
+        let remote = tree.run(args);
+        let local = tree.local(args);
+        assert!(remote.status.success(), "{remote:?}");
+        assert_eq!(remote.stdout, local.stdout, "{args:?}");
+        let listed = String::from_utf8_lossy(&remote.stdout);
+        assert!(listed.contains("src/.env.example"), "{args:?}: {listed}");
+        assert!(!listed.contains(".env.local"), "{args:?}: {listed}");
+    }
+    let shows = || String::from_utf8_lossy(&tree.run(lists[0]).stdout).contains("src/.env.example");
+    fs::write(tree.base.join("src/.ignore"), b"# none\n").unwrap();
+    wait(|| !shows());
+    fs::write(tree.base.join("src/.ignore"), b"!.env.example\n").unwrap();
+    wait(shows);
 }

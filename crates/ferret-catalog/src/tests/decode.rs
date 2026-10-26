@@ -33,8 +33,10 @@ fn sample(name: &str) -> Vec<u8> {
             ..file_stat(11)
         };
         w.file(skip, b"b.bin", odd, Content::Binary);
-        w.file(root, b"c", file_stat(12), Content::Hashed(hash(2)));
-        w.symlink(root, b"d", link_stat(13), b"sub/a.rs");
+        w.revealing(true)
+            .file(root, b"c", file_stat(12), Content::Hashed(hash(2)));
+        w.revealing(true)
+            .symlink(root, b"d", link_stat(13), b"sub/a.rs");
         w.work_tree(sub, WorkTreeKind::Linked, b"/repo/.git", (1, 2));
         w.entry_count(sub, 2);
         let other = w.root(
@@ -213,6 +215,11 @@ fn exercise(catalog: &Catalog) -> usize {
     if has(&[Roots, Strings]) {
         touched += catalog.roots().count();
     }
+    if has(&[Revealed]) {
+        touched += (0..catalog.name_count())
+            .filter(|&id| catalog.is_revealed(NameId(id)))
+            .count();
+    }
     if has(&[WorkTrees, Strings]) {
         touched += catalog.work_trees().count();
     }
@@ -299,6 +306,33 @@ fn the_sample_decodes_and_every_section_is_populated() {
     assert_eq!(catalog.work_trees().count(), 1);
     assert_eq!(catalog.doc_count(), 2);
     assert!(catalog.link_target(catalog.name(NameId(1)).child).is_some());
+    assert!(catalog.is_revealed(NameId(0)) && catalog.is_revealed(NameId(1)));
+    assert!(!catalog.is_revealed(NameId(2)));
+}
+
+/// The revealed section is name ids, strictly rising and below the name
+/// count (D127); its rows are a binary search's input, so disorder would
+/// hide revealed names rather than fail.
+#[test]
+fn revealed_rows_out_of_order_or_out_of_range_are_rejected() {
+    let bytes = sample("decode-revealed");
+    let start = section_start(&bytes, Section::Revealed);
+    let row = |bytes: &[u8], i: usize| {
+        u32::from_le_bytes(bytes[start + i * 4..][..4].try_into().unwrap())
+    };
+    assert_eq!((row(&bytes, 0), row(&bytes, 1)), (0, 1));
+    let set = |value: [u32; 2]| {
+        let mut bad = bytes.clone();
+        bad[start..start + 4].copy_from_slice(&value[0].to_le_bytes());
+        bad[start + 4..start + 8].copy_from_slice(&value[1].to_le_bytes());
+        bad
+    };
+    assert!(Catalog::from_bytes(resigned(set([0, 2]))).is_ok());
+    assert_corrupt(set([1, 0]), "revealed");
+    assert_corrupt(set([1, 1]), "revealed");
+    let names = Catalog::from_bytes(bytes.clone()).unwrap().name_count();
+    assert_corrupt(set([0, names]), "revealed");
+    assert_corrupt(resize_section(&bytes, Section::Revealed, 1), "revealed");
 }
 
 #[test]

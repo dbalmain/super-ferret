@@ -141,9 +141,13 @@ pub(crate) fn opaque_checkpoint(
         let next = match d.parent {
             None => batch.root(d.name, *d.stat),
             Some(parent) if d.traversed => {
-                batch.traversed_dir(*mapped.get(&parent)?, d.name, *d.stat)
+                batch
+                    .revealing(d.revealed)
+                    .traversed_dir(*mapped.get(&parent)?, d.name, *d.stat)
             }
-            Some(parent) => batch.dir(*mapped.get(&parent)?, d.name, *d.stat),
+            Some(parent) => batch
+                .revealing(d.revealed)
+                .dir(*mapped.get(&parent)?, d.name, *d.stat),
         };
         mapped.insert(token, next);
         if !denied.contains(&token) {
@@ -159,9 +163,13 @@ pub(crate) fn opaque_checkpoint(
                 && let Some(&parent) = mapped.get(&f.parent)
             {
                 if let Some(target) = f.target {
-                    batch.symlink(parent, f.name, f.stat, target);
+                    batch
+                        .revealing(f.revealed)
+                        .symlink(parent, f.name, f.stat, target);
                 } else {
-                    batch.file(parent, f.name, f.stat, f.content);
+                    batch
+                        .revealing(f.revealed)
+                        .file(parent, f.name, f.stat, f.content);
                 }
             }
         }
@@ -601,7 +609,15 @@ pub(crate) fn checkpoint_observations(
         }
         if protection.tokens.contains(&token) {
             let id = resolver.directory(token)?;
-            copy_subtree(&old, &mut carried, id, parent, d.name, &protection.markers)?;
+            copy_subtree(
+                &old,
+                &mut carried,
+                id,
+                parent,
+                d.name,
+                d.revealed,
+                &protection.markers,
+            )?;
             represented.insert(id.0);
             continue;
         }
@@ -644,7 +660,15 @@ pub(crate) fn checkpoint_observations(
             if !protection.directories.contains(&id.0) {
                 return None;
             }
-            copy_subtree(&old, &mut carried, id, None, path, &protection.markers)?;
+            copy_subtree(
+                &old,
+                &mut carried,
+                id,
+                None,
+                path,
+                false,
+                &protection.markers,
+            )?;
             represented.insert(id.0);
         }
     }
@@ -693,6 +717,7 @@ fn copy_subtree(
     id: InoId,
     parent: Option<DirToken>,
     name: &[u8],
+    revealed: bool,
     markers: &BTreeSet<u32>,
 ) -> Option<()> {
     // The legacy full builder cannot express an independently suppressed old
@@ -703,8 +728,8 @@ fn copy_subtree(
     let stat = old.inode(id).stat;
     let token = match parent {
         None => batch.root(name, stat),
-        Some(p) if old.is_traversed(id) => batch.traversed_dir(p, name, stat),
-        Some(p) => batch.dir(p, name, stat),
+        Some(p) if old.is_traversed(id) => batch.revealing(revealed).traversed_dir(p, name, stat),
+        Some(p) => batch.revealing(revealed).dir(p, name, stat),
     };
     if markers.contains(&id.0) {
         if let Some(seq) = retained_sequence(old, id) {
@@ -743,7 +768,8 @@ fn copy_edge(
         return Some(());
     };
     if old.is_directory(id) {
-        return copy_subtree(old, batch, id, Some(parent), edge.bytes, markers);
+        let revealed = old.is_revealed(name);
+        return copy_subtree(old, batch, id, Some(parent), edge.bytes, revealed, markers);
     }
     let inode = old.inode(id);
     if old.kind(id) == Kind::Symlink {
@@ -753,6 +779,7 @@ fn copy_edge(
             inode.stat,
             Content::Unindexed,
             Some(old.link_target(id)?),
+            old.is_revealed(name),
         );
     } else {
         let content = match inode.state {
@@ -761,7 +788,14 @@ fn copy_edge(
             ContentState::Fault => Content::Fault,
             ContentState::Hashed => Content::Hashed(old.doc_hash(inode.doc?)?),
         };
-        batch.retained_file(parent, edge.bytes, inode.stat, content, None);
+        batch.retained_file(
+            parent,
+            edge.bytes,
+            inode.stat,
+            content,
+            None,
+            old.is_revealed(name),
+        );
     }
     Some(())
 }
