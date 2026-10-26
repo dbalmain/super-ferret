@@ -517,6 +517,9 @@ impl Policy {
         }
         let item = match kind {
             FileKind::Directory => PolicyEntry::Dir,
+            // Rg's rules have no size cap (`load_grep_policy`), so a file's
+            // size would go unused; skip the stat.
+            FileKind::File if self.anchors.fallback => PolicyEntry::File { size: 0 },
             FileKind::File => PolicyEntry::File {
                 size: entry.metadata()?.len(),
             },
