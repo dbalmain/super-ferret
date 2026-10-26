@@ -548,9 +548,10 @@ impl Policy {
         }
         let item = match kind {
             FileKind::Directory => PolicyEntry::Dir,
-            // Rg's rules have no size cap (`load_grep_policy`), so a file's
-            // size would go unused; skip the stat.
-            FileKind::File if self.anchors.rg_rules() => PolicyEntry::File { size: 0 },
+            // An uncovered walk accepts a file over the size cap as readily
+            // as one under it (below), so its size would go unused; skip the
+            // stat.
+            FileKind::File if self.anchors.fallback => PolicyEntry::File { size: 0 },
             FileKind::File => PolicyEntry::File {
                 size: entry.metadata()?.len(),
             },
