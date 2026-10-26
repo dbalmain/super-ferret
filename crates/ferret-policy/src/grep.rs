@@ -149,37 +149,27 @@ impl GrepSelection {
         Ok(())
     }
 
-    /// Whether a file path relative to cwd is selected. `depth` is the walk
-    /// depth below its explicit start; that start and its ancestors bypass
-    /// overrides and hidden filtering. Descendant directories must each pass
-    /// before a file can be selected.
-    pub fn allows(&self, path: &[u8], depth: usize) -> bool {
+    /// Whether a file, by its path relative to cwd, is selected. A walk asks
+    /// only after every directory above the file passed [`Self::descend`],
+    /// so only the file itself is judged: its name for hidden filtering, its
+    /// whole path for globs.
+    pub fn allows(&self, path: &[u8]) -> bool {
         if self.rules.is_empty() && self.types.is_empty() {
-            // Without overrides only hidden filtering applies: to the name and
-            // the descendant directories above it, the last `max(depth, 1)`
-            // components. Checking them in place keeps the index producer,
-            // which asks once per catalog entry, off the allocator:
-            // collecting every component cost 43% of its time on a
+            // Without overrides only the name's hidden filtering applies.
+            // Reading it in place keeps a walk off the allocator: collecting
+            // every component cost 43% of the index producer's time on a
             // 300k-file tree (kdiag, 2026-10-20).
             return self.hidden
                 || components_from_end(path)
-                    .take(depth.max(1))
-                    .all(|name| !name.starts_with(b"."));
+                    .next()
+                    .is_none_or(|name| !name.starts_with(b"."));
         }
         with_components(path, |components| {
-            self.allows_components(components, depth, self.hidden)
+            self.allows_components(components, self.hidden)
         })
     }
 
-    fn allows_components(&self, components: &[&[u8]], depth: usize, hidden: bool) -> bool {
-        for end in components.len().saturating_sub(depth) + 1..components.len() {
-            let matched = self.decision(&components[..end], true);
-            if matched == Some(false)
-                || (!hidden && components[end - 1].starts_with(b".") && matched != Some(true))
-            {
-                return false;
-            }
-        }
+    fn allows_components(&self, components: &[&[u8]], hidden: bool) -> bool {
         let name = components.last().copied().unwrap_or_default();
         self.decision(components, false).unwrap_or_else(|| {
             !self.positive
@@ -277,14 +267,14 @@ impl GrepSelection {
                 if directory {
                     depth == 0 || self.descend_components(parts, true)
                 } else {
-                    self.allows_components(parts, 0, true)
+                    self.allows_components(parts, true)
                 }
             })
         } else {
             (if directory {
                 self.descend(relative, depth)
             } else {
-                self.allows(relative, 0)
+                self.allows(relative)
             }) && !self.hides_stripped(walked, relative, depth.min(1))
         }
     }
@@ -495,16 +485,15 @@ mod tests {
         for hidden in [false, true] {
             let selection = GrepSelection::default().with_hidden(hidden);
             for path in paths() {
+                let general =
+                    with_components(&path, |c| selection.allows_components(c, selection.hidden));
+                assert_eq!(
+                    selection.allows(&path),
+                    general,
+                    "allows {:?} hidden {hidden}",
+                    path.escape_ascii().to_string(),
+                );
                 for depth in (0..=6).chain([39, 40, 41, 100]) {
-                    let general = with_components(&path, |c| {
-                        selection.allows_components(c, depth, selection.hidden)
-                    });
-                    assert_eq!(
-                        selection.allows(&path, depth),
-                        general,
-                        "allows {:?} depth {depth} hidden {hidden}",
-                        path.escape_ascii().to_string(),
-                    );
                     let general = depth == 0
                         || with_components(&path, |c| {
                             selection.descend_components(c, selection.hidden)
@@ -531,7 +520,7 @@ mod tests {
             ruled.push("!no-such-name").unwrap();
             for path in paths() {
                 for depth in [0, 1, 2, 3, 40] {
-                    assert_eq!(fast.allows(&path, depth), ruled.allows(&path, depth));
+                    assert_eq!(fast.allows(&path), ruled.allows(&path));
                     assert_eq!(fast.descend(&path, depth), ruled.descend(&path, depth));
                 }
             }
@@ -590,9 +579,8 @@ mod tests {
                 }
             }
             for (path, selected) in *files {
-                let depth = path.matches('/').count() + 1;
                 assert_eq!(
-                    selection.allows(path.as_bytes(), depth),
+                    walked(&selection, path.as_bytes()),
                     *selected,
                     "{filters:?} {path}"
                 );
@@ -604,18 +592,26 @@ mod tests {
         );
     }
 
+    /// A walk from cwd selects a file when each directory above it, at its
+    /// own depth, descends, and then the file is allowed.
+    fn walked(selection: &GrepSelection, path: &[u8]) -> bool {
+        let parts: Vec<&[u8]> = path.split(|&byte| byte == b'/').collect();
+        (1..parts.len()).all(|end| selection.descend(&parts[..end].join(&b'/'), end))
+            && selection.allows(path)
+    }
+
     #[test]
     fn hidden_filtering_covers_only_the_walked_components() {
         let held = GrepSelection::default();
-        assert!(held.allows(b".hidden/x", 1));
-        assert!(!held.allows(b".hidden/x", 2));
-        assert!(!held.allows(b"a/.x", 0));
-        assert!(held.allows(b"", 0));
+        assert!(held.allows(b".hidden/x"));
+        assert!(!walked(&held, b".hidden/x"));
+        assert!(!held.allows(b"a/.x"));
+        assert!(held.allows(b""));
         assert!(held.descend(b".hidden", 0));
         assert!(!held.descend(b"a/.hidden", 1));
         assert!(held.descend(b".hidden/a", 1));
         let shown = GrepSelection::default().with_hidden(true);
-        assert!(shown.allows(b".hidden/x", 2));
+        assert!(walked(&shown, b".hidden/x"));
         assert!(shown.descend(b"a/.hidden", 1));
     }
 }
