@@ -453,6 +453,7 @@ differential! {
     stdin_no_match: ["violet"], stdin = b"red\n";
     stdin_bom: ["^red$"], stdin = b"\xef\xbb\xbfred\n";
     stdin_plus_file: ["-n", "red", "-", "one.rs"], stdin = b"red pipe\n";
+    stdin_slash_spelling: ["-H", "red", "--", "-/", "-/."], stdin = b"red\n";
     explicit_file_with_pipe: ["red", "one.rs"], stdin = b"red pipe\n";
     explicit_directory_with_pipe: ["red", "sub"], stdin = b"red pipe\n";
     long_aliases: ["--line-number", "--glob=*.rs", "red", "."];
@@ -1727,6 +1728,7 @@ profile_cases! {
     files_duplicate_operands: 0 => ["--files", "one.rs", "one.rs"];
     files_dash_operand: 0 => ["--files", "--", "-dash"];
     files_stdin_label: 0 => ["--files", "-"];
+    files_stdin_slash_label: 0 => ["--files", "--", "-/"];
     files_stdin_and_file: 0 => ["--files", "-", "one.rs"];
     files_ignores_piped_stdin: 0 => ["--files"], stdin = b"no path here\n";
     files_quiet: 0 => ["--files", "-q", "."];

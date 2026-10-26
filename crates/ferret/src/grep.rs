@@ -639,8 +639,10 @@ fn resolve_each(paths: &[PathBuf], names_only: bool, cwd: &Path) -> Vec<Input> {
     paths
         .iter()
         .map(|path| {
+            // `-/` and `-/.` are stdin too; one spelling keeps `label` a
+            // byte comparison.
             if path == Path::new("-") {
-                return Input::Stream(path.clone());
+                return Input::Stream(PathBuf::from("-"));
             }
             match fs::metadata(cwd.join(path)) {
                 Ok(metadata) if metadata.is_dir() => Input::Directory(path.clone()),
@@ -1039,8 +1041,8 @@ impl<W: Write> Write for DirectStream<'_, '_, W> {
 }
 
 /// Called for every listed name, so it compares bytes: `Path` equality
-/// parses components. Only the operand `-` is stdin; a walked file of that
-/// name is `./-`.
+/// parses components. `resolve_each` spells every stdin operand `-`; a
+/// walked file of that name is `./-`.
 fn label(path: &Path, implicit: bool) -> &[u8] {
     if path.as_os_str() == "-" {
         b"<stdin>"
