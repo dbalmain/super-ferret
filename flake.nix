@@ -50,6 +50,7 @@
         mkdir -p $out/bin
         install -m755 ${./contrib/agents/rg} $out/bin/rg
         install -m755 ${./contrib/agents/ferret-shadow} $out/bin/ferret-shadow
+        install -m755 ${./contrib/agents/ferret-shadow-report} $out/bin/ferret-shadow-report
         patchShebangs $out/bin
         # The launcher runs these before the shadow's PATH exists, and rg
         # itself should see the caller's PATH, so name them directly.
@@ -60,6 +61,8 @@
         wrapProgram $out/bin/ferret-shadow \
           --set-default FERRET_BIN ${ferret}/bin/ferret \
           --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [ coreutils diffutils findutils gnugrep gnused util-linux ])}
+        wrapProgram $out/bin/ferret-shadow-report \
+          --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [ coreutils gawk ])}
       '';
     in {
       packages.${system} = { inherit rustfmt fmt findutils ferret agent-rg; default = ferret; };

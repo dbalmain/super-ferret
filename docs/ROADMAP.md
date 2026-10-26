@@ -2026,6 +2026,9 @@ rejected per call. In a `claude -p` run with it on PATH
 and `USE_BUILTIN_RIPGREP=0`, all three Grep calls agreed; Glob's
 `--sort=modified --no-ignore` is rejected and stays with rg. Step 2 switches
 the shim to answer from ferret once a day's log is clean.
+`contrib/agents/ferret-shadow-report` (2026-10-26) judges that: it counts the
+verdicts and lists each differ or rejected argv shape once, with a replayable
+newest call and its kept runs, exiting 1 while anything needs a look.
 
 ## S5 — Daemon for the content index
 

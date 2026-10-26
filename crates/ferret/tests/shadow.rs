@@ -441,3 +441,44 @@ fn any_reachable_special_file_skips_the_comparison() {
     symlink("..", looped.tree.join("sub/up")).unwrap();
     skipped(&looped, &["hit", "."]);
 }
+
+/// Runs ferret-shadow-report over the bed's log.
+fn report(bed: &Bed) -> Output {
+    bed.command(&script("ferret-shadow-report"), Path::new(FERRET))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn the_report_lists_each_mismatch_shape_once_with_its_kept_run() {
+    let bed = Bed::new("report", false);
+    bed.write("a.txt", b"foo bar\nquux bar\n");
+    let ferret = Path::new(FERRET);
+    assert_eq!(report(&bed).status.code(), Some(2), "no log yet");
+
+    assert_eq!(verdict(&bed, ferret, &["-l", "foo", "."]), "agree");
+    let clean = report(&bed);
+    assert_eq!(clean.status.code(), Some(0), "{clean:?}");
+    assert!(String::from_utf8_lossy(&clean.stdout).contains("nothing needs a look"));
+
+    let wrong = bed.fake("wrong", "sed s/bar/baz/");
+    for pattern in ["foo", "quux"] {
+        assert_eq!(
+            verdict(&bed, &wrong, &["-g", "*.txt", pattern, "."]),
+            "differ"
+        );
+    }
+    let out = report(&bed);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("2 x differ\n  shape:  -g X X X\n"), "{text}");
+    assert!(
+        text.contains("rg -g \\*.txt quux . "),
+        "newest call replays: {text}"
+    );
+    assert_eq!(
+        text.matches("/mismatch/").count(),
+        2,
+        "both kept runs: {text}"
+    );
+}
