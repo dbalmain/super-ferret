@@ -440,7 +440,12 @@ fallback without nested ignores. Other outside-root/new directory starts fail
 with index/live advice. **Special files (2026-10-26):** a content search
 reads an explicit special-file operand (a FIFO, `/dev/null`, a process
 substitution) once, front to back, as it reads stdin, as rg does; it used to
-exit 2. `xargs rg PATTERN /dev/null` is the idiom this serves.
+exit 2. `xargs rg PATTERN /dev/null` is the idiom this serves. Named
+special files are read after every other operand, so a pipe whose producer
+stays open cannot hold back the files; they are read one at a time, though,
+so with two pipes the first holds back the second, where rg reads both at
+once and `-q` can answer from the second. Reading them concurrently needs a
+scheduler that can abandon a worker blocked in `read`; deferred.
 **M3 clarification (2026-10-17):** `--files` lists an explicit special-file
 operand without opening it; walked specials and symlinks are skipped. Explicit
 directory symlinks follow their start only, using find's trailing-slash source
