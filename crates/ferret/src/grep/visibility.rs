@@ -15,6 +15,11 @@ pub(super) enum Visit {
 
 pub(super) struct Visibility<'a> {
     pub selection: &'a GrepSelection,
+    /// Under `--rg`, the catalog a covered walk lists, which records the
+    /// hidden names a repository ignore file's `!` line reveals (D127). Needs
+    /// [`Section::Revealed`](ferret_catalog::Section::Revealed). `None` in
+    /// ferret mode, where a `!` line does not override hidden selection.
+    pub revealed: Option<&'a ferret_catalog::Catalog>,
     pub cwd: &'a Path,
     pub max_depth: Option<usize>,
     /// Content search: D13's size and binary rules apply to files.
@@ -48,12 +53,34 @@ impl Visibility<'_> {
         }
         .as_os_str()
         .as_bytes();
+        // rg shows a hidden name that an ignore file's `!` line reveals, as
+        // the live walk does through `Policy::selects`. A catalogued entry
+        // has no rules at hand; the crawl recorded the answer (D127). Only a
+        // dot name can be revealed, so others skip the lookup.
+        let revealed = !rg
+            && entry.name().starts_with(b".")
+            && self.revealed.is_some_and(|catalog| {
+                entry
+                    .catalog_name()
+                    .is_some_and(|name| catalog.is_revealed(name))
+            });
+        let directory = kind == FileKind::Directory;
+        let selected = |plain: &dyn Fn() -> bool| {
+            if revealed {
+                self.selection
+                    .selects(path, relative, entry.depth(), directory, true)
+            } else {
+                plain()
+            }
+        };
         let visit = match kind {
             FileKind::Directory => {
                 let descend = self.max_depth.is_none_or(|limit| entry.depth() < limit)
                     && (rg
-                        || (self.selection.descend(relative, entry.depth())
-                            && !self.selection.hides_stripped(path, relative, entry.depth())));
+                        || selected(&|| {
+                            self.selection.descend(relative, entry.depth())
+                                && !self.selection.hides_stripped(path, relative, entry.depth())
+                        }));
                 if !descend {
                     return Ok(Visit::Skip);
                 }
@@ -61,8 +88,10 @@ impl Visibility<'_> {
             }
             FileKind::File
                 if rg
-                    || (self.selection.allows(relative)
-                        && !self.selection.hides_stripped(path, relative, entry.depth())) =>
+                    || selected(&|| {
+                        self.selection.allows(relative)
+                            && !self.selection.hides_stripped(path, relative, entry.depth())
+                    }) =>
             {
                 Visit::File
             }

@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::gitignore::{LineError, Pattern, parse};
-use crate::lists::{List, Lists, Rule};
+use crate::lists::{Band, List, Lists, Rule};
 use crate::{Config, Decision, Entry, IgnoreFile, IgnoreFiles, PatternError, Reason};
 
 /// Rules in force for one directory: the configured root's rules and its
@@ -150,7 +150,14 @@ impl DirRules {
         });
         let mut state = State {
             global: global.and_then(|text| {
-                Layer::compile(IgnoreFile::Global, text, false, &shared.lists, &mut errors).live()
+                Layer::compile(
+                    IgnoreFile::Global,
+                    text,
+                    Band::Global,
+                    &shared.lists,
+                    &mut errors,
+                )
+                .live()
             }),
             ..State::default()
         };
@@ -233,6 +240,15 @@ impl DirRules {
         self.list
             .last_match(name.as_bytes(), directory)
             .map(|(include, _)| include)
+    }
+
+    /// Whether rg would show this hidden entry for its ignore files' sake:
+    /// the last rule matching it in a `.gitignore`, `.git/info/exclude`,
+    /// `.ignore` or `.rgignore` is a `!` line. Rules from `.ferretignore`
+    /// and the global ignore file are ferret's alone and do not count (D127).
+    /// The crawler asks only for dot-named entries.
+    pub fn reveals(&self, name: &OsStr, directory: bool) -> bool {
+        self.list.repo_whitelists(name.as_bytes(), directory)
     }
 
     /// Decides the entry at root-relative `path`, which must be a direct child
@@ -356,13 +372,13 @@ impl State {
         if let Some(text) = files.ferretignore {
             let file = IgnoreFile::Ferret(dir.join(".ferretignore"));
             self.ferret
-                .extend(Layer::compile(file, text, true, lists, errors).live());
+                .extend(Layer::compile(file, text, Band::Ferret, lists, errors).live());
         }
         if files.git_root {
             self.git = Some(WorkTree {
                 exclude: files.git_exclude.and_then(|text| {
                     let file = IgnoreFile::GitExclude(dir.join(".git/info/exclude"));
-                    Layer::compile(file, text, false, lists, errors).live()
+                    Layer::compile(file, text, Band::Repo, lists, errors).live()
                 }),
                 ignores: Vec::new(),
             });
@@ -370,7 +386,7 @@ impl State {
         if let (Some(tree), Some(text)) = (&mut self.git, files.gitignore) {
             let file = IgnoreFile::Git(dir.join(".gitignore"));
             tree.ignores
-                .extend(Layer::compile(file, text, false, lists, errors).live());
+                .extend(Layer::compile(file, text, Band::Repo, lists, errors).live());
         }
         for (name, text, layers) in [
             (".ignore", files.ignore, &mut self.ignore),
@@ -378,7 +394,7 @@ impl State {
         ] {
             if let Some(text) = text {
                 let file = IgnoreFile::Dot(dir.join(name));
-                layers.extend(Layer::compile(file, text, false, lists, errors).live());
+                layers.extend(Layer::compile(file, text, Band::Repo, lists, errors).live());
             }
         }
     }
@@ -452,11 +468,11 @@ impl Layer {
     fn compile(
         file: IgnoreFile,
         text: &str,
-        ferret: bool,
+        band: Band,
         lists: &Lists,
         errors: &mut Vec<PatternError>,
     ) -> Self {
-        let (layer, line_errors) = Self::compile_text(text, ferret, lists);
+        let (layer, line_errors) = Self::compile_text(text, band, lists);
         errors.extend(line_errors.into_iter().map(|error| PatternError::Line {
             file: file.clone(),
             line: error.line,
@@ -466,7 +482,7 @@ impl Layer {
         layer
     }
 
-    fn compile_text(text: &str, ferret: bool, lists: &Lists) -> (Self, Vec<LineError>) {
+    fn compile_text(text: &str, band: Band, lists: &Lists) -> (Self, Vec<LineError>) {
         let (patterns, errors) = parse(text);
         let mut shared = Vec::new();
         let mut anchored = Vec::new();
@@ -475,11 +491,11 @@ impl Layer {
                 // One that cannot match anything (an escaped edge) projects
                 // to nothing.
                 if let Some(Some(projected)) = pattern.projections().into_iter().next() {
-                    shared.push((pattern.line(), lists.rule(projected, ferret)));
+                    shared.push((pattern.line(), lists.rule(projected, band)));
                 }
                 continue;
             }
-            let reaches = ferret
+            let reaches = band == Band::Ferret
                 && pattern.is_anchored_reinclude()
                 && !patterns[at + 1..]
                     .iter()
@@ -487,7 +503,7 @@ impl Layer {
             let projections = pattern
                 .projections()
                 .into_iter()
-                .map(|projected| Some(lists.rule(projected?, ferret)))
+                .map(|projected| Some(lists.rule(projected?, band)))
                 .collect();
             anchored.push(Anchored {
                 pattern: pattern.clone(),
@@ -584,7 +600,7 @@ pub(crate) struct OneFile {
 impl OneFile {
     pub(crate) fn compile(text: &str) -> (Self, Vec<LineError>) {
         let lists = Lists::default();
-        let (layer, errors) = Layer::compile_text(text, false, &lists);
+        let (layer, errors) = Layer::compile_text(text, Band::Repo, &lists);
         let state = State {
             global: Some(layer),
             ..State::default()
@@ -920,6 +936,43 @@ mod tests {
     }
 
     #[test]
+    fn only_a_repository_whitelist_reveals_a_hidden_name() {
+        let reveals = |dir: &Dir, name: &str| dir.0.reveals(OsStr::new(name), false);
+        let files = IgnoreFiles {
+            gitignore: Some(".env*\n!.env.example\n!.both\n.mine\n"),
+            ferretignore: Some("!.kept\n!.both\n!.mine\n"),
+            git_root: true,
+            ..IgnoreFiles::default()
+        };
+        let root = Dir::root(Some("!.global\n.g*\n"), files);
+        assert!(reveals(&root, ".env.example"));
+        assert!(!reveals(&root, ".env.local"));
+        assert!(!reveals(&root, ".other"));
+        // A .ferretignore rule is ferret's alone: it neither reveals ...
+        assert!(!reveals(&root, ".kept"));
+        // ... nor hides what a repository rule below it revealed, though it
+        // is the last match ...
+        assert!(reveals(&root, ".both"));
+        // ... and its own whitelist over a repository exclusion is no reveal.
+        assert_eq!(root.decide(".mine", FILE), Decision::Index);
+        assert!(!reveals(&root, ".mine"));
+        // Nor is the global file's.
+        assert!(!reveals(&root, ".global"));
+        let sub = root.enter("sub", gitignore("!.gk\n"));
+        assert!(reveals(&sub, ".gk"));
+        // `.ignore` and `.rgignore` count, in a work tree or not.
+        let plain = Dir::root(
+            None,
+            IgnoreFiles {
+                ignore: Some("!.a\n"),
+                rgignore: Some("!.b\n"),
+                ..IgnoreFiles::default()
+            },
+        );
+        assert!(reveals(&plain, ".a") && reveals(&plain, ".b"));
+    }
+
+    #[test]
     fn the_last_matching_line_wins_between_a_projection_and_a_shared_rule() {
         let root = Dir::root(None, git("docs/*.md\n!readme.md\n"));
         let docs = root.empty("docs");
@@ -1115,7 +1168,7 @@ mod tests {
 
     fn reaches(line: &str, dir: &str) -> bool {
         let lists = Lists::default();
-        let (layer, errors) = Layer::compile_text(line, true, &lists);
+        let (layer, errors) = Layer::compile_text(line, Band::Ferret, &lists);
         assert!(errors.is_empty(), "{errors:?}");
         let mut state = State {
             ferret: vec![layer],
@@ -1146,7 +1199,7 @@ mod tests {
         ];
         let lists = Lists::default();
         for (line, want) in cases {
-            let (layer, _) = Layer::compile_text(line, true, &lists);
+            let (layer, _) = Layer::compile_text(line, Band::Ferret, &lists);
             let qualifies = layer
                 .source
                 .anchored

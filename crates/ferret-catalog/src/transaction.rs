@@ -313,17 +313,25 @@ impl Transaction {
                     continue;
                 }
                 let inode = old.inode(name.child);
+                let revealed = old.is_revealed(name_id);
                 match old.kind(name.child) {
                     Kind::Dir if old.is_traversed(name.child) => {
                         queue.push((
                             name.child,
-                            batch.traversed_dir(token, name.bytes, inode.stat),
+                            batch
+                                .revealing(revealed)
+                                .traversed_dir(token, name.bytes, inode.stat),
                         ));
                     }
-                    Kind::Dir => queue.push((name.child, batch.dir(token, name.bytes, inode.stat))),
+                    Kind::Dir => queue.push((
+                        name.child,
+                        batch.revealing(revealed).dir(token, name.bytes, inode.stat),
+                    )),
                     Kind::Symlink => {
                         let target = old.link_target(name.child).unwrap_or_default();
-                        batch.symlink(token, name.bytes, inode.stat, target);
+                        batch
+                            .revealing(revealed)
+                            .symlink(token, name.bytes, inode.stat, target);
                     }
                     Kind::File | Kind::Fifo | Kind::Socket | Kind::Block | Kind::Character => {
                         let content = match inode.state {
@@ -335,7 +343,9 @@ impl Transaction {
                                 .map_or(Content::Fault, Content::Hashed),
                             ContentState::Fault => Content::Fault,
                         };
-                        batch.file(token, name.bytes, inode.stat, content);
+                        batch
+                            .revealing(revealed)
+                            .file(token, name.bytes, inode.stat, content);
                     }
                 }
             }

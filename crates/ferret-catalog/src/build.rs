@@ -198,6 +198,9 @@ pub(crate) struct Plan {
     specials: Vec<(u32, u32)>,
     /// (dir InoId, offset in strings, common id, kind), sorted by dir.
     work_trees: Vec<(u32, u32, (u64, u64), u8)>,
+    /// The NameIds a repository ignore file's `!` line reveals (D127),
+    /// rising.
+    revealed: Vec<u32>,
     /// (hash as big-endian halves, DocId), sorted by id.
     docs: Vec<((u64, u64), u32)>,
 }
@@ -216,6 +219,21 @@ impl Plan {
                 .index
                 .ignored(entry - self.index.dirs - self.index.files);
             batches[b].ignored[i].name.of(&batches[b].names)
+        }
+    }
+
+    /// Whether a repository ignore file's `!` line reveals the entry (D127).
+    /// An ignored marker is never revealed.
+    fn revealed(&self, batches: &[Batch], entry: u32) -> bool {
+        let entry = entry as usize;
+        if entry < self.index.dirs {
+            let (b, d) = self.index.dir(entry);
+            batches[b].dirs[d].revealed
+        } else if entry < self.index.dirs + self.index.files {
+            let (b, f) = self.index.file(entry - self.index.dirs);
+            batches[b].revealed_files.binary_search(&(f as u32)).is_ok()
+        } else {
+            false
         }
     }
 
@@ -352,6 +370,7 @@ impl Plan {
             (Section::Docs, self.docs.len() * HASH_ROW),
             (Section::DocRefs, self.docs.len() * 4),
             (Section::Policy, 16),
+            (Section::Revealed, self.revealed.len() * 4),
         ] {
             lens[section as usize] = len as u64;
         }
@@ -528,6 +547,7 @@ pub(crate) fn plan(
         specials: Vec::new(),
         work_trees: Vec::new(),
         docs: Vec::new(),
+        revealed: Vec::new(),
     };
     for &(path, global) in &roots {
         if path.is_empty() || path.contains(&0) {
@@ -577,6 +597,12 @@ pub(crate) fn plan(
                 .checked_add(name.len() + 1)
                 .filter(|&end| end <= heap_limit())
                 .ok_or(BuildError::TooLarge)?;
+            // A directory without a visible descendant becomes an ignored
+            // marker, which is never revealed.
+            if plan.revealed(batches, entry) && (entry as usize >= dirs || visible[entry as usize])
+            {
+                plan.revealed.push(name_id as u32);
+            }
             let entry = entry as usize;
             if entry < dirs {
                 if visible[entry] {
@@ -1006,6 +1032,11 @@ pub(crate) fn write(
     let mut fingerprint = section(Section::Policy);
     fingerprint.write_all(&policy)?;
     fingerprint.finish()?;
+    let mut revealed = section(Section::Revealed);
+    for &name in &plan.revealed {
+        format::put_u32(&mut revealed, name)?;
+    }
+    revealed.finish()?;
     format::seal(out)
 }
 

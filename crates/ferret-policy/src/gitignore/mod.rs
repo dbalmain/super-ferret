@@ -100,30 +100,55 @@ impl Gitignore {
 
     /// The index and action of the last pattern that matches entry `name`.
     pub(crate) fn best(&self, name: &[u8], is_dir: bool) -> Option<(usize, Match)> {
+        self.best_below(name, is_dir, usize::MAX)
+    }
+
+    /// As [`Self::best`], among the patterns whose index is below `limit`.
+    pub(crate) fn best_below(
+        &self,
+        name: &[u8],
+        is_dir: bool,
+        limit: usize,
+    ) -> Option<(usize, Match)> {
         let mut best = self
             .literals
             .get(name)
-            .and_then(|entries| latest_fast(entries, is_dir));
+            .and_then(|entries| latest_fast(entries, is_dir, limit));
         if let Some(dot) = name.iter().rposition(|byte| *byte == b'.')
             && let Some(candidate) = self
                 .extensions
                 .get(&name[dot..])
-                .and_then(|entries| latest_fast(entries, is_dir))
+                .and_then(|entries| latest_fast(entries, is_dir, limit))
             && best.is_none_or(|current| candidate.index > current.index)
         {
             best = Some(candidate);
         }
-        scan_byte_fast(&self.prefixes, name, is_dir, &mut best, |name, bytes| {
-            name.starts_with(bytes)
-        });
-        scan_byte_fast(&self.suffixes, name, is_dir, &mut best, |name, bytes| {
-            name.ends_with(bytes)
-        });
-        scan_byte_fast(&self.contains, name, is_dir, &mut best, |name, bytes| {
-            name.windows(bytes.len()).any(|window| window == bytes)
-        });
-        scan_fixed_suffixes(&self.fixed_suffixes, name, is_dir, &mut best);
-        scan_patterns(&self.general, name, is_dir, &mut best);
+        scan_byte_fast(
+            &self.prefixes,
+            name,
+            is_dir,
+            limit,
+            &mut best,
+            |name, bytes| name.starts_with(bytes),
+        );
+        scan_byte_fast(
+            &self.suffixes,
+            name,
+            is_dir,
+            limit,
+            &mut best,
+            |name, bytes| name.ends_with(bytes),
+        );
+        scan_byte_fast(
+            &self.contains,
+            name,
+            is_dir,
+            limit,
+            &mut best,
+            |name, bytes| name.windows(bytes.len()).any(|window| window == bytes),
+        );
+        scan_fixed_suffixes(&self.fixed_suffixes, name, is_dir, limit, &mut best);
+        scan_patterns(&self.general, name, is_dir, limit, &mut best);
         best.map(|candidate| (candidate.index, candidate.result))
     }
 
@@ -166,10 +191,14 @@ fn scan_fixed_suffixes(
     patterns: &[FixedSuffixMatch],
     basename: &[u8],
     is_dir: bool,
+    limit: usize,
     best: &mut Option<FastMatch>,
 ) {
     for fixed in patterns.iter().rev() {
         let pattern = &fixed.pattern;
+        if pattern.index >= limit {
+            continue;
+        }
         if best.is_some_and(|candidate| pattern.index < candidate.index) {
             break;
         }
@@ -188,10 +217,14 @@ fn scan_byte_fast(
     patterns: &[ByteFastMatch],
     basename: &[u8],
     is_dir: bool,
+    limit: usize,
     best: &mut Option<FastMatch>,
     matches: impl Fn(&[u8], &[u8]) -> bool,
 ) {
     for pattern in patterns.iter().rev() {
+        if pattern.action.index >= limit {
+            continue;
+        }
         if best.is_some_and(|candidate| pattern.action.index < candidate.index) {
             break;
         }
@@ -202,8 +235,17 @@ fn scan_byte_fast(
     }
 }
 
-fn scan_patterns(patterns: &[Pattern], name: &[u8], is_dir: bool, best: &mut Option<FastMatch>) {
+fn scan_patterns(
+    patterns: &[Pattern],
+    name: &[u8],
+    is_dir: bool,
+    limit: usize,
+    best: &mut Option<FastMatch>,
+) {
     for pattern in patterns.iter().rev() {
+        if pattern.index >= limit {
+            continue;
+        }
         if best.is_some_and(|candidate| pattern.index < candidate.index) {
             break;
         }
@@ -218,12 +260,12 @@ fn scan_patterns(patterns: &[Pattern], name: &[u8], is_dir: bool, best: &mut Opt
     }
 }
 
-fn latest_fast(entries: &[FastMatch], is_dir: bool) -> Option<FastMatch> {
+fn latest_fast(entries: &[FastMatch], is_dir: bool, limit: usize) -> Option<FastMatch> {
     entries
         .iter()
         .rev()
         .copied()
-        .find(|entry| !entry.directory_only || is_dir)
+        .find(|entry| entry.index < limit && (!entry.directory_only || is_dir))
 }
 
 #[cfg(test)]

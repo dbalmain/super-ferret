@@ -259,6 +259,7 @@ impl State {
         for (&id, e) in &self.edges {
             if old.edges.get(&id) != Some(e) {
                 records.push(Record::NamePut {
+                    revealed: false,
                     id,
                     parent: e.parent,
                     child: e.child,

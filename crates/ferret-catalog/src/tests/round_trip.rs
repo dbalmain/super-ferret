@@ -467,6 +467,62 @@ fn keep_carries_entry_counts_and_link_counts() {
     assert_counts(&reopen(&scratch.path));
 }
 
+/// `/r` with every kind of entry revealed once and once not (D127).
+fn fill_revealed(txn: &Transaction) -> Batch {
+    let mut b = txn.batch();
+    let root = b.root(b"/r", dir_stat(1));
+    let shown = b.revealing(true).dir(root, b".shown", dir_stat(2));
+    let walked = b
+        .revealing(true)
+        .traversed_dir(root, b".walked", dir_stat(3));
+    b.dir(root, b".plain", dir_stat(4));
+    b.revealing(true)
+        .file(shown, b".env", file_stat(10), Content::Hashed(hash(1)));
+    b.file(shown, b".local", file_stat(11), Content::Hashed(hash(2)));
+    b.revealing(true)
+        .symlink(walked, b".link", link_stat(12), b"x");
+    b.symlink(walked, b".other", link_stat(13), b"x");
+    b
+}
+
+fn assert_revealed(catalog: &Catalog) {
+    let mut revealed: Vec<String> = catalog
+        .names()
+        .filter(|&(id, _)| catalog.is_revealed(id))
+        .map(|(id, _)| {
+            let mut path = Vec::new();
+            catalog.path(id, &mut path);
+            String::from_utf8(path).unwrap()
+        })
+        .collect();
+    revealed.sort();
+    assert_eq!(
+        revealed,
+        [
+            "/r/.shown",
+            "/r/.shown/.env",
+            "/r/.walked",
+            "/r/.walked/.link"
+        ]
+    );
+}
+
+/// The revealed flag round-trips for directories, traversed directories,
+/// files and symlinks, and a root copied forward keeps it.
+#[test]
+fn revealed_names_round_trip_and_keep_carries_them() {
+    let scratch = Scratch::new("round-trip-revealed");
+    let catalog = commit(&scratch.path, |txn| {
+        let batch = fill_revealed(txn);
+        txn.add(batch);
+    });
+    assert_revealed(&catalog);
+    assert_revealed(&reopen(&scratch.path));
+    let kept = commit(&scratch.path, |txn| txn.keep(b"/r").unwrap());
+    assert_revealed(&kept);
+    assert_revealed(&reopen(&scratch.path));
+}
+
 /// A count past what the file can hold stays a count; only "unknown" is the
 /// sentinel.
 #[test]

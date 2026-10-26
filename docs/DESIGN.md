@@ -274,11 +274,14 @@ Liveness is catalog state: a doc is live while some inode points at it. The
 index reads a live-docs bitset from the catalog rather than keeping its own
 tombstones, so there is one source of truth.
 
-**Storage.** S1+ now publishes a checked v4 snapshot plus a bounded transaction
+**Storage.** S1+ now publishes a checked v5 snapshot plus a bounded transaction
 log under a manifest, with epoch-scoped inode/name ids and stable DocIds.
 [S1PLUS.md](S1PLUS.md) defines the implemented publication, recovery and
 effective-reader contract. The column-layout description below records the
 S1a/find baseline; its per-run snapshot replacement is superseded by S1+.
+Version 5 (D127) adds the revealed section, the ids of hidden names that a
+repository ignore file's `!` line reveals to `grep --rg`, and the matching
+NamePut flag; [S1PLUS.md](S1PLUS.md) has the current section count.
 The snapshot contains a versioned header (magic, format version, sniffer version, next
 `DocId`, the directory, inode, name and document counts), a table of 23 sections by
 offset and length, a descriptor per packed column, and the sections themselves.

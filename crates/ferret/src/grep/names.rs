@@ -2,7 +2,7 @@
 //! loads catalog namespace sections; remote::serve supplies its pinned catalog.
 //! Neither path prepares document identities, postings or content sections.
 
-use ferret_catalog::Catalog;
+use ferret_catalog::{Catalog, Section};
 use ferret_query::line_grep::{Names, Sort};
 use std::cmp::Reverse;
 use std::io::IsTerminal;
@@ -48,7 +48,9 @@ pub(super) fn run(
     }
 }
 
-fn open_catalog(index: Option<&Path>) -> Result<Catalog, String> {
+/// Opens the catalog a listing walks; under `--rg` (`rg`) it also loads the
+/// names a `!` line reveals (D127).
+fn open_catalog(index: Option<&Path>, rg: bool) -> Result<Catalog, String> {
     let index = index_path(index)?;
     let catalog = Catalog::open(&index)
         .map_err(|error| format!("{}: {error}; re-index this directory", index.display()))?
@@ -60,6 +62,13 @@ fn open_catalog(index: Option<&Path>) -> Result<Catalog, String> {
         })?;
     catalog
         .load(CatalogSource::sections())
+        .and_then(|()| {
+            if rg {
+                catalog.load(&[Section::Revealed])
+            } else {
+                Ok(())
+            }
+        })
         .map_err(|error| error.to_string())?;
     #[cfg(test)]
     OPENED.with_borrow_mut(|opened| *opened = Some(catalog.clone()));
@@ -93,7 +102,9 @@ fn execute_routed(
         catalog,
         ..
     } = routed;
-    let catalog = catalog.then(|| open_catalog(index)).transpose()?;
+    let catalog = catalog
+        .then(|| open_catalog(index, plan.traversal.rg))
+        .transpose()?;
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let stderr = |message: &str| {
         cli::error(message);
@@ -249,6 +260,7 @@ impl Listing<'_> {
                     .following_links(plan.traversal.follow);
                     let visibility = Visibility {
                         selection: &selection,
+                        revealed: catalog.filter(|_| plan.traversal.rg),
                         cwd,
                         max_depth: plan.traversal.max_depth,
                         content: false,

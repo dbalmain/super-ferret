@@ -1517,6 +1517,7 @@ pub(crate) struct Deferred {
     pub(crate) name: Vec<u8>,
     pub(crate) stat: Stat,
     pub(crate) path: PathBuf,
+    pub(crate) revealed: bool,
 }
 
 /// The per-worker visitor: fills one batch and reads the files it must.
@@ -1618,8 +1619,12 @@ impl<'a> Hasher<'a> {
             Some(Content::Unindexed) | None => {}
             Some(content) => {
                 out.counts.carried += 1;
-                out.batch
-                    .file(decided.parent, decided.name.as_bytes(), stat, content);
+                out.batch.revealing(decided.revealed).file(
+                    decided.parent,
+                    decided.name.as_bytes(),
+                    stat,
+                    content,
+                );
                 #[cfg(test)]
                 hook(self.root, Probe::Carried(decided.path));
                 return;
@@ -1649,6 +1654,7 @@ impl<'a> Hasher<'a> {
                         name: decided.name.as_bytes().to_vec(),
                         stat,
                         path: self.root.join(decided.path),
+                        revealed: decided.revealed,
                     };
                     self.out.defer(alias, self.cache);
                     #[cfg(test)]
@@ -1694,9 +1700,12 @@ impl<'a> Hasher<'a> {
             || self.root.join(decided.path),
             content,
         );
-        self.out
-            .batch
-            .file(decided.parent, decided.name.as_bytes(), stat, content);
+        self.out.batch.revealing(decided.revealed).file(
+            decided.parent,
+            decided.name.as_bytes(),
+            stat,
+            content,
+        );
     }
 
     fn fault(
@@ -1809,8 +1818,11 @@ impl Output {
             Some(stored) => observe::consume(stored, &alias.stat),
             None => (alias.stat, Err(ContentFault::Alias)),
         };
+        let revealed = alias.revealed;
         let content = self.outcome(alias.path.as_os_str().len(), || alias.path, content);
-        self.batch.file(alias.parent, &alias.name, stat, content);
+        self.batch
+            .revealing(revealed)
+            .file(alias.parent, &alias.name, stat, content);
     }
 }
 
@@ -1926,40 +1938,58 @@ impl EventVisitor for Hasher<'_> {
                 }
                 let stat = decided.stat.as_ref().map(observe::from_walk)?;
                 let name = decided.name.as_bytes();
+                let revealed = decided.revealed;
                 match decided.decision {
                     Decision::Skip => None,
                     Decision::Descend => {
                         self.out.counts.dirs += 1;
-                        let token = self.out.batch.dir(decided.parent, name, stat);
+                        let token =
+                            self.out
+                                .batch
+                                .revealing(revealed)
+                                .dir(decided.parent, name, stat);
                         self.promote_changed_parent(token, &stat, decided.path);
                         Some(token)
                     }
                     Decision::Traverse => {
                         self.out.counts.traversed += 1;
-                        let token = self.out.batch.traversed_dir(decided.parent, name, stat);
+                        let token = self.out.batch.revealing(revealed).traversed_dir(
+                            decided.parent,
+                            name,
+                            stat,
+                        );
                         self.promote_changed_parent(token, &stat, decided.path);
                         Some(token)
                     }
                     Decision::Catalog(Reason::Symlink) => {
                         let target = decided.stat.and_then(|s| s.link_target)?;
                         self.out.counts.symlinks += 1;
-                        self.out
-                            .batch
-                            .symlink(decided.parent, name, stat, target.as_bytes());
+                        self.out.batch.revealing(revealed).symlink(
+                            decided.parent,
+                            name,
+                            stat,
+                            target.as_bytes(),
+                        );
                         None
                     }
                     Decision::Catalog(Reason::TooLarge) => {
                         self.out.counts.files += 1;
-                        self.out
-                            .batch
-                            .file(decided.parent, name, stat, Content::Unindexed);
+                        self.out.batch.revealing(revealed).file(
+                            decided.parent,
+                            name,
+                            stat,
+                            Content::Unindexed,
+                        );
                         None
                     }
                     Decision::Catalog(Reason::Special) => {
                         self.out.counts.specials += 1;
-                        self.out
-                            .batch
-                            .file(decided.parent, name, stat, Content::Unindexed);
+                        self.out.batch.revealing(revealed).file(
+                            decided.parent,
+                            name,
+                            stat,
+                            Content::Unindexed,
+                        );
                         None
                     }
                     Decision::Index => {

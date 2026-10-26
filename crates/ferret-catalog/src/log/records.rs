@@ -20,6 +20,10 @@ pub enum Record {
         parent: u32,
         child: u32,
         name: Vec<u8>,
+        /// A repository ignore file's `!` line reveals this hidden name
+        /// (D127). On the wire, bit 0 of the record header's byte 1, which
+        /// every other record leaves zero.
+        revealed: bool,
     },
     NameDelete {
         id: u32,
@@ -126,6 +130,7 @@ impl Record {
                 parent,
                 child,
                 name,
+                ..
             } => {
                 put32(out, *id);
                 put32(out, *parent);
@@ -233,6 +238,7 @@ impl Record {
         }
         let len = u32::try_from(out.len() - start).map_err(|_| bad())?;
         out[start] = op;
+        out[start + 1] = u8::from(matches!(self, Self::NamePut { revealed: true, .. }));
         out[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
         Ok(())
     }
@@ -301,7 +307,8 @@ pub(super) fn decode(
     let mut records = Vec::new();
     let mut rest = bytes;
     while !rest.is_empty() {
-        if rest.len() < 8 || rest[1..4] != [0; 3] {
+        // Byte 1 is a NamePut's flags; every other record's is zero.
+        if rest.len() < 8 || rest[2..4] != [0; 2] || rest[1] > u8::from(rest[0] == 3) {
             return Err(bad());
         }
         let len = u32_at(rest, 4) as usize;
@@ -360,6 +367,7 @@ pub(super) fn decode(
                     parent,
                     child,
                     name,
+                    revealed: b[1] == 1,
                 }
             }
             4 => {

@@ -780,6 +780,7 @@ fn overlay_fill(dir: &Path, rows: &str) -> Result<()> {
         let mut name = n.bytes.to_vec();
         name.extend_from_slice(b".m3");
         records.push(Record::NamePut {
+            revealed: false,
             id,
             parent: n.parent.0,
             child: n.child.0,
@@ -983,6 +984,7 @@ fn overlay_rename_once(dir: &Path) -> Result<()> {
     name.extend_from_slice(b".next");
     let c = ChangeSet {
         records: vec![Record::NamePut {
+            revealed: false,
             id: id.0,
             parent: old.parent.0,
             child: old.child.0,
@@ -1194,6 +1196,7 @@ fn churn_checkpoint(dir: &Path, percent: &str, rounds: &str) -> Result<()> {
             {
                 records.push(Record::NameDelete { id: id.0 });
                 records.push(Record::NamePut {
+                    revealed: false,
                     id: next_name,
                     parent: edge.parent.0,
                     child: remap[child.0 as usize],
@@ -1650,6 +1653,7 @@ fn name_index_update(dir: &Path, count: &str) -> Result<()> {
         let mut bytes = name.bytes.to_vec();
         bytes.extend_from_slice(b".s1b-cache");
         records.push(Record::NamePut {
+            revealed: false,
             id: row,
             parent: name.parent.0,
             child: name.child.0,

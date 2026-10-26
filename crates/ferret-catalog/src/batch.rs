@@ -176,6 +176,8 @@ pub(crate) struct DirEntry {
     pub(crate) parent: Option<DirToken>,
     pub(crate) name: Span,
     pub(crate) traversed: bool,
+    /// A repository ignore file's `!` line reveals this hidden name (D127).
+    pub(crate) revealed: bool,
     pub(crate) retained_at: Option<u64>,
 }
 
@@ -207,6 +209,7 @@ struct PendingFile {
     stat: Stat,
     content: Content,
     target: Option<Span>,
+    revealed: bool,
 }
 
 /// The rows one worker recorded. Fill it, then hand it to
@@ -237,6 +240,9 @@ pub struct Batch {
     pub(crate) dir_stats: Vec<Stat>,
     pub(crate) files: Vec<FileEntry>,
     retained_files: Vec<u64>,
+    /// Indices of the files a repository ignore file's `!` line reveals
+    /// (D127), rising. A handful per tree, so a list, not a column.
+    pub(crate) revealed_files: Vec<u32>,
     pub(crate) ignored: Vec<IgnoredEntry>,
     pub(crate) file_stats: Vec<Stat>,
     pub(crate) contents: Vec<Content>,
@@ -274,6 +280,7 @@ impl Batch {
             dir_stats: Vec::new(),
             files: Vec::new(),
             retained_files: Vec::new(),
+            revealed_files: Vec::new(),
             ignored: Vec::new(),
             file_stats: Vec::new(),
             contents: Vec::new(),
@@ -290,12 +297,22 @@ impl Batch {
     /// returns its token. A root's path is its identity: committing two roots
     /// with one path is an error.
     pub fn root(&mut self, path: &[u8], stat: Stat) -> DirToken {
-        self.push_dir(None, path, stat, false)
+        self.push_dir(None, path, stat, false, false)
+    }
+
+    /// Records the next entry with `revealed` (D127): whether a repository
+    /// ignore file's `!` line reveals it although its name is hidden. The
+    /// plain methods record `false`.
+    pub fn revealing(&mut self, revealed: bool) -> Revealing<'_> {
+        Revealing {
+            batch: self,
+            revealed,
+        }
     }
 
     /// Records a directory the policy catalogues (`Descend`).
     pub fn dir(&mut self, parent: DirToken, name: &[u8], stat: Stat) -> DirToken {
-        self.push_dir(Some(parent), name, stat, false)
+        self.revealing(false).dir(parent, name, stat)
     }
 
     /// Records a directory the walk passes through without cataloguing it
@@ -303,13 +320,13 @@ impl Batch {
     /// has a visible descendant, preserving its search-suppression flag
     /// (D29). Otherwise it becomes one ignored marker without an inode.
     pub fn traversed_dir(&mut self, parent: DirToken, name: &[u8], stat: Stat) -> DirToken {
-        self.push_dir(Some(parent), name, stat, true)
+        self.revealing(false).traversed_dir(parent, name, stat)
     }
 
     /// Records a regular file. Each name of a hard-linked file is recorded
     /// with the same observation; the commit keeps one inode row (D31).
     pub fn file(&mut self, parent: DirToken, name: &[u8], stat: Stat, content: Content) {
-        self.observe_file(parent, name, stat, content, None);
+        self.revealing(false).file(parent, name, stat, content);
     }
 
     /// Copies a checked retained namespace occurrence. Fresh aliases of the
@@ -321,9 +338,10 @@ impl Batch {
         stat: Stat,
         content: Content,
         target: Option<&[u8]>,
+        revealed: bool,
     ) {
         let index = self.files.len();
-        self.push_file(parent, name, stat, content, target);
+        self.push_file(parent, name, stat, content, target, revealed);
         if self.files.len() > index {
             self.retained_files
                 .resize(self.retained_files.len().max(index / 64 + 1), 0);
@@ -407,6 +425,8 @@ impl Batch {
         });
         self.dir_stats.truncate(write);
         let retained = std::mem::take(&mut self.retained_files);
+        let revealed = std::mem::take(&mut self.revealed_files);
+        let mut revealed = revealed.into_iter().peekable();
         let mut read = 0;
         let mut write = 0;
         let mut target_read = 0;
@@ -422,6 +442,7 @@ impl Batch {
             if target.is_some() {
                 target_read += 1;
             }
+            let was_revealed = revealed.next_if_eq(&(index as u32)).is_some();
             let Some(&parent) = mapping.get(&file.parent) else {
                 return false;
             };
@@ -442,6 +463,9 @@ impl Batch {
                 self.retained_files
                     .resize(self.retained_files.len().max(write / 64 + 1), 0);
                 self.retained_files[write / 64] |= 1 << (write % 64);
+            }
+            if was_revealed {
+                self.revealed_files.push(write as u32);
             }
             write += 1;
             true
@@ -523,6 +547,7 @@ impl Batch {
         stat: Stat,
         content: Content,
         target: Option<&[u8]>,
+        revealed: bool,
     ) {
         if !self.full && self.previous.is_some() && parent.old != NONE {
             if self.pending.first().is_some_and(|f| f.parent != parent) {
@@ -545,11 +570,12 @@ impl Batch {
                 stat,
                 content,
                 target,
+                revealed,
             });
             self.pending_peak = self.pending_peak.max(self.pending.len());
             self.pending_bytes_peak = self.pending_bytes_peak.max(self.pending_bytes.len());
         } else {
-            self.push_file(parent, name, stat, content, target);
+            self.push_file(parent, name, stat, content, target, revealed);
         }
     }
 
@@ -560,6 +586,7 @@ impl Batch {
         stat: Stat,
         content: Content,
         target: Option<&[u8]>,
+        revealed: bool,
     ) {
         if !self.reserve_input(
             1,
@@ -593,6 +620,9 @@ impl Batch {
         self.files.push(FileEntry { parent, name });
         self.file_stats.push(stat);
         self.contents.push(content);
+        if revealed {
+            self.revealed_files.push(index);
+        }
         if let Some(target) = target {
             let span = push(&mut self.strings, target, &mut self.overflow);
             self.targets.push((index, span));
@@ -672,13 +702,22 @@ impl Batch {
                             } else {
                                 target.is_none()
                             }
-                    });
+                    })
+                    // A changed `!` rule changes only the flag (D127).
+                    && matched.is_some_and(|(id, _)| old.is_revealed(id) == file.revealed);
                 if reusable {
                     if let Some((id, edge)) = matched {
                         self.reused.insert(file.parent, id, Some(edge.child));
                     }
                 } else {
-                    self.push_file(file.parent, name, file.stat, file.content, target);
+                    self.push_file(
+                        file.parent,
+                        name,
+                        file.stat,
+                        file.content,
+                        target,
+                        file.revealed,
+                    );
                 }
             }
         }
@@ -720,6 +759,7 @@ impl Batch {
                     old.inode(child).stat,
                     content(&old, child),
                     old.link_target(child),
+                    old.is_revealed(id),
                 );
             }
         }
@@ -747,7 +787,7 @@ impl Batch {
 
     /// Records a symlink with its target as `readlink` returned it.
     pub fn symlink(&mut self, parent: DirToken, name: &[u8], stat: Stat, target: &[u8]) {
-        self.observe_file(parent, name, stat, Content::Unindexed, Some(target));
+        self.revealing(false).symlink(parent, name, stat, target);
     }
 
     /// Records that `dir` is the top of a work tree (D23). `common_id` is the
@@ -824,6 +864,7 @@ impl Batch {
         name: &[u8],
         stat: Stat,
         traversed: bool,
+        revealed: bool,
     ) -> DirToken {
         let old = self
             .previous
@@ -874,10 +915,46 @@ impl Batch {
             parent,
             name,
             traversed,
+            revealed,
             retained_at: None,
         });
         self.dir_stats.push(stat);
         token
+    }
+}
+
+/// A [`Batch`] recording entries with a given revealed flag (D127); see
+/// [`Batch::revealing`]. Each method is the batch's method of that name.
+pub struct Revealing<'a> {
+    batch: &'a mut Batch,
+    revealed: bool,
+}
+
+impl Revealing<'_> {
+    pub fn dir(self, parent: DirToken, name: &[u8], stat: Stat) -> DirToken {
+        self.batch
+            .push_dir(Some(parent), name, stat, false, self.revealed)
+    }
+
+    pub fn traversed_dir(self, parent: DirToken, name: &[u8], stat: Stat) -> DirToken {
+        self.batch
+            .push_dir(Some(parent), name, stat, true, self.revealed)
+    }
+
+    pub fn file(self, parent: DirToken, name: &[u8], stat: Stat, content: Content) {
+        self.batch
+            .observe_file(parent, name, stat, content, None, self.revealed);
+    }
+
+    pub fn symlink(self, parent: DirToken, name: &[u8], stat: Stat, target: &[u8]) {
+        self.batch.observe_file(
+            parent,
+            name,
+            stat,
+            Content::Unindexed,
+            Some(target),
+            self.revealed,
+        );
     }
 }
 
@@ -902,6 +979,8 @@ pub struct DirectoryObservation<'a> {
     pub name: &'a [u8],
     pub stat: &'a Stat,
     pub traversed: bool,
+    /// A repository ignore file's `!` line reveals this hidden name (D127).
+    pub revealed: bool,
     pub retained_at: Option<u64>,
 }
 
@@ -913,6 +992,8 @@ pub struct FileObservation<'a> {
     pub stat: Stat,
     pub content: Content,
     pub target: Option<&'a [u8]>,
+    /// A repository ignore file's `!` line reveals this hidden name (D127).
+    pub revealed: bool,
 }
 
 impl Batch {
@@ -931,6 +1012,7 @@ impl Batch {
                 name: dir.name.of(&self.names),
                 stat: &self.dir_stats[i],
                 traversed: dir.traversed,
+                revealed: dir.revealed,
                 retained_at: dir.retained_at,
             })
     }
@@ -949,6 +1031,7 @@ impl Batch {
                 stat: f.stat,
                 content: f.content,
                 target: f.target.map(|span| span.of(&self.pending_bytes)),
+                revealed: f.revealed,
             };
         }
         let file = &self.files[index];
@@ -958,6 +1041,7 @@ impl Batch {
             stat: self.file_stats[index],
             content: self.contents[index],
             target: self.target(index),
+            revealed: self.revealed_files.binary_search(&(index as u32)).is_ok(),
         }
     }
     /// Equal rows proven against this batch's pinned generation. The token
@@ -1003,6 +1087,7 @@ impl Batch {
             stat: old.inode(edge.child).stat,
             content: content(old, edge.child),
             target: old.link_target(edge.child),
+            revealed: old.is_revealed(name),
         }
     }
     /// Preserves an untouched edge under a checked same-path parent. This is
