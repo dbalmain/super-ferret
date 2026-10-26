@@ -141,6 +141,7 @@ Remaining ranked flags, in ranking order within each milestone:
 | M7 | `--multiline-dotall` |
 | M9 | `--json` (rank 25, postponed for coherent output work) |
 | S4 | `-M`/`--max-columns` (Claude Code's Grep tool passes `--max-columns 500` on every call; D118). Refused with `-r`, and with `-U` in colour: rg's notice there counts source or whole-group matches, which rendered lines do not keep |
+| S4 | `-t`/`--type`, `-T`/`--type-not` (the Grep tool's `type` parameter; first shadow rejection, 2026-10-26) |
 
 M1 adds `--color=never`, help/version and `--scan`/`--scan-uncovered`; M5 adds
 colour auto/always/ansi. Support rg aliases (`-.`, `-p`) and negating switches.
@@ -157,8 +158,18 @@ multiline mode, newline validation, `-F` escaping and qualifiers **before**
 shared compilation/derivation. Without `-U`, literal LF patterns error; with
 `-U` they match across lines, including under `-F`. Repeated `-e` patterns OR.
 
+**Types (2026-10-26):** the table is rg 15.2.0's `--type-list` output,
+transcribed in `ferret-policy/src/grep_types.rs`; `all` selects every type.
+Probed against rg: types match the file name only and apply only to files,
+after `-g` and the ignore rules. A selected type admits a held hidden file
+but never opens a hidden directory. Once any `-t` is given a file of no
+selected type is dropped; `-T` alone keeps untyped files. The last `-t`/`-T`
+naming a matching type wins, a positive `-g` that misses beats a matching
+type, and explicit file operands bypass types. An unknown name is a usage
+error, `unrecognized file type: NAME`, as in rg.
+
 All other flags **refuse**, never pass through or silently disappear:
-`-t`, `-T`, `--type-add/list/clear`; `-L`; `-z` (compressed search);
+`--type-add/list/clear`; `-L`; `-z` (compressed search);
 `--no-ignore-vcs/dot/files/global/parent/exclude/messages`; `--encoding`;
 `--sort`, `--sortr`; `--passthru`; `--vimgrep`; `--path-separator`;
 `--trim`; `--iglob`; `--max-columns`, `--max-columns-preview`; `--column`;

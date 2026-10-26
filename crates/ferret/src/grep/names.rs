@@ -157,7 +157,7 @@ fn execute_routed(
 }
 
 fn selection(plan: &Names) -> Result<GrepSelection, String> {
-    super::preflight::selection(plan.hidden, &plan.globs)
+    super::preflight::selection(plan.hidden, &plan.filters)
 }
 
 /// Lists against the request's resident pin without loading catalog sections
@@ -550,7 +550,7 @@ mod tests {
             for color in [line_grep::Color::Never, line_grep::Color::Always] {
                 let plan = Names {
                     paths: vec![root.clone()],
-                    globs: Vec::new(),
+                    filters: Vec::new(),
                     quiet: false,
                     hidden: false,
                     traversal: Default::default(),

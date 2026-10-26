@@ -14,6 +14,8 @@ pub enum GrepGlobError {
     UnclosedClass,
     DanglingEscape,
     Pattern(String),
+    /// A `-t`/`-T` name that is not one of rg's built-in types.
+    Type(String),
 }
 
 impl std::fmt::Display for GrepGlobError {
@@ -26,6 +28,7 @@ impl std::fmt::Display for GrepGlobError {
             Self::UnclosedClass => f.write_str("unclosed glob character class"),
             Self::DanglingEscape => f.write_str("dangling glob escape"),
             Self::Pattern(detail) => f.write_str(detail),
+            Self::Type(name) => write!(f, "unrecognized file type: {name}"),
         }
     }
 }
@@ -74,10 +77,17 @@ impl GrepIgnore {
 
 /// Ordered command-line overrides. A positive rule admits held hidden names,
 /// but cannot restore a name excluded from the catalog by ferret policy.
+///
+/// File types (`-t`, `-T`) are a second layer, consulted for a file no glob
+/// matched, and only for files: like a glob, a selected type admits a held
+/// hidden file, and once any type is selected a file matching none is left
+/// out. The last selection naming a matching type wins.
 #[derive(Clone, Debug, Default)]
 pub struct GrepSelection {
     rules: Vec<(bool, Vec<Pattern>)>,
     positive: bool,
+    types: Vec<(bool, Vec<Pattern>)>,
+    typed: bool,
     hidden: bool,
 }
 
@@ -118,12 +128,33 @@ impl GrepSelection {
         Ok(())
     }
 
+    /// Adds one `-t` (`include`) or `-T` selection of rg's built-in type
+    /// `name`; `all` names every type.
+    pub fn push_type(&mut self, name: &str, include: bool) -> Result<(), GrepGlobError> {
+        let globs: Vec<&str> = crate::grep_types::TYPES
+            .iter()
+            .filter(|(type_name, _)| name == "all" || *type_name == name)
+            .flat_map(|(_, globs)| globs.iter().copied())
+            .collect();
+        if globs.is_empty() {
+            return Err(GrepGlobError::Type(name.to_owned()));
+        }
+        let patterns = globs
+            .into_iter()
+            .filter_map(|glob| Pattern::compile_override(glob).transpose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(GrepGlobError::Pattern)?;
+        self.typed |= include;
+        self.types.push((include, patterns));
+        Ok(())
+    }
+
     /// Whether a file path relative to cwd is selected. `depth` is the walk
     /// depth below its explicit start; that start and its ancestors bypass
     /// overrides and hidden filtering. Descendant directories must each pass
     /// before a file can be selected.
     pub fn allows(&self, path: &[u8], depth: usize) -> bool {
-        if self.rules.is_empty() {
+        if self.rules.is_empty() && self.types.is_empty() {
             // Without overrides only hidden filtering applies: to the name and
             // the descendant directories above it, the last `max(depth, 1)`
             // components. Checking them in place keeps the index producer,
@@ -149,8 +180,22 @@ impl GrepSelection {
                 return false;
             }
         }
+        let name = components.last().copied().unwrap_or_default();
         self.decision(components, false).unwrap_or_else(|| {
-            !self.positive && (hidden || !components.last().is_some_and(|p| p.starts_with(b".")))
+            !self.positive
+                && self
+                    .type_decision(name)
+                    .unwrap_or_else(|| !self.typed && (hidden || !name.starts_with(b".")))
+        })
+    }
+
+    /// The last type selection whose globs match file name `name`.
+    fn type_decision(&self, name: &[u8]) -> Option<bool> {
+        self.types.iter().rev().find_map(|(include, globs)| {
+            globs
+                .iter()
+                .any(|p| p.matches_override(&[name], false))
+                .then_some(*include)
         })
     }
 
@@ -491,6 +536,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Each row: `-g` globs and `-t`/`-T` types in argv order, then whether
+    // each file at walk depth 1 or 2 is selected. The rows that discriminate:
+    // a typed hidden file is admitted, a hidden directory is not; an
+    // unmatched glob whitelist beats a matching type; the later of `-t py`
+    // and `-T py` wins; exclusions alone keep untyped files.
+    #[test]
+    fn types_sit_below_globs_and_admit_hidden_files() {
+        type Filters<'a> = &'a [(&'a str, Option<bool>)];
+        let rows: &[(Filters, &[(&str, bool)])] = &[
+            (
+                &[("rust", Some(true))],
+                &[
+                    ("a.rs", true),
+                    (".h.rs", true),
+                    (".d/z.rs", false),
+                    ("c.txt", false),
+                ],
+            ),
+            (
+                &[("rust", Some(true)), ("*.py", None)],
+                &[("a.rs", false), ("b.py", true)],
+            ),
+            (
+                &[("rust", Some(true)), ("!a.rs", None)],
+                &[("a.rs", false), ("d.rs", true)],
+            ),
+            (
+                &[("py", Some(true)), ("py", Some(false))],
+                &[("b.py", false)],
+            ),
+            (
+                &[("py", Some(false)), ("py", Some(true))],
+                &[("b.py", true)],
+            ),
+            (
+                &[("rust", Some(false))],
+                &[("a.rs", false), ("c.txt", true), (".c.txt", false)],
+            ),
+            (
+                &[("all", Some(true)), ("rust", Some(false))],
+                &[("a.rs", false), ("Makefile", true), ("c.unknown", false)],
+            ),
+        ];
+        for (filters, files) in rows {
+            let mut selection = GrepSelection::default();
+            for (text, include) in *filters {
+                match include {
+                    Some(include) => selection.push_type(text, *include).unwrap(),
+                    None => selection.push(text).unwrap(),
+                }
+            }
+            for (path, selected) in *files {
+                let depth = path.matches('/').count() + 1;
+                assert_eq!(
+                    selection.allows(path.as_bytes(), depth),
+                    *selected,
+                    "{filters:?} {path}"
+                );
+            }
+        }
+        assert_eq!(
+            GrepSelection::default().push_type("no-such-type", true),
+            Err(GrepGlobError::Type("no-such-type".into()))
+        );
     }
 
     #[test]

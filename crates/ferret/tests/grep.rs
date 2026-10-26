@@ -646,6 +646,50 @@ fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     fixture.compare(&["-n", "red", "large", "one.rs"], None);
 }
 
+// rg's type layer, after globs and ignore rules: a selected type admits a
+// held hidden file but never enters a hidden directory, any `-t` drops files
+// of no selected type, the last selection naming a type wins, and explicit
+// file operands bypass types. Each row runs indexed and as a live walk.
+#[test]
+fn file_types_select_as_rg_does() {
+    let fixture = Fixture::new("types");
+    fixture.write("sub/Makefile", b"red make\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let rows: &[&[&str]] = &[
+        &["-l", "red", "-t", "rust"],
+        &["-l", "red", "-trust", "--hidden"],
+        &["-l", "red", "--type=rust", "-g", "*.txt"],
+        &["-l", "red", "-t", "rust", "-g", "!one.rs"],
+        &["-l", "red", "-T", "rust"],
+        &["-l", "red", "--type-not", "rust", "-t", "make"],
+        &["-l", "red", "-t", "rust", "-T", "rust"],
+        &["-l", "red", "-T", "rust", "-t", "rust"],
+        &["-c", "red", "-t", "all", "-T", "rust"],
+        &["-l", "red", "-t", "rust", "two.txt", "sub"],
+        &["-l", "red", "-t", "c"],
+        &["-l", "red", "-t", "no-such-type"],
+        &["--files", "-t", "rust"],
+        &["--files", "-T", "rust", "--hidden"],
+    ];
+    for row in rows {
+        fixture.compare(row, None);
+        let mut live = row.to_vec();
+        live.push("--live");
+        let rg = fixture.oracle(row, None);
+        let ferret = fixture.ferret(&[&["grep"][..], &live].concat(), None);
+        assert_eq!(
+            ferret.status.code(),
+            rg.status.code(),
+            "{live:?}: {ferret:?}"
+        );
+        assert_eq!(
+            groups(&ferret.stdout, &fixture.tree()),
+            groups(&rg.stdout, &fixture.tree()),
+            "{live:?}"
+        );
+    }
+}
+
 #[test]
 fn glob_literals_and_class_braces_keep_their_argv_meaning() {
     let fixture = Fixture::new("glob-literals");

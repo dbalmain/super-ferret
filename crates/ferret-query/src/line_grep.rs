@@ -28,11 +28,18 @@ pub enum Command {
     Files(Names),
 }
 
+/// One path filter from argv, in argv order: `-g`, or `-t`/`-T` by type name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Filter {
+    Glob(String),
+    Type { name: String, include: bool },
+}
+
 /// Selected names only: no regex or document candidate plan is constructed.
 #[derive(Clone, Debug)]
 pub struct Names {
     pub paths: Vec<PathBuf>,
-    pub globs: Vec<String>,
+    pub filters: Vec<Filter>,
     pub quiet: bool,
     pub hidden: bool,
     pub presentation: Presentation,
@@ -88,7 +95,7 @@ impl Presentation {
 pub struct Plan {
     pub grep: Grep,
     pub paths: Vec<PathBuf>,
-    pub globs: Vec<String>,
+    pub filters: Vec<Filter>,
     pub line_number: bool,
     pub quiet: bool,
     pub hidden: bool,
@@ -250,7 +257,7 @@ pub fn parse_with(
 ) -> Result<Command, ParseError> {
     let mut positionals = Vec::new();
     let mut sources = Vec::new();
-    let mut globs = Vec::new();
+    let mut filters = Vec::new();
     let (mut line_number, mut quiet, mut done) = (false, false, false);
     let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
     let mut smart_case = false;
@@ -390,8 +397,9 @@ pub fn parse_with(
                     files = false;
                 }
                 "--scan" | "--scan-uncovered" if value.is_none() => {}
-                "--glob" | "--color" | "--regexp" | "--max-count" | "--before-context"
-                | "--after-context" | "--context" | "--max-depth" | "--max-columns" => {
+                "--glob" | "--type" | "--type-not" | "--color" | "--regexp" | "--max-count"
+                | "--before-context" | "--after-context" | "--context" | "--max-depth"
+                | "--max-columns" => {
                     let value = value
                         .map(str::to_owned)
                         .or_else(|| args.next().and_then(|s| s.to_str()).map(str::to_owned))
@@ -413,7 +421,11 @@ pub fn parse_with(
                             max_count = Some(value.parse().map_err(|_| ParseError::Number(value))?)
                         }
                         "--max-columns" => max_columns = columns(&value)?,
-                        "--glob" => globs.push(value),
+                        "--glob" => filters.push(Filter::Glob(value)),
+                        "--type" | "--type-not" => filters.push(Filter::Type {
+                            name: value,
+                            include: flag == "--type",
+                        }),
                         "--regexp" => sources.push(PatternSource::Argument(value)),
                         _ => {
                             presentation.color = match value.as_str() {
@@ -509,7 +521,7 @@ pub fn parse_with(
                         sources.push(PatternSource::File(path));
                         break;
                     }
-                    b'g' | b'e' | b'm' | b'M' | b'A' | b'B' | b'C' => {
+                    b'g' | b't' | b'T' | b'e' | b'm' | b'M' | b'A' | b'B' | b'C' => {
                         let value = if at + 1 < bytes.len() {
                             std::str::from_utf8(&bytes[at + 1..]).ok()
                         } else {
@@ -534,7 +546,12 @@ pub fn parse_with(
                         } else if flag == b'M' {
                             max_columns = columns(value)?;
                         } else if flag == b'g' {
-                            globs.push(value.to_owned());
+                            filters.push(Filter::Glob(value.to_owned()));
+                        } else if matches!(flag, b't' | b'T') {
+                            filters.push(Filter::Type {
+                                name: value.to_owned(),
+                                include: flag == b't',
+                            });
                         } else {
                             sources.push(PatternSource::Argument(value.to_owned()));
                         }
@@ -563,7 +580,7 @@ pub fn parse_with(
     if files {
         return Ok(Command::Files(Names {
             paths: positionals.into_iter().map(PathBuf::from).collect(),
-            globs,
+            filters,
             quiet,
             hidden,
             presentation,
@@ -645,7 +662,7 @@ pub fn parse_with(
         grep,
         replacement,
         paths,
-        globs,
+        filters,
         line_number,
         quiet,
         hidden,
@@ -1550,6 +1567,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Globs and types share one ordered list, so `-g` and `-t` interleave
+    // as written, in every spelling.
+    #[test]
+    fn globs_and_types_keep_argv_order() {
+        let args: Vec<OsString> = [
+            "-tpy",
+            "-g",
+            "*.rs",
+            "--type",
+            "rust",
+            "-T",
+            "md",
+            "--type-not=c",
+            "--type=sh",
+            "-g!x",
+            "red",
+        ]
+        .iter()
+        .map(Into::into)
+        .collect();
+        let Command::Search(plan) = parse(&args).unwrap() else {
+            panic!("search")
+        };
+        let ty = |name: &str, include| Filter::Type {
+            name: name.into(),
+            include,
+        };
+        assert_eq!(
+            plan.filters,
+            [
+                ty("py", true),
+                Filter::Glob("*.rs".into()),
+                ty("rust", true),
+                ty("md", false),
+                ty("c", false),
+                ty("sh", true),
+                Filter::Glob("!x".into()),
+            ]
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@
 
 mod gitignore;
 mod grep;
+mod grep_types;
 mod lists;
 mod rules;
 

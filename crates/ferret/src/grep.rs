@@ -33,6 +33,8 @@ use crate::xdg::Dirs;
 const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -n, --line-number   print 1-based line numbers\n\
   -g, --glob GLOB     select paths; repeat for ordered overrides\n\
+  -t, --type TYPE     search only files of rg's type TYPE (`all` for any)\n\
+  -T, --type-not TYPE skip files of rg's type TYPE\n\
   -q, --quiet         stop after a match\n\
   -i, --ignore-case   Unicode case-insensitive matching\n\
   -S, --smart-case    fold unless a literal is uppercase\n\
@@ -478,7 +480,7 @@ impl Execution<'_> {
             Exit::Ok
         } else if plan.paths.is_empty() && !searched {
             let _ = (runtime.stderr)(
-                "grep: no files were searched; a glob, depth, hidden or ignore filter probably \
+                "grep: no files were searched; a glob, type, depth, hidden or ignore filter probably \
              excluded every file under the current directory",
             );
             Exit::Usage

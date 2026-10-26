@@ -3,7 +3,7 @@
 //! combination one host refuses cannot run through the other.
 
 use ferret_policy::GrepSelection;
-use ferret_query::line_grep::{Output, Plan};
+use ferret_query::line_grep::{Filter, Output, Plan};
 
 /// A resolved plan's outcome before any input is opened.
 #[derive(Debug)]
@@ -28,20 +28,26 @@ pub(super) fn prepare(plan: &Plan) -> Result<Prepared, String> {
     {
         return Err("-M with -U in colour is not supported; use rg for this command".into());
     }
-    let selection = selection(plan.hidden, &plan.globs)?;
+    let selection = selection(plan.hidden, &plan.filters)?;
     if plan.max_count == Some(0) {
         return Ok(Prepared::NoMatch);
     }
     Ok(Prepared::Search(selection))
 }
 
-/// The hidden switch and ordered `-g` overrides, shared with `--files`.
-pub(super) fn selection(hidden: bool, globs: &[String]) -> Result<GrepSelection, String> {
+/// The hidden switch and ordered `-g`, `-t` and `-T` filters, shared with
+/// `--files`.
+pub(super) fn selection(hidden: bool, filters: &[Filter]) -> Result<GrepSelection, String> {
     let mut selection = GrepSelection::default().with_hidden(hidden);
-    for glob in globs {
-        selection
-            .push(glob)
-            .map_err(|error| format!("glob {glob:?}: {error}"))?;
+    for filter in filters {
+        match filter {
+            Filter::Glob(glob) => selection
+                .push(glob)
+                .map_err(|error| format!("glob {glob:?}: {error}"))?,
+            Filter::Type { name, include } => selection
+                .push_type(name, *include)
+                .map_err(|error| error.to_string())?,
+        }
     }
     Ok(selection)
 }
