@@ -465,7 +465,8 @@ fn read_file_policy(
     };
     match listed {
         None => engine::reader::direct(path, cap, &mut pass, stopped),
-        Some(parent) => engine::reader::listed(parent, path, cap, &mut pass, stopped),
+        // Uncovered rg-mode scans read once, as rg does (D123).
+        Some(parent) => engine::reader::listed(parent, path, !rg, cap, &mut pass, stopped),
     }
 }
 

@@ -77,10 +77,12 @@ pub(crate) enum Parent {
 
 /// A walked file, by its name beneath the directory it was listed in,
 /// never through a symlink; otherwise as [`direct`]. A closed parent
-/// reopened as another directory reads as changed.
+/// reopened as another directory reads as changed. Unless `checked`, the
+/// file is read once with no changed-during-read check (D123).
 pub(crate) fn listed(
     parent: &Parent,
     path: &std::path::Path,
+    checked: bool,
     cap: Option<u64>,
     each: ferret_query::Consumer<'_>,
     cancelled: &dyn Fn() -> bool,
@@ -122,8 +124,14 @@ pub(crate) fn listed(
             reopened.as_fd()
         }
     };
-    match ferret_crawl::content::stream_search_listed_until(directory, name, cap, each, cancelled) {
-        Ok(_) => ReadOutcome::Stable(ReadVersion::Current),
+    let read = if checked {
+        ferret_crawl::content::stream_search_listed_until(directory, name, cap, each, cancelled)
+            .map(drop)
+    } else {
+        ferret_crawl::content::stream_listed_once_until(directory, name, each, cancelled)
+    };
+    match read {
+        Ok(()) => ReadOutcome::Stable(ReadVersion::Current),
         Err(error) => fault(error, false),
     }
 }

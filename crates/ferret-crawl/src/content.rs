@@ -91,6 +91,27 @@ pub fn stream_search_listed_until(
     stream_file_until_with_growth(named, cap, each, cancelled, true)
 }
 
+/// [`stream_search_listed_until`] without the changed-during-read check: reads
+/// the opening size once and passes whatever it read, as rg does. For
+/// uncovered rg-mode scans only, which answer for the moment the command ran
+/// rather than for one consistent version (D123); a check would retry once
+/// and then drop a file that is written to throughout, such as a live log.
+pub fn stream_listed_once_until(
+    directory: BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), ContentFault> {
+    let named = Named {
+        directory,
+        name,
+        open: OFlags::NOFOLLOW,
+        check: AtFlags::SYMLINK_NOFOLLOW,
+    };
+    let (mut file, current) = open_named(&named, None, cancelled)?;
+    pass_extent(&mut file, current.size, each, cancelled)
+}
+
 /// A file to open by `name` beneath `directory`, with the symlink policy
 /// for its open and for its closing name check, which must agree.
 struct Named<'a> {
@@ -119,6 +140,22 @@ fn stream_file_until_with_growth(
     cancelled: &dyn Fn() -> bool,
     accept_growth: bool,
 ) -> Result<ferret_catalog::Stat, ContentFault> {
+    let (file, current) = open_named(&named, cap, cancelled)?;
+    checked_file(
+        file,
+        current,
+        accept_growth,
+        &mut |first| check_read_name(named.directory, named.name, named.check, first),
+        &mut |file, size| pass_extent(file, size, each, cancelled),
+    )
+}
+
+/// Opens `named` as a regular file no larger than `cap`.
+fn open_named(
+    named: &Named<'_>,
+    cap: Option<u64>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(File, ferret_catalog::Stat), ContentFault> {
     if cancelled() {
         return Err(ContentFault::Cancelled);
     }
@@ -143,22 +180,25 @@ fn stream_file_until_with_growth(
             cap,
         });
     }
-    checked_file(
-        file,
-        current,
-        accept_growth,
-        &mut |first| check_read_name(named.directory, named.name, named.check, first),
-        &mut |file, size| {
-            let extent = if size == 0 { u64::MAX } else { size };
-            each(&mut Read::take(file, extent), extent).map_err(|error| {
-                if cancelled() {
-                    ContentFault::Cancelled
-                } else {
-                    ContentFault::Read(error)
-                }
-            })
-        },
-    )
+    Ok((file, current))
+}
+
+/// Passes the opening `size` of `file`, or all of it when that was zero, as
+/// a virtual file's is.
+fn pass_extent(
+    file: &mut File,
+    size: u64,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), ContentFault> {
+    let extent = if size == 0 { u64::MAX } else { size };
+    each(&mut Read::take(file, extent), extent).map_err(|error| {
+        if cancelled() {
+            ContentFault::Cancelled
+        } else {
+            ContentFault::Read(error)
+        }
+    })
 }
 
 /// Validate the open descriptor, rather than path metadata that may already

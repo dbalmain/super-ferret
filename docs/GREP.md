@@ -396,6 +396,15 @@ tree snapshot. Stdin and other non-regular streams cannot be version-checked:
 their output describes the bytes received. Explicit special-file operands still
 refuse under the operand rule below.
 
+**Uncovered scans read once (D123, 2026-10-26):** files walked under a
+directory operand no index root covers are read as rg reads them: opened
+beneath their listed parent without following a symlink, read once up to
+their opening size (to EOF when that is zero), and printed as read. There is
+no closing bracket, name check or retry, so a file rewritten during its read
+prints whatever was read, and a file written to throughout still prints its
+matches rather than failing as changed. Explicit file operands, indexed
+candidates and `--live` keep the bracket above.
+
 **Read-extent clarification (2026-10-17, review R3; corrects review R2):** a
 regular file reporting size zero may still yield content (for example
 `/proc/version`). Explicit operands and opaque/ignored-directory fallback read

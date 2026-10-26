@@ -5508,6 +5508,50 @@ fn streaming_changed_file_reports_partial_output_without_retry() {
     }
 }
 
+// D123: a directory no index covers is scanned as rg scans it, reading each
+// file once and printing what was read. A file rewritten during its read is
+// neither retried nor reported as changed, so a log written to throughout
+// still prints its matches.
+#[test]
+fn uncovered_scan_prints_a_file_changed_during_its_read() {
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::new("uncovered-changed");
+    let outside = fixture.base.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let mut line = b"hit ".to_vec();
+    line.resize(1023, b'x');
+    line.push(b'\n');
+    let bytes = line.repeat(32 * 1024);
+    fs::write(outside.join("large"), &bytes).unwrap();
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "-I", "hit"])
+        .arg(&outside)
+        .env("FERRET_SEARCH_THREADS", "8");
+    let mut child = command.spawn().unwrap();
+    let mut pipe = child.stdout.take().unwrap();
+    let mut first = [0; 1024];
+    pipe.read_exact(&mut first).unwrap();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(outside.join("large"))
+        .unwrap();
+    file.write_all_at(b"CHG", 0).unwrap();
+    // Shrinking fails the closing check that indexed reads keep.
+    file.set_len(bytes.len() as u64 - 1).unwrap();
+    child.stdout = Some(pipe);
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let stdout = [first.as_slice(), &output.stdout].concat();
+    assert!(stdout.starts_with(b"hit "), "{:?}", &stdout[..16]);
+    assert!(stdout.len() > bytes.len() / 2, "{} bytes", stdout.len());
+}
+
 // Astra finding 1: a surviving hard link must not hide replacement of the
 // searched name after output has begun. An explicit file operand is read
 // directly; a directory under an index reads its catalogued names through the
