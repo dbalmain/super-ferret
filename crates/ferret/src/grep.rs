@@ -1038,8 +1038,11 @@ impl<W: Write> Write for DirectStream<'_, '_, W> {
     }
 }
 
+/// Called for every listed name, so it compares bytes: `Path` equality
+/// parses components. Only the operand `-` is stdin; a walked file of that
+/// name is `./-`.
 fn label(path: &Path, implicit: bool) -> &[u8] {
-    if path == Path::new("-") {
+    if path.as_os_str() == "-" {
         b"<stdin>"
     } else {
         let bytes = path.as_os_str().as_bytes();

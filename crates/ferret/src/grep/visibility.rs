@@ -38,12 +38,16 @@ impl Visibility<'_> {
         let kind = entry.kind()?;
         let rg = policy.as_ref().is_some_and(|policy| policy.rg());
         let path = entry.path().as_os_str().as_bytes();
-        let relative = entry
-            .path()
-            .strip_prefix(self.cwd)
-            .unwrap_or(entry.path())
-            .as_os_str()
-            .as_bytes();
+        // Only an absolute path can lie under the absolute cwd; skipping the
+        // component-wise strip for the usual relative path saves a parse per
+        // entry.
+        let relative = if entry.path().is_absolute() {
+            entry.path().strip_prefix(self.cwd).unwrap_or(entry.path())
+        } else {
+            entry.path()
+        }
+        .as_os_str()
+        .as_bytes();
         let visit = match kind {
             FileKind::Directory => {
                 let descend = self.max_depth.is_none_or(|limit| entry.depth() < limit)
