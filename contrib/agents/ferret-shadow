@@ -22,6 +22,8 @@
 #   lag        differed, then agreed when both ran again two seconds later
 #   known:git  `--files --hidden` differed only by rg listing .git, which the
 #              index leaves out (docs/GREP.md)
+#   known:policy  a listing differed only by names rg found under a directory
+#              ferret's ignore file excludes by plain name (D124)
 #   differ     still differed; both runs are kept under mismatch/
 #   rejected:MESSAGE  ferret grep refused the command (exit 2)
 #   skipped:WHY  not compared: busy (another comparison ran for 30 s), stdin
@@ -406,6 +408,28 @@ compare() {
     echo $? > "$run/ferret.status"
 }
 
+# A listing's records rg alone printed, all under a name ferret's ignore file
+# excludes outright: a plain `name` or `name/` line. Other lines (globs,
+# anchored paths) are not read, and any `!` line disables the check, so their
+# differences stay `differ`.
+policy_only() {
+    local file=${XDG_CONFIG_HOME:-$HOME/.config}/ferret/ignore excluded
+    if ! ((files || names)) || [[ ! -f $file ]] || grep -q '^[[:space:]]*!' "$file"; then
+        return 1
+    fi
+    excluded=$(sed -nE 's#^([A-Za-z0-9_.+-]+/)[[:space:]]*$#\1#p
+        s#^([A-Za-z0-9_.+-]+)[[:space:]]*$#\1(/|$)#p' "$file" |
+        sed -E 's#[.+]#\\&#g' | paste -sd '|')
+    if [[ -z $excluded ]]; then
+        return 1
+    fi
+    LC_ALL=C comm $split -12 <(normal "$run/ferret.out") <(normal "$run/rg.out") > "$run/both"
+    # Nothing ferret alone printed, and every rg-only record is under a name.
+    cmp -s "$run/both" <(normal "$run/ferret.out") &&
+        ! LC_ALL=C comm $split -13 "$run/both" <(normal "$run/rg.out") |
+        LC_ALL=C grep -aq $split -Ev "(^|/)($excluded)"
+}
+
 verdict() {
     local rg ferret rs fs same=agree
     rg=$(< "$run/rg.status") ferret=$(< "$run/ferret.status")
@@ -432,6 +456,8 @@ verdict() {
             cmp -s <(LC_ALL=C grep -a $split -Ev '(^|/)\.git(/|$)' "$run/rg.out" | LC_ALL=C sort $split) \
                 <(normal "$run/ferret.out"); then
             same=known:git
+        elif policy_only; then
+            same=known:policy
         else
             echo differ
             return
@@ -449,7 +475,7 @@ verdict() {
 compare 9>&-
 first=$(verdict 9>&-)
 case $first in
-    agree | known:git | skipped:* | rejected:*)
+    agree | known:* | skipped:* | rejected:*)
         log "$first" "$(< "$run/rg.status")" "$(< "$run/ferret.status")"
         exit 0
         ;;
@@ -460,7 +486,7 @@ mv "$run"/*.out "$run"/*.err "$run"/*.status "$run/first/"
 sleep 2
 compare 9>&-
 again=$(verdict 9>&-)
-if [[ $again == agree || $again == known:git ]]; then
+if [[ $again == agree || $again == known:* ]]; then
     log lag "${statuses[@]}"
     exit 0
 fi

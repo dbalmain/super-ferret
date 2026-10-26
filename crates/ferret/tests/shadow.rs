@@ -180,6 +180,31 @@ fn nul_listings_compare_whole_records() {
 }
 
 #[test]
+fn listings_short_only_of_names_ferret_ignores_are_policy() {
+    let bed = Bed::new("policy", false);
+    bed.write("a.txt", b"foo\n");
+    bed.write("vendor/b.txt", b"foo\n");
+    bed.write("vendors/c.txt", b"foo\n");
+    let ignore = bed.base.join("home/config/ferret/ignore");
+    fs::create_dir_all(ignore.parent().unwrap()).unwrap();
+    fs::write(&ignore, b"# seed\nvendor/\n*.log\n").unwrap();
+    let policy = bed.fake("policy", "grep -v '^vendor/'");
+    let near = bed.fake("near", "grep -v '^vendors/'");
+    let extra = bed.fake("extra", "{ grep -v '^vendor/'; echo z.txt; }");
+    for args in [&["--files"][..], &["-l", "foo"]] {
+        assert_eq!(verdict(&bed, &policy, args), "known:policy", "{args:?}");
+        // A name that only starts like an ignored one is a real difference,
+        // and so is a record ferret alone printed.
+        assert_eq!(verdict(&bed, &near, args), "differ", "{args:?}");
+        assert_eq!(verdict(&bed, &extra, args), "differ", "{args:?}");
+    }
+    // Lines are not listings, and a negation may re-include the name.
+    assert_eq!(verdict(&bed, &policy, &["foo"]), "differ");
+    fs::write(&ignore, b"vendor/\n!vendor/b.txt\n").unwrap();
+    assert_eq!(verdict(&bed, &policy, &["--files"]), "differ");
+}
+
+#[test]
 fn commands_reading_stdin_or_config_are_skipped() {
     let bed = Bed::new("skips", false);
     bed.write("a.txt", b"foo\n");

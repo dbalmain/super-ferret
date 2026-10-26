@@ -7040,6 +7040,15 @@ Context, from the S4 shadow log on 2026-10-26 (msa2):
   (3 of about 45) with tracked files under any seeded name; 99.9% of those
   files are under `vendor/`. Elsewhere the names are already gitignored, so
   rg skips them too.
+- A sweep later the same evening, counting the files `rg --files --hidden`
+  lists under any seeded name in each git repo under `~/w`, found one more
+  case of size: a second repository that does not gitignore its Rust
+  `target/` (7,913 files of build output) or `.direnv/` (2). The rest are
+  tiny: 31 files of another untracked `target/`, 16 under a nested
+  `vendor/`, one `__pycache__/`. Only the first repository's `vendor/` is
+  tracked. The shadow now logs a listing (`--files`, `-l`) that differs
+  only by such names as `known:policy` rather than `differ`; lines output
+  still reads `differ`.
 - GREP.md already lists "Git's user-global ignores differ from ferret's
   global file" as a known difference, so this is policy, not a bug. Once
   S4 step 2 switches agents to ferret, an agent searching that repository
@@ -7055,7 +7064,9 @@ Context, from the S4 shadow log on 2026-10-26 (msa2):
 nearly always gitignored, so the seed adds little; where they are committed
 they are source, which a search should see. B is more faithful for the
 names left in the seed (`node_modules/`, `target/`) but no repo here
-commits those.
+commits those. The untracked `target/` above stays a `known:policy`
+difference under C: there rg's answer is build output an agent would
+rather not see.
 
 **Fact that would change it:** a repo where a committed tree under one of
 these names is large enough to matter for index size (say over 1 GB); then
