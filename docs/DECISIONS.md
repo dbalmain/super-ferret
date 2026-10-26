@@ -7157,6 +7157,8 @@ line costs one list lookup per hidden name at crawl time.
 **Fact that would change it:** D65's catalog rework landing soon, which
 would make A's format change cheaper to fold in there (A after D65).
 
+> Dave: A (2026-10-27). Needed only under D128's `--rg`.
+
 ## D128 — Whose visibility rules `ferret grep` follows by default
 
 **Question:** Should `ferret grep` follow ferret's own visibility rules by
@@ -7184,3 +7186,5 @@ are written against rg; the flag keeps the hard parity work where it pays.
 
 **Fact that would change it:** you're content for agents to see dot files
 that rg hides. Then B is simpler and deletes code.
+
+> Dave: A (2026-10-27).
