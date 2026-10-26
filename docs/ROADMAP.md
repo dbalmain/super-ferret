@@ -60,6 +60,13 @@ inode caches stay warm, so cold crawls understate a reboot. Every `find` time is
 measured against the **D38 B reader** (positional section reads); D43 (mmap) is
 open.
 
+**Cold re-walk with every cache dropped (2026-10-27, msa2):** after `echo 3 >
+/proc/sys/vm/drop_caches` (page, dentry and inode caches) and a ferretd
+restart, the startup backstop over `~/w` (6,794 directories, 60,116 files,
+nothing re-read) walked in 1.85 s against 0.31 s warm, 5.9 times slower;
+1.86 s in total. This is the reboot case the note above could not measure,
+and the cost of the first backstop after a boot.
+
 The `$HOME` census:
 
 - 2.11M entries. The default global rules prune 1.28M of them (`target/` 30%,

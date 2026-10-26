@@ -7128,3 +7128,5 @@ answer.
 
 **Fact that would change it:** agents working in repositories you don't
 own, where `.ignore` files are common (B).
+
+> Dave: B (2026-10-27). "This tool isn't just for me."
