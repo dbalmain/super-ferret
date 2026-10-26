@@ -875,10 +875,38 @@ fn files_sort_by_modification_time_as_rg_does() {
             "--hidden",
             ".",
         ],
+        // rg lists stdin as `<stdin>`, after every timed name.
+        &["--files", "--sort=modified", "-", "one.rs", "two.txt"],
+        &["--files", "--sortr=modified", "one.rs", "-", "two.txt"],
     ] {
         let result = fixture.compare_raw(args, None);
         assert_eq!(result.status.code(), Some(0), "{args:?}: {result:?}");
     }
+    // A listing large enough to read times on several threads still
+    // completes when no thread can be started.
+    let mut command = fixture.command(OsStr::new("sh"));
+    command
+        .args(["-c", "ulimit -u 0 && exec \"$0\" \"$@\""])
+        .arg(env!("CARGO_BIN_EXE_ferret"))
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "--files", "--sort=modified"])
+        .args(std::iter::repeat_n("one.rs", 8193));
+    let output = run(command, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output
+            .stdout
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .count(),
+        8193
+    );
 }
 
 // The selection is an argument error, so it is reported before routing looks
@@ -6473,7 +6501,12 @@ fn streaming_context_and_match_limit_preserve_record_boundaries() {
                 .args(["red", if stdin { "-" } else { "large" }])
                 .env("TMPDIR", fixture.base.join("missing"));
             let output = run(command, stdin.then_some(bytes.as_slice()));
-            assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(output.stderr.is_empty());
             assert!(output.stdout == expected, "context/limit output differs");
         }

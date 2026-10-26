@@ -188,18 +188,42 @@ fn listings_short_only_of_names_ferret_ignores_are_policy() {
     let ignore = bed.base.join("home/config/ferret/ignore");
     fs::create_dir_all(ignore.parent().unwrap()).unwrap();
     fs::write(&ignore, b"# seed\nvendor/\n*.log\n").unwrap();
-    let policy = bed.fake("policy", "grep -v '^vendor/'");
-    let near = bed.fake("near", "grep -v '^vendors/'");
-    let extra = bed.fake("extra", "{ grep -v '^vendor/'; echo z.txt; }");
-    for args in [&["--files"][..], &["-l", "foo"]] {
+    // A ferret whose index covers `root` and that drops what `filter` drops.
+    let fake = |name: &str, root: &Path, filter: &str| {
+        let path = bed.base.join(name);
+        let body = format!(
+            "#!/bin/sh\nif [ \"$1\" = roots ]; then echo {root:?}; exit; fi\nshift\n{:?} \"$@\" | {filter}\n",
+            rg()
+        );
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let tree = bed.tree.canonicalize().unwrap();
+    let policy = fake("policy", &tree, "grep -v 'vendor/'");
+    let near = fake("near", &tree, "grep -v 'vendors/'");
+    let extra = fake("extra", &tree, "{ grep -v 'vendor/'; echo z.txt; }");
+    let elsewhere = fake("elsewhere", &bed.base.join("other"), "grep -v 'vendor/'");
+    for args in [&["--files"][..], &["-l", "foo"], &["--files", "."]] {
         assert_eq!(verdict(&bed, &policy, args), "known:policy", "{args:?}");
         // A name that only starts like an ignored one is a real difference,
-        // and so is a record ferret alone printed.
+        // and so is a record ferret alone printed, or a tree not indexed.
         assert_eq!(verdict(&bed, &near, args), "differ", "{args:?}");
         assert_eq!(verdict(&bed, &extra, args), "differ", "{args:?}");
+        assert_eq!(verdict(&bed, &elsewhere, args), "differ", "{args:?}");
     }
-    // Lines are not listings, and a negation may re-include the name.
-    assert_eq!(verdict(&bed, &policy, &["foo"]), "differ");
+    // Where ferret's ignore file does not apply, the same omission is a bug:
+    // with ignore rules off, for a named file, or below the excluded name.
+    for args in [
+        &["--files", "--no-ignore"][..],
+        &["--files", "-u"],
+        &["--files", "a.txt", "vendor/b.txt"],
+        &["--files", "vendor"],
+        &["foo"],
+    ] {
+        assert_eq!(verdict(&bed, &policy, args), "differ", "{args:?}");
+    }
+    // A negation may re-include the name.
     fs::write(&ignore, b"vendor/\n!vendor/b.txt\n").unwrap();
     assert_eq!(verdict(&bed, &policy, &["--files"]), "differ");
 }

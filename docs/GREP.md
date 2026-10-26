@@ -173,8 +173,9 @@ error, `unrecognized file type: NAME`, as in rg.
 `--sort` and `--sortr` are one setting and the last wins; `none` clears it;
 every listed name, across operands, is in one order by the modification time
 of what it names. Equal times keep walk order in both directions; rg keeps
-its directory read order, which matched ferret's on a 305,607-name tree. An
-unknown key is a usage error. Other keys, and any sort in content search,
+its directory read order, which matched ferret's on a 305,607-name tree. A
+name with no time, as `-` for stdin, sorts as the newest: last ascending,
+first descending, where rg puts `<stdin>`. An unknown key is a usage error. Other keys, and any sort in content search,
 refuse.
 
 All other flags **refuse**, never pass through or silently disappear:

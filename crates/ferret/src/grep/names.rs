@@ -309,10 +309,12 @@ impl Listing<'_> {
         }
         if let (Some(held), Some(sort)) = (listed.held.take(), plan.sort) {
             let mut held: Vec<_> = modified(cwd, &held).into_iter().zip(held).collect();
-            // Stable, so equal times keep walk order both ways.
+            // Stable, so equal times keep walk order both ways. No time
+            // sorts as the newest, as rg places `<stdin>`.
+            let key = |time: Option<SystemTime>| (time.is_none(), time);
             match sort {
-                Sort::Oldest => held.sort_by_key(|&(time, _)| time),
-                Sort::Newest => held.sort_by_key(|&(time, _)| Reverse(time)),
+                Sort::Oldest => held.sort_by_key(|&(time, _)| key(time)),
+                Sort::Newest => held.sort_by_key(|&(time, _)| Reverse(key(time))),
             }
             for (_, path) in held {
                 if emit(plan, writer, cancelled, &path, false, &mut listed)? {
@@ -348,15 +350,20 @@ fn diagnostic(
     Ok(false)
 }
 
-/// Each path's modification time, following a named symlink; `None` sorts
-/// first. A large listing reads them on several threads: one thread spends
-/// about 1.5 µs a name.
+/// Each path's modification time, following a named symlink; stdin (`-`)
+/// has none. A large listing reads them on several threads, one thread
+/// spending about 1.5 µs a name; a chunk no thread could be started for is
+/// read here.
 fn modified(cwd: &Path, paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
     const PER_THREAD: usize = 8192;
     let read = |paths: &[PathBuf]| -> Vec<_> {
         paths
             .iter()
-            .map(|path| fs::metadata(cwd.join(path)).and_then(|m| m.modified()).ok())
+            .map(|path| {
+                (path != Path::new("-"))
+                    .then(|| fs::metadata(cwd.join(path)).and_then(|m| m.modified()).ok())
+                    .flatten()
+            })
             .collect()
     };
     let threads = thread::available_parallelism()
@@ -369,14 +376,19 @@ fn modified(cwd: &Path, paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
     thread::scope(|scope| {
         let workers: Vec<_> = paths
             .chunks(paths.len().div_ceil(threads))
-            .map(|chunk| scope.spawn(move || read(chunk)))
+            .map(|chunk| {
+                thread::Builder::new()
+                    .spawn_scoped(scope, move || read(chunk))
+                    .map_err(|_| chunk)
+            })
             .collect();
         workers
             .into_iter()
-            .flat_map(|worker| {
-                worker
+            .flat_map(|worker| match worker {
+                Ok(worker) => worker
                     .join()
-                    .unwrap_or_else(|panic| panic::resume_unwind(panic))
+                    .unwrap_or_else(|panic| panic::resume_unwind(panic)),
+                Err(chunk) => read(chunk),
             })
             .collect()
     })

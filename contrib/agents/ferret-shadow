@@ -59,7 +59,7 @@ scratch=${XDG_RUNTIME_DIR:-$state}
 # --files, --count, --files-with-matches and --json override one another, the
 # last one winning, so `mode` holds the last: files, count, names, json or
 # lines.
-mode=lines null=0 hidden=0 unrestricted=0 sources=0 heading=0 why=
+mode=lines null=0 hidden=0 unrestricted=0 ignoring=1 sources=0 heading=0 why=
 operands=() inputs=()
 value_short=ABCdEefgjMmrtT
 value_long=' regexp file pre pre-glob dfa-size-limit encoding engine max-count
@@ -92,7 +92,10 @@ option() {
         0 | null) null=1 ;;
         . | hidden) hidden=1 ;;
         no-hidden) hidden=0 ;;
+        no-ignore) ignoring=0 ;;
+        ignore) ignoring=1 ;;
         u)
+            ignoring=0
             unrestricted=$((unrestricted + 1))
             if ((unrestricted == 2)); then hidden=1; fi
             ;;
@@ -411,10 +414,13 @@ compare() {
 # A listing's records rg alone printed, all under a name ferret's ignore file
 # excludes outright: a plain `name` or `name/` line. Other lines (globs,
 # anchored paths) are not read, and any `!` line disables the check, so their
-# differences stay `differ`.
+# differences stay `differ`. The file applies only where ferret's index
+# answers with its ignore rules on: each operand a directory under an indexed
+# root, not itself under an excluded name, and no --no-ignore or -u.
 policy_only() {
-    local file=${XDG_CONFIG_HOME:-$HOME/.config}/ferret/ignore excluded
-    if ! ((files || names)) || [[ ! -f $file ]] || grep -q '^[[:space:]]*!' "$file"; then
+    local file=${XDG_CONFIG_HOME:-$HOME/.config}/ferret/ignore excluded roots operand root under
+    if ! ((files || names)) || ! ((ignoring)) || [[ ! -f $file ]] ||
+        grep -q '^[[:space:]]*!' "$file"; then
         return 1
     fi
     excluded=$(sed -nE 's#^([A-Za-z0-9_.+-]+/)[[:space:]]*$#\1#p
@@ -423,6 +429,21 @@ policy_only() {
     if [[ -z $excluded ]]; then
         return 1
     fi
+    roots=$("$ferret" roots list 2> /dev/null) || return 1
+    for operand in "${operands[@]:-.}"; do
+        if [[ ! -d $operand ]] || LC_ALL=C grep -aqE "(^|/)($excluded)" <<< "$operand/"; then
+            return 1
+        fi
+        operand=$(realpath -- "$operand") under=0
+        while IFS= read -r root; do
+            if [[ -n $root && ($operand == "$root" || $operand == "$root"/*) ]]; then
+                under=1
+            fi
+        done <<< "$roots"
+        if ((!under)); then
+            return 1
+        fi
+    done
     LC_ALL=C comm $split -12 <(normal "$run/ferret.out") <(normal "$run/rg.out") > "$run/both"
     # Nothing ferret alone printed, and every rg-only record is under a name.
     cmp -s "$run/both" <(normal "$run/ferret.out") &&
@@ -431,9 +452,9 @@ policy_only() {
 }
 
 verdict() {
-    local rg ferret rs fs same=agree
-    rg=$(< "$run/rg.status") ferret=$(< "$run/ferret.status")
-    case "$rg $ferret" in
+    local rg_status ferret_status rs fs same=agree
+    rg_status=$(< "$run/rg.status") ferret_status=$(< "$run/ferret.status")
+    case "$rg_status $ferret_status" in
         124\ * | *\ 124 | 137\ * | *\ 137)
             echo skipped:slow
             return
@@ -443,11 +464,11 @@ verdict() {
             return
             ;;
     esac
-    if ((ferret == 2 && rg != 2)); then
+    if ((ferret_status == 2 && rg_status != 2)); then
         echo "rejected:$(head -n 1 "$run/ferret.err" | head -c 200 | tr '\t' ' ')"
         return
     fi
-    if [[ $rg != "$ferret" ]]; then
+    if [[ $rg_status != "$ferret_status" ]]; then
         echo differ
         return
     fi
