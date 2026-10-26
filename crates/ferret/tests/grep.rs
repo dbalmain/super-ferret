@@ -630,6 +630,9 @@ fn glob_prunes_an_opaque_live_fallback_before_reading_its_directory() {
 #[test]
 fn dot_ignore_files_hide_as_rg_does() {
     let fixture = Fixture::new("visibility");
+    // A work tree, so the `.gitignore` files below compete.
+    fixture.write(".git/HEAD", b"ref: refs/heads/main\n");
+    fixture.write(".gitignore", b"*.md\n");
     fixture.write(".ignore", b"*.cache\nrepos/\n");
     fixture.write(".rgignore", b"!keep.cache\n");
     fixture.write("extra.cache", b"lantern\n");
@@ -640,6 +643,8 @@ fn dot_ignore_files_hide_as_rg_does() {
     fixture.write("inner/.git/HEAD", b"ref: refs/heads/main\n");
     fixture.write("inner/c.cache", b"lantern\n");
     fixture.write("inner/c.txt", b"lantern\n");
+    fixture.write("inner/c.md", b"lantern\n");
+    fixture.write("d.md", b"lantern\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     let listed = fixture.compare(&["-l", "lantern"], None);
     assert!(!listed.stdout.is_empty(), "{listed:?}");
