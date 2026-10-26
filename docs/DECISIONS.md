@@ -6966,6 +6966,8 @@ the restart cost on these machines is about a second.
 transient writer panic on a tree whose startup backstop takes minutes; then
 C, and B only if transient panics recur.
 
+> Dave: Agree. (2026-10-26)
+
 ## D123 — Keep the changed-during-read check on rg-mode scans?
 
 **Question:** When `ferret grep` scans a directory no index covers, should
@@ -6995,3 +6997,17 @@ with every core.
 
 **Fact that would change it:** a decision that uncovered scans should match
 rg's behaviour exactly rather than only its output; then B.
+
+> Dave: what is the benefit of re-reading? If it's constantly changing,
+> you'll end up re-reading forever. I think we should be erring to the truth
+> when the command was called rather than when we send the response.
+> (2026-10-26)
+
+The retry is bounded: one re-read, then the file is reported as "changed
+during read" and its matches are dropped. A file that is appended to without
+pause, such as a live log, therefore prints an error instead of its matches,
+which is further from the truth at call time than a single read. Taken as
+B: uncovered rg-mode scans read each file once and print what was read.
+Indexed reads keep the check, because there it decides whether the bytes
+read are the catalogued version and may be cached against it; `--live` is
+unchanged for now.
