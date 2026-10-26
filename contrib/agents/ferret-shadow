@@ -407,7 +407,7 @@ normal() {
 compare() {
     side rg "$real" "${args[@]}"
     echo $? > "$run/rg.status"
-    FERRET_STALE_NOTICE=0 side ferret "$ferret" grep "${args[@]}"
+    FERRET_STALE_NOTICE=0 side ferret "$ferret" grep --rg "${args[@]}"
     echo $? > "$run/ferret.status"
 }
 

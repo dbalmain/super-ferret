@@ -1535,7 +1535,7 @@ impl Filter<'_> {
             max_depth: self.traversal.max_depth,
             content: true,
         };
-        let rg = policy.as_ref().is_some_and(|policy| policy.rg());
+        let uncovered = policy.as_ref().is_some_and(|policy| policy.uncovered());
         let mut policy = policy;
         let visit = visibility.select(entry, policy.as_deref_mut(), stopped);
         if let Some(policy) = policy {
@@ -1599,7 +1599,7 @@ impl Filter<'_> {
                     self.cwd.join(entry.path()),
                     engine::reader::Parent::Followed,
                     true,
-                    rg,
+                    uncovered,
                 ),
             ));
         }
@@ -1625,9 +1625,9 @@ impl Filter<'_> {
                 entry.path().to_owned(),
                 self.cwd.join(entry.path()),
                 parent,
-                rg,
+                uncovered,
                 // Uncovered scans read once, as rg does (D123).
-                rg,
+                uncovered,
             ),
         ))
     }

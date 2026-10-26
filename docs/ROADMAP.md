@@ -2093,8 +2093,8 @@ verdicts and lists each differ or rejected argv shape once, with a replayable
 newest call and its kept runs, exiting 1 while anything needs a look.
 
 Step 2 is built behind a switch (2026-10-26) and stays off until the log is
-judged clean. With `FERRET_ANSWER=ferret` the stand-in execs `ferret grep`
-with `FERRET_GREP_FALLBACK` naming the real rg, so a command ferret
+judged clean. With `FERRET_ANSWER=ferret` the stand-in execs
+`ferret grep --rg` (rg's visibility rules, D128) with `FERRET_GREP_FALLBACK` naming the real rg, so a command ferret
 refuses as unsupported (Glob's `--sort=modified`, `--type-add`, a set
 `RIPGREP_CONFIG_PATH`, `-L` in an indexed tree, coloured `-U -M`) is
 answered by rg in the same process, decided before any output or operand

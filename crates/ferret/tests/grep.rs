@@ -120,7 +120,7 @@ impl Fixture {
         self.check(args, input, true)
     }
     fn check(&self, args: &[&str], input: Option<&[u8]>, raw: bool) -> Output {
-        let mut ferret_args = vec!["grep"];
+        let mut ferret_args = vec!["grep", "--rg"];
         ferret_args.extend_from_slice(args);
         let actual = self.ferret(&ferret_args, input);
         let same = |oracle: &Output| {
@@ -691,7 +691,7 @@ fn file_types_select_as_rg_does() {
         let mut live = row.to_vec();
         live.push("--live");
         let rg = fixture.oracle(row, None);
-        let ferret = fixture.ferret(&[&["grep"][..], &live].concat(), None);
+        let ferret = fixture.ferret(&[&["grep", "--rg"][..], &live].concat(), None);
         assert_eq!(
             ferret.status.code(),
             rg.status.code(),
@@ -748,6 +748,9 @@ fn unsupported_commands_fall_back_to_the_named_rg() {
         );
         assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
     }
+    // rg has no `--rg`: the stand-in's leading one is dropped (D128).
+    let output = run_with(&["--rg", "--sort", "path", "red"], &fallback, None);
+    assert_eq!(output.stdout, b"fallback --sort path red\n", "{output:?}");
     let refused = run_with(&["--sort", "path", "red"], &[], None);
     assert_eq!(refused.status.code(), Some(2), "{refused:?}");
     assert!(refused.stdout.is_empty());
@@ -777,7 +780,7 @@ fn unsupported_commands_fall_back_to_the_named_rg() {
     let mixed = run_with(&["-L", "red", ".", "../outside"], &fallback, None);
     assert_eq!(mixed.status.code(), Some(7), "{mixed:?}");
     assert!(mixed.stderr.is_empty(), "{mixed:?}");
-    let walked = run_with(&["red", "../outside"], &fallback, None);
+    let walked = run_with(&["--rg", "red", "../outside"], &fallback, None);
     assert_eq!(walked.stdout, b"../outside/x.txt:red\n", "{walked:?}");
     assert!(
         String::from_utf8_lossy(&walked.stderr).contains("warning: ignore pattern skipped:"),
@@ -1845,7 +1848,8 @@ fn visibility_matrix(files: bool) {
                     } else {
                         catalogued[usize::from(hidden)]
                     };
-                    let actual = fixture.ferret(&args, None);
+                    let actual =
+                        fixture.ferret(&[&["grep", "--rg"][..], &args[1..]].concat(), None);
                     assert_eq!(actual.status.code(), Some(expected), "{args:?}: {actual:?}");
                     assert!(actual.stderr.is_empty(), "{args:?}: {actual:?}");
                     assert_eq!(
@@ -1972,7 +1976,7 @@ fn files_never_waits_for_stdin_eof_even_when_implicitly_piped() {
         let child = command
             .arg("--index")
             .arg(fixture.base.join("index"))
-            .arg("grep")
+            .args(["grep", "--rg"])
             .args(&args)
             .stdin(Stdio::from(fd))
             .spawn()
@@ -3342,7 +3346,7 @@ impl Fixture {
         let mut oracle = args.to_vec();
         oracle.retain(|arg| *arg != "--live");
         let expected = self.oracle(&oracle, input);
-        let mut candidate = vec!["grep"];
+        let mut candidate = vec!["grep", "--rg"];
         candidate.extend_from_slice(args);
         let actual = self.ferret(&candidate, input);
         assert_eq!(
@@ -3509,7 +3513,7 @@ fn m6_live_bad_patterns_warn_and_preserve_valid_rules() {
         (vec!["red"], &b"rules/keep.txt:red\n"[..]),
         (vec!["--files"], &b"rules/keep.txt\n"[..]),
     ] {
-        let mut args = vec!["grep", "--live"];
+        let mut args = vec!["grep", "--rg", "--live"];
         args.extend(flags);
         args.push("rules");
         let result = fixture.ferret(&args, None);
@@ -4852,7 +4856,7 @@ impl Fixture {
     fn compare_json(&self, args: &[&str], input: Option<&[u8]>) -> Output {
         let mut options = vec!["--json"];
         options.extend_from_slice(args);
-        let mut ferret_args = vec!["grep"];
+        let mut ferret_args = vec!["grep", "--rg"];
         ferret_args.extend_from_slice(&options);
         let actual = self.ferret(&ferret_args, input);
         let quiet = args.contains(&"-q");
@@ -6643,7 +6647,7 @@ fn hidden_names_below_the_operand_stay_hidden_whatever_the_cwd() {
                             command
                                 .arg("--index")
                                 .arg(fixture.base.join("index"))
-                                .arg("grep");
+                                .args(["grep", "--rg"]);
                         }
                         // rg has no --live: it always reads the live tree.
                         command.args(args.iter().filter(|&&arg| grep || arg != "--live"));
@@ -6746,7 +6750,7 @@ fn globs_match_the_same_paths_as_rg_whatever_the_cwd() {
                             command
                                 .arg("--index")
                                 .arg(fixture.base.join("index"))
-                                .arg("grep");
+                                .args(["grep", "--rg"]);
                         }
                         // rg has no --live: it always reads the live tree.
                         command.args(args.iter().filter(|&&arg| grep || arg != "--live"));

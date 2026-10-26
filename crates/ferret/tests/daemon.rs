@@ -3342,7 +3342,7 @@ fn compare_over_cap_grep(name: &str, nul: Option<usize>) {
             .output()
             .unwrap();
         for local in [true, false] {
-            let mut command = tree.command(&["grep"]);
+            let mut command = tree.command(&["grep", "--rg"]);
             command.args(&args).env("FERRET_SEARCH_THREADS", "1");
             if local {
                 command.env("FERRET_NO_DAEMON", "1");
