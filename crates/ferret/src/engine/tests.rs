@@ -461,9 +461,10 @@ fn from_ask(asks: &Cell<usize>, n: usize) -> impl Fn() -> bool + '_ {
 
 /// A catalog whose base holds 16,384 documents, all but the first hundred
 /// since deleted in its overlay: `next_doc` stays past them, and the dead
-/// rows stay in the base. The default limits would checkpoint at 5% dead;
-/// raised limits stand for a log written under larger host limits, or
-/// for any dead fraction below the trigger at ten million documents.
+/// rows stay in the base. The default limits would checkpoint this 99% dead
+/// log at their 5% dead trigger, so they are raised: the fixture stands for
+/// a large catalog below that trigger, where 5% of ten million documents is
+/// half a million dead rows still in the base.
 fn mostly_deleted() -> (Tree, Engine) {
     let tree = Tree::with_files(4 * DocSet::CHECK_EVERY);
     let mut writer = ferret_catalog::WriterSession::open(&tree.0.join("index")).unwrap();
