@@ -2056,6 +2056,19 @@ the shim to answer from ferret once a day's log is clean.
 verdicts and lists each differ or rejected argv shape once, with a replayable
 newest call and its kept runs, exiting 1 while anything needs a look.
 
+Step 2 is built behind a switch (2026-10-26) and stays off until the log is
+judged clean. With `FERRET_ANSWER=ferret` the stand-in execs `ferret grep`
+with `FERRET_GREP_FALLBACK` naming the real rg, so any command ferret
+refuses as unsupported (Glob's `--sort=modified`, `--type-add`, a set
+`RIPGREP_CONFIG_PATH`) is answered by rg in the same process, before any
+output; one call in ten is still shadowed. A terminal caller always gets
+rg. The first generated traffic (156 calls, a `claude -p` session doing
+code search across `~/w`) found `-t`/`-T`, the Grep tool's `type`
+parameter, rejected on every typed call; both are now supported (GREP.md
+§ Types). Its only `differ` verdicts are D124: a repository that commits
+`vendor/`. The shadow now queues behind a running comparison for up to
+30 s instead of skipping it, which had lost 71 of those 156 calls.
+
 ## S5 — Daemon for the content index
 
 S1b's daemon extended to the content index: postings kept current from its

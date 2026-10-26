@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# A stand-in `rg` for agents' PATH (D118, step 1). The caller gets the real rg
-# itself: this script execs it, so output, diagnostics, exit status, signals
-# and closed pipes are rg's own. Before that it starts ferret-shadow, detached
-# and holding none of the caller's descriptors, which runs the same argv
-# through rg and `ferret grep` at idle priority and logs whether they agree.
+# A stand-in `rg` for agents' PATH (D118). By default (step 1) the caller gets
+# the real rg itself: this script execs it, so output, diagnostics, exit
+# status, signals and closed pipes are rg's own. Before that it starts
+# ferret-shadow, detached and holding none of the caller's descriptors, which
+# runs the same argv through rg and `ferret grep` at idle priority and logs
+# whether they agree.
+#
+# With FERRET_ANSWER=ferret (step 2) the caller gets `ferret grep` instead,
+# which execs the real rg for any command it refuses as unsupported
+# (FERRET_GREP_FALLBACK), and one call in FERRET_SHADOW_EVERY is still
+# compared. A terminal caller always gets the real rg.
 #
 # Enable for Claude Code by putting this directory first on PATH and setting
 # USE_BUILTIN_RIPGREP=0; codex and Bash calls already use PATH's rg.
 #
 # Environment:
-#   FERRET_REAL_RG     the real rg (default: the next rg on PATH)
-#   FERRET_SHADOW=0    serve rg only, compare nothing
+#   FERRET_REAL_RG       the real rg (default: the next rg on PATH)
+#   FERRET_ANSWER        rg (default) or ferret: who answers the caller
+#   FERRET_SHADOW=0      compare nothing
+#   FERRET_SHADOW_EVERY  compare one call in N (default 1 when rg answers,
+#                        10 when ferret does)
 # ferret-shadow documents the rest.
 
 self=$(readlink -f -- "${BASH_SOURCE[0]}" 2> /dev/null)
@@ -30,10 +39,23 @@ if [[ -z $real ]]; then
     exit 2
 fi
 
+answer=${FERRET_ANSWER:-rg}
+if [[ -t 1 ]]; then
+    answer=rg
+fi
+if [[ $answer == ferret ]]; then
+    every=${FERRET_SHADOW_EVERY:-10}
+else
+    every=${FERRET_SHADOW_EVERY:-1}
+fi
+if [[ ! $every =~ ^[1-9][0-9]*$ ]]; then
+    every=1
+fi
+
 shadow=${self%/*}/ferret-shadow
 # A terminal reader sees colour and headings, which a captured replay would
 # not, so terminal calls are not compared.
-if [[ ${FERRET_SHADOW:-1} != 0 && ! -t 1 && -x $shadow ]]; then
+if [[ ${FERRET_SHADOW:-1} != 0 && ! -t 1 && -x $shadow ]] && ((RANDOM % every == 0)); then
     # rg reads a stdin that is not a terminal or /dev/null when given no path,
     # and the replay's is /dev/null, so say which this was. Tested here: an
     # asynchronous subshell's stdin is already /dev/null.
@@ -50,5 +72,8 @@ if [[ ${FERRET_SHADOW:-1} != 0 && ! -t 1 && -x $shadow ]]; then
         done
         FERRET_SHADOW_STDIN=$stdin exec setsid "$shadow" "$real" "$@" < /dev/null > /dev/null 2>&1
     ) 2> /dev/null &
+fi
+if [[ $answer == ferret ]]; then
+    FERRET_GREP_FALLBACK=$real exec "${FERRET_BIN:-ferret}" grep "$@"
 fi
 exec "$real" "$@"

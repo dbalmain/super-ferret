@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,8 +94,10 @@ enum Input {
 pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let start = std::time::Instant::now();
     let mut pattern_files = Vec::new();
+    let mut stdin_read = false;
     let command = match line_grep::parse_with(args, &mut |path| {
         let bytes = if path == Path::new("-") {
+            stdin_read = true;
             let mut bytes = Vec::new();
             io::stdin().lock().read_to_end(&mut bytes)?;
             bytes
@@ -105,6 +108,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(bytes)
     }) {
         Ok(command) => command,
+        Err(error @ line_grep::ParseError::Unsupported(_)) => {
+            return unsupported(args, &error.to_string(), false);
+        }
         Err(error) => return failure(&error.to_string()),
     };
     let mut plan = match command {
@@ -113,7 +119,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             return print(format!("ferret grep {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
         }
         line_grep::Command::Files(mut plan) => {
-            if let Some(exit) = context_error(global_json) {
+            if let Some(exit) = context_error(args, global_json, stdin_read) {
                 return exit;
             }
             let tty = presentation::resolve(&mut plan.presentation);
@@ -121,7 +127,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         }
         line_grep::Command::Search(plan) => *plan,
     };
-    if let Some(exit) = context_error(global_json) {
+    if let Some(exit) = context_error(args, global_json, stdin_read) {
         return exit;
     }
     let tty = presentation::resolve(&mut plan.presentation);
@@ -159,8 +165,10 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .as_ref()
             .is_none_or(|anchors| anchors.any_covered(&inputs))
     {
-        return failure(
+        return unsupported(
+            args,
             "-L is supported for uncovered directories and -u; use -u to follow links in an indexed tree",
+            stdin_read,
         );
     }
     if covered
@@ -502,16 +510,39 @@ fn test_injections() -> bool {
     std::env::vars_os().any(|(key, _)| key.as_bytes().starts_with(b"FERRET_TEST_"))
 }
 
-fn context_error(global_json: bool) -> Option<Exit> {
+fn context_error(args: &[OsString], global_json: bool, stdin_read: bool) -> Option<Exit> {
     if global_json {
         return Some(failure(
             "global --json framing is not supported for grep; use ferret grep --json",
         ));
     }
     if std::env::var_os("RIPGREP_CONFIG_PATH").is_some_and(|s| !s.is_empty()) {
-        return Some(failure("RIPGREP_CONFIG_PATH is set; pass flags explicitly"));
+        return Some(unsupported(
+            args,
+            "RIPGREP_CONFIG_PATH is set; pass flags explicitly",
+            stdin_read,
+        ));
     }
     None
+}
+
+/// Refuses a command ferret grep does not support. When
+/// `FERRET_GREP_FALLBACK` names a real rg (D118 step 2: the agents' stand-in
+/// `rg` sets it), that rg runs the same argv in this process instead. Every
+/// such refusal comes before any output, so the caller sees only rg's
+/// answer; the exception is a command whose `-f -` already consumed stdin,
+/// which rg could not read again.
+fn unsupported(args: &[OsString], message: &str, stdin_read: bool) -> Exit {
+    if let Some(rg) = std::env::var_os("FERRET_GREP_FALLBACK").filter(|rg| !rg.is_empty())
+        && !stdin_read
+    {
+        let error = std::process::Command::new(&rg).args(args).exec();
+        return failure(&format!(
+            "{message}; running {}: {error}",
+            Path::new(&rg).display()
+        ));
+    }
+    failure(message)
 }
 
 fn print(bytes: &[u8]) -> Exit {

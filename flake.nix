@@ -57,7 +57,8 @@
         substituteInPlace $out/bin/rg \
           --replace-fail 'readlink -f' '${pkgs.coreutils}/bin/readlink -f' \
           --replace-fail 'exec setsid' 'exec ${pkgs.util-linux}/bin/setsid'
-        wrapProgram $out/bin/rg --set-default FERRET_REAL_RG ${pkgs.ripgrep}/bin/rg
+        wrapProgram $out/bin/rg --set-default FERRET_REAL_RG ${pkgs.ripgrep}/bin/rg \
+          --set-default FERRET_BIN ${ferret}/bin/ferret
         wrapProgram $out/bin/ferret-shadow \
           --set-default FERRET_BIN ${ferret}/bin/ferret \
           --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [ coreutils diffutils findutils gnugrep gnused util-linux ])}

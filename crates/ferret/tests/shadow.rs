@@ -279,6 +279,38 @@ fn the_stand_in_answers_as_rg_and_logs_in_the_background() {
     assert_eq!(bed.log()[0].split('\t').nth(1), Some("agree"));
 }
 
+// Step 2: FERRET_ANSWER=ferret hands the caller to `ferret grep`, naming the
+// real rg as its fallback. The fake ferret shows what it was given.
+#[test]
+fn answer_mode_hands_the_caller_to_ferret_with_rg_as_fallback() {
+    let bed = Bed::new("answer", false);
+    let fake = bed.base.join("echo-ferret");
+    fs::write(
+        &fake,
+        b"#!/bin/sh\nprintf '%s|' \"$FERRET_GREP_FALLBACK\" \"$@\"; echo\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let call = |answer: &str| {
+        bed.command(&script("rg"), &fake)
+            .env("FERRET_REAL_RG", rg())
+            .env("FERRET_ANSWER", answer)
+            .env("FERRET_SHADOW", "0")
+            .args(["-l", "foo", "."])
+            .output()
+            .unwrap()
+    };
+    let output = call("ferret");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}|grep|-l|foo|.|\n", rg().display())
+    );
+    // Any other value keeps rg answering.
+    bed.write("a.txt", b"foo\n");
+    let output = call("rg");
+    assert_eq!(output.stdout, b"./a.txt\n");
+}
+
 #[test]
 fn heading_output_is_not_compared_line_by_line() {
     // Sorted lines lose which heading a line sat under, so bodies swapped

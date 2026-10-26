@@ -24,7 +24,7 @@
 #              index leaves out (docs/GREP.md)
 #   differ     still differed; both runs are kept under mismatch/
 #   rejected:MESSAGE  ferret grep refused the command (exit 2)
-#   skipped:WHY  not compared: busy (another comparison is running), stdin
+#   skipped:WHY  not compared: busy (another comparison ran for 30 s), stdin
 #              (the command reads it), special (it names a FIFO, device or
 #              socket, or its roots reach one, or cannot be walked), heading (--heading or --pretty output), info (--help,
 #              --version), effects (it runs a program), config
@@ -214,11 +214,12 @@ fi
 renice -n 19 $$ > /dev/null 2>&1
 ionice -c 3 -p $$ > /dev/null 2>&1
 
-# One comparison at a time. The lock is this shell's alone: every command
-# below runs with descriptor 9 closed, so no child, and no daemon a child
-# starts, can keep it.
+# One comparison at a time, queued: an agent's searches come in bursts, and
+# skipping while one ran lost a quarter of them. The lock is this shell's
+# alone: every command below runs with descriptor 9 closed, so no child, and
+# no daemon a child starts, can keep it.
 exec 9> "$state/lock" || exit 0
-if ! flock -n 9; then
+if ! flock -w 30 9; then
     log skipped:busy - -
     exit 0
 fi

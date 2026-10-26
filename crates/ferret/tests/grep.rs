@@ -690,6 +690,66 @@ fn file_types_select_as_rg_does() {
     }
 }
 
+// D118 step 2: with FERRET_GREP_FALLBACK set, a command ferret grep refuses
+// as unsupported runs that program on the same argv instead, and nothing
+// else does. A `-f -` that already consumed stdin is refused, not replayed.
+#[test]
+fn unsupported_commands_fall_back_to_the_named_rg() {
+    let fixture = Fixture::new("fallback");
+    let fake = fixture.base.join("fake-rg");
+    fs::write(
+        &fake,
+        b"#!/bin/sh\nprintf 'fallback'; printf ' %s' \"$@\"; echo\nexit 7\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let run_with = |args: &[&str], env: &[(&str, &OsStr)], input: Option<&[u8]>| {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(args)
+            .envs(env.iter().copied());
+        run(command, input)
+    };
+    let fallback = [("FERRET_GREP_FALLBACK", fake.as_os_str())];
+    let config = fixture.base.join("rgrc");
+    fs::write(&config, b"").unwrap();
+    let with_config = [fallback[0], ("RIPGREP_CONFIG_PATH", config.as_os_str())];
+    for (args, env) in [
+        (&["--sort", "path", "red"][..], &fallback[..]),
+        (&["-f", "-", "--sort=path"], &fallback),
+        (&["red", "."], &with_config),
+    ] {
+        let output = run_with(args, env, Some(b"red\n"));
+        assert_eq!(output.status.code(), Some(7), "{args:?}: {output:?}");
+        assert_eq!(
+            output.stdout,
+            format!("fallback {}\n", args.join(" ")).as_bytes()
+        );
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+    let refused = run_with(&["--sort", "path", "red"], &[], None);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(refused.stdout.is_empty());
+    // Supported commands, and errors rg would also report, stay with ferret.
+    for (args, status) in [
+        (&["-l", "red", "one.rs"][..], 0),
+        (&["-t", "no-such-type", "red"], 2),
+    ] {
+        let output = run_with(args, &fallback, None);
+        assert_eq!(output.status.code(), Some(status), "{args:?}: {output:?}");
+        assert!(
+            !output.stdout.starts_with(b"fallback"),
+            "{args:?}: {output:?}"
+        );
+    }
+    let consumed = run_with(&["-f", "-", "red", "."], &with_config, Some(b"red\n"));
+    assert_eq!(consumed.status.code(), Some(2), "{consumed:?}");
+    assert!(consumed.stdout.is_empty(), "{consumed:?}");
+}
+
 #[test]
 fn glob_literals_and_class_braces_keep_their_argv_meaning() {
     let fixture = Fixture::new("glob-literals");
