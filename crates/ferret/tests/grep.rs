@@ -975,15 +975,31 @@ fn a_held_pipe_is_read_after_the_files() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     assert_eq!(status.code(), Some(0));
-    // A writer that opens after ferret does: the open meets ferret's, and
-    // closing it ends the stream.
+    // The held writer already has the bytes; it closes only once ferret has
+    // the pipe open, ending the stream. A writer that opens after ferret
+    // instead races any child another test forks meanwhile: the fork's copy
+    // of a read-write descriptor can meet that open, take the bytes, and
+    // drop them at exec, leaving ferret waiting for a writer forever.
+    (&writer).write_all(b"red\n").unwrap();
+    let mut child = spawn(&["-l", "red"]);
+    let fd = PathBuf::from(format!("/proc/{}/fd", child.id()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    // A match may let ferret close the pipe, and exit, between two looks.
+    while child.try_wait().unwrap().is_none()
+        && !fs::read_dir(&fd).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| fs::read_link(entry.path()).is_ok_and(|to| to == fifo))
+        })
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ferret never opened the pipe"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     drop(writer);
-    let producer = std::thread::spawn({
-        let fifo = fifo.clone();
-        move || fs::write(fifo, b"red\n").unwrap()
-    });
-    let output = spawn(&["-l", "red"]).wait_with_output().unwrap();
-    producer.join().unwrap();
+    let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         output.stdout,
