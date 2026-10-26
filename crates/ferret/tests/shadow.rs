@@ -452,7 +452,7 @@ fn report(bed: &Bed) -> Output {
 #[test]
 fn the_report_lists_each_mismatch_shape_once_with_its_kept_run() {
     let bed = Bed::new("report", false);
-    bed.write("a.txt", b"foo bar\nquux bar\n");
+    bed.write("a.txt", b"foo bar\nquux bar\n-foo bar\n-quux bar\n");
     let ferret = Path::new(FERRET);
     assert_eq!(report(&bed).status.code(), Some(2), "no log yet");
 
@@ -481,4 +481,32 @@ fn the_report_lists_each_mismatch_shape_once_with_its_kept_run() {
         2,
         "both kept runs: {text}"
     );
+
+    // A repeated argv keeps every run it left; attached values and operands
+    // after `--` that look like options are not part of the shape.
+    assert_eq!(
+        verdict(&bed, &wrong, &["-g", "*.txt", "foo", "."]),
+        "differ"
+    );
+    for args in [
+        ["-efoo", "."].as_slice(),
+        &["-equux", "."],
+        &["--", "-foo", "."],
+        &["--", "-quux", "."],
+    ] {
+        assert_eq!(verdict(&bed, &wrong, args), "differ", "{args:?}");
+    }
+    let out = report(&bed);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let group = |shape: &str| {
+        let start = text
+            .find(&format!("shape:  {shape}\n"))
+            .unwrap_or_else(|| panic!("no {shape:?} group: {text}"));
+        let rest = &text[start..];
+        rest[..rest.find("\n\n").unwrap_or(rest.len())].to_owned()
+    };
+    assert!(text.contains("3 x differ\n  shape:  -g X X X\n"), "{text}");
+    assert_eq!(group("-g X X X").matches("/mismatch/").count(), 3, "{text}");
+    assert!(text.contains("2 x differ\n  shape:  -eX X\n"), "{text}");
+    assert!(text.contains("2 x differ\n  shape:  -- X X\n"), "{text}");
 }

@@ -48,8 +48,8 @@ for dir in "$state"/mismatch/*/; do
 done
 
 LC_ALL=C awk -F '\t' -v since="$since" -v kept="$kept" '
-# rg options that take a value as the next argument; the value is not part
-# of the shape.
+# rg options that take a value, as the next argument or attached; the value
+# is not part of the shape.
 BEGIN {
     split("-e -f -g -m -t -T -A -B -C -E -M -j -r --regexp --file --glob " \
         "--iglob --type --type-not --type-add --type-clear --max-count " \
@@ -61,9 +61,10 @@ BEGIN {
         "--regex-size-limit --ignore-file --hostname-bin --hyperlink-format",
         names, " ")
     for (i in names) valued[names[i]] = 1
+    # Several kept runs can share one argv.
     while ((getline line < kept) > 0) {
         split(line, field, "\t")
-        keptdir[field[1]] = field[2]
+        keptdirs[field[1]] = keptdirs[field[1]] SUBSEP field[2]
     }
 }
 since != "" && substr($1, 1, 10) < since { next }
@@ -84,13 +85,26 @@ since != "" && substr($1, 1, 10) < since { next }
     n = split(argv, words, " ")
     shape = ""
     after = 0
+    operands = 0
     for (i = 1; i <= n; i++) {
         word = words[i]
         if (word == "") continue
         if (after) { word = "X"; after = 0 }
-        else if (word == "--") { }
+        else if (operands) word = "X"
+        else if (word == "--") operands = 1
         else if (word ~ /^--[^=]+=/) { sub(/=.*/, "=X", word) }
-        else if (word ~ /^-/) { if (word in valued) after = 1 }
+        else if (word ~ /^--/) { if (word in valued) after = 1 }
+        else if (word ~ /^-./) {
+            # A cluster of short flags: the first that takes a value takes
+            # the rest of the word, or the next word when nothing is left.
+            for (c = 2; c <= length(word); c++) {
+                if (("-" substr(word, c, 1)) in valued) {
+                    if (c < length(word)) word = substr(word, 1, c) "X"
+                    else after = 1
+                    break
+                }
+            }
+        }
         else word = "X"
         shape = shape (shape == "" ? "" : " ") word
     }
@@ -99,8 +113,12 @@ since != "" && substr($1, 1, 10) < since { next }
     seen[key]++
     newest[key] = "cd " $5 " && rg " $6
     when[key] = $1
-    if ($6 in keptdir && index(" " dirs[key] " ", " " keptdir[$6] " ") == 0)
-        dirs[key] = dirs[key] (dirs[key] == "" ? "" : " ") keptdir[$6]
+    if ($6 in keptdirs) {
+        k = split(substr(keptdirs[$6], 2), found, SUBSEP)
+        for (j = 1; j <= k; j++)
+            if (index(" " dirs[key] " ", " " found[j] " ") == 0)
+                dirs[key] = dirs[key] (dirs[key] == "" ? "" : " ") found[j]
+    }
 }
 END {
     if (calls == 0) {
