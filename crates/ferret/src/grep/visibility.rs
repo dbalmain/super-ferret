@@ -55,9 +55,11 @@ impl Visibility<'_> {
                 }
                 Visit::Descend
             }
+            // Each directory above the file passed `descend` when walked, so
+            // only the file itself is judged: depth 0 skips its ancestors.
             FileKind::File
                 if rg
-                    || (self.selection.allows(relative, entry.depth())
+                    || (self.selection.allows(relative, 0)
                         && !self.selection.hides_stripped(path, relative, entry.depth())) =>
             {
                 Visit::File
