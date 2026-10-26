@@ -2027,10 +2027,13 @@ took `find -I corpus -type f` at 32 threads from 636 ms to 55.
 | `-c -F -a the` | 32 | 595 | 181 | 171 |
 | `-l -F -a the` | 32 | 622 | 164 | 167 |
 
-Output matched rg's on every row. What remains: at one thread, mostly the
-changed-during-read check (D123); for `-F -a the`, which prints 2.35 GB, the
-single publisher thread, with workers handing large outputs over in 64 KB
-chunks through a one-slot channel.
+Output matched rg's on every row. What remains: for `-F -a the`, which
+prints 2.35 GB, the single publisher thread, with workers handing large
+outputs over in 64 KB chunks through a one-slot channel. At one thread most
+of the gap was the changed-during-read check, which uncovered scans dropped
+under D123 B (9010608): `-F -a xylophone` at one thread then took 833 ms
+against rg's 784 (1.06x), and 182 against 208 at 32 threads (hyperfine
+through bash, 2 warmups and 8 runs, output identical).
 
 ## S4 — Agent skill
 
