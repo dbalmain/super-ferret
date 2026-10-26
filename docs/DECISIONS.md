@@ -6927,3 +6927,41 @@ A re-walk of `~/w` costs at most a quarter of a second, and at most 74 MiB on
 the largest tree; throttled to one CPU at nice 19 it is still under 1.2 s. By
 the fact above the hourly walk is free here: **outcome A, keep 1 h.**
 Cold-cache cost is not measured.
+
+## D122 — When the index writer panics: exit, or contain it?
+
+**Question:** When the daemon's index writer panics, should the daemon keep
+exiting so the next client starts a fresh one (today, since 7fce850), or
+contain the panic and keep serving?
+
+Context, from a read of the code on 2026-10-26:
+
+- The writer mutex is held through `refresh` (walk, hash, commit, `select`),
+  `index_change`, `compact` and the content `attach`/`follow` paths, all in
+  `engine.rs`. A panic there lands in the writer thread's `catch_unwind`, or
+  is re-raised from a command thread, and the host drains and exits with
+  status 3. The 2026-10-25 "dead name" panic (fixed in 61411b0) is the one
+  seen in the field; before 7fce850 it left msa2's daemon serving a 10-hour
+  stale view.
+- What a user sees today: a client waiting on `index` or `roots remove` gets
+  exit 3, "writer failed; retry". Queries already running finish. The next
+  query answers in-process (tens of ms at `$HOME`, about 1 s at 10M) and
+  spawns a fresh daemon, whose startup backstop re-walks everything (0.1-1.2 s
+  for `~/w`, D121; minutes past the watch cap).
+- A deterministic panic re-fires in each new daemon's startup backstop: a
+  crash and respawn loop paced by queries, each paying an in-process load.
+- The "writer stopped" log line drops the panic message; the payload is
+  available (`panic_message`).
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep exit-on-panic; put the panic message in the "writer stopped" line | One restart per panic, as above; a deterministic panic loops. About 15 min. | Simplest: a fresh process reloads exactly what is on disk. The log names the cause. |
+| B. Contain: `catch_unwind` in each writer method, rebuild the writer session from disk, clear the poison, re-select from the recovered view, retry with backoff, exit after a cap | 1-2 days plus review; a recovery path that runs only on bugs and is hard to test; while retrying, answers come from a frozen catalog, the state 7fce850 removed | No restart or reload cost; a transient panic is invisible to clients |
+| C. A, plus a crash-loop guard: a daemon whose writer panics again soon after a respawn stops respawning; clients answer in-process and `status` reports the panic | About half a day | Bounds the deterministic loop; keeps A's simplicity |
+
+**Recommendation: A.** One panic has been seen, it was deterministic, and
+the restart cost on these machines is about a second.
+
+**Fact that would change it:** a crash loop actually observed, or a
+transient writer panic on a tree whose startup backstop takes minutes; then
+C, and B only if transient panics recur.
