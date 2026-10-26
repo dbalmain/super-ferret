@@ -168,11 +168,20 @@ naming a matching type wins, a positive `-g` that misses beats a matching
 type, and explicit file operands bypass types. An unknown name is a usage
 error, `unrecognized file type: NAME`, as in rg.
 
+**Sort (2026-10-26):** `--files` takes `--sort=modified` and
+`--sortr=modified`, the shape of the agents' Glob tool. Probed against rg:
+`--sort` and `--sortr` are one setting and the last wins; `none` clears it;
+every listed name, across operands, is in one order by the modification time
+of what it names. Equal times keep walk order in both directions; rg keeps
+its directory read order, which matched ferret's on a 305,607-name tree. An
+unknown key is a usage error. Other keys, and any sort in content search,
+refuse.
+
 All other flags **refuse**, never pass through or silently disappear:
 `--type-add/list/clear`; `-L` in an indexed tree without `-u` (supported for
 uncovered directories and `-u`); `-z` (compressed search);
 `--no-ignore-vcs/dot/files/global/parent/exclude/messages`; `--encoding`;
-`--sort`, `--sortr`; `--passthru`; `--vimgrep`; `--path-separator`;
+`--sort`, `--sortr` (except above); `--passthru`; `--vimgrep`; `--path-separator`;
 `--trim`; `--iglob`; `--max-columns-preview`; `--column`;
 `--engine`, `--auto-hybrid-regex`; `--field-match-separator`,
 `--field-context-separator`; `--max-filesize`; `--null-data`;

@@ -3,8 +3,11 @@
 //! Neither path prepares document identities, postings or content sections.
 
 use ferret_catalog::Catalog;
-use ferret_query::line_grep::Names;
+use ferret_query::line_grep::{Names, Sort};
+use std::cmp::Reverse;
 use std::io::IsTerminal;
+use std::time::SystemTime;
+use std::{panic, thread};
 
 use super::visibility::{Visibility, Visit};
 use super::*;
@@ -208,7 +211,10 @@ impl Listing<'_> {
                 errors = true;
             }
         }
-        let mut listed = false;
+        let mut listed = Listed {
+            any: false,
+            held: plan.sort.map(|_| Vec::new()),
+        };
         for input in inputs {
             if cancelled.load(Ordering::Acquire) {
                 break;
@@ -301,12 +307,25 @@ impl Listing<'_> {
                 return Ok(error);
             }
         }
+        if let (Some(held), Some(sort)) = (listed.held.take(), plan.sort) {
+            let mut held: Vec<_> = modified(cwd, &held).into_iter().zip(held).collect();
+            // Stable, so equal times keep walk order both ways.
+            match sort {
+                Sort::Oldest => held.sort_by_key(|&(time, _)| time),
+                Sort::Newest => held.sort_by_key(|&(time, _)| Reverse(time)),
+            }
+            for (_, path) in held {
+                if emit(plan, writer, cancelled, &path, false, &mut listed)? {
+                    return Ok(Exit::Ok);
+                }
+            }
+        }
         if let Some(exit) = flush_output(writer, cancelled)? {
             return Ok(exit);
         }
         Ok(if errors {
             Exit::Usage
-        } else if listed {
+        } else if listed.any {
             Exit::Ok
         } else {
             Exit::NoMatch
@@ -329,19 +348,64 @@ fn diagnostic(
     Ok(false)
 }
 
+/// Each path's modification time, following a named symlink; `None` sorts
+/// first. A large listing reads them on several threads: one thread spends
+/// about 1.5 µs a name.
+fn modified(cwd: &Path, paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
+    const PER_THREAD: usize = 8192;
+    let read = |paths: &[PathBuf]| -> Vec<_> {
+        paths
+            .iter()
+            .map(|path| fs::metadata(cwd.join(path)).and_then(|m| m.modified()).ok())
+            .collect()
+    };
+    let threads = thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8)
+        .min(paths.len().div_ceil(PER_THREAD));
+    if threads <= 1 {
+        return read(paths);
+    }
+    thread::scope(|scope| {
+        let workers: Vec<_> = paths
+            .chunks(paths.len().div_ceil(threads))
+            .map(|chunk| scope.spawn(move || read(chunk)))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
+/// What a listing has selected so far. Under `--sort` names are held, since
+/// rg sorts every name before it prints any.
+struct Listed {
+    any: bool,
+    held: Option<Vec<PathBuf>>,
+}
+
 fn emit(
     plan: &Names,
     writer: &mut impl Write,
     cancelled: &AtomicBool,
     path: &Path,
     flush_each: bool,
-    listed: &mut bool,
+    listed: &mut Listed,
 ) -> Result<bool, String> {
-    *listed = true;
+    listed.any = true;
     if plan.quiet {
         // The serial host returns immediately; this is normal completion,
         // not cancellation of the socket connection supplying the flag.
         return Ok(true);
+    }
+    if let Some(held) = &mut listed.held {
+        held.push(path.to_owned());
+        return Ok(false);
     }
     presentation::path(
         &plan.presentation,
@@ -432,6 +496,7 @@ mod tests {
                     quiet: false,
                     hidden: false,
                     traversal: Default::default(),
+                    sort: None,
                     presentation: line_grep::Presentation {
                         color,
                         null: color.enabled(),

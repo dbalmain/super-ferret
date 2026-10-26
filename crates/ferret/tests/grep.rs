@@ -825,6 +825,62 @@ fn read_denial_is_an_error_and_special_operands_are_streams() {
     }
 }
 
+// The agents' Glob tool lists with `--sort=modified`. Distinct times make
+// the order exact; equal times keep walk order, which rg does not promise.
+#[test]
+fn files_sort_by_modification_time_as_rg_does() {
+    let fixture = Fixture::new("sort-modified");
+    let mut names = Vec::new();
+    let mut directories = vec![fixture.tree()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if kind.is_file() {
+                names.push(entry.path());
+            }
+        }
+    }
+    names.sort();
+    for (age, name) in names.iter().enumerate() {
+        let time = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_000_000 * (age as u64 % 7) + age as u64);
+        fs::File::options()
+            .append(true)
+            .open(name)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+    for args in [
+        &["--files", "--sort=modified"][..],
+        &["--files", "--sortr", "modified", "--hidden"],
+        &[
+            "--files",
+            "--sort=path",
+            "--sortr=modified",
+            "sub",
+            "one.rs",
+            "two.txt",
+        ],
+        &[
+            "--files",
+            "--null",
+            "--glob",
+            "*",
+            "--sort=modified",
+            "--no-ignore",
+            "--hidden",
+            ".",
+        ],
+    ] {
+        let result = fixture.compare_raw(args, None);
+        assert_eq!(result.status.code(), Some(0), "{args:?}: {result:?}");
+    }
+}
+
 // The selection is an argument error, so it is reported before routing looks
 // for an index, in both modes.
 #[test]

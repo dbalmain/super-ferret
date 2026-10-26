@@ -44,6 +44,16 @@ pub struct Names {
     pub hidden: bool,
     pub presentation: Presentation,
     pub traversal: Traversal,
+    pub sort: Option<Sort>,
+}
+
+/// rg's `--sort=modified` and `--sortr=modified`, for names only: every
+/// listed name in one order by modification time. Equal times keep walk
+/// order, which differs from rg's directory read order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sort {
+    Oldest,
+    Newest,
 }
 
 /// Namespace freshness and depth, shared by content and names-only modes.
@@ -284,6 +294,8 @@ pub fn parse_with(
     let mut include_zero = false;
     let mut max_count = None;
     let mut max_columns = None;
+    // The spelling of a sort ferret lacks is kept for its refusal.
+    let mut sort: Option<Result<Sort, String>> = None;
     let (mut before, mut after, mut around) = (None, None, 0);
     let mut presentation = Presentation::default();
     let mut output = Output::Lines;
@@ -410,7 +422,7 @@ pub fn parse_with(
                 "--scan" | "--scan-uncovered" if value.is_none() => {}
                 "--glob" | "--type" | "--type-not" | "--color" | "--regexp" | "--max-count"
                 | "--before-context" | "--after-context" | "--context" | "--max-depth"
-                | "--max-columns" => {
+                | "--max-columns" | "--sort" | "--sortr" => {
                     let value = value
                         .map(str::to_owned)
                         .or_else(|| args.next().and_then(|s| s.to_str()).map(str::to_owned))
@@ -438,6 +450,17 @@ pub fn parse_with(
                             include: flag == "--type",
                         }),
                         "--regexp" => sources.push(PatternSource::Argument(value)),
+                        "--sort" | "--sortr" => {
+                            sort = match value.as_str() {
+                                "none" => None,
+                                "modified" if flag == "--sort" => Some(Ok(Sort::Oldest)),
+                                "modified" => Some(Ok(Sort::Newest)),
+                                "path" | "accessed" | "created" => {
+                                    Some(Err(format!("{flag}={value}")))
+                                }
+                                _ => return Err(ParseError::Choice(flag.to_owned(), value)),
+                            }
+                        }
                         _ => {
                             presentation.color = match value.as_str() {
                                 "auto" => Color::Auto,
@@ -581,6 +604,19 @@ pub fn parse_with(
     if version {
         return Ok(Command::Version);
     }
+    let sort = match sort {
+        Some(Ok(sort)) if files => Some(sort),
+        Some(Ok(sort)) => {
+            let flag = if sort == Sort::Oldest {
+                "--sort"
+            } else {
+                "--sortr"
+            };
+            return Err(unsupported(&format!("{flag}=modified without --files")));
+        }
+        Some(Err(spelling)) => return Err(unsupported(&spelling)),
+        None => None,
+    };
     if json && (files || output != Output::Lines) {
         return Err(ParseError::JsonMode);
     }
@@ -596,6 +632,7 @@ pub fn parse_with(
             hidden,
             presentation,
             traversal,
+            sort,
         }));
     }
     // rg's notice counts source matches, which expansion does not keep. Only
@@ -1639,6 +1676,53 @@ mod tests {
             error.to_string(),
             "error parsing flag --color: choice 'bogus' is unrecognized"
         );
+    }
+
+    #[test]
+    fn only_a_names_listing_sorts_by_modification_time() {
+        let names = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(Into::into).collect();
+            match parse(&args) {
+                Ok(Command::Files(names)) => Ok(names.sort),
+                Ok(_) => panic!("{args:?} is not a listing"),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        assert_eq!(
+            names(&["--files", "--sort=modified"]),
+            Ok(Some(Sort::Oldest))
+        );
+        assert_eq!(
+            names(&["--files", "--sortr", "modified"]),
+            Ok(Some(Sort::Newest))
+        );
+        // One setting, the last given; `none` clears it.
+        assert_eq!(
+            names(&["--files", "--sortr=modified", "--sort=modified"]),
+            Ok(Some(Sort::Oldest))
+        );
+        assert_eq!(
+            names(&["--files", "--sort=modified", "--sort=none"]),
+            Ok(None)
+        );
+        let refused = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(Into::into).collect();
+            parse(&args).unwrap_err()
+        };
+        for args in [
+            &["--files", "--sort=path"][..],
+            &["--files", "--sort=modified", "--sortr=created"],
+            &["--sort=modified", "red"],
+        ] {
+            assert!(
+                matches!(refused(args), ParseError::Unsupported(_)),
+                "{args:?}"
+            );
+        }
+        assert!(matches!(
+            refused(&["--files", "--sort=size"]),
+            ParseError::Choice(..)
+        ));
     }
 
     fn admits(query: &Trigrams, original: &[u8]) -> bool {
