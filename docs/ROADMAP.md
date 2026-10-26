@@ -2044,6 +2044,26 @@ measures only the handoff to the publisher, which a reader that consumes
 the bytes hides; widening the chunk channel or writing from workers would
 trade the memory bound for a case nobody reads. Left as is.
 
+**In-process setup on a large index (2026-10-26):** on the 112,376-document
+flat corpus (20 segments, 551 MB of index), `grep -q -F the` without the
+daemon took 70 ms and 76 MiB against rg's 2 ms and 6 MiB (hyperfine `-N`,
+10 runs, one thread); `grep -q` for an absent literal peaked at 86 MiB to
+rg's 21. The whole gap is opening the index, and it grows with the term
+dictionary, not with the query. Callgrind on the `-q -F the` run (674M
+instructions):
+
+- 51% is BLAKE3 over each segment's Index, Sums and FingerprintIndex
+  sections, which `Segment::open` reads and verifies whole;
+- `parse_index` decodes every dictionary block into heap: 36 MiB of `Block`
+  entries and 10.6 MiB of first terms, 47 of the 71 MiB heap peak (massif);
+- the catalog's `ResidentNames` build is 31%, half of it a sort.
+
+On the live 48k-name `~/w` index the same commands peak at 4-11 MiB, and
+through the daemon (D111) the client opens no segment, only the catalog
+to route (6.5 MiB peak). D65's static dictionary replaces the parsed block
+index with a resident FST (17 MB for 10.3M terms); verifying the index
+sections at open is a separate choice, left as is.
+
 ## S4 — Agent skill
 
 A Claude Code skill that routes AI agents' file and content search through
