@@ -543,13 +543,18 @@ impl Refusal {
 /// `rg` sets it), that rg runs the same argv in this process instead. Every
 /// such refusal comes before any output, so the caller sees only rg's
 /// answer; the exception is a command whose `-f` already consumed a source
-/// rg could not read again. rg has no `--rg`, so a leading one, where the
-/// stand-in puts it, is dropped.
+/// rg could not read again. rg has no `--rg`, so each argument the parser
+/// takes as that flag is dropped.
 fn unsupported(args: &[OsString], message: &str, consumed: bool) -> Exit {
     if let Some(rg) = std::env::var_os("FERRET_GREP_FALLBACK").filter(|rg| !rg.is_empty())
         && !consumed
     {
-        let args = args.strip_prefix(&[OsString::from("--rg")]).unwrap_or(args);
+        let own = line_grep::own_flags(args);
+        let args = args
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !own.contains(at))
+            .map(|(_, arg)| arg);
         let error = std::process::Command::new(&rg).args(args).exec();
         return failure(&format!(
             "{message}; running {}: {error}",

@@ -280,6 +280,42 @@ pub fn parse_with(
     args: &[OsString],
     read: &mut dyn FnMut(&Path) -> io::Result<Vec<u8>>,
 ) -> Result<Command, ParseError> {
+    parse_marked(args, read, &mut Marks::default())
+}
+
+/// The argv positions a parse takes as ferret's own `--rg` flag, which rg
+/// rejects: a host handing a refused command to rg drops exactly these. A
+/// refusal stops the parse at the refused argument, so the scan resumes past
+/// it, taking it as a flag without a value; rg alone knows whether an
+/// unknown flag takes one, so a `--rg` right after one is dropped as a flag.
+pub fn own_flags(args: &[OsString]) -> Vec<usize> {
+    let mut flags = Vec::new();
+    let mut start = 0;
+    loop {
+        let mut marks = Marks::default();
+        let result = parse_marked(&args[start..], &mut |_| Ok(Vec::new()), &mut marks);
+        flags.extend(marks.rg.iter().map(|at| start + at));
+        match (result, marks.at) {
+            (Err(ParseError::Unsupported(_)), Some(at)) => start += at + 1,
+            _ => return flags,
+        }
+    }
+}
+
+/// What a parse saw of argv positions: where it took `--rg`, and the
+/// argument it was reading, until the last one is done.
+#[derive(Default)]
+struct Marks {
+    rg: Vec<usize>,
+    at: Option<usize>,
+}
+
+fn parse_marked(
+    args: &[OsString],
+    read: &mut dyn FnMut(&Path) -> io::Result<Vec<u8>>,
+    marks: &mut Marks,
+) -> Result<Command, ParseError> {
+    let total = args.len();
     let mut positionals = Vec::new();
     let mut sources = Vec::new();
     let mut filters = Vec::new();
@@ -307,6 +343,7 @@ pub fn parse_with(
     let (mut help, mut version) = (false, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
+        marks.at = Some(total - args.len() - 1);
         let bytes = arg.as_bytes();
         if !done && bytes == b"--" {
             done = true;
@@ -365,7 +402,10 @@ pub fn parse_with(
                 "--json" if value.is_none() => json = true,
                 "--no-json" if value.is_none() => json = false,
                 "--live" if value.is_none() => traversal.live = true,
-                "--rg" if value.is_none() => traversal.rg = true,
+                "--rg" if value.is_none() => {
+                    traversal.rg = true;
+                    marks.rg.extend(marks.at);
+                }
                 "--follow" if value.is_none() => traversal.follow = true,
                 "--no-follow" if value.is_none() => traversal.follow = false,
                 "--no-ignore" if value.is_none() => traversal.unrestricted = true,
@@ -604,6 +644,7 @@ pub fn parse_with(
             positionals.push(arg.clone());
         }
     }
+    marks.at = None;
     if help {
         return Ok(Command::Help);
     }
@@ -1312,6 +1353,33 @@ fn scan_records(
 mod tests {
     use super::*;
     use ferret_verify::Trigrams;
+
+    // A refused command reaches rg without the arguments the parser took as
+    // `--rg`, and with every `--rg` it took as something else: a value, a
+    // positional after `--`, or the unsupported `--rg=x`. A refusal mid-argv
+    // does not hide a later flag.
+    #[test]
+    fn own_flags_are_the_rg_flags_the_parser_took() {
+        let own = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            own_flags(&args)
+        };
+        assert_eq!(own(&["--rg", "--sort", "path", "red"]), [0]);
+        assert_eq!(own(&["-n", "--rg", "--sort", "path", "hit"]), [1]);
+        assert_eq!(own(&["--rg", "red", "--rg"]), [0, 2]);
+        for args in [
+            &["-e", "--rg", "red"][..],
+            &["--regexp", "--rg"],
+            &["-g", "--rg", "red"],
+            &["red", "--", "--rg"],
+            &["--rg=x", "red"],
+        ] {
+            assert_eq!(own(args), [0usize; 0], "{args:?}");
+        }
+        assert_eq!(own(&["--pcre2", "--rg", "red"]), [1]);
+        assert_eq!(own(&["--pcre2", "red", "--rg", "-uuu", "--rg"]), [2, 4]);
+        assert_eq!(own(&["--pcre2", "-e", "--rg", "red"]), [0usize; 0]);
+    }
 
     // D128: hidden names show unless `--rg`; an explicit switch wins in
     // either mode, in argv order.
