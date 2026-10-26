@@ -7130,3 +7130,29 @@ answer.
 own, where `.ignore` files are common (B).
 
 > Dave: B (2026-10-27). "This tool isn't just for me."
+
+## D127 — A hidden file revealed by a `!` rule, in indexed answers
+
+**Question:** How should indexed grep learn that an ignore file's `!` line
+reveals a hidden name, as it does for rg and for ferret's live walk?
+
+Context (2026-10-27): rg lists a hidden file or directory when the last
+matching ignore rule whitelists it (`!.env.example`, `!/.claude/skills/`).
+The live walk asks `DirRules` and agrees. The indexed path has no rules at
+query time and the catalog keeps no flag, so it hides them. Under `~/w`, 7 of
+54,932 files rg lists are revealed this way: four under `.claude/`, three
+`.env.example`. Agents do Glob for `.claude/` skill files. The failing test
+is parked on the D126 branch work (an rg differential, `-l` and `--files`).
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. The crawler records a revealed-name set in the catalog | A catalog section kept through incremental refreshes, and a rebuild; the crawl asks the rules once per hidden name | Exact answers with no query cost; the set is tiny (7 entries here) |
+| B. At query time, load the rules for each hidden candidate's directory | Reads ignore files on queries; every hidden name in scope pays, about 2-4 ms answers grow | No format change |
+| C. Document it; the shadow labels it `known:policy` | Agents miss whitelisted dotfiles, `.claude/skills/` included | Nothing to build |
+
+**Recommendation: A.** The crawler already decides each name with the
+rules in hand, so asking whether a hidden name's deciding rule was a `!`
+line costs one list lookup per hidden name at crawl time.
+
+**Fact that would change it:** D65's catalog rework landing soon, which
+would make A's format change cheaper to fold in there (A after D65).
