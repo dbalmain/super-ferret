@@ -608,6 +608,8 @@ fn serve(
         {
             if deferred.is_some() {
                 watch.defer(burst);
+                // Its retry is still that poll, for the refresh log.
+                poll_issued |= polled;
             } else {
                 watch.finish(burst, result.is_ok() && !retry_current);
             }
