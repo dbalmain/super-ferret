@@ -215,14 +215,30 @@ renice -n 19 $$ > /dev/null 2>&1
 ionice -c 3 -p $$ > /dev/null 2>&1
 
 # One comparison at a time, queued: an agent's searches come in bursts, and
-# skipping while one ran lost a quarter of them. The lock is this shell's
-# alone: every command below runs with descriptor 9 closed, so no child, and
-# no daemon a child starts, can keep it.
+# skipping while one ran lost 71 of one session's 156 calls. At most eight
+# calls wait, each holding a queue slot, so a burst cannot pile up waiting
+# shells. The lock is this shell's alone: every command below runs with
+# descriptor 9 closed, so no child, and no daemon a child starts, can keep
+# it; the slot is released once the lock is held.
+queued=
+for slot in 0 1 2 3 4 5 6 7; do
+    exec 8> "$state/queue.$slot" || exit 0
+    if flock -n 8; then
+        queued=1
+        break
+    fi
+    exec 8>&-
+done
+if [[ -z $queued ]]; then
+    log skipped:busy - -
+    exit 0
+fi
 exec 9> "$state/lock" || exit 0
 if ! flock -w 30 9; then
     log skipped:busy - -
     exit 0
 fi
+exec 8>&-
 
 # rg opens by name the ignore files it finds, and git's, in and above each
 # root, by rules for symlinks that differ from its walk's. Anything there that

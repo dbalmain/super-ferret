@@ -8,40 +8,18 @@ use std::io::IsTerminal;
 
 use super::*;
 
-pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bool) -> Exit {
-    let inputs = resolve_inputs(&plan.paths, true);
-    let routing = if inputs
-        .iter()
-        .any(|input| matches!(input, Input::Directory(_)))
-        && !plan.traversal.unrestricted
-        && !plan.traversal.live
-    {
-        match live::Anchors::routing(index, &inputs) {
-            Ok(anchors) => Some(anchors),
-            Err(error) => return failure(&error),
-        }
-    } else {
-        None
+pub(super) fn run(
+    plan: &Names,
+    index: Option<&Path>,
+    args: &[OsString],
+    tty: bool,
+    consumed: bool,
+) -> Exit {
+    let routed = match routing::route(resolve_inputs(&plan.paths, true), plan.traversal, index) {
+        Ok(routed) => routed,
+        Err(refusal) => return refusal.exit(args, consumed),
     };
-    if inputs
-        .iter()
-        .any(|input| matches!(input, Input::Directory(_)))
-        && plan.traversal.follow
-        && !plan.traversal.unrestricted
-        && routing
-            .as_ref()
-            .is_none_or(|anchors| anchors.any_covered(&inputs))
-    {
-        return failure(
-            "-L is supported for uncovered directories and -u; use -u to follow links in an indexed tree",
-        );
-    }
-    if routing.as_ref().is_none_or(live::Anchors::all_covered)
-        && !plan.traversal.unrestricted
-        && !plan.traversal.live
-        && !test_injections()
-        && daemon_operands(&inputs)
-    {
+    if routed.daemon {
         if let Err(error) = selection(plan) {
             return failure(&error);
         }
@@ -58,7 +36,7 @@ pub(super) fn run(plan: &Names, index: Option<&Path>, args: &[OsString], tty: bo
         // As in `block_stdout`: live policy warnings bypass the writer.
         !plan.presentation.null && !plan.traversal.live,
     );
-    match execute_routed(plan, index, routing, &mut writer, &cancelled) {
+    match execute_routed(plan, index, routed, &mut writer, &cancelled) {
         Ok(exit) => exit,
         Err(error) => failure(&error),
     }
@@ -89,48 +67,26 @@ fn execute(
     writer: &mut impl Write,
     cancelled: &AtomicBool,
 ) -> Result<Exit, String> {
-    let routing = if !plan.traversal.unrestricted && !plan.traversal.live {
-        Some(live::Anchors::routing(
-            index,
-            &resolve_inputs(&plan.paths, true),
-        )?)
-    } else {
-        None
-    };
-    execute_routed(plan, index, routing, writer, cancelled)
+    let routed = routing::route(resolve_inputs(&plan.paths, true), plan.traversal, index)
+        .map_err(Refusal::into_message)?;
+    execute_routed(plan, index, routed, writer, cancelled)
 }
 
 fn execute_routed(
     plan: &Names,
     index: Option<&Path>,
-    routing: Option<live::Anchors>,
+    routed: routing::Routed,
     writer: &mut impl Write,
     cancelled: &AtomicBool,
 ) -> Result<Exit, String> {
     let selection = selection(plan)?;
-    let inputs = resolve_inputs(&plan.paths, true);
-    let catalog = inputs
-        .iter()
-        .any(|input| {
-            matches!(input, Input::Directory(_))
-                && !plan.traversal.unrestricted
-                && !plan.traversal.live
-                && routing
-                    .as_ref()
-                    .is_none_or(|anchors| anchors.any_covered(&inputs))
-        })
-        .then(|| open_catalog(index))
-        .transpose()?;
-    let live = if inputs
-        .iter()
-        .any(|input| matches!(input, Input::Directory(_)))
-        && plan.traversal.live
-        && !plan.traversal.unrestricted
-    {
-        Some(live::Anchors::open(index)?)
-    } else {
-        routing
-    };
+    let routing::Routed {
+        inputs,
+        live,
+        catalog,
+        ..
+    } = routed;
+    let catalog = catalog.then(|| open_catalog(index)).transpose()?;
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let stderr = |message: &str| {
         cli::error(message);
@@ -259,15 +215,8 @@ impl Listing<'_> {
                         return Ok(Exit::Ok);
                     }
                 }
-                Input::Stdin => {
-                    if emit(
-                        plan,
-                        writer,
-                        cancelled,
-                        Path::new("-"),
-                        flush_each,
-                        &mut listed,
-                    )? {
+                Input::Stream(path) => {
+                    if emit(plan, writer, cancelled, &path, flush_each, &mut listed)? {
                         return Ok(Exit::Ok);
                     }
                 }

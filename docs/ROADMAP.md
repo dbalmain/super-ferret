@@ -2058,10 +2058,14 @@ newest call and its kept runs, exiting 1 while anything needs a look.
 
 Step 2 is built behind a switch (2026-10-26) and stays off until the log is
 judged clean. With `FERRET_ANSWER=ferret` the stand-in execs `ferret grep`
-with `FERRET_GREP_FALLBACK` naming the real rg, so any command ferret
+with `FERRET_GREP_FALLBACK` naming the real rg, so a command ferret
 refuses as unsupported (Glob's `--sort=modified`, `--type-add`, a set
-`RIPGREP_CONFIG_PATH`) is answered by rg in the same process, before any
-output; one call in ten is still shadowed. A terminal caller always gets
+`RIPGREP_CONFIG_PATH`, `-L` in an indexed tree, coloured `-U -M`) is
+answered by rg in the same process, decided before any output or operand
+read; one call in ten is still shadowed. Two refusals stay with ferret: an
+error rg would also report (a bad glob, type or `--color` choice), and a
+command whose `-f` already drained a source rg cannot read again (stdin,
+a pipe, a device). A terminal caller always gets
 rg. The first generated traffic (156 calls, a `claude -p` session doing
 code search across `~/w`) found `-t`/`-T`, the Grep tool's `type`
 parameter, rejected on every typed call; both are now supported (GREP.md

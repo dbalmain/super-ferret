@@ -407,8 +407,8 @@ crawl reads already reject unlink/replacement through their ctime bracket.
 The attempt publishes only that attempt’s buffered output;
 it does not reread an unchanged file. This is per-file consistency, not an atomic
 tree snapshot. Stdin and other non-regular streams cannot be version-checked:
-their output describes the bytes received. Explicit special-file operands still
-refuse under the operand rule below.
+their output describes the bytes received. Explicit special-file operands are
+such streams (2026-10-26, below).
 
 **Uncovered scans read once (D123, 2026-10-26):** files walked under a
 directory operand no index root covers are read as rg reads them: opened
@@ -437,7 +437,10 @@ Explicit files bypass posting absence and ignore/glob filters, including new,
 ignored and outside-root files. Follow file symlinks; dangling links error.
 Ignored directory starts and indexed opaque directories reuse find's live
 fallback without nested ignores. Other outside-root/new directory starts fail
-with index/live advice. Content searches of special-file operands exit 2.
+with index/live advice. **Special files (2026-10-26):** a content search
+reads an explicit special-file operand (a FIFO, `/dev/null`, a process
+substitution) once, front to back, as it reads stdin, as rg does; it used to
+exit 2. `xargs rg PATTERN /dev/null` is the idiom this serves.
 **M3 clarification (2026-10-17):** `--files` lists an explicit special-file
 operand without opening it; walked specials and symlinks are skipped. Explicit
 directory symlinks follow their start only, using find's trailing-slash source

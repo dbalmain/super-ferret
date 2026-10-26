@@ -5,6 +5,8 @@
 use ferret_policy::GrepSelection;
 use ferret_query::line_grep::{Filter, Output, Plan};
 
+use super::Refusal;
+
 /// A resolved plan's outcome before any input is opened.
 #[derive(Debug)]
 pub(super) enum Prepared {
@@ -14,9 +16,9 @@ pub(super) enum Prepared {
 }
 
 /// Refuses unsupported resolved combinations, then builds the path selection.
-/// The error is the diagnostic without its `grep: ` prefix, which each host
+/// The message is the diagnostic without its `grep: ` prefix, which each host
 /// adds.
-pub(super) fn prepare(plan: &Plan) -> Result<Prepared, String> {
+pub(super) fn prepare(plan: &Plan) -> Result<Prepared, Refusal> {
     // In colour rg's notice counts a multiline group's matches, which the
     // rendered lines do not keep.
     if plan.max_columns.is_some()
@@ -26,9 +28,11 @@ pub(super) fn prepare(plan: &Plan) -> Result<Prepared, String> {
         && plan.presentation.color.enabled()
         && !plan.json
     {
-        return Err("-M with -U in colour is not supported; use rg for this command".into());
+        return Err(Refusal::Unsupported(
+            "-M with -U in colour is not supported; use rg for this command".into(),
+        ));
     }
-    let selection = selection(plan.hidden, &plan.filters)?;
+    let selection = selection(plan.hidden, &plan.filters).map_err(Refusal::Failed)?;
     if plan.max_count == Some(0) {
         return Ok(Prepared::NoMatch);
     }
@@ -88,7 +92,7 @@ mod tests {
                 panic!("{args:?} is not a search");
             };
             plan.presentation.color = *color;
-            let actual = match prepare(&plan) {
+            let actual = match prepare(&plan).map_err(Refusal::into_message) {
                 Ok(Prepared::Search(_)) => "search".to_owned(),
                 Ok(Prepared::NoMatch) => "no match".to_owned(),
                 Err(error) if error.starts_with("glob \"[\": ") => "glob".to_owned(),

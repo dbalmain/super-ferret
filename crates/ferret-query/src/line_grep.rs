@@ -170,6 +170,11 @@ pub enum ParseError {
     Depth(String),
     Columns(String),
     Utf8(&'static str),
+    /// A flag's value names no choice rg offers: an error, not a missing
+    /// feature, so the host never hands it to rg.
+    Choice(String, String),
+    /// Either a flag rg has and ferret lacks, or one neither has; the host
+    /// may hand both to rg, which diagnoses the second.
     Unsupported(String),
     Pattern(ferret_verify::GrepError),
     PatternFile(PathBuf, io::Error),
@@ -199,6 +204,12 @@ impl std::fmt::Display for ParseError {
                 "invalid context size {value:?}; expected a nonnegative integer"
             ),
             Self::Utf8(argument) => write!(f, "{argument} must be UTF-8"),
+            Self::Choice(flag, value) => {
+                write!(
+                    f,
+                    "error parsing flag {flag}: choice '{value}' is unrecognized"
+                )
+            }
             Self::Unsupported(flag) => {
                 write!(f, "{flag} is not supported; use rg for this command")
             }
@@ -433,7 +444,7 @@ pub fn parse_with(
                                 "never" => Color::Never,
                                 "always" => Color::Always,
                                 "ansi" => Color::Ansi,
-                                _ => return Err(unsupported(text)),
+                                _ => return Err(ParseError::Choice(flag.to_owned(), value)),
                             }
                         }
                     }
@@ -1617,6 +1628,17 @@ mod tests {
             assert!(matches!(parse(&[flag.into(), "red".into()]),
                 Err(ParseError::Unsupported(value)) if value == flag));
         }
+    }
+
+    #[test]
+    fn an_unknown_colour_choice_is_an_error_not_a_missing_feature() {
+        let error = parse(&["--color=bogus".into(), "red".into()]).unwrap_err();
+        assert!(matches!(&error, ParseError::Choice(flag, value)
+            if flag == "--color" && value == "bogus"));
+        assert_eq!(
+            error.to_string(),
+            "error parsing flag --color: choice 'bogus' is unrecognized"
+        );
     }
 
     fn admits(query: &Trigrams, original: &[u8]) -> bool {

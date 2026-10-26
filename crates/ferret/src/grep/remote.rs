@@ -170,7 +170,7 @@ pub(crate) fn serve(
     let selection = match super::preflight::prepare(&plan) {
         Ok(super::preflight::Prepared::Search(selection)) => selection,
         Ok(super::preflight::Prepared::NoMatch) => return Ok(Exit::NoMatch),
-        Err(error) => return Ok(runtime.failure(&error)),
+        Err(refusal) => return Ok(runtime.failure(&refusal.into_message())),
     };
     let paths = if plan.paths.is_empty() {
         vec![PathBuf::from(".")]
@@ -180,7 +180,7 @@ pub(crate) fn serve(
     let inputs = resolve_inputs_at(&paths, false, &cwd);
     if plan.traversal.live
         || plan.traversal.unrestricted
-        || inputs.iter().any(|input| matches!(input, Input::Stdin))
+        || inputs.iter().any(|input| matches!(input, Input::Stream(_)))
     {
         return Ok(runtime.failure("socket grep requires indexed directory operands without stdin"));
     }

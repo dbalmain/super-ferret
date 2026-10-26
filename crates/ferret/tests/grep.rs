@@ -721,6 +721,9 @@ fn unsupported_commands_fall_back_to_the_named_rg() {
         (&["--sort", "path", "red"][..], &fallback[..]),
         (&["-f", "-", "--sort=path"], &fallback),
         (&["red", "."], &with_config),
+        (&["-U", "-M3", "--color=always", "red", "one.rs"], &fallback),
+        (&["-L", "red", "."], &fallback),
+        (&["--files", "-L", "."], &fallback),
     ] {
         let output = run_with(args, env, Some(b"red\n"));
         assert_eq!(output.status.code(), Some(7), "{args:?}: {output:?}");
@@ -737,6 +740,10 @@ fn unsupported_commands_fall_back_to_the_named_rg() {
     for (args, status) in [
         (&["-l", "red", "one.rs"][..], 0),
         (&["-t", "no-such-type", "red"], 2),
+        (&["--color=bogus", "red"], 2),
+        // rg reads a special file as a stream, and so does ferret.
+        (&["red", "/dev/null"], 1),
+        (&["-c", "red", "one.rs", "/dev/null"], 0),
     ] {
         let output = run_with(args, &fallback, None);
         assert_eq!(output.status.code(), Some(status), "{args:?}: {output:?}");
@@ -745,9 +752,29 @@ fn unsupported_commands_fall_back_to_the_named_rg() {
             "{args:?}: {output:?}"
         );
     }
-    let consumed = run_with(&["-f", "-", "red", "."], &with_config, Some(b"red\n"));
-    assert_eq!(consumed.status.code(), Some(2), "{consumed:?}");
-    assert!(consumed.stdout.is_empty(), "{consumed:?}");
+    // Routing decides the refusal before it loads git's global excludes,
+    // whose warnings would otherwise precede rg's answer. The second run is
+    // the control: the bad line does warn once a walk needs it.
+    fs::create_dir_all(fixture.base.join("home/config/git")).unwrap();
+    fs::write(fixture.base.join("home/config/git/ignore"), b"bad\\\n").unwrap();
+    fs::create_dir_all(fixture.base.join("outside")).unwrap();
+    fs::write(fixture.base.join("outside/x.txt"), b"red\n").unwrap();
+    let mixed = run_with(&["-L", "red", ".", "../outside"], &fallback, None);
+    assert_eq!(mixed.status.code(), Some(7), "{mixed:?}");
+    assert!(mixed.stderr.is_empty(), "{mixed:?}");
+    let walked = run_with(&["red", "../outside"], &fallback, None);
+    assert_eq!(walked.stdout, b"../outside/x.txt:red\n", "{walked:?}");
+    assert!(
+        String::from_utf8_lossy(&walked.stderr).contains("warning: ignore pattern skipped:"),
+        "{walked:?}"
+    );
+    // A pattern source rg could not read again keeps the refusal, whatever
+    // its spelling.
+    for source in ["-", "/dev/stdin"] {
+        let consumed = run_with(&["-f", source, "red", "."], &with_config, Some(b"red\n"));
+        assert_eq!(consumed.status.code(), Some(2), "{source}: {consumed:?}");
+        assert!(consumed.stdout.is_empty(), "{source}: {consumed:?}");
+    }
 }
 
 #[test]
@@ -779,16 +806,23 @@ fn glob_literals_and_class_braces_keep_their_argv_meaning() {
 }
 
 #[test]
-fn read_denial_is_an_error_and_special_operands_are_refused() {
+fn read_denial_is_an_error_and_special_operands_are_streams() {
     let fixture = Fixture::new("read-denial");
     let path = fixture.tree().join("one.rs");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
     let result = fixture.compare(&["red", "one.rs"], None);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(result.status.code(), Some(2));
-    let result = fixture.ferret(&["grep", "red", "/dev/null"], None);
-    assert_eq!(result.status.code(), Some(2));
-    assert!(result.stdout.is_empty() && !result.stderr.is_empty());
+    // `xargs rg PATTERN /dev/null`: the device is read, as rg reads it.
+    for (args, status) in [
+        (&["red", "/dev/null"][..], 1),
+        (&["red", "one.rs", "/dev/null"], 0),
+        (&["-c", "red", "/dev/null", "one.rs"], 0),
+    ] {
+        let result = fixture.compare(args, None);
+        assert_eq!(result.status.code(), Some(status), "{args:?}: {result:?}");
+        assert!(result.stderr.is_empty(), "{args:?}: {result:?}");
+    }
 }
 
 // D99: only a run with no path operand, which searches the current

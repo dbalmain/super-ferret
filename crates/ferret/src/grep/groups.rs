@@ -1314,7 +1314,7 @@ pub(super) fn walk<W: Write>(
                         }
                     }
                     // The parent splits operands at stdin barriers.
-                    Input::Stdin => false,
+                    Input::Stream(_) => false,
                 };
                 if !go {
                     break;
@@ -1810,7 +1810,7 @@ impl<'a> Source<'a> {
                     self.descend = true;
                 }
                 // The parent splits operands at stdin barriers before scheduling.
-                Input::Stdin => return None,
+                Input::Stream(_) => return None,
             }
         }
     }

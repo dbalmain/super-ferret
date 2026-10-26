@@ -126,18 +126,24 @@ impl Anchors {
             }
         }
         anchors.uncovered = uncovered.into();
-        if !anchors.uncovered.is_empty() {
-            anchors.global = git_global_excludes()
+        Ok(anchors)
+    }
+    /// Loads git's global excludes for the uncovered operands. Kept apart
+    /// from [`Self::routing`] because its warnings are output: a request
+    /// refused after routing must not have printed them.
+    pub fn with_git_global(mut self) -> Self {
+        if !self.uncovered.is_empty() {
+            self.global = git_global_excludes()
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default()
                 .into();
-            let (rules, errors) = ferret_policy::GrepIgnore::new(&anchors.global);
+            let (rules, errors) = ferret_policy::GrepIgnore::new(&self.global);
             for error in errors {
                 eprintln!("ferret: warning: ignore pattern skipped: {error}");
             }
-            anchors.git_global = Arc::new(rules);
+            self.git_global = Arc::new(rules);
         }
-        Ok(anchors)
+        self
     }
     pub fn walks(&self, path: &Path) -> bool {
         !self.fallback || self.uncovered.iter().any(|operand| operand == path)

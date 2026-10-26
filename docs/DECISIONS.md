@@ -7022,7 +7022,7 @@ were retried once, then reported as changed with their matches dropped.
 The outcome stands. Built in 9010608; `-L` walks were missed there and are
 covered in the follow-up.
 
-## D124 — Committed `vendor/` trees: rg searches them, ferret never does
+## D124 — Committed `vendor/` trees: rg searches them, ferret's walks skip them
 
 **Question:** When a repository commits a directory that ferret's seeded
 global ignore excludes (`vendor/`, `build/`, `dist/`, …), should
@@ -7030,25 +7030,26 @@ global ignore excludes (`vendor/`, `build/`, `dist/`, …), should
 
 Context, from the S4 shadow log on 2026-10-26 (msa2):
 
-- All three `differ` verdicts so far are one case: a private app repository commits
-  `vendor/` (5,393 files, 59 MB), which `~/.config/ferret/ignore` excludes.
-  rg searches it from the repo root; ferret treats it as absent. Starting
-  the search at `vendor/` itself works in both, because an explicit start
-  bypasses ignore rules.
+- All three `differ` verdicts so far are one case: a private app
+  repository commits `vendor/` (5,393 tracked files, 56 MiB), which
+  `~/.config/ferret/ignore` excludes. rg searches 2,774 of those files
+  (14 MiB; its hidden and nested-ignore rules drop the rest) from the repo
+  root; ferret treats the directory as absent. Starting the search at `vendor/` itself works in
+  both, because an explicit start bypasses ignore rules.
 - Under `~/w`, that repository and its two worktrees are the only git repos
   (3 of about 45) with tracked files under any seeded name; 99.9% of those
   files are under `vendor/`. Elsewhere the names are already gitignored, so
   rg skips them too.
 - GREP.md already lists "Git's user-global ignores differ from ferret's
   global file" as a known difference, so this is policy, not a bug. Once
-  S4 step 2 switches agents to ferret, an agent searching that repository gets
-  no vendor hits and no hint that anything was skipped.
+  S4 step 2 switches agents to ferret, an agent searching that repository
+  gets no vendor hits and no hint that anything was skipped.
 
 | Option | Costs | Buys |
 | --- | --- | --- |
 | A. Keep the policy; the shadow labels these `known:policy` | Agents silently miss committed vendor code in repos like that one | Nothing to build; a smaller index |
-| B. In rg mode, scan live any directory excluded only by the global ignore file (not by git or `.ferretignore`) | A second visibility rule in the walker and index planner; every search from such a repo root rescans the tree (here 2.7k files, tens of ms) | rg's answer exactly, with the index still small |
-| C. Drop `vendor/`, `build/` and `dist/` from the seed, and from your own file | +16k names and +176 MB of content indexed on msa2 (three checkouts of one repo); new setups only, unless you edit your file | rg's answer for these names with no new mechanism; gitignored build output stays excluded by `.gitignore` |
+| B. In rg mode, scan live any directory excluded only by the global ignore file (not by git or `.ferretignore`) | A second visibility rule in the walker and index planner; every search from such a repo root rescans the tree (here 2.8k files, 14 MiB, tens of ms) | rg's answer for these trees, with the index still small; other documented differences remain |
+| C. Drop `vendor/`, `build/` and `dist/` from the seed, and from your own file | On msa2 (three checkouts of one repo) at most about +8k names and +42 MiB of content, the files rg searches; estimated from rg's file list, not measured by indexing. New setups only, unless you edit your file | rg's answer for these names with no new mechanism; gitignored build output stays excluded by `.gitignore` |
 
 **Recommendation: C.** Where these directories are build output they are
 nearly always gitignored, so the seed adds little; where they are committed

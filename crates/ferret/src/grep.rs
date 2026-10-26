@@ -19,6 +19,7 @@ mod output;
 mod preflight;
 mod presentation;
 pub(crate) mod remote;
+mod routing;
 mod sources;
 
 use ferret_catalog::NameId;
@@ -84,7 +85,10 @@ decoding is deferred. Excluded paths are absent. Exit: 0 match, 1 none, 2 error.
 enum Input {
     File(PathBuf, u64),
     Directory(PathBuf),
-    Stdin,
+    /// Read once, front to back: `-` is stdin; any other path is a special
+    /// file (a FIFO or a device such as `/dev/null`), which rg reads as a
+    /// stream too.
+    Stream(PathBuf),
     Failed(PathBuf, io::Error),
 }
 
@@ -94,14 +98,18 @@ enum Input {
 pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let start = std::time::Instant::now();
     let mut pattern_files = Vec::new();
-    let mut stdin_read = false;
+    // A pattern source rg could not read again: stdin, or any pipe or device
+    // spelling of it (`/dev/stdin`, `/proc/self/fd/0`). Falling back to rg
+    // after reading one would hand rg an exhausted source.
+    let mut consumed = false;
     let command = match line_grep::parse_with(args, &mut |path| {
         let bytes = if path == Path::new("-") {
-            stdin_read = true;
+            consumed = true;
             let mut bytes = Vec::new();
             io::stdin().lock().read_to_end(&mut bytes)?;
             bytes
         } else {
+            consumed |= !fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
             fs::read(path)?
         };
         pattern_files.push(bytes.clone());
@@ -119,15 +127,15 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             return print(format!("ferret grep {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
         }
         line_grep::Command::Files(mut plan) => {
-            if let Some(exit) = context_error(args, global_json, stdin_read) {
+            if let Some(exit) = context_error(args, global_json, consumed) {
                 return exit;
             }
             let tty = presentation::resolve(&mut plan.presentation);
-            return names::run(&plan, index, args, tty);
+            return names::run(&plan, index, args, tty, consumed);
         }
         line_grep::Command::Search(plan) => *plan,
     };
-    if let Some(exit) = context_error(args, global_json, stdin_read) {
+    if let Some(exit) = context_error(args, global_json, consumed) {
         return exit;
     }
     let tty = presentation::resolve(&mut plan.presentation);
@@ -135,67 +143,34 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let selection = match preflight::prepare(&plan) {
         Ok(preflight::Prepared::Search(selection)) => selection,
         Ok(preflight::Prepared::NoMatch) => return Exit::NoMatch,
-        Err(error) => return failure(&error),
+        Err(refusal) => return refusal.exit(args, consumed),
     };
     let inputs = if plan.stdin_patterns && plan.paths.is_empty() {
         resolve_inputs(&[PathBuf::from(".")], false)
     } else {
         resolve_inputs(&plan.paths, false)
     };
-    let recursive = inputs
-        .iter()
-        .any(|input| matches!(input, Input::Directory(_)));
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(error) => return failure(&error.to_string()),
     };
-    let routing = if recursive && !plan.traversal.unrestricted && !plan.traversal.live {
-        match live::Anchors::routing(index, &inputs) {
-            Ok(anchors) => Some(anchors),
-            Err(error) => return failure(&error),
-        }
-    } else {
-        None
+    let routed = match routing::route(inputs, plan.traversal, index) {
+        Ok(routed) => routed,
+        Err(refusal) => return refusal.exit(args, consumed),
     };
-    let covered = routing.as_ref().is_none_or(live::Anchors::all_covered);
-    if recursive
-        && plan.traversal.follow
-        && !plan.traversal.unrestricted
-        && routing
-            .as_ref()
-            .is_none_or(|anchors| anchors.any_covered(&inputs))
-    {
-        return unsupported(
-            args,
-            "-L is supported for uncovered directories and -u; use -u to follow links in an indexed tree",
-            stdin_read,
-        );
-    }
-    if covered
-        && daemon_operands(&inputs)
-        && !plan.traversal.unrestricted
-        && !plan.traversal.live
-        && !test_injections()
+    if routed.daemon
         && let Ok(index) = index_path(index)
         && let Some(exit) = remote::run(args, &pattern_files, &plan, tty, &index)
     {
         return exit;
     }
-    let live = if recursive && plan.traversal.live && !plan.traversal.unrestricted {
-        match live::Anchors::open(index) {
-            Ok(anchors) => Some(anchors),
-            Err(error) => return failure(&error),
-        }
-    } else {
-        routing
-    };
-    let engine = if recursive
-        && !plan.traversal.unrestricted
-        && !plan.traversal.live
-        && live
-            .as_ref()
-            .is_none_or(|anchors| anchors.any_covered(&inputs))
-    {
+    let routing::Routed {
+        inputs,
+        live,
+        catalog,
+        ..
+    } = routed;
+    let engine = if catalog {
         match open_index(index) {
             Ok(engine) => Some(engine),
             Err(error) => return failure(&error),
@@ -390,7 +365,7 @@ impl Execution<'_> {
         'inputs: while inputs.peek().is_some() {
             let mut segment = Vec::new();
             while inputs.peek().is_some_and(|input| {
-                !matches!(input, Input::Stdin)
+                !matches!(input, Input::Stream(_))
                     && (segment.is_empty()
                         || !buffered_path_output(plan, runtime.tty) && covered_inputs(live))
             }) {
@@ -462,10 +437,19 @@ impl Execution<'_> {
                     return runtime.output_failure(&error);
                 }
             }
-            if matches!(inputs.peek(), Some(Input::Stdin)) {
-                inputs.next();
+            if let Some(Input::Stream(path)) =
+                inputs.next_if(|input| matches!(input, Input::Stream(_)))
+            {
                 searched = true;
-                if let Err(error) = host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX) {
+                let result = if path == Path::new("-") {
+                    host.direct(&path, &mut io::stdin().lock(), u64::MAX)
+                } else {
+                    match fs::File::open(cwd.join(&path)) {
+                        Ok(mut file) => host.direct(&path, &mut file, u64::MAX),
+                        Err(error) => host.error(&path, &error),
+                    }
+                };
+                if let Err(error) = result {
                     return runtime.output_failure(&error);
                 }
                 if plan.quiet && host.matched {
@@ -510,7 +494,7 @@ fn test_injections() -> bool {
     std::env::vars_os().any(|(key, _)| key.as_bytes().starts_with(b"FERRET_TEST_"))
 }
 
-fn context_error(args: &[OsString], global_json: bool, stdin_read: bool) -> Option<Exit> {
+fn context_error(args: &[OsString], global_json: bool, consumed: bool) -> Option<Exit> {
     if global_json {
         return Some(failure(
             "global --json framing is not supported for grep; use ferret grep --json",
@@ -520,21 +504,44 @@ fn context_error(args: &[OsString], global_json: bool, stdin_read: bool) -> Opti
         return Some(unsupported(
             args,
             "RIPGREP_CONFIG_PATH is set; pass flags explicitly",
-            stdin_read,
+            consumed,
         ));
     }
     None
+}
+
+/// Why a request is not run, decided before any output or input read.
+enum Refusal {
+    /// ferret lacks the feature; rg may answer instead.
+    Unsupported(String),
+    /// The command is wrong, or its resources are; rg would not help.
+    Failed(String),
+}
+
+impl Refusal {
+    fn exit(self, args: &[OsString], consumed: bool) -> Exit {
+        match self {
+            Self::Unsupported(message) => unsupported(args, &message, consumed),
+            Self::Failed(message) => failure(&message),
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Unsupported(message) | Self::Failed(message) => message,
+        }
+    }
 }
 
 /// Refuses a command ferret grep does not support. When
 /// `FERRET_GREP_FALLBACK` names a real rg (D118 step 2: the agents' stand-in
 /// `rg` sets it), that rg runs the same argv in this process instead. Every
 /// such refusal comes before any output, so the caller sees only rg's
-/// answer; the exception is a command whose `-f -` already consumed stdin,
-/// which rg could not read again.
-fn unsupported(args: &[OsString], message: &str, stdin_read: bool) -> Exit {
+/// answer; the exception is a command whose `-f` already consumed a source
+/// rg could not read again.
+fn unsupported(args: &[OsString], message: &str, consumed: bool) -> Exit {
     if let Some(rg) = std::env::var_os("FERRET_GREP_FALLBACK").filter(|rg| !rg.is_empty())
-        && !stdin_read
+        && !consumed
     {
         let error = std::process::Command::new(&rg).args(args).exec();
         return failure(&format!(
@@ -623,17 +630,14 @@ fn resolve_inputs_at(paths: &[PathBuf], names_only: bool, cwd: &Path) -> Vec<Inp
         .iter()
         .map(|path| {
             if path == Path::new("-") {
-                return Input::Stdin;
+                return Input::Stream(path.clone());
             }
             match fs::metadata(cwd.join(path)) {
                 Ok(metadata) if metadata.is_dir() => Input::Directory(path.clone()),
                 Ok(metadata) if metadata.is_file() || names_only => {
                     Input::File(path.clone(), metadata.len())
                 }
-                Ok(_) => Input::Failed(
-                    path.clone(),
-                    io::Error::other("special-file operands are not supported"),
-                ),
+                Ok(_) => Input::Stream(path.clone()),
                 Err(error) => Input::Failed(path.clone(), error),
             }
         })
