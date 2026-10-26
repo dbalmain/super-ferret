@@ -160,7 +160,7 @@ fn entry_scope(
         return Err(IndexError::BadEntry(name.to_vec()));
     }
     let (root, mut relative) = relative_scope(view, parent)?;
-    if matches!(name, b".ferretignore" | b".gitignore" | b".git") {
+    if name == b".git" || ferret_policy::is_ignore_file(name) {
         return Ok((root, relative));
     }
     if relative.components().any(|c| c.as_os_str() == ".git") {

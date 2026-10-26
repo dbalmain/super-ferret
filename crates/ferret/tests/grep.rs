@@ -57,7 +57,9 @@ impl Fixture {
         self.base.join("tree")
     }
     fn write(&self, path: &str, bytes: &[u8]) {
-        fs::write(self.tree().join(path), bytes).unwrap();
+        let path = self.tree().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
     }
     fn command(&self, binary: &OsStr) -> Command {
         let mut command = Command::new(binary);
@@ -622,19 +624,31 @@ fn glob_prunes_an_opaque_live_fallback_before_reading_its_directory() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+// `.ignore` and `.rgignore` are crawl inputs (D126), so indexed answers
+// hide what rg hides: `.rgignore` outranks `.ignore`, both outrank a closer
+// `.gitignore`, and a nested work tree keeps the enclosing `.ignore`.
 #[test]
-fn ignore_visibility_is_the_documented_d74_difference() {
+fn dot_ignore_files_hide_as_rg_does() {
     let fixture = Fixture::new("visibility");
-    fixture.write(".ignore", b"*.cache\n");
+    // A work tree, so the `.gitignore` files below compete.
+    fixture.write(".git/HEAD", b"ref: refs/heads/main\n");
+    fixture.write(".gitignore", b"*.md\n");
+    fixture.write(".ignore", b"*.cache\nrepos/\n");
+    fixture.write(".rgignore", b"!keep.cache\n");
     fixture.write("extra.cache", b"lantern\n");
+    fixture.write("keep.cache", b"lantern\n");
+    fixture.write("repos/a.txt", b"lantern\n");
+    fixture.write("sub/.gitignore", b"!*.cache\n");
+    fixture.write("sub/b.cache", b"lantern\n");
+    fixture.write("inner/.git/HEAD", b"ref: refs/heads/main\n");
+    fixture.write("inner/c.cache", b"lantern\n");
+    fixture.write("inner/c.txt", b"lantern\n");
+    fixture.write("inner/c.md", b"lantern\n");
+    fixture.write("d.md", b"lantern\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
-    let rg = fixture.oracle(&["lantern", "."], None);
-    let ferret = fixture.ferret(&["grep", "lantern", "."], None);
-    assert_eq!(rg.status.code(), Some(0));
-    assert_eq!(ferret.status.code(), Some(0));
-    let extra = b"./extra.cache:lantern\n";
-    assert!(ferret.stdout.windows(extra.len()).any(|w| w == extra));
-    assert!(!rg.stdout.windows(extra.len()).any(|w| w == extra));
+    let listed = fixture.compare(&["-l", "lantern"], None);
+    assert!(!listed.stdout.is_empty(), "{listed:?}");
+    fixture.compare(&["--files"], None);
 }
 
 #[test]

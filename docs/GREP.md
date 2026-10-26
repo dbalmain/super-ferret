@@ -532,15 +532,14 @@ glob semantics, not find's `-path` glob dialect. A walked cwd is matched as
 the empty path, as in rg: `*`, `**`, `**/*` and `/*` whitelist a hidden cwd
 below the operand, `?*` and `*/**` do not (review R2-2, 2026-10-20).
 
-Conversely ferret can search what default rg excludes: `.ignore`/`.rgignore`
-are not ferret inputs; Git's user-global ignores differ from ferret's global
-file; ignores above indexed roots and `.gitignore` outside a worktree are absent;
-`.ferretignore` can override VCS exclusions and re-include below a pruned tree.
-Ferret's symlinked-ignore/gitdir handling and lossy non-UTF-8 rule parsing can
-also change visibility; pin those fixtures against rg. Suppress held hidden
-files unless an explicit start, positive glob or `--hidden` permits them.
-Tracked status is irrelevant; recursive symlinks stay skipped even if ferret's
-content aliases would otherwise return them.
+Conversely ferret can search what default rg excludes: Git's user-global ignores
+differ from ferret's global file; ignores above indexed roots and `.gitignore`
+outside a worktree are absent; `.ferretignore` can override VCS exclusions and
+re-include below a pruned tree. Ferret's symlinked-ignore/gitdir handling and
+lossy non-UTF-8 rule parsing can also change visibility; pin those fixtures
+against rg. Suppress held hidden files unless an explicit start, positive glob
+or `--hidden` permits them. Tracked status is irrelevant; recursive symlinks
+stay skipped even if ferret's content aliases would otherwise return them.
 
 `--no-ignore`/`-u` uses find's unrestricted live walk, retaining the hidden
 filter; `-uu` reveals hidden entries. `-uuu` refuses until `--binary` exists.
@@ -1259,14 +1258,15 @@ raw payload codec described in S1B.md.
 
 ## Answered decisions (checked 2026-10-16)
 
-D72 A: automatic grep scans; `search --scan` remains explicit. D73 A+D:
-snapshot membership/absence by default plus opt-in policy-preserving `--live`.
-D74 A: D47 visibility with explicit/unrestricted exceptions; `.ignore` and
-`.rgignore` support is a possible later feature, not scheduled. D74 A agrees
-with this document’s earlier D47 recommendation; its provisional status was
-stale, not its visibility choice. D75 D replaces the earlier raw-input A:
-strip initial UTF-8 BOMs everywhere; retain the approved UTF-16 difference.
-No new unresolved product decision was needed for these corrections.
+D72 A: automatic grep scans; `search --scan` remains explicit. D73 A+D: snapshot
+membership/absence by default plus opt-in policy-preserving `--live`. D74 A: D47
+visibility with explicit/unrestricted exceptions. D126 B (2026-10-27) made
+`.ignore` and `.rgignore` crawl inputs, so indexed answers hide what they hide;
+`.ferretignore` still outranks both. D74 A agrees with this document’s earlier
+D47 recommendation; its provisional status was stale, not its visibility choice.
+D75 D replaces the earlier raw-input A: strip initial UTF-8 BOMs everywhere;
+retain the approved UTF-16 difference. No new unresolved product decision was
+needed for these corrections.
 
 **Round 2 raw frames (2026-10-21):** negotiated `raw-output-v1` keeps JSON
 headers/control and sends exact-length stdout/stderr bytes. Native find shares

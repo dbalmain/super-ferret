@@ -46,7 +46,7 @@ ferret-bench   → anything; nothing depends on it
 
 | Crate            | Owns                                                                                                                                   | Knows nothing about                  |
 | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `ferret-policy`  | `DirRules::decide(path, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global (D13); the defaults setup writes         | the catalog, the index               |
+| `ferret-policy`  | `DirRules::decide(path, entry) -> Decision`, `sniff`; `.ferretignore` / `.rgignore` / `.ignore` / `.gitignore` / global (D13, D126); the defaults setup writes | the catalog, the index               |
 | `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing; the stat/read bracket around reading a document                 | query, index formats                 |
 | `ferret-catalog` | names, inodes, documents, storage, name dictionary and catalog row postings (D54, S1b)                                                 | content tokens and document postings |
 | `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                                 | files, ids                           |
@@ -420,39 +420,41 @@ then `enter` with that directory's ignore-file contents, or `traverse`), asks it
 to `decide` each entry using a borrowed root-relative path, and `sniff`s file
 heads; it is tested against a golden corpus of trees and expected decisions.
 Precedence, most specific first: a `.ferretignore` in the directory or an
-ancestor within the configured root; `.gitignore` and `.git/info/exclude` inside
-a work tree that starts at or below the configured root (a `.git` file
-contributes exclude from its gitdir, or from that gitdir's `commondir` when it
-has one; a symlinked `.git` contributes none, and a symlinked `.gitignore` is
-disregarded, as git does; a gitdir or common directory that no longer exists
-contributes none and is not a fault, as in rg, D26); the user's global ignore file
-(`$XDG_CONFIG_HOME/ferret/ignore`), which setup seeds once with the defaults
-(`node_modules/`, `target/`, `.venv/`, …) and which is the user's to edit from
-then on. A size cap and a binary check sit beside the patterns. `!pat` in a
-`.ferretignore` overrides an ancestor `.ferretignore` or any `.gitignore`, and
-can re-include below an excluded directory; the walker traverses an excluded
-directory (its ignore files unread) only when an anchored
-`.ferretignore` `!` pattern could match inside it — never for an unanchored one
-such as `!*.pdf`. A `.ferretignore` inside an excluded directory is never read;
-overriding an exclusion takes a `!` pattern at that directory's level or above
-(D13). D16 replaces the first implementation's `ignore` crate edge with an
-in-crate matcher. The crawler owns the candidate path so policy decisions do not
-allocate a joined path per entry. Re-inclusion pruning discards negations that a
-later exclusion provably supersedes; uncertain overlaps still permit traversal.
+ancestor within the configured root; then rg's `.rgignore` and then `.ignore`
+files, in or out of a work tree, each outranking every git source (D126);
+`.gitignore` and `.git/info/exclude` inside a work tree that starts at or below
+the configured root (a `.git` file contributes exclude from its gitdir, or from
+that gitdir's `commondir` when it has one; a symlinked `.git` contributes none,
+and a symlinked `.gitignore` is disregarded, as git does; a gitdir or common
+directory that no longer exists contributes none and is not a fault, as in rg,
+D26); the user's global ignore file (`$XDG_CONFIG_HOME/ferret/ignore`), which
+setup seeds once with the defaults (`node_modules/`, `target/`, `.venv/`, …) and
+which is the user's to edit from then on. A size cap and a binary check sit
+beside the patterns. `!pat` in a `.ferretignore` overrides an ancestor
+`.ferretignore` or any `.gitignore`, and can re-include below an excluded
+directory; the walker traverses an excluded directory (its ignore files unread)
+only when an anchored `.ferretignore` `!` pattern could match inside it — never
+for an unanchored one such as `!*.pdf`. A `.ferretignore` inside an excluded
+directory is never read; overriding an exclusion takes a `!` pattern at that
+directory's level or above (D13). D16 replaces the first implementation's
+`ignore` crate edge with an in-crate matcher. The crawler owns the candidate
+path so policy decisions do not allocate a joined path per entry. Re-inclusion
+pruning discards negations that a later exclusion provably supersedes; uncertain
+overlaps still permit traversal.
 
 Each directory's rules are one list (D19). Concatenating the files lowest
-precedence first — global ferret rules, `info/exclude`, `.gitignore` root to here,
-`.ferretignore` root to here — and taking the last matching line gives the
-precedence above. Every rule in the list matches an entry's name alone. A
-pattern with no slash before its last character applies unchanged in every
-directory. An anchored one (`/build/`, `docs/**/*.tmp`) is followed by cursors,
-positions in the pattern stepped one component per directory entered, which put
-its last component into the list only where it can match. A run of `**/`
-compiles to one globstar, and a step marks positions in a bitset, so a pattern
-of k components costs O(k) per directory however its globstars fall. Only ignore
-files at or below the configured root contribute rules (D22). The same cursors
-answer whether a `.ferretignore` `!` pattern reaches below an excluded
-directory. No whole path is ever matched.
+precedence first — global ferret rules, `info/exclude`, then `.gitignore`,
+`.ignore`, `.rgignore` and `.ferretignore`, each root to here — and taking the
+last matching line gives the precedence above. Every rule in the list matches an
+entry's name alone. A pattern with no slash before its last character applies
+unchanged in every directory. An anchored one (`/build/`, `docs/**/*.tmp`) is
+followed by cursors, positions in the pattern stepped one component per
+directory entered, which put its last component into the list only where it can
+match. A run of `**/` compiles to one globstar, and a step marks positions in a
+bitset, so a pattern of k components costs O(k) per directory however its
+globstars fall. Only ignore files at or below the configured root contribute
+rules (D22). The same cursors answer whether a `.ferretignore` `!` pattern
+reaches below an excluded directory. No whole path is ever matched.
 
 A list is identified by its rules' text and flags in order, band included: a
 `.ferretignore` line differs from the same `.gitignore` line. It is compiled

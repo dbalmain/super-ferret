@@ -174,6 +174,8 @@ impl Case {
             gitignore: content(".gitignore"),
             git_root: self.nodes.contains_key(&dir.join(".git")),
             git_exclude: content(".git/info/exclude"),
+            ignore: content(".ignore"),
+            rgignore: content(".rgignore"),
         }
     }
 

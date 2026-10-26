@@ -1,0 +1,63 @@
+# `.ignore` and `.rgignore`: rg's ignore files, in or out of a work tree,
+# ranked above every git source and below `.ferretignore` (D126).
+
+== a .ignore excludes outside any work tree
+.ignore                 index
+  | repos/
+  | *.log
+repos/                  skip
+repos/a.txt             unvisited
+a.log                   skip
+a.txt                   index
+
+== a vendored project's .ignore applies only below it
+.git/                   skip
+vendor/                 descend
+vendor/lib/             descend
+vendor/lib/.ignore      index
+  | repos/
+vendor/lib/repos/       skip
+vendor/lib/repos/x.ts   unvisited
+repos/                  descend
+repos/y.ts              index
+
+== .rgignore outranks .ignore in the same directory
+.ignore                 index
+  | *.log
+.rgignore               index
+  | !keep.log
+keep.log                index
+other.log               skip
+
+== a root .ignore outranks a closer .gitignore
+.git/                   skip
+.ignore                 index
+  | !*.log
+sub/                    descend
+sub/.gitignore          index
+  | *.log
+sub/a.log               index
+
+== a .ferretignore outranks .ignore and .rgignore
+.ignore                 index
+  | repos/
+.rgignore               index
+  | *.tmp
+.ferretignore           index
+  | !repos/
+  | !keep.tmp
+repos/                  descend
+repos/a.txt             index
+keep.tmp                index
+drop.tmp                skip
+
+== a nested work tree drops enclosing .gitignore rules but keeps .ignore
+.git/                   skip
+.gitignore              index
+  | *.md
+.ignore                 index
+  | *.log
+inner/                  descend
+inner/.git/             skip
+inner/a.md              index
+inner/a.log             skip

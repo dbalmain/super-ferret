@@ -1094,7 +1094,7 @@ impl Burst {
         self.marker.is_some()
             || !self.roots.is_empty()
             || self.pending.iter().any(|((_, name), h)| {
-                h.subtree || matches!(name.as_slice(), b".git" | b".gitignore" | b".ferretignore")
+                h.subtree || name == b".git" || ferret_policy::is_ignore_file(name)
             })
     }
     /// Loss/backstop reason associated with this detached watermark.
@@ -1109,9 +1109,7 @@ impl Burst {
         let mut moves: BTreeMap<u32, MovePair> = BTreeMap::new();
         for ((_, name), hint) in &self.pending {
             for directory in &hint.directories {
-                if name.is_empty()
-                    || matches!(name.as_slice(), b".git" | b".gitignore" | b".ferretignore")
-                {
+                if name.is_empty() || name == b".git" || ferret_policy::is_ignore_file(name) {
                     roots.insert((*directory.root).clone());
                 } else if let Some(parent) = directory.resolve(view) {
                     scopes.push(RefreshScope::Entry {

@@ -934,7 +934,8 @@ fn protect(
 
 fn fingerprint(options: &IndexOptions) -> ferret_catalog::Hash {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"ferret-policy-v1\0");
+    // v2: `.ignore` and `.rgignore` became policy inputs (D126).
+    hash.update(b"ferret-policy-v2\0");
     hash.update(&options.config.size_cap.to_le_bytes());
     hash.update(&[u8::from(options.global.is_some())]);
     hash.update(options.global.as_deref().unwrap_or_default().as_bytes());
@@ -2023,7 +2024,7 @@ impl EventVisitor for Hasher<'_> {
                     ferret_policy::IgnoreFile::Ferret(path)
                     | ferret_policy::IgnoreFile::Git(path)
                     | ferret_policy::IgnoreFile::GitExclude(path)
-                    | ferret_policy::IgnoreFile::Grep(path) => path.as_os_str().len(),
+                    | ferret_policy::IgnoreFile::Dot(path) => path.as_os_str().len(),
                     ferret_policy::IgnoreFile::Global => 0,
                 };
                 // Lossy path display can expand each invalid byte to three;
