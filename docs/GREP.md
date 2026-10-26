@@ -169,16 +169,19 @@ type, and explicit file operands bypass types. An unknown name is a usage
 error, `unrecognized file type: NAME`, as in rg.
 
 All other flags **refuse**, never pass through or silently disappear:
-`--type-add/list/clear`; `-L`; `-z` (compressed search);
+`--type-add/list/clear`; `-L` in an indexed tree without `-u` (supported for
+uncovered directories and `-u`); `-z` (compressed search);
 `--no-ignore-vcs/dot/files/global/parent/exclude/messages`; `--encoding`;
 `--sort`, `--sortr`; `--passthru`; `--vimgrep`; `--path-separator`;
-`--trim`; `--iglob`; `--max-columns`, `--max-columns-preview`; `--column`;
+`--trim`; `--iglob`; `--max-columns-preview`; `--column`;
 `--engine`, `--auto-hybrid-regex`; `--field-match-separator`,
 `--field-context-separator`; `--max-filesize`; `--null-data`;
 `--one-file-system`; `--context-separator`; `--binary`; `--hyperlink-format`;
 `--no-unicode`; `-b`. Unranked flags, including preprocessor, custom colour,
 thread/mmap/buffering/stats/debug/config controls, also refuse. Message:
-`grep: FLAG is not supported; use rg for this command`. `--heading-off` is
+`grep: FLAG is not supported; use rg for this command`. When
+`FERRET_GREP_FALLBACK` names a real rg (D118 step 2), these refusals run it on
+the same argv instead, before any output. `--heading-off` is
 not an rg spelling and refuses. BRE/ERE switches `-G`/`-E` are not grep
 compatibility aliases (`-E` in rg selects encoding).
 
