@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -223,6 +223,12 @@ fn listings_short_only_of_names_ferret_ignores_are_policy() {
     ] {
         assert_eq!(verdict(&bed, &policy, args), "differ", "{args:?}");
     }
+    // An operand is judged where it resolves: `link` is `vendor`, so its
+    // missing `inner/vendor/` rows are not the policy's to explain.
+    bed.write("vendor/inner/vendor/d.txt", b"foo\n");
+    symlink(bed.tree.join("vendor"), bed.tree.join("link")).unwrap();
+    assert_eq!(verdict(&bed, &policy, &["--files"]), "known:policy");
+    assert_eq!(verdict(&bed, &policy, &["--files", "link"]), "differ");
     // A negation may re-include the name.
     fs::write(&ignore, b"vendor/\n!vendor/b.txt\n").unwrap();
     assert_eq!(verdict(&bed, &policy, &["--files"]), "differ");

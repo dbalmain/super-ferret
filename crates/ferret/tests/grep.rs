@@ -992,10 +992,10 @@ fn a_held_pipe_is_read_after_the_files() {
                 .any(|entry| fs::read_link(entry.path()).is_ok_and(|to| to == fifo))
         })
     {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ferret never opened the pipe"
-        );
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("ferret never opened the pipe");
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     drop(writer);

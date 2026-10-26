@@ -431,12 +431,15 @@ policy_only() {
     fi
     roots=$("$ferret" roots list 2> /dev/null) || return 1
     for operand in "${operands[@]:-.}"; do
-        if [[ ! -d $operand ]] || LC_ALL=C grep -aqE "(^|/)($excluded)" <<< "$operand/"; then
+        if [[ ! -d $operand ]]; then
             return 1
         fi
+        # Judged where the operand resolves, below its root: `.` inside an
+        # excluded directory is itself excluded.
         operand=$(realpath -- "$operand") under=0
         while IFS= read -r root; do
-            if [[ -n $root && ($operand == "$root" || $operand == "$root"/*) ]]; then
+            if [[ -n $root && ($operand == "$root" || $operand == "$root"/*) ]] &&
+                ! LC_ALL=C grep -aqE "(^|/)($excluded)" <<< "${operand#"$root"}/"; then
                 under=1
             fi
         done <<< "$roots"
