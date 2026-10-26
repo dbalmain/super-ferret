@@ -7103,3 +7103,28 @@ you rarely search, which makes B's cost close to nothing.
 
 > Dave: A (2026-10-27). Flip after C is deployed and a day's shadow log shows
 > no unexplained `differ`.
+
+## D126 — A committed `vendor/` tree's `.ignore` file
+
+**Question:** Now that D124 indexes committed `vendor/` trees, should the
+index honour `.ignore` and `.rgignore`, which rg reads and ferret does not?
+
+Context (2026-10-27): in the one repository that commits `vendor/`, a
+vendored project's `.ignore` excludes a 2,526-file source checkout. rg skips
+it; ferret's indexed answer lists it, so the shadow logs `differ` there and
+D125's clean day cannot happen. Under `~/w` this is the only `.ignore` or
+`.rgignore` outside test fixtures. The same tree also exposed a separate
+bug, fixed regardless of this answer: a gitignore `!.env.example` reveals
+that hidden file to rg and to ferret's live walk, but not to the indexed
+answer.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. One line in that repository's `.ferretignore` | Per-repo, by hand; the next such file differs again | No code; the shadow is clean tomorrow |
+| B. Crawl honours `.ignore`/`.rgignore` like `.gitignore` | A policy input, a full refresh, and a design line; `--no-ignore-dot` must then bypass the index | rg's answer for every such file |
+| C. Leave it; extra results are harmless | The shadow keeps logging `differ` there, so D125 needs a manual exception | Nothing to do |
+
+**Recommendation: A** now, B if a second repository needs it.
+
+**Fact that would change it:** agents working in repositories you don't
+own, where `.ignore` files are common (B).
