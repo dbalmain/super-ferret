@@ -50,7 +50,7 @@ impl Directory {
 
 /// A walk of the live tree below directory operand `path`.
 pub(super) fn live(path: &Path, cwd: &Path) -> LiveWalk {
-    LiveWalk::paths(vec![start(path)], cwd.to_owned())
+    LiveWalk::paths(vec![start(path)], cwd.to_owned()).lazy_directories()
 }
 
 // Follow an explicit directory symlink only at its start. Descendant symlinks

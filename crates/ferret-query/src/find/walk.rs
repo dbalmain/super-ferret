@@ -738,6 +738,15 @@ impl LiveWalk {
         Self::new(paths, Options::at(cwd))
     }
 
+    /// Leaves each directory unstatted until it is opened. find stats a
+    /// directory before visiting it, as GNU does, so that a vanished one
+    /// faults even at a depth limit; a host that reports only failed opens,
+    /// as rg does, saves a stat per directory.
+    pub fn lazy_directories(mut self) -> Self {
+        self.options.lazy_directories = true;
+        self
+    }
+
     /// Follows descendant symlinks, diagnosing ancestor cycles.
     pub fn following_links(mut self, follow: bool) -> Self {
         if follow {
@@ -1137,7 +1146,10 @@ impl LiveWalk {
             // batch flush, but later directories are checked when visited.
             // Removed directories can therefore print and still fault at a
             // depth limit; regular file metadata remains lazy.
-            if target.is_none() && kind == Some(FileKind::Directory) && self.children.len() == start
+            if target.is_none()
+                && kind == Some(FileKind::Directory)
+                && self.children.len() == start
+                && !self.options.lazy_directories
             {
                 // Observed relative to the handle just opened for this
                 // listing, not the entry's pathname: an action run while
@@ -1366,6 +1378,7 @@ impl LiveWalk {
             }
             if child.kind == Some(FileKind::Directory)
                 && (child.target.is_none() || self.options.live_checks)
+                && !self.options.lazy_directories
             {
                 match level.first.take() {
                     Some(stat) if index == level.start => {

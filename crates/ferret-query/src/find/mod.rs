@@ -80,6 +80,9 @@ pub(crate) struct Options {
     pub xdev: bool,
     pub follow: Follow,
     pub live_checks: bool,
+    /// Skip GNU's directory stats before a visit; opening the directory
+    /// reports what they would.
+    pub lazy_directories: bool,
     pub retain_parent: bool,
     /// Retained parents are charged to a budget, closed past it.
     pub bounded_parents: bool,
