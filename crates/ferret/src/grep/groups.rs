@@ -687,12 +687,21 @@ impl Cache {
     }
 }
 
+/// A feed worker: [`Scratch`] plus the checked reader an indexed run reads
+/// catalogued files through. The reader is not `Send`, so live walkers, which
+/// read no catalogued file, hold only the scratch.
 struct Worker<'a> {
-    plan: Plan,
-    buffer: Vec<u8>,
+    scratch: Scratch,
     read: Option<Box<CheckedReader<'a>>>,
 }
-impl Worker<'_> {
+impl<'a> Worker<'a> {
+    fn new(plan: Plan, read: Option<Box<CheckedReader<'a>>>) -> Self {
+        Self {
+            scratch: Scratch::new(plan),
+            read,
+        }
+    }
+
     fn prepare(
         &mut self,
         job: &Job,
@@ -705,9 +714,7 @@ impl Worker<'_> {
             Option<&Arc<capture::Budget>>,
         ),
     ) -> io::Result<Observed> {
-        prepare(
-            &self.plan,
-            &mut self.buffer,
+        self.scratch.prepare(
             self.read.as_deref_mut(),
             job,
             filename,
@@ -718,16 +725,56 @@ impl Worker<'_> {
     }
 }
 
-/// Searches one job's bytes into a group, or replays a cached duplicate's.
-#[allow(clippy::too_many_arguments)]
-fn prepare(
+/// One search thread's own plan clone and reusable read buffer, for the feed
+/// and the live walk alike.
+struct Scratch {
+    plan: Plan,
+    buffer: Vec<u8>,
+}
+impl Scratch {
+    fn new(plan: Plan) -> Self {
+        Self {
+            plan,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Searches one job's bytes into a group, or replays a cached
+    /// duplicate's, then drops a buffer an outsized file grew.
+    fn prepare(
+        &mut self,
+        read: Option<&mut CheckedReader<'_>>,
+        job: &Job,
+        filename: bool,
+        cache: &Mutex<Cache>,
+        eligible: bool,
+        destination: (
+            &dyn Fn() -> bool,
+            &mut dyn Write,
+            Option<&Arc<capture::Budget>>,
+        ),
+    ) -> io::Result<Observed> {
+        let observed = search_job(
+            &self.plan,
+            &mut self.buffer,
+            read,
+            job,
+            (filename, cache, eligible),
+            destination,
+        );
+        if self.buffer.capacity() > ferret_query::KEPT_BUFFER {
+            self.buffer = Vec::new();
+        }
+        observed
+    }
+}
+
+fn search_job(
     plan: &Plan,
     buffer: &mut Vec<u8>,
     read: Option<&mut CheckedReader<'_>>,
     job: &Job,
-    filename: bool,
-    cache: &Mutex<Cache>,
-    eligible: bool,
+    (filename, cache, eligible): (bool, &Mutex<Cache>, bool),
     destination: (
         &dyn Fn() -> bool,
         &mut dyn Write,
@@ -1022,14 +1069,10 @@ pub(super) fn run<'a, W: Write>(
                 .then(|| lock(&search.publication));
             next(stopped)
         },
-        || Worker {
-            plan: search.plan.clone(),
-            buffer: Vec::new(),
-            read: fork(),
-        },
+        || Worker::new(search.plan.clone(), fork()),
         |worker, job, stopped, handoff, concurrent| {
             let eligible = matches!(&job, Job::Checked(_,_,doc) if names.is_some_and(|names| names.names(*doc).len() > 1));
-            let group = search.work(job, stopped, handoff, concurrent, |job, target| {
+            search.work(job, stopped, handoff, concurrent, |job, target| {
                 worker.prepare(
                     job,
                     search.filename,
@@ -1037,11 +1080,7 @@ pub(super) fn run<'a, W: Write>(
                     eligible,
                     (stopped, target, Some(&search.capture)),
                 )
-            });
-            if worker.buffer.capacity() > ferret_query::KEPT_BUFFER {
-                worker.buffer = Vec::new();
-            }
-            group
+            })
         },
         weight,
         |group| search.publish(host, &mut current, group),
@@ -1258,8 +1297,7 @@ pub(super) fn walk<W: Write>(
                 stopped,
                 found: &found,
                 live: live.is_some(),
-                plan: search.plan.clone(),
-                buffer: Vec::new(),
+                scratch: Scratch::new(search.plan.clone()),
             };
             let mut first = walker(0);
             // A walker's panic stops the lanes too: a sibling may be waiting
@@ -1365,8 +1403,7 @@ struct Walker<'w, 's> {
     stopped: &'w (dyn Fn() -> bool + Sync),
     found: &'w AtomicBool,
     live: bool,
-    plan: Plan,
-    buffer: Vec<u8>,
+    scratch: Scratch,
 }
 
 impl Walker<'_, '_> {
@@ -1385,9 +1422,7 @@ impl Walker<'_, '_> {
         let group = self
             .search
             .work(job, self.stopped, &handoff, true, |job, target| {
-                prepare(
-                    &self.plan,
-                    &mut self.buffer,
+                self.scratch.prepare(
                     None,
                     job,
                     self.search.filename,
@@ -1396,9 +1431,6 @@ impl Walker<'_, '_> {
                     (self.stopped, target, Some(&self.search.capture)),
                 )
             });
-        if self.buffer.capacity() > ferret_query::KEPT_BUFFER {
-            self.buffer = Vec::new();
-        }
         drop(reservation);
         if (self.stopped)() {
             return false;
@@ -2430,11 +2462,7 @@ mod tests {
             }
             ReadOutcome::Stable(version)
         };
-        let mut worker = Worker {
-            plan: plan(&["red"]),
-            buffer: Vec::new(),
-            read: Some(Box::new(read)),
-        };
+        let mut worker = Worker::new(plan(&["red"]), Some(Box::new(read)));
         let cache = Mutex::new(Cache::default());
         let mut outputs = Vec::new();
         for (name, path, doc) in [
@@ -2489,11 +2517,7 @@ mod tests {
             }
             ReadOutcome::Stable(ReadVersion::Catalogued)
         };
-        let mut worker = Worker {
-            plan: plan(&["--heading", "-nC1", "red"]),
-            buffer: Vec::new(),
-            read: Some(Box::new(read)),
-        };
+        let mut worker = Worker::new(plan(&["--heading", "-nC1", "red"]), Some(Box::new(read)));
         let cache = Mutex::new(Cache::default());
         for (name, path) in [(0, "copy-a"), (1, "copy-b")] {
             let Observed::Ready(mut group) = worker
@@ -2535,11 +2559,10 @@ mod tests {
             }
             ReadOutcome::Stable(ReadVersion::Catalogued)
         };
-        let mut worker = Worker {
-            plan: plan(&["-Un", "--color=always", "red\\nblue"]),
-            buffer: Vec::new(),
-            read: Some(Box::new(read)),
-        };
+        let mut worker = Worker::new(
+            plan(&["-Un", "--color=always", "red\\nblue"]),
+            Some(Box::new(read)),
+        );
         let cache = Mutex::new(Cache::default());
         for (name, path) in [(0, "copy-a"), (1, "copy-b")] {
             let Observed::Ready(mut group) = worker
@@ -2587,11 +2610,10 @@ mod tests {
             }
             ReadOutcome::Stable(ReadVersion::Catalogued)
         };
-        let mut worker = Worker {
-            plan: plan(&["-UnC1", "--color=always", "-r", "<$2/$1>", "(red)\\n(blue)"]),
-            buffer: Vec::new(),
-            read: Some(Box::new(read)),
-        };
+        let mut worker = Worker::new(
+            plan(&["-UnC1", "--color=always", "-r", "<$2/$1>", "(red)\\n(blue)"]),
+            Some(Box::new(read)),
+        );
         let cache = Mutex::new(Cache::default());
         for name in [0, 1] {
             let Observed::Ready(mut group) = worker
@@ -3010,11 +3032,7 @@ mod tests {
             }
             ReadOutcome::Stable(ReadVersion::Catalogued)
         };
-        let mut worker = Worker {
-            plan: plan(&["--json", "-B1", "red"]),
-            buffer: Vec::new(),
-            read: Some(Box::new(read)),
-        };
+        let mut worker = Worker::new(plan(&["--json", "-B1", "red"]), Some(Box::new(read)));
         let cache = Mutex::new(Cache::default());
         for (name, path) in [(0, "first"), (1, "second")] {
             let Observed::Ready(mut group) = worker
@@ -3147,11 +3165,7 @@ mod tests {
             }
             ReadOutcome::Stable(ReadVersion::Catalogued)
         };
-        let mut worker = Worker {
-            plan: plan(&["--json", "red"]),
-            buffer: Vec::new(),
-            read: Some(Box::new(read)),
-        };
+        let mut worker = Worker::new(plan(&["--json", "red"]), Some(Box::new(read)));
         let cache = Mutex::new(Cache::default());
         let first = worker
             .prepare(
