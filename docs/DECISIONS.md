@@ -7082,6 +7082,12 @@ Context: S4 step 2 is built and off (ROADMAP § S4). The shadow log's only
 `differ` verdicts so far are D124's committed `vendor/` tree; every
 `rejected` call is either fixed or a refusal that falls back to rg.
 
+Evidence (2026-10-27): with 2323dac deployed on msa2, which lists
+`--files --sort=modified` (the Glob tool's shape) instead of refusing it,
+three fresh agent runs logged 127 calls: 117 `agree`, 10 skipped (stdin,
+`--version`, special paths), no `differ` and no `rejected`. Each earlier run
+had 13 to 16 sort refusals.
+
 | Option | Costs | Buys |
 | --- | --- | --- |
 | A. Flip after D124 is settled and a fresh day's log has no unexplained `differ` | Waits on D124 and a day of shadow traffic | Agents meet no known wrong answer on the first day |
