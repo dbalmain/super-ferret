@@ -33,8 +33,10 @@ pub use grep::{GrepGlobError, GrepIgnore, GrepSelection};
 pub use rules::DirRules;
 
 /// What setup writes to a new global ignore file: the M1 list, measured on
-/// Dave's tree (research M1), in sections a user can comment out. After that
-/// the file is the user's; nothing here applies these patterns by itself.
+/// Dave's tree (research M1), less `vendor/`, `dist/` and `build/`, which
+/// rg searches when they are committed (D124). In sections a user can
+/// comment out. After that the file is the user's; nothing here applies
+/// these patterns by itself.
 /// `result` has no slash: Nix's `result` is a symlink.
 pub const DEFAULT_IGNORE: &str = "\
 # ferret's global ignore file: gitignore syntax, applied under every root,
@@ -46,13 +48,10 @@ pub const DEFAULT_IGNORE: &str = "\
 
 # Dependencies
 node_modules/
-vendor/
 .venv/
 
 # Build output
 target/
-dist/
-build/
 .next/
 # Nix build output: a symlink, so no trailing slash.
 result

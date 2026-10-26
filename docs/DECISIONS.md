@@ -7072,6 +7072,9 @@ rather not see.
 these names is large enough to matter for index size (say over 1 GB); then
 B, or A with a per-repo `.ferretignore`.
 
+> Dave: C (2026-10-27). The seed drops `vendor/`, `dist/` and `build/`, and
+> msa2's ignore file loses the same three lines.
+
 ## D125 — When the agents' `rg` starts answering from ferret
 
 **Question:** When should the stand-in `rg` switch to `FERRET_ANSWER=ferret`,
@@ -7097,3 +7100,6 @@ had 13 to 16 sort refusals.
 
 **Fact that would change it:** the repository that commits `vendor/` is one
 you rarely search, which makes B's cost close to nothing.
+
+> Dave: A (2026-10-27). Flip after C is deployed and a day's shadow log shows
+> no unexplained `differ`.
