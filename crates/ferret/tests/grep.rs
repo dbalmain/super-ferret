@@ -825,6 +825,89 @@ fn read_denial_is_an_error_and_special_operands_are_streams() {
     }
 }
 
+// The selection is an argument error, so it is reported before routing looks
+// for an index, in both modes.
+#[test]
+fn a_bad_type_is_reported_before_a_missing_index() {
+    let fixture = Fixture::new("type-before-index");
+    for mode in [&["--files"][..], &["red"]] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .arg("--index")
+            .arg(fixture.base.join("absent"))
+            .arg("grep")
+            .args(mode)
+            .args(["--live", "-t", "no-such-type", "."]);
+        let output = run(command, None);
+        assert_eq!(output.status.code(), Some(2), "{mode:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("unrecognized file type: no-such-type"),
+            "{mode:?}: {output:?}"
+        );
+    }
+}
+
+// A pipe whose producer holds it open must not hold back the files after
+// it: rg answers `-q` from them, and `-l` lists them, while the pipe waits.
+#[test]
+fn a_held_pipe_is_read_after_the_files() {
+    let fixture = Fixture::new("held-pipe");
+    let fifo = fixture.base.join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let spawn = |args: &[&str]| {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(args)
+            .arg(&fifo)
+            .arg("one.rs");
+        command.spawn().unwrap()
+    };
+    // Opening read-write never blocks, and keeps a writer on the pipe.
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
+    let mut quiet = spawn(&["-q", "red"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = quiet.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            quiet.kill().unwrap();
+            panic!("-q waited on the held pipe");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0));
+    // A writer that opens after ferret does: the open meets ferret's, and
+    // closing it ends the stream.
+    drop(writer);
+    let producer = std::thread::spawn({
+        let fifo = fifo.clone();
+        move || fs::write(fifo, b"red\n").unwrap()
+    });
+    let output = spawn(&["-l", "red"]).wait_with_output().unwrap();
+    producer.join().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        format!("one.rs\n{}\n", fifo.display()).as_bytes(),
+        "{output:?}"
+    );
+}
+
 // D99: only a run with no path operand, which searches the current
 // directory, diagnoses a walk that searched nothing; it exits 2 as rg does. An
 // explicit `.`, stdin, or a file that fails to open (it was searched) keeps

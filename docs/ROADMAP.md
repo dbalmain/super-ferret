@@ -2035,6 +2035,15 @@ under D123 B (9010608): `-F -a xylophone` at one thread then took 833 ms
 against rg's 784 (1.06x), and 182 against 208 at 32 threads (hyperfine
 through bash, 2 warmups and 8 runs, output identical).
 
+**Dense output to a real destination (4d08031, 2026-10-26):** the `-F -a
+the` gap exists only when stdout is `/dev/null`. At 32 threads (hyperfine
+`-N`, 2 warmups, 8 runs, medians) ferret took 324 ms to rg's 260 there,
+but 889 to rg's 1063 through a pipe (`| cat > /dev/null`) and 990 to 1005
+written to a tmpfs file. As D95 found for indexed output, `/dev/null`
+measures only the handoff to the publisher, which a reader that consumes
+the bytes hides; widening the chunk channel or writing from workers would
+trade the memory bound for a case nobody reads. Left as is.
+
 ## S4 — Agent skill
 
 A Claude Code skill that routes AI agents' file and content search through
@@ -2077,6 +2086,18 @@ parameter, rejected on every typed call; both are now supported (GREP.md
 
 S1b's daemon extended to the content index: postings kept current from its
 change events, hot index files resident (D14).
+
+**Status (read from the code, 2026-10-26): the core has landed.** The
+daemon follows content after each refresh under a 256 KiB, 100 ms budget,
+merges on its own thread (D114), adopts each publication without a reload,
+and serves directory grep from a resident pin (D111); S2.md § "What S5
+needs" is met, status block included. What remains grows with the index
+rather than the searched tree: the candidate set is sized to the whole
+index and postings are decoded for all of it before the operand's subtree
+cuts them; the first grep after a cross-epoch publication rebuilds
+`DocNames` over every name (D111 B's `st_nlink` check would remove it);
+and segments are read by `pread`, so "resident" means the page cache. Each
+needs a bench row at 1M names before it is worth doing.
 
 ## S6 — Opt-in experiments and metrics
 

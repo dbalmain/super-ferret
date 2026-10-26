@@ -7049,7 +7049,7 @@ Context, from the S4 shadow log on 2026-10-26 (msa2):
 | --- | --- | --- |
 | A. Keep the policy; the shadow labels these `known:policy` | Agents silently miss committed vendor code in repos like that one | Nothing to build; a smaller index |
 | B. In rg mode, scan live any directory excluded only by the global ignore file (not by git or `.ferretignore`) | A second visibility rule in the walker and index planner; every search from such a repo root rescans the tree (here 2.8k files, 14 MiB, tens of ms) | rg's answer for these trees, with the index still small; other documented differences remain |
-| C. Drop `vendor/`, `build/` and `dist/` from the seed, and from your own file | On msa2 (three checkouts of one repo) at most about +8k names and +42 MiB of content, the files rg searches; estimated from rg's file list, not measured by indexing. New setups only, unless you edit your file | rg's answer for these names with no new mechanism; gitignored build output stays excluded by `.gitignore` |
+| C. Drop `vendor/`, `build/` and `dist/` from the seed, and from your own file | Measured by indexing one checkout both ways: 1,061 → 6,160 indexed documents, 1.8 → 9.6 MB of index on disk. Three checkouts on msa2: about +15k documents and +24 MB. New setups only, unless you edit your file | rg's answer for these names with no new mechanism; gitignored build output stays excluded by `.gitignore` |
 
 **Recommendation: C.** Where these directories are build output they are
 nearly always gitignored, so the seed adds little; where they are committed
@@ -7061,3 +7061,22 @@ commits those.
 these names is large enough to matter for index size (say over 1 GB); then
 B, or A with a per-repo `.ferretignore`.
 
+## D125 — When the agents' `rg` starts answering from ferret
+
+**Question:** When should the stand-in `rg` switch to `FERRET_ANSWER=ferret`,
+so agents get ferret's answers with real rg taking the commands ferret
+refuses?
+
+Context: S4 step 2 is built and off (ROADMAP § S4). The shadow log's only
+`differ` verdicts so far are D124's committed `vendor/` tree; every
+`rejected` call is either fixed or a refusal that falls back to rg.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Flip after D124 is settled and a fresh day's log has no unexplained `differ` | Waits on D124 and a day of shadow traffic | Agents meet no known wrong answer on the first day |
+| B. Flip now and accept the D124 gap | Agents miss committed `vendor/` code in one repository | Answer-mode traffic a day sooner |
+
+**Recommendation: A.**
+
+**Fact that would change it:** the repository that commits `vendor/` is one
+you rarely search, which makes B's cost close to nothing.

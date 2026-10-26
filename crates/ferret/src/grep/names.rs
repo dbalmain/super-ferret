@@ -15,19 +15,21 @@ pub(super) fn run(
     tty: bool,
     consumed: bool,
 ) -> Exit {
+    // As in content search, the selection is checked before routing opens
+    // anything.
+    let selection = match selection(plan) {
+        Ok(selection) => selection,
+        Err(error) => return failure(&error),
+    };
     let routed = match routing::route(resolve_inputs(&plan.paths, true), plan.traversal, index) {
         Ok(routed) => routed,
         Err(refusal) => return refusal.exit(args, consumed),
     };
-    if routed.daemon {
-        if let Err(error) = selection(plan) {
-            return failure(&error);
-        }
-        if let Ok(index) = index_path(index)
-            && let Some(exit) = remote::names(args, plan, tty, &index)
-        {
-            return exit;
-        }
+    if routed.daemon
+        && let Ok(index) = index_path(index)
+        && let Some(exit) = remote::names(args, plan, tty, &index)
+    {
+        return exit;
     }
     let cancelled = AtomicBool::new(false);
     let stdout = io::stdout();
@@ -36,7 +38,7 @@ pub(super) fn run(
         // As in `block_stdout`: live policy warnings bypass the writer.
         !plan.presentation.null && !plan.traversal.live,
     );
-    match execute_routed(plan, index, routed, &mut writer, &cancelled) {
+    match execute_routed(plan, selection, index, routed, &mut writer, &cancelled) {
         Ok(exit) => exit,
         Err(error) => failure(&error),
     }
@@ -67,19 +69,20 @@ fn execute(
     writer: &mut impl Write,
     cancelled: &AtomicBool,
 ) -> Result<Exit, String> {
+    let selection = selection(plan)?;
     let routed = routing::route(resolve_inputs(&plan.paths, true), plan.traversal, index)
         .map_err(Refusal::into_message)?;
-    execute_routed(plan, index, routed, writer, cancelled)
+    execute_routed(plan, selection, index, routed, writer, cancelled)
 }
 
 fn execute_routed(
     plan: &Names,
+    selection: GrepSelection,
     index: Option<&Path>,
     routed: routing::Routed,
     writer: &mut impl Write,
     cancelled: &AtomicBool,
 ) -> Result<Exit, String> {
-    let selection = selection(plan)?;
     let routing::Routed {
         inputs,
         live,

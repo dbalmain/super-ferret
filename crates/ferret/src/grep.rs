@@ -625,7 +625,16 @@ fn resolve_inputs(paths: &[PathBuf], names_only: bool) -> Vec<Input> {
     resolve_inputs_at(paths, names_only, Path::new("."))
 }
 
+/// Content search reads named special files after every other operand: a
+/// pipe's producer may hold it open, and rg answers `-q` or `-l` from the
+/// files meanwhile. Stdin keeps its place.
 fn resolve_inputs_at(paths: &[PathBuf], names_only: bool, cwd: &Path) -> Vec<Input> {
+    let mut inputs = resolve_each(paths, names_only, cwd);
+    inputs.sort_by_key(|input| matches!(input, Input::Stream(path) if path != Path::new("-")));
+    inputs
+}
+
+fn resolve_each(paths: &[PathBuf], names_only: bool, cwd: &Path) -> Vec<Input> {
     paths
         .iter()
         .map(|path| {
