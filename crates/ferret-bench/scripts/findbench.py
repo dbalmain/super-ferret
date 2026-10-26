@@ -133,7 +133,9 @@ class Bench:
         if logged:
             with open(self.log, "rb") as f:
                 f.seek(max(0, os.fstat(f.fileno()).st_size - 8192))
-                line = json.loads(f.read().splitlines()[-1])
+                # A resident daemon logs its own refresh lines in between.
+                lines = map(json.loads, reversed(f.read().splitlines()))
+                line = next(l for l in lines if l["cmd"] == "search")
             assert line["query"] == argv[1:], (line["query"], argv)
             result.update(
                 total=line["total_us"] / 1e3,

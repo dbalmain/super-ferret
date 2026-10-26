@@ -1610,7 +1610,11 @@ fn a_rebuilt_catalog_incarnation_is_confirmed_and_adopted() {
     );
     let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
     assert!(
-        log.lines().last().unwrap().contains("\"host\":\"socket\""),
+        // The new daemon's startup backstop logs a refresh line of its own.
+        log.lines()
+            .rfind(|line| line.contains("\"cmd\":\"search\""))
+            .unwrap()
+            .contains("\"host\":\"socket\""),
         "incarnation change stranded the client on fallback"
     );
 }

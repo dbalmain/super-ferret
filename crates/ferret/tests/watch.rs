@@ -323,6 +323,15 @@ impl Tree {
     fn path(&self, name: &str) -> PathBuf {
         self.base.join(name)
     }
+    /// The daemon's own `refresh` lines in the query log.
+    fn refresh_lines(&self) -> Vec<String> {
+        fs::read_to_string(self.path("home/state/ferret/log.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("\"cmd\":\"refresh\""))
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 #[test]
@@ -688,6 +697,84 @@ fn polling_does_not_refresh_a_fully_covered_tree() {
         last, last_after,
         "covered roots were refreshed by polling: {after}"
     );
+}
+
+/// Each backstop, and each poll that walks a root, leaves one query-log line
+/// saying what it cost, so the hourly backstop's price (D121) can be read
+/// from real use. The fixture's root holds src, left, deep and right, and one
+/// file.
+#[test]
+fn the_daemon_logs_what_each_backstop_and_poll_cost() {
+    let mut tree = Tree::new();
+    tree.start(&[
+        ("FERRET_WATCH_CAP", "1"),
+        ("FERRET_POLL_MS", "200"),
+        ("FERRET_BACKSTOP_MS", "400"),
+    ]);
+    let kind = |lines: &[String], kind: &str| {
+        lines
+            .iter()
+            .filter(|line| line.contains(&format!("\"kind\":\"{kind}\"")))
+            .count()
+    };
+    // The startup backstop, a timed one, and a poll of the uncovered root.
+    wait(|| {
+        let lines = tree.refresh_lines();
+        kind(&lines, "backstop") >= 2 && kind(&lines, "poll") >= 1
+    });
+    let lines = tree.refresh_lines();
+    assert_eq!(
+        kind(&lines, "backstop") + kind(&lines, "poll"),
+        lines.len(),
+        "{lines:#?}"
+    );
+    for line in &lines {
+        assert!(line.contains("\"v\":1"), "{line}");
+        assert!(line.contains("\"outcome\":\"unchanged\""), "{line}");
+        assert!(
+            number(line, "total_us") >= number(line, "walk_us"),
+            "{line}"
+        );
+        assert_eq!(number(line, "refreshed"), 1, "{line}");
+        assert_eq!(number(line, "dirs"), 4, "{line}");
+        assert_eq!(number(line, "files"), 1, "{line}");
+    }
+}
+
+/// An inotify-driven refresh is not logged: one can follow every save. A
+/// poll with nothing to walk issues no refresh, so the burst after it is not
+/// counted as one.
+#[test]
+fn an_inotify_refresh_is_not_logged_even_after_an_empty_poll() {
+    let mut tree = Tree::new();
+    tree.start(&[("FERRET_POLL_MS", "100")]);
+    let before = number(&tree.status(), "refreshes");
+    std::thread::sleep(Duration::from_millis(400));
+    write(tree.path("src/left/saved.txt"), "saved");
+    tree.converges();
+    assert!(number(&tree.status(), "refreshes") > before);
+    let lines = tree.refresh_lines();
+    assert_eq!(lines.len(), 1, "only the startup backstop: {lines:#?}");
+    assert!(lines[0].contains("\"kind\":\"backstop\""), "{lines:#?}");
+}
+
+/// A backstop that bulk admission defers is retried every second for as long
+/// as the shortage lasts, which could be all day; it logs the first attempt
+/// only.
+#[test]
+fn a_deferred_backstop_logs_once_however_often_it_retries() {
+    let mut tree = Tree::new();
+    // More memory than the fixture's signals report available.
+    tree.spawn(&[("FERRET_MEMORY_FLOOR_BYTES", "10000000000000000")]);
+    wait(|| {
+        tree.status()
+            .contains("\"blocked_reason\":\"memory-blocked\"")
+    });
+    std::thread::sleep(Duration::from_millis(3500));
+    let lines = tree.refresh_lines();
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains("\"kind\":\"backstop\""), "{lines:#?}");
+    assert!(lines[0].contains("\"outcome\":\"deferred\""), "{lines:#?}");
 }
 
 #[test]

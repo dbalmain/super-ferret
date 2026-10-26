@@ -455,7 +455,9 @@ pub(crate) fn log_result(
     log_report(object, report);
 }
 
-fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
+/// A crawl report's log fields: root counts, phase times and walk counts.
+/// Index lines and the daemon's refresh lines share it.
+pub(crate) fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
     let c = &report.counts;
     object
         .int("refreshed", report.refreshed.len() as u64)

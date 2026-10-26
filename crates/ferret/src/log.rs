@@ -1,5 +1,6 @@
-//! The local query and timing log: one JSON line per `search` and per index
-//! run, appended to `$XDG_STATE_HOME/ferret/log.jsonl`.
+//! The local query and timing log: one JSON line per `search`, per index
+//! run and per daemon backstop or poll refresh, appended to
+//! `$XDG_STATE_HOME/ferret/log.jsonl`.
 //!
 //! It is the future source of the opt-in upload and of structure choices
 //! (DESIGN § Experiments and metrics), so it records query text, plans,

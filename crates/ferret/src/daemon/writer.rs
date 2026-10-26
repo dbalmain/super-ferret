@@ -316,8 +316,10 @@ fn serve(
     let polling = duration("FERRET_POLL_MS", 5 * 60 * 1000).max(Duration::from_millis(1));
     let mut full_due = Instant::now() + hourly;
     let mut poll_due = Instant::now() + polling;
-    // Whether a poll was issued that no refresh has taken yet.
+    // Whether a poll with roots to walk was issued that no refresh has taken
+    // yet.
     let mut poll_issued = false;
+    let mut refresh_log = RefreshLog::default();
     let mut retry_due: Option<Duration> = None;
     let mut initial = watch.is_none();
     host.writer_status
@@ -437,16 +439,19 @@ fn serve(
                     .into_iter()
                     .chain(retained_roots(pin.catalog()))
                     .collect::<BTreeSet<_>>();
+                // A poll with nothing to walk issues no refresh. Marking it
+                // issued would make the next inotify burst count as a poll.
+                poll_issued |= !scopes.is_empty();
                 w.scoped_roots(scopes.into_iter().collect());
             } else {
                 initial = true;
+                poll_issued = true;
                 host.writer_status
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .fallback_backstop = true;
             }
             poll_due = Instant::now() + polling;
-            poll_issued = true;
         }
         if retry_due.is_some_and(|retry| scheduler.now() < retry) {
             continue;
@@ -523,6 +528,7 @@ fn serve(
         if elapsed >= Duration::from_secs(1) {
             release_freed_memory();
         }
+        refresh_log.record(&context, reason, polled, elapsed, &result);
         let deferred = result
             .as_ref()
             .ok()
@@ -802,6 +808,66 @@ fn global_inputs(watch: Option<&Arc<Watch>>, engine: &Engine, context: &crate::c
             w.policy_path(root, &dirs.ignore_file());
             w.policy_path(root, &dirs.config.join("config"));
         }
+    }
+}
+/// The query log's record of what the daemon's own refreshes cost, so the
+/// hourly backstop's price (D121) can be read from real use: one `refresh`
+/// line per backstop, overflow or poll refresh, with its kind, outcome,
+/// elapsed time and the walk's counts. An inotify burst is not logged, since
+/// one can follow every save. A refresh that is deferred or fails is retried
+/// every second while the cause lasts, so only the first line of such a run
+/// is written; the next line is the kind's next different outcome.
+#[derive(Default)]
+struct RefreshLog {
+    /// The kind and outcome of the last line, when it was one a retry would
+    /// repeat.
+    repeating: Option<(&'static str, &'static str)>,
+}
+impl RefreshLog {
+    /// Logs a finished refresh. `polled` says it took a poll's roots. Without
+    /// a watch every refresh is a full walk, so a poll is logged as a
+    /// backstop. A line that cannot be written is a warning on the daemon's
+    /// stderr, as a command's is on the client's.
+    fn record(
+        &mut self,
+        context: &crate::cli::Context,
+        reason: RefreshReason,
+        polled: bool,
+        elapsed: Duration,
+        result: &io::Result<ferret_crawl::RefreshReport>,
+    ) {
+        use ferret_crawl::RefreshOutcome;
+        let kind = match reason {
+            RefreshReason::Backstop => "backstop",
+            RefreshReason::Overflow => "overflow",
+            RefreshReason::PolicyChange => "policy-change",
+            RefreshReason::Burst if polled => "poll",
+            RefreshReason::Burst => return,
+        };
+        let outcome = match result.as_ref().map(|r| &r.outcome) {
+            Ok(RefreshOutcome::Unchanged) => "unchanged",
+            Ok(RefreshOutcome::Committed { .. } | RefreshOutcome::Checkpointed) => "published",
+            Ok(RefreshOutcome::DeferredBulk(_)) => "deferred",
+            Ok(RefreshOutcome::RetryFromCurrent(_)) => "retry",
+            Err(_) => "error",
+        };
+        let repeats = matches!(outcome, "deferred" | "retry" | "error");
+        if repeats && self.repeating == Some((kind, outcome)) {
+            return;
+        }
+        self.repeating = repeats.then_some((kind, outcome));
+        let began = SystemTime::now().checked_sub(elapsed).unwrap_or(UNIX_EPOCH);
+        let mut line = Vec::new();
+        let mut object = crate::log::line(&mut line, "refresh", began);
+        object
+            .str("kind", kind)
+            .str("outcome", outcome)
+            .int("total_us", elapsed.as_micros() as i128);
+        if let Ok(refreshed) = result {
+            crate::index::log_report(&mut object, &refreshed.report);
+        }
+        object.end();
+        context.log(&line);
     }
 }
 fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {

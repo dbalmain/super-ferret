@@ -754,8 +754,8 @@ upload of those logs and the local query log. The local query and timing log
 exists from S1 and is the source of both.
 
 The log is `$XDG_STATE_HOME/ferret/log.jsonl` (mode 0600), one JSON line per
-`search` and per index run (`ferret index`, `ferret roots remove`), each with
-`"v":1`. A `search` line records:
+`search`, per index run (`ferret index`, `ferret roots remove`) and per daemon
+refresh, each with `"v":1`. A `search` line records:
 
 - the query atoms, the plan (`explain()`) and the strategy;
 - `Stats`, the rows, the time to the first row and the total time;
@@ -767,6 +767,15 @@ An index line records:
   withdrew (outcome `partial`, exit 4);
 - the walk, hash, commit and content-fault-pass times, and the peak RSS;
 - the crawl's counts and the published generation's counts.
+
+A `refresh` line is the daemon's own, one per backstop, overflow or poll
+refresh it runs, so what the hourly backstop costs (D121) can be read from
+real use. An inotify burst is not logged, since one can follow every save. The
+line records the `kind` (`backstop`, `overflow` or `poll`), the `outcome`
+(`published`, `unchanged`, `deferred`, `retry` or `error`), `total_us`, and
+the index line's crawl fields. A deferred or failing refresh is retried every
+second while its cause lasts, and only the first line of such a run is
+written.
 
 No field holds an id (D27 renumbers them), a result path or a root path. The
 query atoms are logged as typed, though, so query text may itself contain a path
