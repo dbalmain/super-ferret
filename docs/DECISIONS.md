@@ -6965,3 +6965,33 @@ the restart cost on these machines is about a second.
 **Fact that would change it:** a crash loop actually observed, or a
 transient writer panic on a tree whose startup backstop takes minutes; then
 C, and B only if transient panics recur.
+
+## D123 — Keep the changed-during-read check on rg-mode scans?
+
+**Question:** When `ferret grep` scans a directory no index covers, should
+each file read keep the changed-during-read check (an fstat after the read
+and a re-stat of the name, retrying on change), or skip it there to match
+rg?
+
+Context, measured on 2026-10-26 (msa2, warm cache, the private 112k-file
+corpus) after ab49c3f:
+
+- The uncovered-directory scan went from 3.6x slower than rg at 32 threads
+  to level (185 ms against 176) and from 1.4x to 1.12x at one thread (889 ms
+  against 794), with output identical to rg's on every row tested.
+- The check is three of the four remaining syscalls per file that rg does not
+  make, and most of the one-thread gap: an uncommitted build without it
+  measured 837 ms against rg's 789 in the same run.
+- rg has no such check: a file rewritten while it is read prints whatever
+  was read. ferret retries and prints a consistent version.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep it everywhere | About 85 ms per 112k files at one thread (~10%); nothing at 32 threads, where ferret is already level | A file rewritten mid-read is retried, never printed torn |
+| B. Skip it for uncovered rg-mode scans only; `--live` and indexed reads keep it | Torn output, silently, for a file rewritten mid-read, as rg does | One thread within ~6% of rg |
+
+**Recommendation: A.** The gap exists only at one thread, and agents run
+with every core.
+
+**Fact that would change it:** a decision that uncovered scans should match
+rg's behaviour exactly rather than only its output; then B.
