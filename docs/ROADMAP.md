@@ -2009,6 +2009,29 @@ Findings:
 - The client's peak RSS at 1 thread is about 86 MiB, against rg's 21; at 32
   threads ferret is the lower of the two in most rows.
 
+### Uncovered-directory scan at ab49c3f (2026-10-26)
+
+Plain `ferret grep` on a directory no index covers (D112), on the same
+corpus, msa2, warm cache, hyperfine `-N`, 2 warmups and 6 runs. Three causes
+were fixed: a pool-wide lock and wake per file for output that most files
+never hold (039860e), a stat per file for a size rg mode never uses
+(5e9c09c), and work-stealing loans that copied the lender's whole child
+stack, all 112k names, under the scheduler's lock (ab49c3f). The last also
+took `find -I corpus -type f` at 32 threads from 636 ms to 55.
+
+| query | t | before | after | rg |
+|---|--:|--:|--:|--:|
+| `-F -a xylophone` | 1 | 1097 | 889 | 794 |
+| `-F -a xylophone` | 32 | 625 | 175 | 169 |
+| `-F -a the` | 32 | 635 | 318 | 251 |
+| `-c -F -a the` | 32 | 595 | 181 | 171 |
+| `-l -F -a the` | 32 | 622 | 164 | 167 |
+
+Output matched rg's on every row. What remains: at one thread, mostly the
+changed-during-read check (D123); for `-F -a the`, which prints 2.35 GB, the
+single publisher thread, with workers handing large outputs over in 64 KB
+chunks through a one-slot channel.
+
 ## S4 — Agent skill
 
 A Claude Code skill that routes AI agents' file and content search through
