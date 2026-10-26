@@ -13,7 +13,7 @@ model. Anything not promised here is not promised. D72–D75 are answered in
 | Input | Source |
 | --- | --- |
 | Recursive directory, default `.` | Pinned catalog and S3 trigram postings; current bytes for candidates |
-| Uncovered directory (D112 B) | Live rg visibility: git rules from the nearest enclosing `.git`, `.ignore`/`.rgignore` from every ancestor |
+| Uncovered directory (D112 B, D128) | Live walk with ferret policy, the operand as its own root; under `--rg`, rg visibility: git rules from the nearest enclosing `.git`, `.ignore`/`.rgignore` from every ancestor |
 | Explicit file, file symlink, or `-` | Direct current-byte search, without opening an index |
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
 | `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
@@ -507,6 +507,20 @@ input with fallible allocation and cancellation; allocation failures are
 errors, never truncation or a no-match answer.
 
 ## Ignore rules and visibility
+
+**D128 A (2026-10-27):** grep follows ferret's visibility rules by default and
+rg's only under `--rg`. By default hidden names are shown (`--no-hidden` hides
+them), and an uncovered directory walks under D13 with ferret's global ignore
+file, as if it were an index root; nothing above the operand is read. Its
+files are read as rg reads them in both modes: no size cap, rg's binary probe,
+one read (D123), matching indexed grep's live reads of oversized files. `--rg`
+restores the rg-parity rules this section describes: hidden names held unless
+revealed, and uncovered directories under rg's rules from `/`. The agents' `rg`
+stand-in and the shadow pass `--rg`, and every rg differential test runs with
+it. `-uu` and `--hidden` mean the same in both modes. When the stand-in's
+`FERRET_GREP_FALLBACK` hands a refused command to rg, a leading `--rg` is
+dropped, since rg has no such flag. The ignore rules below hold in both
+modes; the hidden-name rules, and the uncovered walk's, are `--rg`'s.
 
 **D74 A (confirmed 2026-10-16):** indexed visibility is D47/D13, with rg hidden/glob filters
 on top. It uses ferret global rules, `.gitignore`/`info/exclude` inside worktrees

@@ -15,6 +15,9 @@ pub(super) struct Anchors {
     roots: Arc<[PathBuf]>,
     uncovered: Arc<[PathBuf]>,
     fallback: bool,
+    /// `--rg`: the uncovered operands walk under rg's rules; otherwise each
+    /// is a policy root of its own, as if it were indexed (D128).
+    rg: bool,
     faults: Arc<[(PathBuf, io::Error)]>,
     /// The first configured root whose destination cannot be established:
     /// an unreadable component or a link loop may hide an alias to any
@@ -82,6 +85,7 @@ impl Anchors {
             roots: roots.into(),
             uncovered: Arc::default(),
             fallback: false,
+            rg: false,
             faults: faults.into(),
             unknown,
             global,
@@ -128,22 +132,33 @@ impl Anchors {
         anchors.uncovered = uncovered.into();
         Ok(anchors)
     }
-    /// Loads git's global excludes for the uncovered operands. Kept apart
-    /// from [`Self::routing`] because its warnings are output: a request
-    /// refused after routing must not have printed them.
-    pub fn with_git_global(mut self) -> Self {
-        if !self.uncovered.is_empty() {
-            self.global = git_global_excludes()
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default()
-                .into();
-            let (rules, errors) = ferret_policy::GrepIgnore::new(&self.global);
-            for error in errors {
-                eprintln!("ferret: warning: ignore pattern skipped: {error}");
-            }
-            self.git_global = Arc::new(rules);
+    /// Loads the global rules for the uncovered operands: git's global
+    /// excludes under `--rg`, ferret's global ignore file otherwise. Kept
+    /// apart from [`Self::routing`] because its warnings are output: a
+    /// request refused after routing must not have printed them.
+    pub fn with_globals(mut self, rg: bool) -> Result<Self, String> {
+        self.rg = rg;
+        if self.uncovered.is_empty() {
+            return Ok(self);
         }
-        self
+        if !rg {
+            self.global = global()?;
+            return Ok(self);
+        }
+        self.global = git_global_excludes()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+            .into();
+        let (rules, errors) = ferret_policy::GrepIgnore::new(&self.global);
+        for error in errors {
+            eprintln!("ferret: warning: ignore pattern skipped: {error}");
+        }
+        self.git_global = Arc::new(rules);
+        Ok(self)
+    }
+    /// The walk applies rg's rules rather than D13.
+    fn rg_rules(&self) -> bool {
+        self.fallback && self.rg
     }
     pub fn walks(&self, path: &Path) -> bool {
         !self.fallback || self.uncovered.iter().any(|operand| operand == path)
@@ -185,14 +200,18 @@ impl Anchors {
     }
     pub fn start(&self, path: &Path, stopped: &dyn Fn() -> bool) -> io::Result<Policy> {
         let real = self.validate(path)?;
-        if self.fallback {
+        if self.rg_rules() {
             return self.start_rg(path, real, stopped);
         }
-        let root = self
-            .roots
-            .iter()
-            .find(|root| real.starts_with(root))
-            .ok_or_else(|| io::Error::other("no covering policy root"))?;
+        // An uncovered operand is a policy root of its own.
+        let root = if self.fallback {
+            &real
+        } else {
+            self.roots
+                .iter()
+                .find(|root| real.starts_with(root))
+                .ok_or_else(|| io::Error::other("no covering policy root"))?
+        };
         let mut state = self.root(root, None, stopped)?;
         let mut at = root.clone();
         for component in real
@@ -440,7 +459,13 @@ pub(super) struct Policy {
     warnings: Option<Vec<String>>,
 }
 impl Policy {
+    /// Entries are selected by rg's rules rather than D13.
     pub fn rg(&self) -> bool {
+        self.anchors.rg_rules()
+    }
+    /// The walk is of an uncovered operand, whose files are read as rg reads
+    /// them in either mode: no size cap, rg's binary probe, one read (D123).
+    pub fn uncovered(&self) -> bool {
         self.anchors.fallback
     }
     /// Holds warnings from directories' rules for [`Self::take_warnings`],
@@ -513,7 +538,7 @@ impl Policy {
         let kind = entry.kind()?;
         let directory = kind == FileKind::Directory;
         if directory
-            && !self.anchors.fallback
+            && !self.anchors.rg_rules()
             && !matches!(state, State::Bypass)
             && self.anchors.roots.contains(&path)
         {
@@ -525,7 +550,7 @@ impl Policy {
             FileKind::Directory => PolicyEntry::Dir,
             // Rg's rules have no size cap (`load_grep_policy`), so a file's
             // size would go unused; skip the stat.
-            FileKind::File if self.anchors.fallback => PolicyEntry::File { size: 0 },
+            FileKind::File if self.anchors.rg_rules() => PolicyEntry::File { size: 0 },
             FileKind::File => PolicyEntry::File {
                 size: entry.metadata()?.len(),
             },
@@ -599,7 +624,7 @@ impl Policy {
             let next = match (decision, state) {
                 (Decision::Descend, State::Rules { root, rules }) => State::Rules {
                     root: root.clone(),
-                    rules: if self.anchors.fallback {
+                    rules: if self.anchors.rg_rules() {
                         load_rg(&path, Some(rules), None, self.warnings.as_mut(), stopped)?
                     } else {
                         enter(rules, &path, self.warnings.as_mut(), stopped)?
@@ -615,8 +640,12 @@ impl Policy {
             self.stack.push((path, next));
             Ok(true)
         } else {
+            // An uncovered operand stands in for an index, whose content
+            // search reads files over the size cap live.
             Ok(matches!(decision, Decision::Index)
-                || (!content && matches!(decision, Decision::Catalog(_))))
+                || (!content && matches!(decision, Decision::Catalog(_)))
+                || (self.anchors.fallback
+                    && matches!(decision, Decision::Catalog(ferret_policy::Reason::TooLarge))))
         }
     }
 }

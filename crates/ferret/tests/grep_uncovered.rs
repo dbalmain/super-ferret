@@ -975,3 +975,66 @@ fn core_excludes_file_is_read_as_rg_reads_it() {
     assert!(rg.stderr.is_empty(), "{rg:?}");
     assert!(ferret.stderr.is_empty(), "{ferret:?}");
 }
+
+// D128: without `--rg`, an uncovered operand is walked as if it were an index
+// root, so the answer must not change when it is indexed. Each named path
+// discriminates against rg's rules: rg hides the dot file, applies the
+// ancestor `.gitignore`, and ignores ferret's global file. A file over the
+// index size cap is searched, as indexed grep reads such files live.
+#[test]
+fn ferret_rules_walk_an_uncovered_operand_as_its_own_root() {
+    let f = Fixture::new("own-root");
+    f.repo();
+    f.write(".gitignore", b"*.log\n");
+    fs::write(f.base.join("home/config/ferret/ignore"), b"*.bak\n").unwrap();
+    for path in [
+        "src/keep.rs",
+        "src/.env",
+        "src/.notes/todo.md",
+        "src/drop.log",
+        "src/old.bak",
+    ] {
+        f.write(path, b"hit\n");
+    }
+    let mut big = b"hit\n".to_vec();
+    big.resize(9 << 20, b'a');
+    f.write("src/big.txt", &big);
+    let src = f.tree.join("src");
+    let expected = [
+        "src/.env",
+        "src/.notes/todo.md",
+        "src/big.txt",
+        "src/drop.log",
+        "src/keep.rs",
+    ];
+    let cases: [&[&str]; 2] = [&["-l", "hit", "src"], &["--files", "src"]];
+    let mut walked = Vec::new();
+    for args in cases {
+        let output = f.ferret_own(&f.tree, args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert_eq!(sorted(&output.stdout), expected, "{args:?}");
+        walked.push(output.stdout);
+    }
+    let hidden = f.ferret_own(&f.tree, &["--no-hidden", "--files", "src"]);
+    assert_eq!(
+        sorted(&hidden.stdout),
+        ["src/big.txt", "src/drop.log", "src/keep.rs"]
+    );
+    let rg = f.ferret(&f.tree, &["--files", "src"]);
+    assert_eq!(
+        sorted(&rg.stdout),
+        ["src/big.txt", "src/keep.rs", "src/old.bak"]
+    );
+
+    f.index(&src);
+    for (args, walked) in cases.into_iter().zip(walked) {
+        let output = f.ferret_own(&f.tree, args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert_eq!(sorted(&output.stdout), sorted(&walked), "indexed {args:?}");
+    }
+    let rg = f.ferret(&f.tree, &["--files", "src"]);
+    assert_eq!(
+        sorted(&rg.stdout),
+        ["src/big.txt", "src/drop.log", "src/keep.rs"]
+    );
+}

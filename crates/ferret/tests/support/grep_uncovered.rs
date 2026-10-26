@@ -81,7 +81,13 @@ impl Fixture {
         command.output().unwrap()
     }
 
+    /// `ferret grep --rg`, the mode every rg differential compares (D128).
     pub fn ferret(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.ferret_own(cwd, &[&["--rg"], args].concat())
+    }
+
+    /// `ferret grep` under ferret's own visibility rules.
+    pub fn ferret_own(&self, cwd: &Path, args: &[&str]) -> Output {
         let mut command = self.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")), cwd);
         command
             .arg("--index")

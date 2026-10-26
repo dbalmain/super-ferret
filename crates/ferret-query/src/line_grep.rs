@@ -61,6 +61,10 @@ pub enum Sort {
 pub struct Traversal {
     pub unrestricted: bool,
     pub live: bool,
+    /// `--rg`: rg's own visibility rules, where ferret's are the default
+    /// (D128): hidden names stay hidden, and an uncovered directory walks
+    /// under rg's ignore files from `/` rather than ferret's policy.
+    pub rg: bool,
     pub follow: bool,
     pub max_depth: Option<usize>,
 }
@@ -285,7 +289,8 @@ pub fn parse_with(
     let mut replacement = None;
     let mut json = false;
     let (mut word, mut line) = (false, false);
-    let mut hidden = false;
+    // `--hidden` and its relatives; otherwise the mode decides (D128).
+    let mut hidden = None;
     let mut text_mode = false;
     let (mut multiline, mut dotall) = (false, false);
     let mut unrestricted_count = 0;
@@ -360,6 +365,7 @@ pub fn parse_with(
                 "--json" if value.is_none() => json = true,
                 "--no-json" if value.is_none() => json = false,
                 "--live" if value.is_none() => traversal.live = true,
+                "--rg" if value.is_none() => traversal.rg = true,
                 "--follow" if value.is_none() => traversal.follow = true,
                 "--no-follow" if value.is_none() => traversal.follow = false,
                 "--no-ignore" if value.is_none() => traversal.unrestricted = true,
@@ -373,8 +379,8 @@ pub fn parse_with(
                 "--no-multiline-dotall" if value.is_none() => dotall = false,
                 "--text" if value.is_none() => text_mode = true,
                 "--no-text" if value.is_none() => text_mode = false,
-                "--hidden" if value.is_none() => hidden = true,
-                "--no-hidden" if value.is_none() => hidden = false,
+                "--hidden" if value.is_none() => hidden = Some(true),
+                "--no-hidden" if value.is_none() => hidden = Some(false),
                 "--ignore-case" if value.is_none() => {
                     fold = true;
                     smart_case = false;
@@ -497,7 +503,7 @@ pub fn parse_with(
                     b'u' => unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?,
                     b'a' => text_mode = true,
                     b'U' => multiline = true,
-                    b'.' => hidden = true,
+                    b'.' => hidden = Some(true),
                     b'i' => {
                         fold = true;
                         smart_case = false;
@@ -617,6 +623,7 @@ pub fn parse_with(
         Some(Err(spelling)) => return Err(unsupported(&spelling)),
         None => None,
     };
+    let hidden = hidden.unwrap_or(!traversal.rg);
     if json && (files || output != Output::Lines) {
         return Err(ParseError::JsonMode);
     }
@@ -737,12 +744,12 @@ pub fn parse_with(
 fn unrestricted(
     count: &mut u8,
     traversal: &mut Traversal,
-    hidden: &mut bool,
+    hidden: &mut Option<bool>,
 ) -> Result<(), ParseError> {
     *count += 1;
     match *count {
         1 => traversal.unrestricted = true,
-        2 => *hidden = true,
+        2 => *hidden = Some(true),
         _ => return Err(unsupported("-uuu")),
     }
     Ok(())
@@ -1305,6 +1312,29 @@ fn scan_records(
 mod tests {
     use super::*;
     use ferret_verify::Trigrams;
+
+    // D128: hidden names show unless `--rg`; an explicit switch wins in
+    // either mode, in argv order.
+    #[test]
+    fn rg_mode_decides_hidden_unless_a_switch_does() {
+        let hidden = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            match parse(&args).unwrap() {
+                Command::Search(plan) => (plan.hidden, plan.traversal.rg),
+                Command::Files(names) => (names.hidden, names.traversal.rg),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(hidden(&["x"]), (true, false));
+        assert_eq!(hidden(&["--files"]), (true, false));
+        assert_eq!(hidden(&["--rg", "x"]), (false, true));
+        assert_eq!(hidden(&["--rg", "--files"]), (false, true));
+        assert_eq!(hidden(&["--no-hidden", "x"]), (false, false));
+        assert_eq!(hidden(&["--rg", "--hidden", "x"]), (true, true));
+        assert_eq!(hidden(&["--rg", "-uu", "x"]), (true, true));
+        assert_eq!(hidden(&["--rg", "-uu", "--no-hidden", "x"]), (false, true));
+        assert_eq!(hidden(&["--hidden", "--no-hidden", "x"]), (false, false));
+    }
 
     #[test]
     fn process_relative_directories_are_not_the_same_in_every_process() {

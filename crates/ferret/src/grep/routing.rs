@@ -50,7 +50,10 @@ pub(super) fn route(
     let live = if recursive && traversal.live && !traversal.unrestricted {
         Some(live::Anchors::open(index).map_err(Refusal::Failed)?)
     } else {
-        anchors.map(live::Anchors::with_git_global)
+        anchors
+            .map(|anchors| anchors.with_globals(traversal.rg))
+            .transpose()
+            .map_err(Refusal::Failed)?
     };
     Ok(Routed {
         inputs,

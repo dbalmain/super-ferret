@@ -59,10 +59,11 @@ impl Bed {
         fs::write(path, bytes).unwrap();
     }
 
-    /// A ferret that answers `grep ARGS` with rg's output through `filter`.
+    /// A ferret that answers `grep --rg ARGS` with rg's output through
+    /// `filter`.
     fn fake(&self, name: &str, filter: &str) -> PathBuf {
         let path = self.base.join(name);
-        let body = format!("#!/bin/sh\nshift\n{:?} \"$@\" | {filter}\n", rg());
+        let body = format!("#!/bin/sh\nshift 2\n{:?} \"$@\" | {filter}\n", rg());
         fs::write(&path, body).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
@@ -192,7 +193,7 @@ fn listings_short_only_of_names_ferret_ignores_are_policy() {
     let fake = |name: &str, root: &Path, filter: &str| {
         let path = bed.base.join(name);
         let body = format!(
-            "#!/bin/sh\nif [ \"$1\" = roots ]; then echo {root:?}; exit; fi\nshift\n{:?} \"$@\" | {filter}\n",
+            "#!/bin/sh\nif [ \"$1\" = roots ]; then echo {root:?}; exit; fi\nshift 2\n{:?} \"$@\" | {filter}\n",
             rg()
         );
         fs::write(&path, body).unwrap();
@@ -358,7 +359,7 @@ fn answer_mode_hands_the_caller_to_ferret_with_rg_as_fallback() {
     let output = call("ferret");
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("{}|grep|-l|foo|.|\n", rg().display())
+        format!("{}|grep|--rg|-l|foo|.|\n", rg().display())
     );
     // Any other value keeps rg answering.
     bed.write("a.txt", b"foo\n");

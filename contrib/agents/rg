@@ -74,6 +74,6 @@ if [[ ${FERRET_SHADOW:-1} != 0 && ! -t 1 && -x $shadow ]] && ((RANDOM % every ==
     ) 2> /dev/null &
 fi
 if [[ $answer == ferret ]]; then
-    FERRET_GREP_FALLBACK=$real exec "${FERRET_BIN:-ferret}" grep "$@"
+    FERRET_GREP_FALLBACK=$real exec "${FERRET_BIN:-ferret}" grep --rg "$@"
 fi
 exec "$real" "$@"

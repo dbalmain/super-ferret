@@ -61,7 +61,8 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -m, --max-count N   stop after N selected lines per file\n\
   -M, --max-columns N print lines over N bytes as an omission notice\n\
   --files            list selected file names without reading contents\n\
-  --hidden, -.       include held hidden files and directories\n\
+  --hidden, -.       include hidden files and directories (the default)\n\
+  --no-hidden        exclude hidden files and directories\n\
   -A/-B/-C N         after/before/around context\n\
   -H/-I              force/suppress filenames\n\
   --heading/--no-heading group matches by file\n\
@@ -70,6 +71,8 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -p, --pretty       colour, headings and line numbers\n\
   --color MODE       auto/always/ansi/never\n\
   --live             current tree with ferret visibility policy\n\
+  --rg               rg's visibility: hidden names hidden, uncovered\n\
+                     directories under rg's ignore rules\n\
   -u/--no-ignore     unrestricted current-tree walk\n\
   -uu                unrestricted including hidden paths\n\
   -a, --text         search binary bytes as text\n\
@@ -77,7 +80,8 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   --scan             accepted; broad patterns always scan\n\n\
 Directories use snapshot names and postings. Candidates and catalogued\n\
 files over the 8 MiB index cap are read live.\n\
-Uncovered directories search live with rg ignore rules, including ancestor\n\
+Uncovered directories search live, each under ferret's policy as if it\n\
+were an index root; with --rg, under rg's ignore rules, including ancestor\n\
 .ignore and .rgignore up to /. Trigrams are optional.\n\
 Explicit files and stdin search directly. UTF-8 BOMs are stripped; UTF-16\n\
 decoding is deferred. Excluded paths are absent. Exit: 0 match, 1 none, 2 error.\n";
@@ -539,11 +543,13 @@ impl Refusal {
 /// `rg` sets it), that rg runs the same argv in this process instead. Every
 /// such refusal comes before any output, so the caller sees only rg's
 /// answer; the exception is a command whose `-f` already consumed a source
-/// rg could not read again.
+/// rg could not read again. rg has no `--rg`, so a leading one, where the
+/// stand-in puts it, is dropped.
 fn unsupported(args: &[OsString], message: &str, consumed: bool) -> Exit {
     if let Some(rg) = std::env::var_os("FERRET_GREP_FALLBACK").filter(|rg| !rg.is_empty())
         && !consumed
     {
+        let args = args.strip_prefix(&[OsString::from("--rg")]).unwrap_or(args);
         let error = std::process::Command::new(&rg).args(args).exec();
         return failure(&format!(
             "{message}; running {}: {error}",
