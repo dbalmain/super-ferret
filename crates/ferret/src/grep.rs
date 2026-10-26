@@ -21,6 +21,7 @@ mod presentation;
 pub(crate) mod remote;
 mod routing;
 mod sources;
+mod visibility;
 
 use ferret_catalog::NameId;
 use ferret_policy::GrepSelection;

@@ -6,6 +6,7 @@ use ferret_catalog::Catalog;
 use ferret_query::line_grep::Names;
 use std::io::IsTerminal;
 
+use super::visibility::{Visibility, Visit};
 use super::*;
 
 pub(super) fn run(
@@ -240,6 +241,12 @@ impl Listing<'_> {
                     )
                     .map_err(|e| e.to_string())?
                     .following_links(plan.traversal.follow);
+                    let visibility = Visibility {
+                        selection: &selection,
+                        cwd,
+                        max_depth: plan.traversal.max_depth,
+                        content: false,
+                    };
                     let mut descend = true;
                     while let Some(entry) =
                         source.next_with_cancel(descend, &mut || Ok(()), &mut || {
@@ -261,90 +268,9 @@ impl Listing<'_> {
                                 continue;
                             }
                         };
-                        if plan
-                            .traversal
-                            .max_depth
-                            .is_some_and(|limit| entry.depth() > limit)
-                        {
-                            continue;
-                        }
-                        let relative = entry
-                            .path()
-                            .strip_prefix(cwd)
-                            .unwrap_or(entry.path())
-                            .as_os_str()
-                            .as_bytes();
-                        let rg = policy.as_ref().is_some_and(|policy| policy.rg());
-                        match entry.kind() {
-                            Ok(FileKind::Directory) => {
-                                descend = plan
-                                    .traversal
-                                    .max_depth
-                                    .is_none_or(|limit| entry.depth() < limit)
-                                    && (rg
-                                        || (selection.descend(relative, entry.depth())
-                                            && !selection.hides_stripped(
-                                                entry.path().as_os_str().as_bytes(),
-                                                relative,
-                                                entry.depth(),
-                                            )));
-                                if descend && let Some(policy) = &mut policy {
-                                    match if rg {
-                                        policy.selects(entry, &selection, cwd, false, &stopped)
-                                    } else {
-                                        policy.accepts(entry, false, &stopped)
-                                    } {
-                                        Ok(allowed) => descend = allowed,
-                                        Err(error) => {
-                                            errors = true;
-                                            descend = false;
-                                            if diagnostic(
-                                                writer,
-                                                runtime,
-                                                &format!(
-                                                    "grep: {}: {error}",
-                                                    entry.path().display()
-                                                ),
-                                            )? {
-                                                return Ok(Exit::Ok);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(FileKind::File)
-                                if rg
-                                    || (selection.allows(relative, entry.depth())
-                                        && !selection.hides_stripped(
-                                            entry.path().as_os_str().as_bytes(),
-                                            relative,
-                                            entry.depth(),
-                                        )) =>
-                            {
-                                if let Some(policy) = &mut policy {
-                                    match if rg {
-                                        policy.selects(entry, &selection, cwd, false, &stopped)
-                                    } else {
-                                        policy.accepts(entry, false, &stopped)
-                                    } {
-                                        Ok(true) => {}
-                                        Ok(false) => continue,
-                                        Err(error) => {
-                                            errors = true;
-                                            if diagnostic(
-                                                writer,
-                                                runtime,
-                                                &format!(
-                                                    "grep: {}: {error}",
-                                                    entry.path().display()
-                                                ),
-                                            )? {
-                                                return Ok(Exit::Ok);
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                }
+                        match visibility.select(entry, policy.as_mut(), &stopped) {
+                            Ok(Visit::Descend) => descend = true,
+                            Ok(Visit::File) => {
                                 if emit(
                                     plan,
                                     writer,
@@ -356,7 +282,7 @@ impl Listing<'_> {
                                     return Ok(Exit::Ok);
                                 }
                             }
-                            Ok(_) => {}
+                            Ok(Visit::Skip) => {}
                             Err(error) => {
                                 if diagnostic(
                                     writer,

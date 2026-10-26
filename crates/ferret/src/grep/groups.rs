@@ -4,6 +4,7 @@
 
 mod capture;
 
+use super::visibility::{Visibility, Visit};
 use super::*;
 use ferret_query::find::LiveWalk;
 use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
@@ -1528,84 +1529,38 @@ impl Filter<'_> {
         publication: Option<&Mutex<()>>,
         stopped: &dyn Fn() -> bool,
     ) -> Option<(u64, Job)> {
-        let kind = match entry.kind() {
-            Ok(kind) => kind,
-            Err(error) => {
-                return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
-            }
+        let visibility = Visibility {
+            selection: self.selection,
+            cwd: &self.cwd,
+            max_depth: self.traversal.max_depth,
+            content: true,
         };
         let rg = policy.as_ref().is_some_and(|policy| policy.rg());
-        let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
-        if self
-            .traversal
-            .max_depth
-            .is_some_and(|limit| entry.depth() > limit)
-        {
-            *descend = false;
-            return None;
-        }
-        if kind == FileKind::Directory {
-            *descend = self
-                .traversal
-                .max_depth
-                .is_none_or(|limit| entry.depth() < limit)
-                && (rg
-                    || (self
-                        .selection
-                        .descend(relative.as_os_str().as_bytes(), entry.depth())
-                        && !self.selection.hides_stripped(
-                            entry.path().as_os_str().as_bytes(),
-                            relative.as_os_str().as_bytes(),
-                            entry.depth(),
-                        )));
-            if *descend && let Some(policy) = policy {
-                let accepted = if rg {
-                    policy.selects(entry, self.selection, &self.cwd, true, stopped)
-                } else {
-                    policy.accepts(entry, true, stopped)
-                };
-                let warnings = policy.take_warnings();
-                if !warnings.is_empty() {
-                    // Not inside another file's group.
-                    let _publication = publication.map(lock);
-                    for warning in warnings {
-                        eprintln!("{warning}");
-                    }
-                }
-                match accepted {
-                    Ok(allowed) => *descend = allowed,
-                    Err(error) => {
-                        *descend = false;
-                        return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
-                    }
+        let mut policy = policy;
+        let visit = visibility.select(entry, policy.as_deref_mut(), stopped);
+        if let Some(policy) = policy {
+            let warnings = policy.take_warnings();
+            if !warnings.is_empty() {
+                // Not inside another file's group.
+                let _publication = publication.map(lock);
+                for warning in warnings {
+                    eprintln!("{warning}");
                 }
             }
-            return None;
         }
-        if kind != FileKind::File
-            || (!rg
-                && (!self
-                    .selection
-                    .allows(relative.as_os_str().as_bytes(), entry.depth())
-                    || self.selection.hides_stripped(
-                        entry.path().as_os_str().as_bytes(),
-                        relative.as_os_str().as_bytes(),
-                        entry.depth(),
-                    )))
-        {
-            return None;
-        }
-        if let Some(policy) = policy {
-            match if rg {
-                policy.selects(entry, self.selection, &self.cwd, true, stopped)
-            } else {
-                policy.accepts(entry, true, stopped)
-            } {
-                Ok(true) => {}
-                Ok(false) => return None,
-                Err(error) => {
-                    return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
-                }
+        match visit {
+            Ok(Visit::File) => {}
+            Ok(Visit::Descend) => {
+                *descend = true;
+                return None;
+            }
+            Ok(Visit::Skip) => {
+                *descend = false;
+                return None;
+            }
+            Err(error) => {
+                *descend = false;
+                return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
             }
         }
         *searched = true;
