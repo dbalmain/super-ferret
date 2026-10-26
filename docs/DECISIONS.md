@@ -7156,3 +7156,31 @@ line costs one list lookup per hidden name at crawl time.
 
 **Fact that would change it:** D65's catalog rework landing soon, which
 would make A's format change cheaper to fold in there (A after D65).
+
+## D128 — Whose visibility rules `ferret grep` follows by default
+
+**Question:** Should `ferret grep` follow ferret's own visibility rules by
+default, with rg's exact rules only behind a flag, and which should the
+agents' `rg` stand-in use?
+
+Context (2026-10-27): Dave, on D127: "I don't think we should be trying so
+hard to match rg's inclusion rules unless --live is passed." Today indexed
+grep applies rg's hidden-file rule over the index: the index holds dot
+files, and grep hides them unless `--hidden`, a positive glob or an explicit
+start reveals them; D127 is the last gap in that. `--live` already exists
+and means something else: a live walk with ferret's policy (D73). Under
+`~/w`, ferret's own rules would show 938 more files than rg's (51,280 to
+52,218): mostly `.ai/` notes (396), `.gitignore` files (134), `.github/`
+(100) and `.claude/` (53).
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Ferret's rules by default; a new `--rg` flag for exact rg visibility, which the stand-in passes | Two visibility modes stay; D127 is still needed for the stand-in | People get ferret's model; agents keep rg's answers and the shadow stays a parity test |
+| B. Ferret's rules everywhere, the stand-in included | Agents see dot files rg hides (about 1.8% more files here); the shadow must classify hidden-path differences as policy | One visibility mode; the held-hidden and whitelist machinery goes; D127 is moot |
+| C. Keep rg's rules as the default (today) and do D127 A | The catalog change in D127 | No behaviour change |
+
+**Recommendation: A.** Agents are the main client of the stand-in, and they
+are written against rg; the flag keeps the hard parity work where it pays.
+
+**Fact that would change it:** you're content for agents to see dot files
+that rg hides. Then B is simpler and deletes code.
