@@ -18,6 +18,10 @@ pub(in super::super) struct Budget {
 #[derive(Default)]
 struct State {
     bytes: usize,
+    /// Threads waiting on `changed`. Releases notify only when one is: the
+    /// futex condvar makes a syscall on every notify, and every searched
+    /// file releases its hold.
+    waiting: usize,
     #[cfg(test)]
     peak: usize,
     #[cfg(test)]
@@ -57,10 +61,12 @@ impl Budget {
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return false;
             };
+            state.waiting += 1;
             (state, _) = self
                 .changed
                 .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner);
+            state.waiting -= 1;
         }
         true
     }
@@ -143,31 +149,43 @@ impl Held {
                 state.waits += 1;
                 self.budget.changed.notify_all();
             }
+            state.waiting += 1;
             (state, _) = self
                 .budget
                 .changed
                 .wait_timeout(state, Duration::from_millis(20))
                 .unwrap_or_else(PoisonError::into_inner);
+            state.waiting -= 1;
         }
     }
 
     /// The caller has freed its prefix allocation before returning its charge.
     pub(super) fn clear(&mut self) {
+        self.release(false);
+    }
+
+    /// Returns this hold's charge, and its streaming slot when `streaming`,
+    /// waking any waiter. Most files render nothing and hold nothing; they
+    /// leave the pool-wide lock alone.
+    fn release(&mut self, streaming: bool) {
+        if self.bytes == 0 && !streaming {
+            return;
+        }
         let mut state = lock(&self.budget.state);
         state.bytes -= self.bytes;
         self.bytes = 0;
-        self.budget.changed.notify_all();
+        if streaming {
+            self.budget.streaming.store(false, Ordering::Release);
+        }
+        if state.waiting > 0 {
+            self.budget.changed.notify_all();
+        }
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let mut state = lock(&self.budget.state);
-        state.bytes -= self.bytes;
-        if self.streaming {
-            self.budget.streaming.store(false, Ordering::Release);
-        }
-        self.budget.changed.notify_all();
+        self.release(self.streaming);
     }
 }
 
