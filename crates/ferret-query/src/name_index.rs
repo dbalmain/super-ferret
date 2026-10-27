@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ferret_catalog::{
-    Catalog, Generation, Handle, InoId, NameId, PackedNameLists, PackedStrings, RetryFromCurrent,
-    Target,
+    Catalog, Generation, Handle, InoId, NameId, PackedNameLists, PackedStrings, ResidentNames,
+    RetryFromCurrent, Target,
 };
 
 /// Candidate work, before the ordinary exact evaluator and output transaction.
@@ -27,6 +27,9 @@ pub struct NameEstimate {
 }
 
 struct Base {
+    /// The interned names of a catalog opened without them, built with the
+    /// base; `None` when the catalog holds them ([`Catalog::into_resident`]).
+    owned: Option<Arc<ResidentNames>>,
     terms: OnceLock<TermIndex>,
     scopes: Vec<u32>,
     live_scopes: Vec<InoId>,
@@ -67,6 +70,8 @@ pub struct NameSelection {
     delta: Vec<NameId>,
     generation: Generation,
     scope: Option<InoId>,
+    /// The index's own interned names, for a catalog without them.
+    owned: Option<Arc<ResidentNames>>,
 }
 
 impl NameIndex {
@@ -75,15 +80,15 @@ impl NameIndex {
     }
 
     /// Shares the immutable base only within the same checkpoint epoch.
+    /// A catalog opened without interned names gets its own, built here.
     pub fn adopt(catalog: &Catalog, previous: Option<&Self>) -> Self {
-        let names = catalog
-            .resident_names()
-            .unwrap_or_else(|| panic!("resident name index requires a resident catalog"));
+        let raw = catalog.resident_names().is_none();
         let checkpoint = catalog.checkpoint_base();
         let base = previous
             .filter(|old| {
                 old.generation.checkpoint == catalog.generation().checkpoint
                     && old.generation.incarnation == catalog.generation().incarnation
+                    && old.base.owned.is_some() == raw
             })
             .map_or_else(
                 || {
@@ -119,6 +124,7 @@ impl NameIndex {
                         })
                         .collect();
                     Arc::new(Base {
+                        owned: raw.then(|| Arc::new(checkpoint.build_resident_names())),
                         terms: OnceLock::new(),
                         scopes,
                         live_scopes,
@@ -127,6 +133,8 @@ impl NameIndex {
                 },
                 |old| old.base.clone(),
             );
+        let owned = base.owned.clone();
+        let names = interned(catalog, owned.as_deref());
         let mut out = Self {
             generation: catalog.generation(),
             base,
@@ -249,11 +257,14 @@ impl NameIndex {
         )
     }
 
+    /// Includes the interned names it built for a raw catalog.
     pub fn bytes(&self) -> usize {
-        self.base
-            .terms
-            .get()
-            .map_or(0, |terms| terms.terms.bytes() + terms.keys.bytes())
+        self.base.owned.as_ref().map_or(0, |names| names.bytes())
+            + self
+                .base
+                .terms
+                .get()
+                .map_or(0, |terms| terms.terms.bytes() + terms.keys.bytes())
             + self.base.scopes.capacity() * std::mem::size_of::<u32>()
             + self
                 .delta
@@ -285,9 +296,7 @@ impl NameIndex {
         let scope = scope
             .map(|handle| catalog.checked_inode(handle))
             .transpose()?;
-        let names = catalog
-            .resident_names()
-            .unwrap_or_else(|| unreachable!("resident index source"));
+        let names = interned(catalog, self.base.owned.as_deref());
         let mut keys = if terms.is_empty() {
             (0..names.distinct_count()).collect()
         } else {
@@ -359,11 +368,21 @@ impl NameIndex {
             delta,
             generation: self.generation,
             scope,
+            owned: self.base.owned.clone(),
         })
     }
 }
 
-fn build_terms(names: &ferret_catalog::ResidentNames) -> TermIndex {
+/// The interned base names: the catalog's when it holds them, else the ones
+/// built with the index.
+fn interned<'a>(catalog: &'a Catalog, owned: Option<&'a ResidentNames>) -> &'a ResidentNames {
+    catalog
+        .resident_names()
+        .or(owned)
+        .unwrap_or_else(|| unreachable!("a raw catalog's index builds its names"))
+}
+
+fn build_terms(names: &ResidentNames) -> TermIndex {
     let started = std::time::Instant::now();
     let mut terms: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
     for key in 0..names.distinct_count() {
@@ -394,9 +413,7 @@ impl NameSelection {
         let mut rows = Vec::new();
         match self.estimate.plan {
             NamePlan::Postings => {
-                let names = catalog
-                    .resident_names()
-                    .unwrap_or_else(|| unreachable!("resident index source"));
+                let names = interned(catalog, self.owned.as_deref());
                 for &key in &self.base {
                     names.postings(key, &mut rows);
                 }

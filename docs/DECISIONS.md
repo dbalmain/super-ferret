@@ -7232,6 +7232,23 @@ built) only replaces the term half.
 `text:` searches, which need both halves. Then B buys nothing and C goes
 first.
 
+Built (2026-10-27). The two no-tradeoff items are on main: no Sums
+re-hash, and `Engine::open_one_shot`, which grep uses so that it skips the
+`ResidentNames` build and the name planner. On the corpus at one thread
+`grep -q` went from 605M to 394M instructions, and from about 68 to 65 ms.
+B is built on branch `perf-d129-open` (9c38677) and waits on this decision:
+65 → 42 ms at one thread, 34 → 28 ms at 16, heap 61.5 → 37.2 MiB, output
+identical. The behaviour B changes, which Astra's review made wider than
+first stated: a damaged section of a segment kind the query never opens
+is no longer reported. That means the term half for every grep, and the
+trigram half for `grep -v` and for patterns with no usable trigram; those
+answer correctly from the files and exit 0 instead of 2. A query that
+reads a damaged half still fails with the same message. If that matters,
+B can open the trigram half eagerly in indexed grep setup: that keeps
+grep's diagnostics, and saves only the term half (about half of B's gain).
+At 9c38677 the trigram half's `parse_index` is 38% of what remains, which
+is C's target.
+
 ## D130 — Whether `ferret grep --files` walks in parallel
 
 **Question:** Should an uncovered `--files` walk run on several threads, as

@@ -292,19 +292,16 @@ impl<R: ReadAt> Segment<R> {
         let sums = read_whole(Section::Sums)?;
         let (blocks_len, postings_len) = (table[0].1, table[1].1);
         let fingerprint_len = table[Section::Fingerprints as usize].1;
+        // The table checksums of blocks, postings and fingerprints are each
+        // the BLAKE3-128 of that section's run of chunk sums. They are not
+        // re-hashed here: the head digest has just verified the table, and
+        // `read_whole` the Sums section whole, so a re-hash could only catch
+        // a writer that stored values inconsistent with its own sums, never
+        // a damaged byte. The chunks themselves are verified when read.
         if sums.len() as u64
             != (chunks(blocks_len) + chunks(postings_len) + chunks(fingerprint_len)) * 16
         {
             return Err(ReadError::Corrupt(Section::Sums));
-        }
-        let mut at = 0;
-        for section in [Section::Blocks, Section::Postings, Section::Fingerprints] {
-            let end = at + chunks(table[section as usize].1) as usize * 16;
-            if sections.contains(&section) && checksum(&sums[at..end]) != table[section as usize].2
-            {
-                return Err(ReadError::Corrupt(section));
-            }
-            at = end;
         }
         let fingerprints = if dictionary == DICTIONARY_CODEC {
             FingerprintIndex::default()

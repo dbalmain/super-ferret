@@ -31,7 +31,7 @@ pub struct Engine {
     /// Content mutation is independent of catalog refresh. When both are
     /// needed, lock `writer` first; merges hold only this mutex and a pin.
     content: Mutex<Option<IndexWriter>>,
-    retired: Mutex<Vec<(u64, Weak<NameIndex>)>>,
+    retired: Mutex<Vec<(u64, Weak<OnceLock<NameIndex>>)>>,
 }
 
 /// The content index's directory inside the catalog's (docs/S2.md §
@@ -42,7 +42,10 @@ pub const CONTENT_DIR: &str = "index";
 #[derive(Clone)]
 pub struct QuerySession {
     catalog: Catalog,
-    names: Arc<NameIndex>,
+    /// The name planner, shared by every pin of the view. Built at open and
+    /// publication, except on a one-shot engine, which builds it when a
+    /// query first needs it ([`Engine::open_one_shot`]).
+    names: Arc<OnceLock<NameIndex>>,
     /// The content index view published with or before this catalog view,
     /// when the engine has one. Every DocId it holds is below the catalog
     /// view's `next_doc`; liveness comes from the catalog.
@@ -116,10 +119,28 @@ impl Engine {
             return Ok(None);
         };
         let catalog = catalog.into_resident()?;
+        let names = Arc::new(OnceLock::from(NameIndex::new(&catalog)));
+        Ok(Some(Self::query_only(index, catalog, names)))
+    }
+
+    /// As [`Engine::open`], for a process that runs one query and exits:
+    /// every section is loaded and checked as before, but the catalog keeps
+    /// its raw name heap instead of interning it, and the name planner is
+    /// built only if a query needs it. A content-only query such as grep
+    /// never does, so it skips both builds.
+    pub fn open_one_shot(index: &Path) -> Result<Option<Self>, OpenError> {
+        let Some(catalog) = Catalog::open(index)? else {
+            return Ok(None);
+        };
+        catalog.load_all()?;
+        Ok(Some(Self::query_only(index, catalog, Arc::default())))
+    }
+
+    fn query_only(index: &Path, catalog: Catalog, names: Arc<OnceLock<NameIndex>>) -> Self {
         OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(Self {
+        Self {
             current: RwLock::new(QuerySession {
-                names: Arc::new(NameIndex::new(&catalog)),
+                names,
                 catalog,
                 content: None,
                 derived: Arc::default(),
@@ -128,7 +149,7 @@ impl Engine {
             writer: Mutex::new(None),
             content: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
-        }))
+        }
     }
 
     /// Number of successful catalog engine opens in this process.
@@ -143,7 +164,7 @@ impl Engine {
         let threads = Threads::new(writer.dir());
         Self {
             current: RwLock::new(QuerySession {
-                names: Arc::new(NameIndex::new(&catalog)),
+                names: Arc::new(OnceLock::from(NameIndex::new(&catalog))),
                 catalog,
                 content: None,
                 derived: Arc::default(),
@@ -470,7 +491,10 @@ impl Engine {
 
     fn select(&self, view: Catalog) {
         let previous = self.pin();
-        let names = Arc::new(NameIndex::adopt(&view, Some(&previous.names)));
+        let names = Arc::new(OnceLock::from(NameIndex::adopt(
+            &view,
+            Some(previous.name_index()),
+        )));
         let derived = Derived::adopt(&previous, &view);
         let mut retired = self
             .retired
@@ -537,11 +561,12 @@ fn catalog_view<'a>(view: &Catalog, live: &'a DocSet) -> CatalogView<'a> {
 impl QuerySession {
     /// Bytes retained by the fully resident catalog and its name planner.
     pub fn resident_bytes(&self) -> u64 {
-        self.catalog.bytes_read() + self.names.bytes() as u64
+        self.catalog.bytes_read() + self.names.get().map_or(0, NameIndex::bytes) as u64
     }
 
+    /// The view's name planner, built here on a one-shot engine's first call.
     pub fn name_index(&self) -> &NameIndex {
-        &self.names
+        self.names.get_or_init(|| NameIndex::new(&self.catalog))
     }
 
     /// The pinned content index view, if the engine has a content index.
@@ -556,7 +581,7 @@ impl QuerySession {
         query: &Query,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
-        query.run_indexed(&self.catalog, &self.names, Some(scope), emit)
+        query.run_indexed(&self.catalog, self.name_index(), Some(scope), emit)
     }
 
     /// Identifies the epoch and sequence in which this pin's ids are valid.
@@ -594,14 +619,14 @@ impl QuerySession {
         if query.has_content() {
             return self.search_content(query, Some(UNCOVERED_BOUND), cancelled, emit);
         }
-        query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit)
+        query.run_indexed_until(&self.catalog, self.name_index(), None, cancelled, emit)
     }
 
     /// Dictionary-only plan for a content query, including one refused by
     /// search. This borrows the same catalog/content pin as execution.
     pub fn explain_content(&self, query: &Query) -> Result<ferret_query::ContentPlan, RunError> {
         let pinned = ferret_index::Pinned::new(self.content.as_deref(), self.live());
-        query.explain_content(&self.catalog, &self.names, &pinned)
+        query.explain_content(&self.catalog, self.name_index(), &pinned)
     }
 
     /// Streams a content query's rows over this pin's content view, or
@@ -653,7 +678,13 @@ impl QuerySession {
             return Ok(Stats::default());
         }
         if !query.has_content() {
-            return query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit);
+            return query.run_indexed_until(
+                &self.catalog,
+                self.name_index(),
+                None,
+                cancelled,
+                emit,
+            );
         }
         let catalog = &self.catalog;
         let Some(docs) = self.doc_names_until(stopped)? else {
@@ -680,7 +711,7 @@ impl QuerySession {
         };
         query.run_content_parallel(
             catalog,
-            &self.names,
+            self.name_index(),
             &content,
             ferret_query::Workers {
                 fork: &fork,
@@ -735,7 +766,7 @@ impl QuerySession {
         let source = if plan.no_ignore() || plan.is_information() {
             plan.live_source()
         } else {
-            plan.indexed_catalog_source(self.catalog.clone(), &self.names)
+            plan.indexed_catalog_source(self.catalog.clone(), self.name_index())
         };
         plan.run_parallel(source, effects, workers)
     }

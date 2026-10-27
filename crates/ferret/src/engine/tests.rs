@@ -804,3 +804,50 @@ fn text_files(session: &QuerySession) -> usize {
         .unwrap();
     rows
 }
+
+/// A one-shot engine keeps the raw name heap and builds the name planner's
+/// interned names itself, on the first name query. Over a view with overlay
+/// births and deaths it answers every plan as the resident engine does.
+#[test]
+fn a_one_shot_engine_answers_name_queries_as_the_resident_one_does() {
+    let tree = Tree::with_files(300);
+    let mut session = ferret_catalog::WriterSession::open(&tree.0.join("index")).unwrap();
+    // Changes stay in the overlay rather than compacting into a checkpoint.
+    session.set_compaction_limits(ferret_catalog::CompactionLimits {
+        dirty_percent: 100,
+        dead_percent: 100,
+        ..ferret_catalog::CompactionLimits::default()
+    });
+    let writer = Engine::from_writer(session);
+    tree.publish(&writer);
+    for i in 100..150 {
+        fs::remove_file(tree.0.join(format!("root/d{}/{i}.txt", i / 100))).unwrap();
+    }
+    tree.refresh(&writer);
+    drop(writer);
+    let index = tree.0.join("index");
+    let resident = Engine::open(&index).unwrap().unwrap().pin();
+    let one_shot = Engine::open_one_shot(&index).unwrap().unwrap().pin();
+    assert!(resident.catalog().resident_names().is_some());
+    assert!(one_shot.catalog().resident_names().is_none());
+    assert!(one_shot.names.get().is_none(), "built before a name query");
+    assert!(one_shot.catalog().suppressed_base_names().count() > 0);
+    let rows = |session: &QuerySession, words: &[&[u8]]| {
+        let query = Query::from_args(words.iter().copied(), SystemTime::now()).unwrap();
+        let mut rows = Vec::new();
+        let stats = session
+            .search(&query, |row| {
+                rows.push(String::from_utf8_lossy(row.path).into_owned());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        (rows, stats.name_plan)
+    };
+    let queries: [&[&[u8]]; 4] = [&[b"txt"], &[b"new"], &[b"12"], &[b"d2"]];
+    for words in queries {
+        let expected = rows(&resident, words);
+        assert!(expected.1.is_some(), "{words:?} ran unplanned");
+        assert_eq!(rows(&one_shot, words), expected, "{words:?}");
+    }
+    assert!(one_shot.names.get().is_some());
+}
