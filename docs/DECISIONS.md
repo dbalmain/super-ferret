@@ -7254,6 +7254,23 @@ the way to get a fixed order.
 **Fact that would change it:** any consumer (test, skill, script) relying on
 `--files` order without `--sort`.
 
+Measured (2026-10-27, branch `d130-b`, built as B): cargo registry, 8,533
+directories. Changes that do not depend on this decision are on main: an
+idle-offer backoff in the scheduler, a depth-indexed live policy, and
+reserving the descriptor table at process start, which removed a 20 ms RCU
+wait. With all of those:
+
+| `--files` | serial (main) | B | rg |
+| --- | --- | --- | --- |
+| 1 thread | 106 ms | 107 ms | 182 ms |
+| 8 threads | 106 ms | 22 ms | 33 ms |
+| default threads | 106 ms | 19 ms | 30 ms |
+
+One test read walk order from `--files`; it now pins one thread. The
+shadow and differential tests already sort. Astra reviewed B and its two
+findings are fixed: a missed operand-boundary flush, and a scheduler
+backoff that could delay a loan.
+
 ## D131 — Whether a crawl hands file bytes to the content index
 
 **Question:** Should the crawl hand the bytes it read for hashing straight
