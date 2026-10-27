@@ -80,7 +80,7 @@ fn read_content(
     let mut buffered = io::BufReader::with_capacity(probe, input);
     let head = buffered.fill_buf()?;
     let binary = if rg {
-        head.contains(&0)
+        line_grep::binary_window(head)
     } else {
         ferret_policy::sniff(head) == ferret_policy::Content::Binary
     };

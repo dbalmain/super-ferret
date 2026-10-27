@@ -960,6 +960,11 @@ pub struct Line<'a> {
     pub highlights: Option<&'a [std::ops::Range<usize>]>,
 }
 
+/// Rg's binary test for a recursive file's first window: any NUL byte.
+pub fn binary_window(head: &[u8]) -> bool {
+    memchr::memchr(0, head).is_some()
+}
+
 /// Stream selected records and bounded before/after context without a second
 /// input read. Multiline buffers the checked input before producing records.
 /// Context-spool failures are Output errors, which the host treats per file.
