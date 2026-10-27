@@ -285,10 +285,10 @@ pub fn parse_with(
 
 /// The argv positions a parse took as ferret's own `--rg` flag, which rg
 /// rejects: a host handing a refused command to rg drops exactly these. A
-/// parse stops at a flag it refuses, and only rg knows that flag's grammar
+/// flag ferret lacks stops the parse, and only rg knows that flag's grammar
 /// (`-Pe` makes the next argument a pattern), so a `--rg` after it is not
-/// one of these: rg gets it and rejects it rather than a guess changing its
-/// answer.
+/// one of these: rg reads it as it would, rather than a guess changing its
+/// answer. A refusal after the last argument leaves every flag found.
 pub fn own_flags(args: &[OsString]) -> Vec<usize> {
     let mut flags = Vec::new();
     let _ = parse_marked(args, &mut |_| Ok(Vec::new()), &mut flags);
