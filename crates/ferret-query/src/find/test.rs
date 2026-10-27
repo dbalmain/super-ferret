@@ -604,7 +604,7 @@ fn birth_stamp(dir: std::os::fd::BorrowedFd<'_>, path: &std::path::Path) -> Opti
     let stat = rustix::fs::statx(
         dir,
         path,
-        rustix::fs::AtFlags::empty(),
+        rustix::fs::AtFlags::NO_AUTOMOUNT,
         rustix::fs::StatxFlags::BTIME,
     )
     .ok()?;
@@ -616,7 +616,9 @@ fn birth_stamp(dir: std::os::fd::BorrowedFd<'_>, path: &std::path::Path) -> Opti
 fn has_entries(dir: std::os::fd::BorrowedFd<'_>, path: &std::path::Path) -> std::io::Result<bool> {
     use rustix::fs::{Dir, Mode, OFlags, openat};
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut listing = Dir::read_from(openat(dir, path, flags, Mode::empty())?)?;
+    // `Dir::new` lists the fresh descriptor itself; `read_from` would reopen
+    // `.` beneath it, which needs search permission GNU does not.
+    let mut listing = Dir::new(openat(dir, path, flags, Mode::empty())?)?;
     while let Some(entry) = listing.read() {
         if !matches!(entry?.file_name().to_bytes(), b"." | b"..") {
             return Ok(true);

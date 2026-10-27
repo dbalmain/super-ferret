@@ -818,6 +818,25 @@ fn a_start_at_the_symlink_limit_resolves_as_gnu_does() {
 }
 
 #[test]
+fn empty_lists_a_directory_it_may_read_but_not_search() {
+    // Astra round 2: listing through `Dir::read_from` reopened `.` beneath
+    // the directory, which needs search permission, so a mode-0400 empty
+    // directory failed with EACCES where GNU matches it.
+    use std::os::unix::fs::PermissionsExt;
+    let tree = Tree::new("empty-unsearchable");
+    let empty = tree.0.join("empty");
+    fs::create_dir(&empty).unwrap();
+    fs::set_permissions(&empty, fs::Permissions::from_mode(0o400)).unwrap();
+    let args = ["empty", "-maxdepth", "0", "-empty", "-print"];
+    let gnu = tree.run(true, &args);
+    let ferret = tree.run(false, &args);
+    fs::set_permissions(&empty, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(gnu.stdout, b"empty\n".as_slice(), "{gnu:?}");
+    assert_eq!(ferret.status.code(), gnu.status.code(), "{ferret:?}");
+    assert_eq!(ferret.stdout, gnu.stdout, "{ferret:?}");
+}
+
+#[test]
 fn a_first_child_directory_observation_survives_an_ancestor_rename() {
     // R3 #3: the first child-directory stat taken while listing a directory
     // used the entry's pathname (`cached_metadata(entry.path(), follow)`)
