@@ -812,8 +812,21 @@ impl Catalog {
     }
 
     /// Loads every section: what a caller that reads the whole generation
-    /// (the writer's previous generation, a test) needs.
+    /// (the writer's previous generation, a one-shot query, a test) needs.
+    /// A large file's sections are read and checked on a few threads first.
     pub fn load_all(&self) -> Result<(), OpenError> {
+        // Below this, starting threads costs more than the checks they share.
+        const PREFETCH_BYTES: usize = 1 << 20;
+        let bytes: usize = SECTIONS
+            .iter()
+            .map(|&section| {
+                let (start, end) = self.layout.range(section);
+                end - start
+            })
+            .sum();
+        if bytes >= PREFETCH_BYTES {
+            self.prefetch(&[]);
+        }
         self.load(&SECTIONS)?;
         if let Some(o) = &self.overlay {
             o.validate_all(self)?;
