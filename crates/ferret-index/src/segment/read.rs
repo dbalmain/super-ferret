@@ -88,12 +88,20 @@ pub struct Info {
     pub pairs: u64,
 }
 
-/// One block's place, from the resident index.
-#[derive(Clone, Copy, Debug)]
-struct Block {
-    /// Its first term's bytes in `Segment::firsts`.
-    term_start: usize,
-    term_end: usize,
+/// Blocks per resident sample of the block index: a lookup binary-searches
+/// the samples, then decodes at most `SAMPLE - 1` index entries.
+pub(super) const SAMPLE: usize = 16;
+
+/// One block's place, decoded from the resident index bytes.
+///
+/// Offsets stay `u64`/`usize`: the format caps only the fingerprint section
+/// at `u32` (`Writer::check_record_length`); blocks, postings, the index and
+/// term lengths have no narrower bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Place {
+    /// Where its index entry starts in `Segment::index_bytes`: the vbyte
+    /// length of its first term, then the term.
+    at: usize,
     /// Byte offset in the blocks section.
     start: u64,
     /// Offset in the postings section of its first list.
@@ -211,8 +219,13 @@ pub struct Segment<R> {
     fingerprints: FingerprintIndex,
     /// Chunk sums: the blocks section's, then the postings section's.
     sums: Vec<u8>,
-    firsts: Vec<u8>,
-    index: Vec<Block>,
+    /// The Index section, verified and parsed at open; blocks' places are
+    /// decoded from it on demand.
+    index_bytes: Vec<u8>,
+    /// The place of every [`SAMPLE`]th block, from block 0.
+    samples: Vec<Place>,
+    /// Dictionary blocks.
+    blocks: usize,
 }
 
 impl<R: ReadAt> Segment<R> {
@@ -310,7 +323,7 @@ impl<R: ReadAt> Segment<R> {
                 .ok_or(ReadError::Corrupt(Section::FingerprintIndex))?
         };
 
-        let (firsts, index) = parse_index(&index, info.terms, blocks_len, postings_len)
+        let samples = parse_index(&index, info.terms, blocks_len, postings_len)
             .ok_or(ReadError::Corrupt(Section::Index))?;
         let mut digest = [0; 16];
         digest.copy_from_slice(&head[head_len - 16..]);
@@ -325,8 +338,9 @@ impl<R: ReadAt> Segment<R> {
             postings_at: (table[1].0, postings_len),
             lengths: table.map(|(_, len, _)| len),
             sums,
-            firsts,
-            index,
+            index_bytes: index,
+            samples,
+            blocks: info.terms.div_ceil(BLOCK as u64) as usize,
         })
     }
 
@@ -352,8 +366,8 @@ impl<R: ReadAt> Segment<R> {
     /// Allocated bytes resident for this segment: block index and chunk sums,
     /// including unused buffer capacity but excluding allocator overhead.
     pub fn resident_bytes(&self) -> usize {
-        self.firsts.capacity()
-            + self.index.capacity() * size_of::<Block>()
+        self.index_bytes.capacity()
+            + self.samples.capacity() * size_of::<Place>()
             + self.sums.capacity()
             + self.fingerprints.allocated_bytes()
     }
@@ -479,13 +493,10 @@ impl<R: ReadAt> Segment<R> {
     /// block and never the postings: what a planner estimates from before
     /// it decides which lists to read.
     pub fn entry(&self, term: &[u8]) -> Result<Option<TermEntry>, ReadError> {
-        let found = self
-            .index
-            .partition_point(|b| &self.firsts[b.term_start..b.term_end] <= term);
-        let Some(block) = found.checked_sub(1) else {
+        let Some((block, place)) = self.locate(term) else {
             return Ok(None);
         };
-        let mut entries = self.block(block)?;
+        let (mut entries, _) = self.block(block, place)?;
         while let Some((candidate, entry)) = entries.next_entry()? {
             match candidate.cmp(term) {
                 std::cmp::Ordering::Less => {}
@@ -500,7 +511,7 @@ impl<R: ReadAt> Segment<R> {
     pub fn terms(&self) -> Terms<'_, R> {
         Terms {
             segment: self,
-            next_block: 0,
+            next: self.samples.first().map(|&place| (0, place)),
             entries: None,
         }
     }
@@ -510,12 +521,12 @@ impl<R: ReadAt> Segment<R> {
     /// terms, which the caller skips. A prefix scan's seek: it reads no
     /// block before that one.
     pub fn terms_from(&self, start: &[u8]) -> Terms<'_, R> {
-        let found = self
-            .index
-            .partition_point(|b| &self.firsts[b.term_start..b.term_end] <= start);
+        let next = self
+            .locate(start)
+            .or_else(|| self.samples.first().map(|&place| (0, place)));
         Terms {
             segment: self,
-            next_block: found.saturating_sub(1),
+            next,
             entries: None,
         }
     }
@@ -536,10 +547,42 @@ impl<R: ReadAt> Segment<R> {
         }
     }
 
-    /// Decodes block `b`'s entries lazily.
-    fn block(&self, b: usize) -> Result<Entries, ReadError> {
-        let here = self.index[b];
-        let next = self.index.get(b + 1);
+    /// A block's first term, in the resident index bytes.
+    fn first_term(&self, place: &Place) -> &[u8] {
+        // `parse_index` decoded this entry at open, so it cannot fail.
+        index_term(&self.index_bytes, &mut { place.at }).unwrap_or_default()
+    }
+
+    /// The last block whose first term is `<= term`, with its place, or
+    /// `None` when `term` sorts before every block.
+    fn locate(&self, term: &[u8]) -> Option<(usize, Place)> {
+        let found = self.samples.partition_point(|p| self.first_term(p) <= term);
+        let sample = found.checked_sub(1)?;
+        let (mut block, mut place) = (sample * SAMPLE, self.samples[sample]);
+        // The next sample's first term is already known to be greater.
+        let end = (block + SAMPLE).min(self.blocks);
+        while block + 1 < end {
+            // `parse_index` decoded every entry at open; a failure here is
+            // unreachable, and stopping leaves a block `block` can read.
+            let Some(next) = next_place(&self.index_bytes, place) else {
+                break;
+            };
+            if self.first_term(&next) > term {
+                break;
+            }
+            (block, place) = (block + 1, next);
+        }
+        Some((block, place))
+    }
+
+    /// Decodes block `b`, at `here`, lazily; also returns the next block's
+    /// place, `None` after the last.
+    fn block(&self, b: usize, here: Place) -> Result<(Entries, Option<Place>), ReadError> {
+        let next = if b + 1 < self.blocks {
+            Some(next_place(&self.index_bytes, here).ok_or(ReadError::Corrupt(Section::Index))?)
+        } else {
+            None
+        };
         let end = next.map_or(self.blocks_at.1, |n| n.start);
         let postings_end = next.map_or(self.postings_at.1, |n| n.postings);
         let (mut bytes, at) = self.read_checked(Section::Blocks, here.start, end)?;
@@ -549,17 +592,18 @@ impl<R: ReadAt> Segment<R> {
         } else {
             (self.info.terms - (b * BLOCK) as u64) as usize
         };
-        Ok(Entries {
+        let entries = Entries {
             bytes,
             at,
-            term: self.firsts[here.term_start..here.term_end].to_vec(),
+            term: self.first_term(&here).to_vec(),
             remaining: count,
             seen: 0,
             postings: here.postings,
             postings_end,
             first: self.info.first,
             span: u64::from(self.info.last - self.info.first),
-        })
+        };
+        Ok((entries, next))
     }
 
     /// Reads `[start, end)` of a chunked section, verifying every chunk it
@@ -603,52 +647,78 @@ impl<R: ReadAt> Segment<R> {
     }
 }
 
+/// One index entry's first term at `*at`, advancing past it.
+fn index_term<'a>(bytes: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::try_from(take(bytes, at)?).ok()?;
+    let term = bytes.get(*at..at.checked_add(len)?)?;
+    *at += len;
+    Some(term)
+}
+
+/// The place of the block after `place`'s; `None` when the entries do not
+/// decode.
+fn next_place(bytes: &[u8], place: Place) -> Option<Place> {
+    let mut at = place.at;
+    index_term(bytes, &mut at)?;
+    take(bytes, &mut at)?;
+    take(bytes, &mut at)?;
+    let next = at;
+    index_term(bytes, &mut at)?;
+    let (step, postings_step) = (take(bytes, &mut at)?, take(bytes, &mut at)?);
+    Some(Place {
+        at: next,
+        start: place.start.checked_add(step)?,
+        postings: place.postings.checked_add(postings_step)?,
+    })
+}
+
+/// Whether `a` sorts strictly before `b`. Inline rather than a `memcmp`
+/// call: first terms are short, and `parse_index` compares one per block.
+fn before(a: &[u8], b: &[u8]) -> bool {
+    for (x, y) in a.iter().zip(b) {
+        if x != y {
+            return x < y;
+        }
+    }
+    a.len() < b.len()
+}
+
 /// Parses the block index; `None` when it is inconsistent with the head or
-/// the section lengths.
-fn parse_index(
-    bytes: &[u8],
-    terms: u64,
-    blocks_len: u64,
-    postings_len: u64,
-) -> Option<(Vec<u8>, Vec<Block>)> {
+/// the section lengths. Returns every [`SAMPLE`]th block's place; the caller
+/// keeps `bytes`, from which the rest are decoded.
+fn parse_index(bytes: &[u8], terms: u64, blocks_len: u64, postings_len: u64) -> Option<Vec<Place>> {
     let count = terms.div_ceil(BLOCK as u64);
     // Each block's index entry is at least three bytes.
     if count > bytes.len() as u64 {
         return None;
     }
-    let mut firsts = Vec::new();
-    let mut index = Vec::with_capacity(count as usize);
+    let mut samples = Vec::with_capacity(count.div_ceil(SAMPLE as u64) as usize);
     let (mut at, mut start, mut postings) = (0, 0u64, 0u64);
+    let mut previous: &[u8] = &[];
     for b in 0..count as usize {
-        let len = usize::try_from(take(bytes, &mut at)?).ok()?;
-        let term = bytes.get(at..at.checked_add(len)?)?;
-        at += len;
+        let entry = at;
+        let term = index_term(bytes, &mut at)?;
         let (step, postings_step) = (take(bytes, &mut at)?, take(bytes, &mut at)?);
-        if b == 0 && (step, postings_step) != (0, 0) || b > 0 && step == 0 {
+        if b == 0 && (step, postings_step) != (0, 0)
+            || b > 0 && (step == 0 || !before(previous, term))
+        {
             return None;
-        }
-        if let Some(previous) = index.last() {
-            let previous: &Block = previous;
-            if term <= &firsts[previous.term_start..previous.term_end] {
-                return None;
-            }
         }
         start = start.checked_add(step)?;
         postings = postings.checked_add(postings_step)?;
         if start >= blocks_len || postings > postings_len {
             return None;
         }
-        let term_start = firsts.len();
-        firsts.extend_from_slice(term);
-        index.push(Block {
-            term_start,
-            term_end: firsts.len(),
-            start,
-            postings,
-        });
+        previous = term;
+        if b % SAMPLE == 0 {
+            samples.push(Place {
+                at: entry,
+                start,
+                postings,
+            });
+        }
     }
-    (at == bytes.len() && (count > 0 || blocks_len == 0 && postings_len == 0))
-        .then_some((firsts, index))
+    (at == bytes.len() && (count > 0 || blocks_len == 0 && postings_len == 0)).then_some(samples)
 }
 
 /// Entries of one dictionary block, decoded in order.
@@ -734,7 +804,8 @@ impl Entries {
 /// Every term of a segment, in order.
 pub struct Terms<'s, R> {
     segment: &'s Segment<R>,
-    next_block: usize,
+    /// The next block to read and its place; `None` after the last.
+    next: Option<(usize, Place)>,
     entries: Option<Entries>,
 }
 
@@ -744,11 +815,12 @@ impl<R: ReadAt> Terms<'_, R> {
         loop {
             let exhausted = self.entries.as_ref().is_none_or(|e| e.remaining == 0);
             if exhausted {
-                if self.next_block == self.segment.index.len() {
+                let Some((block, place)) = self.next else {
                     return Ok(None);
-                }
-                self.entries = Some(self.segment.block(self.next_block)?);
-                self.next_block += 1;
+                };
+                let (entries, next) = self.segment.block(block, place)?;
+                self.entries = Some(entries);
+                self.next = next.map(|place| (block + 1, place));
                 continue;
             }
             let Some(entries) = self.entries.as_mut() else {
@@ -785,5 +857,161 @@ impl<R: ReadAt> Records<'_, R> {
         let record = self.records[self.at];
         self.at += 1;
         Ok(Some(record))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::put;
+    use super::*;
+
+    /// An Index section: per block its first term, byte step and postings
+    /// step, as the writer lays them out.
+    fn index(entries: &[(&[u8], u64, u64)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(term, step, postings_step) in entries {
+            put(term.len() as u64, &mut out);
+            out.extend_from_slice(term);
+            put(step, &mut out);
+            put(postings_step, &mut out);
+        }
+        out
+    }
+
+    /// Each block's first term, byte offset and postings base, decoded the
+    /// way lookups do: from the samples `parse_index` keeps, stepping with
+    /// `next_place`. Fails the test if a sample disagrees with the walk.
+    fn parsed(
+        bytes: &[u8],
+        blocks: u64,
+        blocks_len: u64,
+        postings_len: u64,
+    ) -> Option<Vec<(Vec<u8>, u64, u64)>> {
+        let samples = parse_index(bytes, blocks * BLOCK as u64, blocks_len, postings_len)?;
+        let mut places = Vec::new();
+        let mut place = samples.first().copied();
+        while let Some(here) = place {
+            places.push(here);
+            place = (places.len() < blocks as usize)
+                .then(|| next_place(bytes, here).expect("parsed entries decode"));
+        }
+        let every: Vec<_> = places.iter().step_by(SAMPLE).copied().collect();
+        assert_eq!(samples, every, "samples are every {SAMPLE}th place");
+        Some(
+            places
+                .iter()
+                .map(|p| {
+                    let term = index_term(bytes, &mut { p.at }).unwrap_or_default();
+                    (term.to_vec(), p.start, p.postings)
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn index_decodes_places_across_samples() {
+        // Steps alternate one and two bytes wide, and the postings base
+        // passes u32 inside the second sample run.
+        let past_u32 = u64::from(u32::MAX) + 1;
+        let names: Vec<_> = (0..2 * SAMPLE + 3)
+            .map(|b| format!("t{b:03}").into_bytes())
+            .collect();
+        let entries: Vec<(&[u8], u64, u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(b, name)| match b {
+                0 => (name.as_slice(), 0, 0),
+                b if b == SAMPLE + 3 => (name.as_slice(), 300, past_u32),
+                b => (name.as_slice(), 1 + 200 * (b as u64 % 2), b as u64),
+            })
+            .collect();
+        let (mut start, mut postings) = (0, 0);
+        let want: Vec<_> = entries
+            .iter()
+            .map(|&(term, step, postings_step)| {
+                start += step;
+                postings += postings_step;
+                (term.to_vec(), start, postings)
+            })
+            .collect();
+        assert_eq!(
+            parsed(&index(&entries), entries.len() as u64, start + 1, postings),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn index_accepts_its_section_boundaries_and_wide_offsets() {
+        let past_u32 = u64::from(u32::MAX) + 1;
+        // The last block starts on the blocks section's last byte, and the
+        // postings base reaches the section's end: both are the widest the
+        // checks allow. Offsets past u32 must not wrap.
+        let bytes = index(&[(b"ab", 0, 0), (b"abc", past_u32, past_u32), (b"b", 7, 1)]);
+        let blocks_len = past_u32 + 8;
+        let postings_len = past_u32 + 1;
+        assert_eq!(
+            parsed(&bytes, 3, blocks_len, postings_len),
+            Some(vec![
+                (b"ab".to_vec(), 0, 0),
+                (b"abc".to_vec(), past_u32, past_u32),
+                (b"b".to_vec(), past_u32 + 7, postings_len),
+            ])
+        );
+        // The same at the top of u64.
+        let top = index(&[(b"a", 0, 0), (b"b", u64::MAX - 1, u64::MAX)]);
+        assert_eq!(
+            parsed(&top, 2, u64::MAX, u64::MAX),
+            Some(vec![
+                (b"a".to_vec(), 0, 0),
+                (b"b".to_vec(), u64::MAX - 1, u64::MAX)
+            ])
+        );
+    }
+
+    #[test]
+    fn index_rejects_entries_outside_their_bounds() {
+        let ok =
+            |entries: &[(&[u8], u64, u64)]| parsed(&index(entries), entries.len() as u64, 100, 50);
+        assert!(
+            ok(&[(b"ab", 0, 0), (b"abc", 99, 50)]).is_some(),
+            "the control"
+        );
+        assert_eq!(
+            ok(&[(b"ab", 0, 0), (b"abc", 100, 0)]),
+            None,
+            "start at the section end"
+        );
+        assert_eq!(
+            ok(&[(b"ab", 0, 0), (b"abc", 1, 51)]),
+            None,
+            "postings past the end"
+        );
+        assert_eq!(ok(&[(b"ab", 0, 0), (b"ab", 1, 0)]), None, "a repeated term");
+        assert_eq!(
+            ok(&[(b"abc", 0, 0), (b"ab", 1, 0)]),
+            None,
+            "a prefix after its extension"
+        );
+        assert_eq!(ok(&[(b"ab", 0, 0), (b"aa", 1, 0)]), None, "a smaller term");
+        assert_eq!(ok(&[(b"ab", 0, 0), (b"abc", 0, 0)]), None, "an empty block");
+        assert_eq!(ok(&[(b"ab", 1, 0)]), None, "block 0 with a step");
+        // Each second entry is in bounds, so only a checked sum rejects the
+        // third: a wrapping one lands back inside the section.
+        let overflow = index(&[(b"a", 0, 0), (b"b", u64::MAX - 1, 0), (b"c", 2, 0)]);
+        assert_eq!(parsed(&overflow, 3, u64::MAX, 0), None, "a wrapping start");
+        let overflow = index(&[(b"a", 0, 0), (b"b", 1, u64::MAX), (b"c", 1, 1)]);
+        assert_eq!(
+            parsed(&overflow, 3, 3, u64::MAX),
+            None,
+            "a wrapping postings base"
+        );
+        let mut trailing = index(&[(b"ab", 0, 0)]);
+        trailing.push(0);
+        assert_eq!(parsed(&trailing, 1, 100, 50), None, "a trailing byte");
+        assert_eq!(
+            parsed(&index(&[(b"ab", 0, 0)]), 2, 100, 50),
+            None,
+            "a missing block"
+        );
     }
 }

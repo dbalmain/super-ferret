@@ -32,8 +32,10 @@
 //!
 //! **Index.** Per block, `vbyte first-term length, first term, vbyte
 //! previous block's byte length, vbyte previous block's postings bytes` (both
-//! 0 for block 0). It is read whole when the segment opens and stays
-//! resident (D64 A), so a lookup binary-searches it and reads one block.
+//! 0 for block 0). It is read whole and checked entry by entry when the
+//! segment opens, and its bytes stay resident (D64 A) with the place of
+//! every 16th block (D129 C). A lookup binary-searches those samples,
+//! decodes at most 15 entries after one, and reads one block.
 //!
 //! **Postings codec 1.** `intpack::pfor128skip` sorted lists of `doc -
 //! first`, doc ids only (D61 B). A codec id, not the format version, says
@@ -309,6 +311,18 @@ fn put(mut value: u64, out: &mut Vec<u8>) {
 /// Reads one LEB128 value at `*at`, advancing it; `None` past the end or
 /// beyond 64 bits.
 fn take(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    // Most values (lengths, block and list steps) fit one or two bytes:
+    // decode those without entering the loop.
+    let &low = bytes.get(*at)?;
+    if low < 0x80 {
+        *at += 1;
+        return Some(u64::from(low));
+    }
+    let &high = bytes.get(*at + 1)?;
+    if high < 0x80 {
+        *at += 2;
+        return Some(u64::from(low & 0x7f) | u64::from(high) << 7);
+    }
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
         let byte = *bytes.get(*at)?;
