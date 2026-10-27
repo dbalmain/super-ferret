@@ -1726,7 +1726,14 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         in_work_tree: bool,
         token: V::Dir,
     ) -> Ignores {
-        let inputs = [".ferretignore", ".ignore", ".rgignore", DOT_GIT, ".gitignore"].map(OsStr::new);
+        let inputs = [
+            ".ferretignore",
+            ".ignore",
+            ".rgignore",
+            DOT_GIT,
+            ".gitignore",
+        ]
+        .map(OsStr::new);
         // `.gitignore` counts only inside a work tree; see below for a root.
         let inputs = match in_work_tree {
             true => &inputs[..],

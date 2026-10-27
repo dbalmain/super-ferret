@@ -265,7 +265,7 @@ impl Watch {
             | WatchFlags::MASK_ADD;
         let installed = s.identities.len();
         if installed >= self.config.watch_cap && !s.identities.contains_key(&identity) {
-            failure(&mut s, root, || input_key(&proc, name));
+            failure(&mut s, root, || input_key(proc, name));
             return;
         }
         let result = s
@@ -302,22 +302,22 @@ impl Watch {
                 if let Some(record) = s.failures.get_mut(root)
                     && record.exact() > 0
                 {
-                    record.repair_policy(&input_key(&proc, name));
+                    record.repair_policy(&input_key(proc, name));
                 }
             }
             Ok(wd) => {
                 let _ = inotify::remove_watch(&self.fd, wd);
                 s.removed.insert(wd);
-                failure(&mut s, root, || input_key(&proc, name));
+                failure(&mut s, root, || input_key(proc, name));
             }
-            Err(_) => failure(&mut s, root, || input_key(&proc, name)),
+            Err(_) => failure(&mut s, root, || input_key(proc, name)),
         }
         drop(s);
         if !matches!(name.as_bytes(), b".git" | b".gitignore" | b"commondir")
             && std::fs::symlink_metadata(proc.join(name)).is_ok_and(|m| m.file_type().is_symlink())
         {
             // Only a followed symlink needs the input's own path.
-            let key = input_key(&proc, name);
+            let key = input_key(proc, name);
             match std::fs::read_link(proc.join(name)) {
                 // A link chain longer than the kernel follows, a cycle
                 // included, cannot resolve: the input is a failure, as when
