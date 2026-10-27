@@ -5912,6 +5912,7 @@ fn streaming_head_stops_before_reading_the_whole_large_file() {
 
 // The pipe blocks the publisher while the test changes the opening bytes.
 // Retrying an already-published attempt would duplicate this complete group.
+// `--live` keeps the checked read that a plain `-uu` scan skips (D123).
 #[test]
 fn streaming_changed_file_reports_partial_output_without_retry() {
     use std::io::Read;
@@ -5926,7 +5927,7 @@ fn streaming_changed_file_reports_partial_output_without_retry() {
         fixture.write("changed/large", &bytes);
         let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
         command
-            .args(["grep", "-uu", "-I"])
+            .args(["grep", "--live", "-uu", "-I"])
             .args(&flags)
             .args(["hit", "changed"])
             .env("FERRET_SEARCH_THREADS", "8");
@@ -5975,8 +5976,9 @@ fn streaming_changed_file_reports_partial_output_without_retry() {
 
 // D123: a directory no index covers is scanned as rg scans it, reading each
 // file once up to its opening size and printing what was read, with or
-// without -L. A file that shrinks during its read is neither retried nor
-// reported as changed; indexed reads and --live still reject it.
+// without -L. A `-uu` walk, which never consults the index, reads the same
+// way. A file that shrinks during its read is neither retried nor reported
+// as changed; indexed reads and --live still reject it.
 #[test]
 fn uncovered_scan_prints_a_file_changed_during_its_read() {
     use std::io::Read;
@@ -5988,7 +5990,7 @@ fn uncovered_scan_prints_a_file_changed_during_its_read() {
     line.resize(1023, b'x');
     line.push(b'\n');
     let bytes = line.repeat(32 * 1024);
-    for flags in [vec![], vec!["-L"]] {
+    for flags in [vec![], vec!["-L"], vec!["-uu"], vec!["-uu", "-L"]] {
         fs::write(outside.join("large"), &bytes).unwrap();
         let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
         command

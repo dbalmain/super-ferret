@@ -7022,6 +7022,15 @@ were retried once, then reported as changed with their matches dropped.
 The outcome stands. Built in 9010608; `-L` walks were missed there and are
 covered in the follow-up.
 
+**Extended to `-u` walks (2026-10-27):** a `-uu` scan never consults the
+index, so it is uncovered by definition, and it already read with rg's
+binary probe and no size cap. It still took the checked read, because
+routing builds no coverage anchors for it, so the flag that selects one
+read was never set. It now reads once too; `--live` keeps the check. On
+the cargo registry at one thread, `-uu -c` went from 394 to 351 ms (rg
+324.5) and stat calls from 144k to 48k; at default threads, 53.7 to
+52.7 ms.
+
 ## D124 — Committed `vendor/` trees: rg searches them, ferret's walks skip them
 
 **Question:** When a repository commits a directory that ferret's seeded

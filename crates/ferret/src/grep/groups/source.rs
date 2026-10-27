@@ -56,6 +56,9 @@ impl Filter<'_> {
             content: true,
         };
         let uncovered = policy.as_ref().is_some_and(|policy| policy.uncovered());
+        // A `-u` walk never consults the index, so it reads once as an
+        // uncovered scan does; `--live` keeps the checked read (D123).
+        let once = uncovered || (self.traversal.unrestricted && !self.traversal.live);
         let mut policy = policy;
         let visit = visibility.select(entry, policy.as_deref_mut(), stopped);
         if let Some(policy) = policy {
@@ -119,7 +122,7 @@ impl Filter<'_> {
                     self.cwd.join(entry.path()),
                     engine::reader::Parent::Followed,
                     true,
-                    uncovered,
+                    once,
                 ),
             ));
         }
@@ -147,7 +150,7 @@ impl Filter<'_> {
                 parent,
                 uncovered,
                 // Uncovered scans read once, as rg does (D123).
-                uncovered,
+                once,
             ),
         ))
     }
