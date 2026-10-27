@@ -1595,8 +1595,7 @@ pub(crate) fn spawn_named<'scope, R: Send + 'scope>(
     if refused_for_tests(name) {
         return Err(rustix::io::Errno::AGAIN.into());
     }
-    static RESERVED: std::sync::Once = std::sync::Once::new();
-    RESERVED.call_once(reserve_descriptor_table);
+    reserve_descriptor_table();
     std::thread::Builder::new()
         .name(name.into())
         .spawn_scoped(scope, work)
@@ -1632,15 +1631,23 @@ pub struct Shortfall {
     pub cause: std::io::Error,
 }
 
-/// Grows the process's descriptor table to 1024 slots before the first worker
-/// shares it. Growing a table that several threads share waits out an RCU grace
-/// period while every other opener waits on the resize, and a deep tree's held
-/// directory chains (D21) reach a few hundred descriptors, so the table used to
-/// grow several times mid-search: 46–49 ms of a 520 ms index grep at 32
-/// threads on a 300k-file tree (kdiag, 2026-10-20). Best effort: under a low
-/// open-file limit, or with no descriptor 2 to duplicate, the table grows as
-/// it did before.
-fn reserve_descriptor_table() {
+/// Grows the process's descriptor table to 1024 slots, once, before the first
+/// worker shares it. Growing a table that several threads share waits out an
+/// RCU grace period while every other opener waits on the resize, and a deep
+/// tree's held directory chains (D21) reach a few hundred descriptors, so the
+/// table used to grow several times mid-search: 46–49 ms of a 520 ms index
+/// grep at 32 threads on a 300k-file tree (kdiag, 2026-10-20). Growing it is
+/// cheap only while the process has one thread: a parallel `--files`, which
+/// spawned its writer's thread first, waited 20 ms here. A host calls this
+/// before its first thread; every worker spawn calls it too. Best effort:
+/// under a low open-file limit, or with no descriptor 2 to duplicate, the
+/// table grows as it did before.
+pub fn reserve_descriptor_table() {
+    static RESERVED: std::sync::Once = std::sync::Once::new();
+    RESERVED.call_once(grow_descriptor_table);
+}
+
+fn grow_descriptor_table() {
     use std::os::fd::AsFd;
     let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
         .current

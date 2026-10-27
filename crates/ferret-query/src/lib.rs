@@ -129,7 +129,7 @@ pub use plan::{
 pub use query::{GREP_PREFIX, ParseError, Query, Strategy};
 pub use read::{CheckedReader, ReadFault, ReadOperation, ReadOutcome, retry_read};
 pub use run::{Row, RunError, Stats};
-pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers};
+pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers, reserve_descriptor_table};
 
 /// Shared bounded scheduling for completed grep file groups.
 pub use verify::{
