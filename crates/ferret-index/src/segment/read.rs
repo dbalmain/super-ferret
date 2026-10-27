@@ -89,11 +89,15 @@ pub struct Info {
 }
 
 /// One block's place, from the resident index.
+///
+/// Offsets stay `u64`/`usize`: the format caps only the fingerprint section
+/// at `u32` (`Writer::check_record_length`); blocks, postings, the index and
+/// term lengths have no narrower bound.
 #[derive(Clone, Copy, Debug)]
 struct Block {
-    /// Its first term's bytes in `Segment::firsts`.
-    term_start: usize,
-    term_end: usize,
+    /// Where its index entry starts in `Segment::index_bytes`: the vbyte
+    /// length of its first term, then the term.
+    term_at: usize,
     /// Byte offset in the blocks section.
     start: u64,
     /// Offset in the postings section of its first list.
@@ -211,7 +215,8 @@ pub struct Segment<R> {
     fingerprints: FingerprintIndex,
     /// Chunk sums: the blocks section's, then the postings section's.
     sums: Vec<u8>,
-    firsts: Vec<u8>,
+    /// The Index section, verified; blocks' first terms are read in place.
+    index_bytes: Vec<u8>,
     index: Vec<Block>,
 }
 
@@ -310,7 +315,7 @@ impl<R: ReadAt> Segment<R> {
                 .ok_or(ReadError::Corrupt(Section::FingerprintIndex))?
         };
 
-        let (firsts, index) = parse_index(&index, info.terms, blocks_len, postings_len)
+        let blocks = parse_index(&index, info.terms, blocks_len, postings_len)
             .ok_or(ReadError::Corrupt(Section::Index))?;
         let mut digest = [0; 16];
         digest.copy_from_slice(&head[head_len - 16..]);
@@ -325,8 +330,8 @@ impl<R: ReadAt> Segment<R> {
             postings_at: (table[1].0, postings_len),
             lengths: table.map(|(_, len, _)| len),
             sums,
-            firsts,
-            index,
+            index_bytes: index,
+            index: blocks,
         })
     }
 
@@ -352,7 +357,7 @@ impl<R: ReadAt> Segment<R> {
     /// Allocated bytes resident for this segment: block index and chunk sums,
     /// including unused buffer capacity but excluding allocator overhead.
     pub fn resident_bytes(&self) -> usize {
-        self.firsts.capacity()
+        self.index_bytes.capacity()
             + self.index.capacity() * size_of::<Block>()
             + self.sums.capacity()
             + self.fingerprints.allocated_bytes()
@@ -479,9 +484,7 @@ impl<R: ReadAt> Segment<R> {
     /// block and never the postings: what a planner estimates from before
     /// it decides which lists to read.
     pub fn entry(&self, term: &[u8]) -> Result<Option<TermEntry>, ReadError> {
-        let found = self
-            .index
-            .partition_point(|b| &self.firsts[b.term_start..b.term_end] <= term);
+        let found = self.index.partition_point(|b| self.first_term(b) <= term);
         let Some(block) = found.checked_sub(1) else {
             return Ok(None);
         };
@@ -510,9 +513,7 @@ impl<R: ReadAt> Segment<R> {
     /// terms, which the caller skips. A prefix scan's seek: it reads no
     /// block before that one.
     pub fn terms_from(&self, start: &[u8]) -> Terms<'_, R> {
-        let found = self
-            .index
-            .partition_point(|b| &self.firsts[b.term_start..b.term_end] <= start);
+        let found = self.index.partition_point(|b| self.first_term(b) <= start);
         Terms {
             segment: self,
             next_block: found.saturating_sub(1),
@@ -536,6 +537,12 @@ impl<R: ReadAt> Segment<R> {
         }
     }
 
+    /// `block`'s first term, in the resident index bytes.
+    fn first_term(&self, block: &Block) -> &[u8] {
+        // `parse_index` decoded this entry at open, so it cannot fail.
+        index_term(&self.index_bytes, &mut { block.term_at }).unwrap_or_default()
+    }
+
     /// Decodes block `b`'s entries lazily.
     fn block(&self, b: usize) -> Result<Entries, ReadError> {
         let here = self.index[b];
@@ -552,7 +559,7 @@ impl<R: ReadAt> Segment<R> {
         Ok(Entries {
             bytes,
             at,
-            term: self.firsts[here.term_start..here.term_end].to_vec(),
+            term: self.first_term(&here).to_vec(),
             remaining: count,
             seen: 0,
             postings: here.postings,
@@ -603,52 +610,58 @@ impl<R: ReadAt> Segment<R> {
     }
 }
 
+/// One index entry's first term at `*at`, advancing past it.
+fn index_term<'a>(bytes: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::try_from(take(bytes, at)?).ok()?;
+    let term = bytes.get(*at..at.checked_add(len)?)?;
+    *at += len;
+    Some(term)
+}
+
+/// Whether `a` sorts strictly before `b`. Inline rather than a `memcmp`
+/// call: first terms are short, and `parse_index` compares one per block.
+fn before(a: &[u8], b: &[u8]) -> bool {
+    for (x, y) in a.iter().zip(b) {
+        if x != y {
+            return x < y;
+        }
+    }
+    a.len() < b.len()
+}
+
 /// Parses the block index; `None` when it is inconsistent with the head or
-/// the section lengths.
-fn parse_index(
-    bytes: &[u8],
-    terms: u64,
-    blocks_len: u64,
-    postings_len: u64,
-) -> Option<(Vec<u8>, Vec<Block>)> {
+/// the section lengths. First terms stay in `bytes`, which the caller keeps.
+fn parse_index(bytes: &[u8], terms: u64, blocks_len: u64, postings_len: u64) -> Option<Vec<Block>> {
     let count = terms.div_ceil(BLOCK as u64);
     // Each block's index entry is at least three bytes.
     if count > bytes.len() as u64 {
         return None;
     }
-    let mut firsts = Vec::new();
     let mut index = Vec::with_capacity(count as usize);
     let (mut at, mut start, mut postings) = (0, 0u64, 0u64);
+    let mut previous: &[u8] = &[];
     for b in 0..count as usize {
-        let len = usize::try_from(take(bytes, &mut at)?).ok()?;
-        let term = bytes.get(at..at.checked_add(len)?)?;
-        at += len;
+        let term_at = at;
+        let term = index_term(bytes, &mut at)?;
         let (step, postings_step) = (take(bytes, &mut at)?, take(bytes, &mut at)?);
-        if b == 0 && (step, postings_step) != (0, 0) || b > 0 && step == 0 {
+        if b == 0 && (step, postings_step) != (0, 0)
+            || b > 0 && (step == 0 || !before(previous, term))
+        {
             return None;
-        }
-        if let Some(previous) = index.last() {
-            let previous: &Block = previous;
-            if term <= &firsts[previous.term_start..previous.term_end] {
-                return None;
-            }
         }
         start = start.checked_add(step)?;
         postings = postings.checked_add(postings_step)?;
         if start >= blocks_len || postings > postings_len {
             return None;
         }
-        let term_start = firsts.len();
-        firsts.extend_from_slice(term);
+        previous = term;
         index.push(Block {
-            term_start,
-            term_end: firsts.len(),
+            term_at,
             start,
             postings,
         });
     }
-    (at == bytes.len() && (count > 0 || blocks_len == 0 && postings_len == 0))
-        .then_some((firsts, index))
+    (at == bytes.len() && (count > 0 || blocks_len == 0 && postings_len == 0)).then_some(index)
 }
 
 /// Entries of one dictionary block, decoded in order.
@@ -785,5 +798,110 @@ impl<R: ReadAt> Records<'_, R> {
         let record = self.records[self.at];
         self.at += 1;
         Ok(Some(record))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::put;
+    use super::*;
+
+    /// An Index section: per block its first term, byte step and postings
+    /// step, as the writer lays them out.
+    fn index(entries: &[(&[u8], u64, u64)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(term, step, postings_step) in entries {
+            put(term.len() as u64, &mut out);
+            out.extend_from_slice(term);
+            put(step, &mut out);
+            put(postings_step, &mut out);
+        }
+        out
+    }
+
+    /// Each parsed block's first term, byte offset and postings base.
+    fn parsed(
+        bytes: &[u8],
+        blocks: u64,
+        blocks_len: u64,
+        postings_len: u64,
+    ) -> Option<Vec<(Vec<u8>, u64, u64)>> {
+        let index = parse_index(bytes, blocks * BLOCK as u64, blocks_len, postings_len)?;
+        Some(
+            index
+                .iter()
+                .map(|b| {
+                    let term = index_term(bytes, &mut { b.term_at }).unwrap_or_default();
+                    (term.to_vec(), b.start, b.postings)
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn index_accepts_its_section_boundaries_and_wide_offsets() {
+        let past_u32 = u64::from(u32::MAX) + 1;
+        // The last block starts on the blocks section's last byte, and the
+        // postings base reaches the section's end: both are the widest the
+        // checks allow. Offsets past u32 must not wrap.
+        let bytes = index(&[(b"ab", 0, 0), (b"abc", past_u32, past_u32), (b"b", 7, 1)]);
+        let blocks_len = past_u32 + 8;
+        let postings_len = past_u32 + 1;
+        assert_eq!(
+            parsed(&bytes, 3, blocks_len, postings_len),
+            Some(vec![
+                (b"ab".to_vec(), 0, 0),
+                (b"abc".to_vec(), past_u32, past_u32),
+                (b"b".to_vec(), past_u32 + 7, postings_len),
+            ])
+        );
+        // The same at the top of u64.
+        let top = index(&[(b"a", 0, 0), (b"b", u64::MAX - 1, u64::MAX)]);
+        assert_eq!(
+            parsed(&top, 2, u64::MAX, u64::MAX),
+            Some(vec![
+                (b"a".to_vec(), 0, 0),
+                (b"b".to_vec(), u64::MAX - 1, u64::MAX)
+            ])
+        );
+    }
+
+    #[test]
+    fn index_rejects_entries_outside_their_bounds() {
+        let ok =
+            |entries: &[(&[u8], u64, u64)]| parsed(&index(entries), entries.len() as u64, 100, 50);
+        assert!(
+            ok(&[(b"ab", 0, 0), (b"abc", 99, 50)]).is_some(),
+            "the control"
+        );
+        assert_eq!(
+            ok(&[(b"ab", 0, 0), (b"abc", 100, 0)]),
+            None,
+            "start at the section end"
+        );
+        assert_eq!(
+            ok(&[(b"ab", 0, 0), (b"abc", 1, 51)]),
+            None,
+            "postings past the end"
+        );
+        assert_eq!(ok(&[(b"ab", 0, 0), (b"ab", 1, 0)]), None, "a repeated term");
+        assert_eq!(
+            ok(&[(b"abc", 0, 0), (b"ab", 1, 0)]),
+            None,
+            "a prefix after its extension"
+        );
+        assert_eq!(ok(&[(b"ab", 0, 0), (b"aa", 1, 0)]), None, "a smaller term");
+        assert_eq!(ok(&[(b"ab", 0, 0), (b"abc", 0, 0)]), None, "an empty block");
+        assert_eq!(ok(&[(b"ab", 1, 0)]), None, "block 0 with a step");
+        let overflow = index(&[(b"a", 0, 0), (b"b", u64::MAX, 0), (b"c", 2, 0)]);
+        assert_eq!(parsed(&overflow, 3, u64::MAX, 0), None, "a wrapping offset");
+        let mut trailing = index(&[(b"ab", 0, 0)]);
+        trailing.push(0);
+        assert_eq!(parsed(&trailing, 1, 100, 50), None, "a trailing byte");
+        assert_eq!(
+            parsed(&index(&[(b"ab", 0, 0)]), 2, 100, 50),
+            None,
+            "a missing block"
+        );
     }
 }
