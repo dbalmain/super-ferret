@@ -856,9 +856,25 @@ fn unsupported_commands_fall_back_to_the_named_rg() {
         );
         assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
     }
-    // rg has no `--rg`: the stand-in's leading one is dropped (D128).
-    let output = run_with(&["--rg", "--sort", "path", "red"], &fallback, None);
-    assert_eq!(output.stdout, b"fallback --sort path red\n", "{output:?}");
+    // rg has no `--rg`: wherever the parser took one as ferret's flag, it is
+    // dropped (D128), and a pattern spelled `--rg` is kept.
+    for (args, rg) in [
+        (&["--rg", "--sort", "path", "red"][..], "--sort path red"),
+        (
+            &["-n", "--rg", "--sort", "path", "red", "--rg"],
+            "-n --sort path red",
+        ),
+        (&["--sort", "path", "-e", "--rg"], "--sort path -e --rg"),
+        (&["-Pe", "--rg", "red"], "-Pe --rg red"),
+        (&["--rg", "--pcre2", "--rg", "red"], "--pcre2 --rg red"),
+    ] {
+        let output = run_with(args, &fallback, None);
+        assert_eq!(
+            output.stdout,
+            format!("fallback {rg}\n").as_bytes(),
+            "{output:?}"
+        );
+    }
     let refused = run_with(&["--sort", "path", "red"], &[], None);
     assert_eq!(refused.status.code(), Some(2), "{refused:?}");
     assert!(refused.stdout.is_empty());

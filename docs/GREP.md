@@ -520,8 +520,14 @@ restores the rg-parity rules this section describes: hidden names held unless
 revealed, and uncovered directories under rg's rules from `/`. The agents' `rg`
 stand-in and the shadow pass `--rg`, and every rg differential test runs with
 it. `-uu` and `--hidden` mean the same in both modes. When the stand-in's
-`FERRET_GREP_FALLBACK` hands a refused command to rg, a leading `--rg` is
-dropped, since rg has no such flag. The ignore rules below hold in both
+`FERRET_GREP_FALLBACK` hands a refused command to rg, each argument the
+parser took as `--rg` is dropped, since rg has no such flag; a `--rg` that is
+a pattern, a flag's value or after `--` is kept. A flag ferret lacks stops
+the parse, and only rg knows its grammar (`-Pe --rg` makes `--rg` a
+pattern), so every argument after it reaches rg unchanged; rg rejects a
+`--rg` there that it reads as a flag. A refusal found after the whole argv
+is read, such as `--sort=path`, still drops every `--rg` flag. The stand-in
+puts its `--rg` first. The ignore rules below hold in both
 modes; the hidden-name rules, and the uncovered walk's, are `--rg`'s.
 
 **D127 A (2026-10-27):** under `--rg`, indexed grep shows a hidden name that

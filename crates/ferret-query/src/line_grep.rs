@@ -280,6 +280,28 @@ pub fn parse_with(
     args: &[OsString],
     read: &mut dyn FnMut(&Path) -> io::Result<Vec<u8>>,
 ) -> Result<Command, ParseError> {
+    parse_marked(args, read, &mut Vec::new())
+}
+
+/// The argv positions a parse took as ferret's own `--rg` flag, which rg
+/// rejects: a host handing a refused command to rg drops exactly these. A
+/// flag ferret lacks stops the parse, and only rg knows that flag's grammar
+/// (`-Pe` makes the next argument a pattern), so a `--rg` after it is not
+/// one of these: rg reads it as it would, rather than a guess changing its
+/// answer. A refusal after the last argument leaves every flag found.
+pub fn own_flags(args: &[OsString]) -> Vec<usize> {
+    let mut flags = Vec::new();
+    let _ = parse_marked(args, &mut |_| Ok(Vec::new()), &mut flags);
+    flags
+}
+
+/// [`parse_with`], recording in `rg` the argv position of each `--rg` flag.
+fn parse_marked(
+    args: &[OsString],
+    read: &mut dyn FnMut(&Path) -> io::Result<Vec<u8>>,
+    rg: &mut Vec<usize>,
+) -> Result<Command, ParseError> {
+    let total = args.len();
     let mut positionals = Vec::new();
     let mut sources = Vec::new();
     let mut filters = Vec::new();
@@ -365,7 +387,10 @@ pub fn parse_with(
                 "--json" if value.is_none() => json = true,
                 "--no-json" if value.is_none() => json = false,
                 "--live" if value.is_none() => traversal.live = true,
-                "--rg" if value.is_none() => traversal.rg = true,
+                "--rg" if value.is_none() => {
+                    traversal.rg = true;
+                    rg.push(total - args.len() - 1);
+                }
                 "--follow" if value.is_none() => traversal.follow = true,
                 "--no-follow" if value.is_none() => traversal.follow = false,
                 "--no-ignore" if value.is_none() => traversal.unrestricted = true,
@@ -1312,6 +1337,40 @@ fn scan_records(
 mod tests {
     use super::*;
     use ferret_verify::Trigrams;
+
+    // A refused command reaches rg without the arguments the parser took as
+    // `--rg`, and with every `--rg` it took as something else: a value, a
+    // positional after `--`, or the unsupported `--rg=x`. After a flag it
+    // refuses, the parse knows nothing: `-Pe --rg` is a pattern to rg, and
+    // `--pre-glob -e --rg` a flag rg rejects, so both reach rg as they are.
+    #[test]
+    fn own_flags_are_the_rg_flags_the_parser_took() {
+        let own = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            own_flags(&args)
+        };
+        assert_eq!(own(&["--rg", "--sort", "path", "red"]), [0]);
+        assert_eq!(own(&["-n", "--rg", "--sort", "path", "hit"]), [1]);
+        assert_eq!(own(&["--rg", "red", "--rg"]), [0, 2]);
+        for args in [
+            &["-e", "--rg", "red"][..],
+            &["--regexp", "--rg"],
+            &["-g", "--rg", "red"],
+            &["red", "--", "--rg"],
+            &["--rg=x", "red"],
+        ] {
+            assert_eq!(own(args), [0usize; 0], "{args:?}");
+        }
+        assert_eq!(own(&["--rg", "--pcre2", "--rg", "red"]), [0]);
+        for args in [
+            &["-Pe", "--rg", "red"][..],
+            &["-uuue", "--rg", "red"],
+            &["--pre-glob", "-e", "--rg", "red"],
+            &["--pre-glob", "--", "--rg", "red"],
+        ] {
+            assert_eq!(own(args), [0usize; 0], "{args:?}");
+        }
+    }
 
     // D128: hidden names show unless `--rg`; an explicit switch wins in
     // either mode, in argv order.
