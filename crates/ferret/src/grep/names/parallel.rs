@@ -230,8 +230,12 @@ impl Visitor<LiveWalk, Task> for Lister<'_> {
                     Ok(Visit::Descend) => task.descend = true,
                     Ok(Visit::File) => self.name(entry.path()),
                     Ok(Visit::Skip) => {}
-                    Err(error) => {
-                        found = Some(format!("grep: {}: {error}", entry.path().display()));
+                    Err(refusal) => {
+                        found = Some(format!(
+                            "grep: {}: {}",
+                            refusal.path.display(),
+                            refusal.error
+                        ));
                     }
                 }
             }

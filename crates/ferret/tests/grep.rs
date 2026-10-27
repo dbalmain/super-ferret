@@ -6073,6 +6073,36 @@ fn streaming_replacement_with_a_surviving_hard_link_is_rejected() {
     }
 }
 
+// A parallel `--files` listing flushes its names at the operand boundary,
+// as the serial one does, so the next operand's policy warning follows them
+// on a shared stream. It once skipped that flush and the warning came first.
+// With no index, both operands are walked live.
+#[test]
+fn parallel_files_flushes_names_before_the_next_operands_warning() {
+    let fixture = Fixture::new("parallel-files-boundary");
+    fixture.write("a/file", b"x\n");
+    fixture.write("b/.ferretignore", b"bad\\\n");
+    let mut command = fixture.command(OsStr::new("sh"));
+    command
+        .arg("-c")
+        .arg("exec \"$0\" \"$@\" 2>&1")
+        .arg(env!("CARGO_BIN_EXE_ferret"))
+        .arg("--index")
+        .arg(fixture.base.join("no-index"))
+        .args(["grep", "--files", "a", "b"])
+        .env("FERRET_SEARCH_THREADS", "2");
+    let output = run(command, None);
+    let combined = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = combined.lines().collect();
+    assert_eq!(lines.first(), Some(&"a/file"), "{combined}");
+    assert!(
+        lines
+            .get(1)
+            .is_some_and(|line| line.contains("trailing backslash")),
+        "{combined}"
+    );
+}
+
 // Review R2-1: a walked file is opened beneath the directory it was listed
 // in, never through a symlink (GREP.md: recursive symlinks are skipped). A
 // listed regular file swapped for a symlink before its open was once read

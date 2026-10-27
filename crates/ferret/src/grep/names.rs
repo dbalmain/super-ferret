@@ -277,80 +277,89 @@ impl Listing<'_> {
                     // A sort or `-q` needs every name, or only the first, in
                     // walk order; anything else may list a live walk on
                     // several workers.
-                    if threads > 1
-                        && listed.held.is_none()
-                        && !plan.quiet
-                        && let sources::Directory::Live(walk) = source
-                    {
-                        let parallel = parallel::Walk {
-                            plan,
-                            visibility: &visibility,
-                            threads,
-                            flush_each,
-                            cancelled,
-                        };
-                        match parallel.run(walk, policy.take(), writer, runtime)? {
-                            parallel::Listed::Done {
-                                any,
-                                errors: failed,
-                            } => {
-                                listed.any |= any;
-                                errors |= failed;
-                                continue;
-                            }
-                            parallel::Listed::Closed => return Ok(Exit::Ok),
-                            parallel::Listed::Refused(refused) => {
-                                let (walk, refused) = *refused;
-                                source = sources::Directory::Live(walk);
-                                policy = refused;
+                    // A parallel listing that ran leaves the operand-boundary
+                    // flush below to order its names before the next operand's
+                    // warnings.
+                    'walk: {
+                        if threads > 1
+                            && listed.held.is_none()
+                            && !plan.quiet
+                            && let sources::Directory::Live(walk) = source
+                        {
+                            let parallel = parallel::Walk {
+                                plan,
+                                visibility: &visibility,
+                                threads,
+                                flush_each,
+                                cancelled,
+                            };
+                            match parallel.run(walk, policy.take(), writer, runtime)? {
+                                parallel::Listed::Done {
+                                    any,
+                                    errors: failed,
+                                } => {
+                                    listed.any |= any;
+                                    errors |= failed;
+                                    break 'walk;
+                                }
+                                parallel::Listed::Closed => return Ok(Exit::Ok),
+                                parallel::Listed::Refused(refused) => {
+                                    let (walk, refused) = *refused;
+                                    source = sources::Directory::Live(walk);
+                                    policy = refused;
+                                }
                             }
                         }
-                    }
-                    let mut descend = true;
-                    while let Some(entry) =
-                        source.next_with_cancel(descend, &mut || Ok(()), &mut || {
-                            cancelled.load(Ordering::Acquire)
-                        })
-                    {
-                        descend = false;
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(error) => {
-                                if diagnostic(
-                                    writer,
-                                    runtime,
-                                    &format!("grep: {}: {}", error.path.display(), error.error),
-                                )? {
-                                    return Ok(Exit::Ok);
+                        let mut descend = true;
+                        while let Some(entry) =
+                            source.next_with_cancel(descend, &mut || Ok(()), &mut || {
+                                cancelled.load(Ordering::Acquire)
+                            })
+                        {
+                            descend = false;
+                            let entry = match entry {
+                                Ok(entry) => entry,
+                                Err(error) => {
+                                    if diagnostic(
+                                        writer,
+                                        runtime,
+                                        &format!("grep: {}: {}", error.path.display(), error.error),
+                                    )? {
+                                        return Ok(Exit::Ok);
+                                    }
+                                    errors = true;
+                                    continue;
                                 }
-                                errors = true;
-                                continue;
-                            }
-                        };
-                        match visibility.select(entry, policy.as_mut(), &stopped) {
-                            Ok(Visit::Descend) => descend = true,
-                            Ok(Visit::File) => {
-                                if emit(
-                                    plan,
-                                    writer,
-                                    cancelled,
-                                    entry.path(),
-                                    flush_each,
-                                    &mut listed,
-                                )? {
-                                    return Ok(Exit::Ok);
+                            };
+                            match visibility.select(entry, policy.as_mut(), &stopped) {
+                                Ok(Visit::Descend) => descend = true,
+                                Ok(Visit::File) => {
+                                    if emit(
+                                        plan,
+                                        writer,
+                                        cancelled,
+                                        entry.path(),
+                                        flush_each,
+                                        &mut listed,
+                                    )? {
+                                        return Ok(Exit::Ok);
+                                    }
                                 }
-                            }
-                            Ok(Visit::Skip) => {}
-                            Err(refusal) => {
-                                if diagnostic(
-                                    writer,
-                                    runtime,
-                                    &format!("grep: {}: {}", refusal.path.display(), refusal.error),
-                                )? {
-                                    return Ok(Exit::Ok);
+                                Ok(Visit::Skip) => {}
+                                Err(refusal) => {
+                                    if diagnostic(
+                                        writer,
+                                        runtime,
+                                        &format!(
+                                            "grep: {}: {}",
+                                            refusal.path.display(),
+                                            refusal.error
+                                        ),
+                                    )? {
+                                        return Ok(Exit::Ok);
+                                    }
+                                    errors = true;
                                 }
-                                errors = true;
                             }
                         }
                     }
