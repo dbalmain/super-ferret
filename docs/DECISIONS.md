@@ -7296,6 +7296,14 @@ that panics inside intpack. The writer already refuses out-of-order terms
 (`WriteError::TermOrder`), so B's only remaining exposure would be a bug in
 how the writer encodes the index.
 
+**Answered (Dave, 2026-10-27): C kept, B dropped.** The daemon has to run
+for indexing, and without it a search should just be live; the indexed
+no-daemon path stays only because it is already built. The first time it
+needs a bug fix or a design read, remove it in favour of live search
+rather than fixing it. B is archived as tag `archive/perf-d129-open`. The
+C follow-up was not put to Dave; main keeps its option A, so a segment
+still checks term order when it opens.
+
 ## D130 — Whether `ferret grep --files` walks in parallel
 
 **Question:** Should an uncovered `--files` walk run on several threads, as
@@ -7344,6 +7352,9 @@ cg-futex merge, gates green). The same names at 1, 8 and 32 threads:
 | 8 threads | 77.7 ms | 20.1 ms | 28.7 ms |
 | 32 threads | 79.3 ms | 25.5 ms | 20.8 ms |
 | default threads | 77.8 ms | 17.8 ms | 24.7 ms |
+
+**Answered (Dave, 2026-10-27): B.** Merged from `d130-b2`. `--files`
+order without `--sort` is now unspecified above one thread, as rg's is.
 
 ## D131 — Whether a crawl hands file bytes to the content index
 
