@@ -2102,6 +2102,9 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
 
 /// A worker's way to the caller: its slot of held groups, and the bounded
 /// queue of handoffs. Shared by [`completion_groups`] and [`lane_groups`].
+/// Weight bounds allocations, not publication effects: a zero-weight group
+/// may print a count or diagnostic. It needs the same idle wakeup as any other
+/// group, before its worker starts another potentially blocking task.
 pub struct Lane<'g, Group> {
     slot: &'g Mutex<Held<Group>>,
     idle: &'g AtomicBool,

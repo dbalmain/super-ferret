@@ -2131,6 +2131,18 @@ mod tests {
     // publishes before either slow file finishes.
     #[test]
     fn held_group_publishes_while_its_worker_reads_a_slow_file() {
+        held_group_before_slow_file(&["red"], ["fast:red", "later:red", "slow:red"]);
+    }
+
+    // Counts render on the publisher, so their capture weight is zero even
+    // when they print. Both slow reads wait for the fast count to publish:
+    // gating idle handoff on capture bytes strands that count behind them.
+    #[test]
+    fn zero_weight_count_publishes_while_its_worker_reads_a_slow_file() {
+        held_group_before_slow_file(&["-c", "red"], ["fast:1", "later:1", "slow:1"]);
+    }
+
+    fn held_group_before_slow_file(args: &[&str], expected: [&str; 3]) {
         struct Signal<'a> {
             bytes: Vec<u8>,
             published: &'a AtomicBool,
@@ -2145,7 +2157,7 @@ mod tests {
                 Ok(())
             }
         }
-        let plan = plan(&["red"]);
+        let plan = plan(args);
         let published = AtomicBool::new(false);
         let waited_out = AtomicBool::new(false);
         let fork = || -> Option<Box<CheckedReader<'_>>> {
@@ -2192,9 +2204,9 @@ mod tests {
         assert!(!waited_out.load(Ordering::Acquire));
         let output = std::str::from_utf8(&host.writer.bytes).unwrap();
         let mut lines: Vec<_> = output.lines().collect();
-        assert_eq!(lines[0], "fast:red");
+        assert_eq!(lines[0], expected[0]);
         lines.sort_unstable();
-        assert_eq!(lines, ["fast:red", "later:red", "slow:red"]);
+        assert_eq!(lines, expected);
     }
 
     // Policy can diagnose while advancing a live source. It must use the same
