@@ -7326,6 +7326,16 @@ shadow and differential tests already sort. Astra reviewed B and its two
 findings are fixed: a missed operand-boundary flush, and a scheduler
 backoff that could delay a loan.
 
+Re-measured (2026-10-27, branch `d130-b2`: B rebased onto D132 and the
+cg-futex merge, gates green). The same names at 1, 8 and 32 threads:
+
+| `--files` | serial (main) | B | rg |
+| --- | --- | --- | --- |
+| 1 thread | 77.9 ms | 77.8 ms | 169.3 ms |
+| 8 threads | 77.7 ms | 20.1 ms | 28.7 ms |
+| 32 threads | 79.3 ms | 25.5 ms | 20.8 ms |
+| default threads | 77.8 ms | 17.8 ms | 24.7 ms |
+
 ## D131 — Whether a crawl hands file bytes to the content index
 
 **Question:** Should the crawl hand the bytes it read for hashing straight
@@ -7389,4 +7399,29 @@ search an ancestor it cannot list.
 **What changed:** a directory the walk cannot list (mode `0311`, say) yields
 no entries, so its rules never load. A bad ignore pattern in it used to warn
 beside the listing fault; now only the fault is reported, as rg reports it.
+
+## D133 — Grep's collector keeps its wakeups
+
+**Decided (2026-10-27):** content grep's completion protocol is unchanged.
+A study (branch `perf-cg-futex`) asked whether collector wakeups explain why
+`grep -c` trails `rg -j32` (about 70 against 44 ms on the cargo registry).
+
+They explain the futex calls: 57,372 per run at eight threads, almost all
+from the publisher's channel waits and the workers' wakes. Dropping empty
+plain completions and futile walk loans cut that to 892, and voluntary
+context switches from about 11,000 to 560. Wall time at 32 threads did not
+move, and system time rose, so none of the runtime candidates was kept.
+Removing the per-file `fstat` made no consistent difference either.
+
+**What was kept:** a test through the real group engine that a completed
+count, whose capture weight is zero, still publishes while its worker reads
+a slow file. Gating the idle handoff on captured bytes strands it.
+
+**Where the gap is:** at 32 threads ferret spends about 1,070 ms of system
+time to rg's 820, with fewer syscalls (294k against 274k under strace,
+mostly the same opens, reads and closes). User time and wakeups are not
+it: a reused probe buffer, which removed the allocator's consolidation pass
+from the profile, changed wall time by under 2%. Kernel profiling needs
+`perf_event_paranoid` at 1 or lower; at the default thread count the gap is
+58.6 against 53 ms.
 
