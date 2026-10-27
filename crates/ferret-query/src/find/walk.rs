@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustix::fs::{
-    AtFlags, CWD, FileType as RawType, Mode, OFlags, RawDir, Statx, StatxFlags, makedev, open,
-    openat, readlinkat, statx,
+    AtFlags, CWD, FileType as RawType, Mode, OFlags, RawDir, Stat as RawStat, Statx, StatxFlags,
+    makedev, open, openat, readlinkat, statat, statx,
 };
 
 use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
@@ -586,18 +586,84 @@ fn metadata_at(dir: BorrowedFd<'_>, path: &Path, follow: bool) -> io::Result<Met
     }
 }
 
+// statx, as GNU's fstatat behaves: a terminal automount point is not
+// triggered. Where statx is unavailable (old kernels, seccomp filters), fall
+// back to fstatat as std does.
 fn stat_at(dir: BorrowedFd<'_>, path: &Path, flags: AtFlags) -> io::Result<Metadata> {
-    Ok(Metadata(statx(dir, path, flags, StatxFlags::BASIC_STATS)?))
+    match statx(
+        dir,
+        path,
+        flags | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::BASIC_STATS,
+    ) {
+        Ok(stat) => Ok(Metadata::from(stat)),
+        Err(rustix::io::Errno::NOSYS) => Ok(Metadata::from(statat(dir, path, flags)?)),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// One live stat of an entry. The accessors keep std's `MetadataExt` names
 /// and values.
 #[derive(Clone, Copy, Debug)]
-pub struct Metadata(Statx);
+pub struct Metadata {
+    mode: u32,
+    size: u64,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    dev: u64,
+    rdev: u64,
+    ino: u64,
+    blocks: u64,
+    atime: (i64, i64),
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl From<Statx> for Metadata {
+    fn from(stat: Statx) -> Self {
+        Self {
+            mode: u32::from(stat.stx_mode),
+            size: stat.stx_size,
+            uid: stat.stx_uid,
+            gid: stat.stx_gid,
+            nlink: u64::from(stat.stx_nlink),
+            dev: makedev(stat.stx_dev_major, stat.stx_dev_minor),
+            rdev: makedev(stat.stx_rdev_major, stat.stx_rdev_minor),
+            ino: stat.stx_ino,
+            blocks: stat.stx_blocks,
+            atime: (stat.stx_atime.tv_sec, i64::from(stat.stx_atime.tv_nsec)),
+            mtime: (stat.stx_mtime.tv_sec, i64::from(stat.stx_mtime.tv_nsec)),
+            ctime: (stat.stx_ctime.tv_sec, i64::from(stat.stx_ctime.tv_nsec)),
+        }
+    }
+}
+
+// `struct stat`'s field widths vary by architecture, so the casts are
+// conversions on some targets and no-ops on others, as in std.
+#[allow(clippy::unnecessary_cast)]
+impl From<RawStat> for Metadata {
+    fn from(stat: RawStat) -> Self {
+        Self {
+            mode: stat.st_mode as u32,
+            size: stat.st_size as u64,
+            uid: stat.st_uid as u32,
+            gid: stat.st_gid as u32,
+            nlink: stat.st_nlink as u64,
+            dev: stat.st_dev as u64,
+            rdev: stat.st_rdev as u64,
+            ino: stat.st_ino as u64,
+            blocks: stat.st_blocks as u64,
+            atime: (stat.st_atime as i64, stat.st_atime_nsec as i64),
+            mtime: (stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+            ctime: (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        }
+    }
+}
 
 impl Metadata {
     pub fn kind(&self) -> FileKind {
-        match RawType::from_raw_mode(self.mode()) {
+        match RawType::from_raw_mode(self.mode) {
             RawType::Directory => FileKind::Directory,
             RawType::Symlink => FileKind::Symlink,
             RawType::Fifo => FileKind::Fifo,
@@ -608,49 +674,49 @@ impl Metadata {
         }
     }
     pub fn size(&self) -> u64 {
-        self.0.stx_size
+        self.size
     }
     pub fn mode(&self) -> u32 {
-        u32::from(self.0.stx_mode)
+        self.mode
     }
     pub fn uid(&self) -> u32 {
-        self.0.stx_uid
+        self.uid
     }
     pub fn gid(&self) -> u32 {
-        self.0.stx_gid
+        self.gid
     }
     pub fn nlink(&self) -> u64 {
-        u64::from(self.0.stx_nlink)
+        self.nlink
     }
     pub fn dev(&self) -> u64 {
-        makedev(self.0.stx_dev_major, self.0.stx_dev_minor)
+        self.dev
     }
     pub fn ino(&self) -> u64 {
-        self.0.stx_ino
+        self.ino
     }
     pub fn rdev(&self) -> u64 {
-        makedev(self.0.stx_rdev_major, self.0.stx_rdev_minor)
+        self.rdev
     }
     pub fn blocks(&self) -> u64 {
-        self.0.stx_blocks
+        self.blocks
     }
     pub fn atime(&self) -> i64 {
-        self.0.stx_atime.tv_sec
+        self.atime.0
     }
     pub fn atime_nsec(&self) -> i64 {
-        i64::from(self.0.stx_atime.tv_nsec)
+        self.atime.1
     }
     pub fn mtime(&self) -> i64 {
-        self.0.stx_mtime.tv_sec
+        self.mtime.0
     }
     pub fn mtime_nsec(&self) -> i64 {
-        i64::from(self.0.stx_mtime.tv_nsec)
+        self.mtime.1
     }
     pub fn ctime(&self) -> i64 {
-        self.0.stx_ctime.tv_sec
+        self.ctime.0
     }
     pub fn ctime_nsec(&self) -> i64 {
-        i64::from(self.0.stx_ctime.tv_nsec)
+        self.ctime.1
     }
 }
 
@@ -2083,6 +2149,50 @@ mod tests {
                     expected
                 );
                 assert!(entry.state.metadata.get().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn the_fstatat_fallback_reads_what_statx_does() {
+        // Where statx is unavailable, stat_at falls back to fstatat. Both
+        // conversions must give the same fields, and std's values. /dev/null
+        // carries a device number; its times move when anything writes it.
+        use std::os::unix::fs::MetadataExt;
+        let exe = std::env::current_exe().unwrap();
+        for path in [exe.as_path(), Path::new("/"), Path::new("/dev/null")] {
+            let flags = AtFlags::SYMLINK_NOFOLLOW;
+            let new = Metadata::from(statx(CWD, path, flags, StatxFlags::BASIC_STATS).unwrap());
+            let old = Metadata::from(statat(CWD, path, flags).unwrap());
+            let std = fs::symlink_metadata(path).unwrap();
+            for metadata in [new, old] {
+                let fields = |m: &Metadata| (m.dev(), m.ino(), m.rdev(), m.mode(), m.nlink());
+                assert_eq!(
+                    fields(&metadata),
+                    (std.dev(), std.ino(), std.rdev(), std.mode(), std.nlink()),
+                    "{path:?}"
+                );
+                assert_eq!(metadata.kind(), kind_of(std.file_type()));
+            }
+            if path != Path::new("/dev/null") {
+                assert_eq!(format!("{new:?}"), format!("{old:?}"), "{path:?}");
+                assert_eq!(
+                    (new.size(), new.blocks(), new.uid(), new.gid()),
+                    (std.size(), std.blocks(), std.uid(), std.gid())
+                );
+                assert_eq!(
+                    (new.mtime(), new.mtime_nsec()),
+                    (std.mtime(), std.mtime_nsec())
+                );
+            }
+        }
+        fn kind_of(kind: fs::FileType) -> FileKind {
+            if kind.is_dir() {
+                FileKind::Directory
+            } else if kind.is_file() {
+                FileKind::File
+            } else {
+                FileKind::Character
             }
         }
     }
