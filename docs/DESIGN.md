@@ -616,8 +616,9 @@ manifest rename. S2 ships front-coded dictionary blocks (codec 1).
 
 **What main ships.** Every writer, merges included, uses codec 1 by default.
 Every term is a dictionary entry, and a df = 1 term inlines its one doc. A
-lookup binary-searches the resident first terms of the 32-term blocks, then
-decodes one block (`ferret-index/src/segment/mod.rs`, `segment/read.rs`).
+lookup binary-searches the resident first terms of every 16th 32-term
+block, decodes at most 15 more index entries from the resident Index bytes
+(D129 C), then decodes one block (`ferret-index/src/segment/mod.rs`, `segment/read.rs`).
 There is no block-key FST, and no query expands a prefix, regex or edit
 distance over the dictionary. Codec 2, D65 H's df = 1 fingerprints, is a
 library opt-in that no host selects. D65 slice C keeps codec 1 the only term

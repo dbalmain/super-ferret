@@ -32,8 +32,10 @@
 //!
 //! **Index.** Per block, `vbyte first-term length, first term, vbyte
 //! previous block's byte length, vbyte previous block's postings bytes` (both
-//! 0 for block 0). It is read whole when the segment opens and stays
-//! resident (D64 A), so a lookup binary-searches it and reads one block.
+//! 0 for block 0). It is read whole and checked entry by entry when the
+//! segment opens, and its bytes stay resident (D64 A) with the place of
+//! every 16th block (D129 C). A lookup binary-searches those samples,
+//! decodes at most 15 entries after one, and reads one block.
 //!
 //! **Postings codec 1.** `intpack::pfor128skip` sorted lists of `doc -
 //! first`, doc ids only (D61 B). A codec id, not the format version, says

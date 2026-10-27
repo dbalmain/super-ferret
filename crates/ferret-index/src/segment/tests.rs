@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use super::read::SAMPLE;
 use super::*;
 
 /// Seeded xorshift64*, matching the idiom in
@@ -238,38 +239,45 @@ fn single_term_segments_round_trip() {
 /// before it and reported absent.
 #[test]
 fn lookup_finds_terms_at_every_block_edge() {
-    let terms: Terms = (0..3 * BLOCK + 5)
-        .map(|i| (format!("t{i:03}").into_bytes(), vec![i as u32]))
+    // Past two resident samples of the block index, and a partial last
+    // block, so lookups land on both sides of each sample edge.
+    let blocks = 2 * SAMPLE + 2;
+    let count = blocks * BLOCK + 5;
+    let terms: Terms = (0..count)
+        .map(|i| (format!("t{i:05}").into_bytes(), vec![i as u32]))
         .collect();
-    let (bytes, _) = write(0, 200, &terms);
+    let last_doc = count as u32;
+    let (bytes, _) = write(0, last_doc, &terms);
     let segment = Segment::open(bytes.as_slice()).unwrap();
     let doc = |term: &str| match segment.lookup(term.as_bytes()).unwrap() {
         Some(Hit::Single(doc)) => Some(doc),
         Some(Hit::Postings(_)) => panic!("{term} has one document"),
         None => None,
     };
-    for b in 0..4 {
+    for b in 0..=blocks {
         let first = b * BLOCK;
         assert_eq!(
-            doc(&format!("t{first:03}")),
+            doc(&format!("t{first:05}")),
             Some(first as u32),
             "first of block {b}"
         );
-        if b < 3 {
+        if b < blocks {
             let last = first + BLOCK - 1;
             assert_eq!(
-                doc(&format!("t{last:03}")),
+                doc(&format!("t{last:05}")),
                 Some(last as u32),
                 "last of block {b}"
             );
             // Between this block's last term and the next block's first.
-            assert_eq!(doc(&format!("t{last:03}~")), None, "after block {b}");
+            assert_eq!(doc(&format!("t{last:05}~")), None, "after block {b}");
         }
     }
     assert_eq!(doc("t"), None, "before the first term");
-    assert_eq!(doc("t0405"), None, "inside a block, absent");
-    assert_eq!(doc(&format!("t{:03}", 3 * BLOCK + 4)), Some(100));
+    assert_eq!(doc("t00405"), Some(405));
+    assert_eq!(doc("t004050"), None, "inside a block, absent");
+    assert_eq!(doc(&format!("t{:05}", count - 1)), Some(count as u32 - 1));
     assert_eq!(doc("u"), None, "after the last term");
+    check(&bytes, 0, last_doc, &terms, &mut Rng(0xb10c));
 }
 
 // ── inverter and writer contract ──

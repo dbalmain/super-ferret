@@ -7249,6 +7249,44 @@ grep's diagnostics, and saves only the term half (about half of B's gain).
 At 9c38677 the trigram half's `parse_index` is 38% of what remains, which
 is C's target.
 
+C built (2026-10-27, branch `perf-d129c`, from main without B, so both
+halves still open; no format change). Two steps, measured on the corpus
+with `grep -q -F the`:
+
+| | instructions, 1 thread | ms, 1 thread | ms, 16 | max RSS |
+| --- | --- | --- | --- | --- |
+| main | 394M | 64 | 34 | 70 MB |
+| C′: first terms read in place, inline order check, one- and two-byte varint fast paths | 309M | 51 | 29 | 65 MB |
+| C: the Index bytes and every 16th block's place stay resident, the rest decoded on demand | 295M | 42 | 26 | 38 MB |
+
+The block offsets could not shrink to `u32`: the writer caps only the
+fingerprint section, so blocks, postings, index and term lengths are
+unbounded, and `Block` was not the instruction cost in any case. That was
+per-block call overhead: a `memcpy` of each first term into a growing buffer
+and a `memcmp` against the last. A lookup now decodes up to 15 index entries;
+on a 40-trigram literal that cost under 1M of 532M instructions. Output is
+identical on 12 queries at 1 and 16 threads.
+
+**Question (C follow-up):** Should a segment still check its block index's
+term order when it opens, now that most of what remains of `parse_index` is
+that check plus the walk the samples need?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Check at open, as now | 33M instructions per corpus open (10% of grep `-q`) | A checksum-valid but misordered Index (writer bug, crafted file) fails at open with `Corrupt(Index)` |
+| B. Check samples at open and each run as a lookup walks it | That Index can make a lookup miss a present term and return no rows instead of an error, because the walk stops at the first greater term | About 33M instructions (342 → 309M under callgrind); the walk itself, 76M, stays |
+
+**Recommendation: A.** Only a writer bug can produce the case B stops
+catching, but B turns it into silently wrong results, and 10% does not buy
+that. The remaining walk could go only with a format change that stores the
+samples, which D65's static dictionary will revisit for the term half.
+
+**Fact that would change it:** a decision that checksum-valid crafted files
+are outside the read contract, as `segment/mod.rs` already says for a list
+that panics inside intpack. The writer already refuses out-of-order terms
+(`WriteError::TermOrder`), so B's only remaining exposure would be a bug in
+how the writer encodes the index.
+
 ## D130 — Whether `ferret grep --files` walks in parallel
 
 **Question:** Should an uncovered `--files` walk run on several threads, as
