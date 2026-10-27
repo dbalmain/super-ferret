@@ -2,10 +2,11 @@
 //! groups keep their charge through publication; the stream owner never waits
 //! for capture space. Descriptor admissions remain held by the caller.
 
-use super::{Arc, CHUNK, GROUP_BYTES, Mutex, lock, publisher_stopped};
+use super::publish::publisher_stopped;
+use super::{CHUNK, GROUP_BYTES, lock};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 pub(in super::super) struct Budget {
