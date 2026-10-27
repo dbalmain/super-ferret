@@ -7425,3 +7425,31 @@ from the profile, changed wall time by under 2%. Kernel profiling needs
 `perf_event_paranoid` at 1 or lower; at the default thread count the gap is
 58.6 against 53 ms.
 
+## D134 — Live lookups resolve beneath retained handles, never through /proc
+
+**Decided (2026-10-27):** every per-entry lookup in the live walk is an
+`*at` call on the retained parent directory (or the cwd handle): `openat`
+to descend, `statx` for metadata, `readlinkat`, `faccessat`, and `openat`
+plus a listing for `-empty`. Before, each one rebuilt a
+`/proc/self/fd/N/name` path for std's path APIs, which costs a full path
+resolution through procfs per call.
+
+| `find -I` on the cargo registry (48k files) | before | after | GNU |
+| ------------------------------------------- | -----: | ----: | --: |
+| `-type f -size +100k`                       |  100.9 |  16.5 | 115.3 |
+| `-empty`                                    |  115.7 |  24.1 | 145.9 |
+| `-readable`                                 |   90.3 |  17.9 |   — |
+
+Times are ms. `grep --files` at one thread went from 77.0 to 67.3 ms.
+
+`walk::Metadata` is now ferret's own struct, filled from `statx` or, where
+the kernel or a seccomp filter refuses `statx` with ENOSYS, from `fstatat`,
+as std did. `statx` carries `AT_NO_AUTOMOUNT`, matching GNU's `fstatat`.
+The procfs hop also used up one of Linux's 40 symlink expansions; a start
+at that limit now resolves as GNU's does. Astra's two review rounds found
+the missing fallback and a listing that needed search permission; both are
+fixed and tested.
+
+**Still through /proc:** `%F` (statfs) and `-newer` reference operands,
+both once per operand rather than per entry.
+
