@@ -269,6 +269,13 @@ impl DirRules {
             .iter()
             .rposition(|byte| *byte == b'/')
             .map_or(bytes, |slash| &bytes[slash + 1..]);
+        self.decide_child(OsStr::from_bytes(name), entry)
+    }
+
+    /// [`DirRules::decide`] for the child `name` of this directory, for a
+    /// walker that has no root-relative path at hand.
+    pub fn decide_child(&self, name: &OsStr, entry: Entry) -> Decision {
+        let name = name.as_bytes();
         let is_dir = entry == Entry::Dir;
         let included = match self.list.last_match(name, is_dir) {
             Some((true, ferret)) => !self.traversing || ferret,

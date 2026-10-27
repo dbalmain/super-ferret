@@ -286,6 +286,12 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
             drop(queue);
             visitor.resume(&mut lent.task);
             let mut steps = 0usize;
+            // After an offer to idle workers finds nothing to lend, the next
+            // offers wait twice as many steps, up to the cadence: a walk with
+            // no siblings to spare would otherwise take the queue lock at
+            // every step while any worker is idle.
+            let mut backoff = 0usize;
+            let mut next_offer = 0usize;
             while !quit.load(Ordering::Acquire) {
                 match visitor.step(&mut lent.walk, &mut lent.task) {
                     Step::Next => {}
@@ -297,7 +303,12 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                 }
                 let cadence = steps.is_multiple_of(STEPS_PER_LOAN);
                 let workers = self.schedule.workers;
-                if cadence || self.active.load(Ordering::Relaxed) < workers {
+                // A visitor about to hold its worker on one long step offers
+                // whatever the backoff, so an idle worker is not left asleep
+                // through it.
+                let offer = self.active.load(Ordering::Relaxed) < workers
+                    && (steps >= next_offer || visitor.holding(&lent.task));
+                if cadence || offer {
                     let mut queue = self.lock();
                     // Workers with no task, less those a runnable queued task
                     // will occupy.
@@ -328,6 +339,10 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                             completion,
                         });
                         self.changed.notify_all();
+                        backoff = 0;
+                    } else if offer {
+                        backoff = (backoff * 2 + 1).min(STEPS_PER_LOAN);
+                        next_offer = steps + backoff;
                     }
                 }
                 steps += 1;

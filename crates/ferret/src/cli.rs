@@ -190,6 +190,8 @@ the query text may itself contain a path (search path:/some/dir).
 
 /// Runs `ferret` with the process's arguments and environment.
 pub fn main() -> ExitCode {
+    // While the process has one thread, growing the table costs nothing.
+    ferret_query::reserve_descriptor_table();
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|arg| arg == "batch") {
         return crate::batch::main(args).into();

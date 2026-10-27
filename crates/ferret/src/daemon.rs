@@ -86,6 +86,8 @@ enum ClientMessage {
 /// Runs ferretd. An unusable endpoint or catalog is an operational error; a
 /// singleton loser connects to the winning host and exits successfully.
 pub fn main() -> ExitCode {
+    // While the process has one thread, growing the table costs nothing.
+    ferret_query::reserve_descriptor_table();
     match run(std::env::args_os().skip(1)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
