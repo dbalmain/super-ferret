@@ -1504,11 +1504,28 @@ impl Visitor<LiveWalk, Walked> for Walker<'_, '_> {
     }
 }
 
+/// Index candidates: the documents that may hold a match.
+pub(super) trait Candidates: Sync {
+    fn contains(&self, doc: u32, stopped: &dyn Fn() -> bool) -> bool;
+}
+
+impl Candidates for ferret_index::DocSet {
+    fn contains(&self, doc: u32, _stopped: &dyn Fn() -> bool) -> bool {
+        ferret_index::DocSet::contains(self, doc)
+    }
+}
+
+impl Candidates for engine::GrepCandidates<'_> {
+    fn contains(&self, doc: u32, stopped: &dyn Fn() -> bool) -> bool {
+        engine::GrepCandidates::contains(self, doc, stopped)
+    }
+}
+
 /// The per-entry selection every walk applies: depth, glob, hidden and
 /// ignore filters, live policy, then the catalog's view of the file.
 pub(super) struct Filter<'a> {
     catalog: Option<&'a ferret_catalog::Catalog>,
-    candidates: Option<&'a ferret_index::DocSet>,
+    candidates: Option<&'a dyn Candidates>,
     emit_absent: bool,
     traversal: line_grep::Traversal,
     text: bool,
@@ -1580,7 +1597,7 @@ impl Filter<'_> {
             };
             if self
                 .candidates
-                .is_some_and(|candidates| !candidates.contains(doc.0))
+                .is_some_and(|candidates| !candidates.contains(doc.0, stopped))
             {
                 if self.emit_absent {
                     return Some((0, Job::Absent(entry.path().to_owned())));
@@ -1656,7 +1673,7 @@ impl<'a> Source<'a> {
     pub fn new(
         inputs: Vec<Input>,
         catalog: Option<&'a ferret_catalog::Catalog>,
-        candidates: Option<&'a ferret_index::DocSet>,
+        candidates: Option<&'a dyn Candidates>,
         selection: &'a GrepSelection,
         cwd: PathBuf,
     ) -> Self {

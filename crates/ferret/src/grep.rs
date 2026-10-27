@@ -227,6 +227,50 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     .run(inputs, output::Writer::new(&stdout, block_stdout(&plan)))
 }
 
+/// Adds the documents below catalog directory `path`, read from the
+/// catalog's tree rather than walked: a superset of those a walk of it can
+/// ask about, or, where the catalog cannot resolve `path`, none of them.
+/// False once more than `budget` names in all would be listed.
+fn documents_below(
+    catalog: &ferret_catalog::Catalog,
+    path: &Path,
+    docs: &mut ferret_index::DocSet,
+    budget: &mut u64,
+    stopped: &dyn Fn() -> bool,
+) -> Result<bool, ferret_index::ReadError> {
+    let Some(ferret_catalog::Resolved {
+        target: ferret_catalog::Target::Inode(start),
+        remainder: b"",
+        ..
+    }) = catalog.resolve(path.as_os_str().as_bytes())
+    else {
+        return Ok(true);
+    };
+    let mut directories = vec![start];
+    while let Some(directory) = directories.pop() {
+        if stopped() {
+            return Err(ferret_index::ReadError::Cancelled);
+        }
+        for name in catalog.children(directory) {
+            let Some(left) = budget.checked_sub(1) else {
+                return Ok(false);
+            };
+            *budget = left;
+            let ferret_catalog::Target::Inode(child) =
+                ferret_catalog::Target::from_child(catalog.child(name))
+            else {
+                continue;
+            };
+            if catalog.is_directory(child) {
+                directories.push(child);
+            } else if let Some(doc) = catalog.doc(child) {
+                docs.insert(doc.0);
+            }
+        }
+    }
+    Ok(true)
+}
+
 struct Runtime<'a> {
     cancelled: &'a AtomicBool,
     stderr: &'a (dyn Fn(&str) -> io::Result<()> + Sync),
@@ -282,7 +326,7 @@ impl Execution<'_> {
         let recursive = inputs
             .iter()
             .any(|input| matches!(input, Input::Directory(_)));
-        let candidates = if !plan.invert {
+        let mut candidates = if !plan.invert {
             match pin
                 .map(|pin| pin.grep_candidates(&plan.grep, &stopped))
                 .transpose()
@@ -308,6 +352,16 @@ impl Execution<'_> {
             Ok(documents) => documents,
             Err(error) => return runtime.failure(&error.to_string()),
         };
+        // The catalog documents the walks below can reach: candidates are
+        // decoded for these alone (S5). Listing a name costs about what
+        // decoding a candidate does, so past half the candidates' bound,
+        // decoding them all is the cheaper answer.
+        let mut reachable = candidates.as_ref().zip(pin).map(|(candidates, pin)| {
+            (
+                ferret_index::DocSet::empty(pin.catalog().doc_count()),
+                candidates.bound() / 2,
+            )
+        });
         for input in &inputs {
             if let Input::Directory(path) = input {
                 if let Some(anchors) = live.filter(|anchors| anchors.walks(path)) {
@@ -327,8 +381,26 @@ impl Execution<'_> {
                         error.error
                     ));
                     }
+                    if let Some((docs, budget)) = &mut reachable {
+                        match documents_below(
+                            pin.catalog(),
+                            &cwd.join(path),
+                            docs,
+                            budget,
+                            &stopped,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => reachable = None,
+                            Err(error) => return runtime.failure(&error.to_string()),
+                        }
+                    }
                 }
             }
+        }
+        if let (Some(candidates), Some((reachable, _))) = (&mut candidates, reachable)
+            && let Err(error) = candidates.probe(reachable, &stopped)
+        {
+            return runtime.failure(&error.to_string());
         }
         let mut host = Host {
             plan,
@@ -390,7 +462,9 @@ impl Execution<'_> {
                 let mut source = groups::Source::new(
                     segment,
                     pin.map(|p| p.catalog()),
-                    candidates.as_ref(),
+                    candidates
+                        .as_ref()
+                        .map(|candidates| candidates as &dyn groups::Candidates),
                     selection,
                     cwd.to_owned(),
                 )

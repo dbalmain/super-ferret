@@ -2130,9 +2130,7 @@ daemon follows content after each refresh under a 256 KiB, 100 ms budget,
 merges on its own thread (D114), adopts each publication without a reload,
 and serves directory grep from a resident pin (D111); S2.md § "What S5
 needs" is met, status block included. What remains grows with the index
-rather than the searched tree: the candidate set is sized to the whole
-index and postings are decoded for all of it before the operand's subtree
-cuts them; the first grep after a cross-epoch publication rebuilds
+rather than the searched tree: the first grep after a cross-epoch publication rebuilds
 `DocNames` over every name (D111 B's `st_nlink` check would remove it);
 and segments are read by `pread`, so "resident" means the page cache.
 
@@ -2158,11 +2156,32 @@ stays at 6 MiB. The daemon's own RSS is 22 MiB on idx1 and 131 MiB on idx21. Its
 first answer after start comes 73 ms (idx1) and 640 ms (idx21) after launch and
 takes 35 and 75 ms; later answers take 5 and 20 ms.
 
-So the daemon removes the index-size cost for a rare literal, but not for a
-common one: `unsafe` on 56 files costs 19 ms at 1M names against 3.9 ms at 48k,
-the whole-index posting decode above. That cut (postings restricted to the
-operand's subtree before decode) is the one worth doing first; the in-process
-cost is S3's "In-process setup" note and D129.
+So the daemon removed the index-size cost for a rare literal, but not for a
+common one: `unsafe` on 56 files cost 19 ms at 1M names against 3.9 ms at 48k.
+Callgrind put 195 of the daemon's 206 M instructions per query in decoding every
+candidate in the index (`line_grep::candidates`), before the walk asked about 56
+of them. The in-process cost is S3's "In-process setup" note and D129.
+
+**Candidates cut to the operand (2026-10-27, msa2).** Grep now lists the
+documents under its directory operands from the catalog tree and seeks the
+candidate cursor to each (`line_grep::candidates_among`); a document outside
+that list decodes every candidate once, so the answer never depends on the
+listing. Listing stops past half the candidates' dictionary bound, where
+decoding them all is cheaper (a whole-index operand, or a rare literal).
+Warm daemon, hyperfine median of 20, old and new binaries side by side on two
+copies of each index; outputs identical:
+
+```text
+literal    subtree (files)   idx1 old → new     idx21 old → new
+xylophone  regex (56)        3.1 → 3.1 ms       3.4 → 3.3 ms
+xylophone  copy 0 (48k)      27.3 → 26.7        28.1 → 27.3
+unsafe     regex (56)        3.9 → 3.0          18.3 → 3.6
+unsafe     tokio (564)       4.1 → 3.5          18.6 → 4.0
+unsafe     copy 0 (48k)      39.7 → 40.3        55.5 → 45.3
+```
+
+In-process `unsafe` on idx21 drops by about 15 ms (158 → 140 ms); the rest of
+that cost is index open (D129).
 
 ## S6 — Opt-in experiments and metrics
 

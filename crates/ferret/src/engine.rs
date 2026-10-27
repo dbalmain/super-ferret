@@ -724,17 +724,25 @@ impl QuerySession {
 
     /// Grep's necessary candidates, including uncovered documents. Missing
     /// trigram sources automatically enumerate; there is no scan refusal.
+    /// Reads the posting lists now and decodes them on demand.
     pub(crate) fn grep_candidates(
         &self,
         grep: &ferret_verify::Grep,
         stopped: &dyn Fn() -> bool,
-    ) -> Result<DocSet, ferret_index::ReadError> {
+    ) -> Result<GrepCandidates<'_>, ferret_index::ReadError> {
         let live = self
             .live_until(stopped)
             .ok_or(ferret_index::ReadError::Cancelled)?;
         let pinned = Pinned::new_until(self.content.as_deref(), live, stopped)
             .ok_or(ferret_index::ReadError::Cancelled)?;
-        ferret_query::line_grep::candidates(grep, &pinned, stopped)
+        let atom = ferret_query::GrepAtom::read_until(grep.clone(), &pinned, stopped)?;
+        Ok(GrepCandidates {
+            atom,
+            probed: DocSet::empty(0),
+            found: DocSet::empty(0),
+            all: OnceLock::new(),
+            pinned,
+        })
     }
 
     /// The catalog view's live documents, built once per view.
@@ -769,6 +777,51 @@ impl QuerySession {
             plan.indexed_catalog_source(self.catalog.clone(), self.name_index())
         };
         plan.run_parallel(source, effects, workers)
+    }
+}
+
+/// Grep's candidates, decoded only as far as the walk needs them (S5).
+/// [`GrepCandidates::probe`] decodes those among the documents a walk will
+/// ask about, seeking past the rest; asking about any other document
+/// decodes every candidate once, so membership never depends on the probe.
+pub(crate) struct GrepCandidates<'s> {
+    pinned: Pinned<'s>,
+    atom: ferret_query::GrepAtom,
+    probed: DocSet,
+    found: DocSet,
+    // `None` when cancelled while decoding: every document is then kept.
+    all: OnceLock<Option<DocSet>>,
+}
+
+impl GrepCandidates<'_> {
+    /// An upper bound on the candidates, from the dictionary.
+    pub(crate) fn bound(&self) -> u64 {
+        self.atom.bound(&self.pinned)
+    }
+
+    /// Decodes the candidates among `docs`.
+    pub(crate) fn probe(
+        &mut self,
+        docs: DocSet,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<(), ferret_index::ReadError> {
+        self.found =
+            ferret_query::line_grep::candidates_among(&self.atom, &self.pinned, &docs, stopped)?;
+        self.probed = docs;
+        Ok(())
+    }
+
+    /// Whether `doc` may hold a match. Cancellation keeps the document.
+    pub(crate) fn contains(&self, doc: u32, stopped: &dyn Fn() -> bool) -> bool {
+        if self.probed.contains(doc) {
+            return self.found.contains(doc);
+        }
+        self.all
+            .get_or_init(|| {
+                ferret_query::line_grep::candidates(&self.atom, &self.pinned, stopped).ok()
+            })
+            .as_ref()
+            .is_none_or(|all| all.contains(doc))
     }
 }
 

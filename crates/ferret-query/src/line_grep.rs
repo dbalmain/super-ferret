@@ -800,11 +800,10 @@ fn unsupported(flag: &str) -> ParseError {
 /// documents are always included and absent indexes automatically scan.
 /// The result is independent of line rendering and never establishes a hit.
 pub fn candidates(
-    grep: &Grep,
+    atom: &crate::GrepAtom,
     pinned: &ferret_index::Pinned<'_>,
     stopped: &dyn Fn() -> bool,
 ) -> Result<ferret_index::DocSet, ferret_index::ReadError> {
-    let atom = crate::GrepAtom::read_until(grep.clone(), pinned, stopped)?;
     let mut cursor = atom.cursor_until(pinned, stopped)?;
     let mut docs = ferret_index::DocSet::empty(pinned.live().bound());
     let mut at = 0;
@@ -817,6 +816,35 @@ pub fn candidates(
             break;
         };
         at = next;
+    }
+    Ok(docs)
+}
+
+/// The members of `among` that [`candidates`] holds. The cursor seeks to
+/// each, so postings far from them are skipped rather than decoded: a small
+/// subtree of a large index costs its own documents, not the index's (S5).
+pub fn candidates_among(
+    atom: &crate::GrepAtom,
+    pinned: &ferret_index::Pinned<'_>,
+    among: &ferret_index::DocSet,
+    stopped: &dyn Fn() -> bool,
+) -> Result<ferret_index::DocSet, ferret_index::ReadError> {
+    let mut cursor = atom.cursor_until(pinned, stopped)?;
+    let mut docs = ferret_index::DocSet::empty(pinned.live().bound());
+    let mut target = among.next_geq(0);
+    while let Some(at) = target {
+        if stopped() {
+            return Err(ferret_index::ReadError::Cancelled);
+        }
+        let Some((doc, _)) = cursor.next_geq(at) else {
+            break;
+        };
+        target = if doc == at {
+            docs.insert(doc);
+            doc.checked_add(1).and_then(|next| among.next_geq(next))
+        } else {
+            among.next_geq(doc)
+        };
     }
     Ok(docs)
 }

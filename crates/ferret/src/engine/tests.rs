@@ -851,3 +851,33 @@ fn a_one_shot_engine_answers_name_queries_as_the_resident_one_does() {
     }
     assert!(one_shot.names.get().is_some());
 }
+
+/// Grep candidates probed for some documents answer exactly for them, and
+/// for any other document decode every candidate rather than guess: one
+/// unprobed hit and one unprobed miss tell a guess either way from the
+/// full answer.
+#[test]
+fn grep_candidates_outside_the_probe_decode_every_candidate() {
+    let tree = Tree::with_files(300);
+    for hit in ["d0/hit.txt", "d2/far.txt"] {
+        fs::write(tree.0.join("root").join(hit), format!("needle in {hit}")).unwrap();
+    }
+    tree.reindex();
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let session = engine.pin();
+    let catalog = session.catalog();
+    let doc = |name: &[u8]| document_named(catalog, name).0;
+    let grep = ferret_verify::GrepFlags::default()
+        .compile("needle")
+        .unwrap();
+    let mut candidates = session.grep_candidates(&grep, &|| false).unwrap();
+    let probed = DocSet::new(catalog.doc_count(), [doc(b"hit.txt"), doc(b"0.txt")]);
+    candidates.probe(probed, &|| false).unwrap();
+    let ask = |name: &[u8]| candidates.contains(doc(name), &|| false);
+    assert!(ask(b"hit.txt"));
+    assert!(!ask(b"0.txt"));
+    assert!(ask(b"far.txt"), "an unprobed candidate was dropped");
+    assert!(!ask(b"250.txt"), "an unprobed non-candidate was kept");
+}

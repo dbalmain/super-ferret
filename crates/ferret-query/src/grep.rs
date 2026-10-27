@@ -153,6 +153,19 @@ impl GrepAtom {
         })
     }
 
+    /// [`GrepAtom::estimate_until`]'s bound, from the lists already read.
+    pub fn bound(&self, pinned: &Pinned<'_>) -> u64 {
+        let live = u64::from(pinned.live().len());
+        let frequencies = self
+            .lists
+            .iter()
+            .map(|(key, found)| (*key, found.as_ref().map_or(live, |c| c.estimate().docs)))
+            .collect();
+        select(&self.tree, &frequencies, live, &|| false)
+            .map_or(live, |(_, bound)| bound)
+            .saturating_add(u64::from(pinned.uncovered().len()))
+    }
+
     /// Necessary candidates, always Maybe, with uncovered documents included.
     pub fn cursor_until<'a>(
         &'a self,
