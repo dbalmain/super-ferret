@@ -33,8 +33,8 @@ pub use refresh::{
 };
 
 pub use walk::{
-    Boundary, Decided, Event, EventVisitor, FaultContext, IoOp, Stat, WalkOptions, WorkTree,
-    WorkTreeKind, default_workers, load_grep_policy, load_policy, walk, walk_parallel,
+    Boundary, Decided, Event, EventVisitor, FaultContext, IoOp, Listed, Stat, WalkOptions,
+    WorkTree, WorkTreeKind, default_workers, load_grep_policy, load_policy, walk, walk_parallel,
 };
 
 #[cfg(test)]

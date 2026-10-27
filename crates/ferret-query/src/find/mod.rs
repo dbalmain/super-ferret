@@ -19,8 +19,8 @@ use std::path::Path;
 pub use output::{OutputBuffer, spill_path};
 pub use parse::{ParseError, Plan};
 pub use walk::{
-    CatalogSource, DirectoryHandle, Entry, EntrySource, FileKind, LiveWalk, Namespace, WalkError,
-    resolve_in,
+    CatalogSource, DirectoryHandle, Entry, EntrySource, FileKind, Listing, LiveWalk, Namespace,
+    WalkError, resolve_in,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +86,9 @@ pub(crate) struct Options {
     pub retain_parent: bool,
     /// Retained parents are charged to a budget, closed past it.
     pub bounded_parents: bool,
+    /// Live listings keep their hidden names for
+    /// [`walk::Entry::listed_beside`].
+    pub hidden_names: bool,
     pub delete: bool,
     guard: Option<CandidateGuard>,
 }

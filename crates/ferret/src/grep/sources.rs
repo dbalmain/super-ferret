@@ -16,9 +16,10 @@ impl Directory {
         catalog: Option<&Catalog>,
         cwd: &Path,
         unrestricted: bool,
+        policy: bool,
     ) -> io::Result<Self> {
-        Ok(if unrestricted {
-            Self::Live(live(path, cwd))
+        Ok(if unrestricted || policy {
+            Self::Live(live(path, cwd, policy))
         } else {
             let catalog =
                 catalog.ok_or_else(|| io::Error::other("directory input has no catalog"))?;
@@ -48,9 +49,15 @@ impl Directory {
     }
 }
 
-/// A walk of the live tree below directory operand `path`.
-pub(super) fn live(path: &Path, cwd: &Path) -> LiveWalk {
-    LiveWalk::paths(vec![start(path)], cwd.to_owned()).lazy_directories()
+/// A walk of the live tree below directory operand `path`. Under live
+/// `policy`, each listed directory stays open with its hidden names, which
+/// [`live::Policy`] reads the directory's ignore files through (D132).
+pub(super) fn live(path: &Path, cwd: &Path, policy: bool) -> LiveWalk {
+    let walk = LiveWalk::paths(vec![start(path)], cwd.to_owned()).lazy_directories();
+    match policy {
+        true => walk.retaining_parents().keeping_hidden_names(),
+        false => walk,
+    }
 }
 
 // Follow an explicit directory symlink only at its start. Descendant symlinks

@@ -49,6 +49,39 @@ pub enum FileKind {
     Character,
 }
 
+/// A listed directory held open, and the hidden names its listing held; see
+/// [`Entry::listing`].
+#[derive(Clone, Copy, Debug)]
+pub struct Listing<'a> {
+    dir: BorrowedFd<'a>,
+    /// Each name beginning with `.`, a NUL after each.
+    hidden: &'a [u8],
+}
+
+impl<'a> Listing<'a> {
+    pub fn dir(&self) -> BorrowedFd<'a> {
+        self.dir
+    }
+
+    /// Whether the listing held `name`, which begins with `.`; `None` for
+    /// any other name, which is not recorded.
+    pub fn holds(&self, name: &[u8]) -> Option<bool> {
+        name.starts_with(b".")
+            .then(|| self.hidden.split(|&b| b == 0).any(|listed| listed == name))
+    }
+}
+
+/// A live listing's hidden names, recorded for [`Entry::listing`].
+#[derive(Clone, Debug, Default)]
+enum Hidden {
+    /// Not a live listing by a walk keeping hidden names.
+    #[default]
+    Unrecorded,
+    Empty,
+    /// Each name beginning with `.`, a NUL after each.
+    Names(Arc<[u8]>),
+}
+
 /// A retained directory descriptor. Clones share both the descriptor and its
 /// budget charge, so queued work keeps the descriptor charged until last use.
 #[derive(Clone, Debug)]
@@ -170,6 +203,7 @@ impl Entry {
                 id: None,
                 catalog: None,
                 listed: None,
+                hidden: Hidden::Unrecorded,
             },
         }
     }
@@ -349,6 +383,26 @@ impl Entry {
     /// the directory by path checks it against this.
     pub fn directory_identity(&self) -> Option<(u64, u64)> {
         self.state.listed
+    }
+
+    /// The directory this entry was listed in, still open, with the hidden
+    /// names its listing held, for a walk [keeping hidden
+    /// names](LiveWalk::keeping_hidden_names) and [retaining
+    /// parents](LiveWalk::retaining_parents). A host loading that
+    /// directory's dot-file configuration reads through it and opens only
+    /// what the listing held, rather than probing each name. `None` for a
+    /// start operand, a catalogued listing, a directory closed for want of
+    /// descriptor budget, or any other walk.
+    pub fn listing(&self) -> Option<Listing<'_>> {
+        let hidden = match &self.state.hidden {
+            Hidden::Unrecorded => return None,
+            Hidden::Empty => &[][..],
+            Hidden::Names(names) => names,
+        };
+        Some(Listing {
+            dir: self.state.directory.as_ref()?.as_fd(),
+            hidden,
+        })
     }
 
     fn follow_catalog(&mut self) -> io::Result<()> {
@@ -632,6 +686,8 @@ struct Saved {
     /// The listing directory's `(dev, ino)`, where a walk bounded by
     /// [`Charge`] closed it instead of retaining it.
     listed: Option<(u64, u64)>,
+    /// The listing directory's hidden names; see [`Level::hidden`].
+    hidden: Hidden,
 }
 
 impl Saved {
@@ -675,6 +731,11 @@ struct Level {
     /// The first child's metadata, observed while listing when it is a
     /// directory.
     first: Option<Result<Metadata, Arc<io::Error>>>,
+    /// A live listing's hidden names, for a walk [keeping hidden
+    /// names](LiveWalk::keeping_hidden_names). A loan clones it with the
+    /// level, so a borrower's entries see the whole listing, not just their
+    /// half.
+    hidden: Hidden,
     own: Saved,
 }
 
@@ -770,6 +831,13 @@ impl LiveWalk {
     pub fn retaining_parents(mut self) -> Self {
         self.options.retain_parent = true;
         self.options.bounded_parents = true;
+        self
+    }
+
+    /// Keeps each listed directory's hidden names for its entries'
+    /// [`Entry::listing`]. Costs an allocation per directory holding any.
+    pub fn keeping_hidden_names(mut self) -> Self {
+        self.options.hidden_names = true;
         self
     }
 
@@ -1087,6 +1155,7 @@ impl LiveWalk {
                 end: self.children.len(),
                 names_start,
                 first: None,
+                hidden: Hidden::Unrecorded,
                 own,
             });
             return Ok(());
@@ -1106,6 +1175,7 @@ impl LiveWalk {
         let start = self.children.len();
         let names_start = self.names.len();
         let mut first = None;
+        let mut hidden = self.options.hidden_names.then(Vec::new);
         if self.buffer.is_empty() {
             self.buffer.resize(LISTING_BUFFER, MaybeUninit::uninit());
         }
@@ -1158,6 +1228,10 @@ impl LiveWalk {
                 let observed = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
                     .join(OsStr::from_bytes(name));
                 first = Some(cached_metadata(&observed, follow));
+            }
+            if let Some(hidden) = hidden.as_mut().filter(|_| name.starts_with(b".")) {
+                hidden.extend_from_slice(name);
+                hidden.push(0);
             }
             let name_start = self.names.len();
             self.names.extend_from_slice(name);
@@ -1222,6 +1296,11 @@ impl LiveWalk {
             end: self.children.len(),
             names_start,
             first,
+            hidden: match hidden {
+                None => Hidden::Unrecorded,
+                Some(names) if names.is_empty() => Hidden::Empty,
+                Some(names) => Hidden::Names(Arc::from(names)),
+            },
             own,
         });
         Ok(())
@@ -1357,6 +1436,7 @@ impl LiveWalk {
             entry.state.followed_symlink = false;
             entry.state.directory = level.handle.clone();
             entry.state.listed = level.identity;
+            entry.state.hidden = level.hidden.clone();
             entry.state.depth = level.own.depth + 1;
             entry.state.kind = child.kind;
             entry.check_directory = false;

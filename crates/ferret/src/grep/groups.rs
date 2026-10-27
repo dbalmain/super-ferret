@@ -1335,7 +1335,7 @@ pub(super) fn walk<W: Write>(
                                 };
                                 schedule::run(
                                     &schedule,
-                                    sources::live(&path, &filter.cwd)
+                                    sources::live(&path, &filter.cwd, policy.is_some())
                                         .following_links(filter.traversal.follow)
                                         .retaining_parents(),
                                     Walked {
@@ -1576,9 +1576,9 @@ impl Filter<'_> {
                 *descend = false;
                 return None;
             }
-            Err(error) => {
+            Err(refusal) => {
                 *descend = false;
-                return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+                return Some((0, Job::Failed(refusal.path, refusal.error.to_string())));
             }
         }
         *searched = true;
@@ -1801,7 +1801,8 @@ impl<'a> Source<'a> {
                         &path,
                         self.filter.catalog,
                         &self.filter.cwd,
-                        self.filter.traversal.unrestricted || self.policy.is_some(),
+                        self.filter.traversal.unrestricted,
+                        self.policy.is_some(),
                     ) {
                         Ok(source) => {
                             self.source = Some(

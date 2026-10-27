@@ -197,7 +197,7 @@ impl Listing<'_> {
                 if let Input::Directory(path) = input
                     && !live.is_some_and(|anchors| anchors.walks(path))
                     && let Some(Err(error)) =
-                        sources::Directory::new(path, Some(catalog), cwd, false)
+                        sources::Directory::new(path, Some(catalog), cwd, false, false)
                             .map_err(|e| e.to_string())?
                             .next(true)
                 {
@@ -254,7 +254,8 @@ impl Listing<'_> {
                         &path,
                         catalog,
                         cwd,
-                        plan.traversal.unrestricted || policy.is_some(),
+                        plan.traversal.unrestricted,
+                        policy.is_some(),
                     )
                     .map_err(|e| e.to_string())?
                     .following_links(plan.traversal.follow);
@@ -301,11 +302,11 @@ impl Listing<'_> {
                                 }
                             }
                             Ok(Visit::Skip) => {}
-                            Err(error) => {
+                            Err(refusal) => {
                                 if diagnostic(
                                     writer,
                                     runtime,
-                                    &format!("grep: {}: {error}", entry.path().display()),
+                                    &format!("grep: {}: {}", refusal.path.display(), refusal.error),
                                 )? {
                                     return Ok(Exit::Ok);
                                 }

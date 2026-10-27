@@ -14,6 +14,15 @@ pub(super) enum Visit {
     File,
 }
 
+/// An entry that could not be selected, and the path its diagnostic names:
+/// the entry's own, or its directory's when that directory's rules failed
+/// to load at this, its first entry ([`live::Policy::reach`]).
+#[derive(Debug)]
+pub(super) struct Refusal {
+    pub path: PathBuf,
+    pub error: io::Error,
+}
+
 pub(super) struct Visibility<'a> {
     pub selection: &'a GrepSelection,
     /// Under `--rg`, the catalog a covered walk lists, which records the
@@ -28,11 +37,29 @@ pub(super) struct Visibility<'a> {
 }
 
 impl Visibility<'_> {
-    /// The visit for an entry. An error (the entry's type, or live policy)
+    /// The visit for an entry. A refusal (the entry's type, or live policy)
     /// is the caller's to report; the entry is then skipped. An entry past
     /// `--max-depth` is skipped before its type is read, as rg never visits
     /// it.
     pub fn select(
+        &self,
+        entry: &Entry,
+        mut policy: Option<&mut live::Policy>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Visit, Refusal> {
+        if let Some(policy) = policy.as_deref_mut() {
+            policy.reach(entry, stopped).map_err(|error| Refusal {
+                path: entry.path().parent().unwrap_or(entry.path()).to_owned(),
+                error,
+            })?;
+        }
+        self.visit(entry, policy, stopped).map_err(|error| Refusal {
+            path: entry.path().to_owned(),
+            error,
+        })
+    }
+
+    fn visit(
         &self,
         entry: &Entry,
         policy: Option<&mut live::Policy>,

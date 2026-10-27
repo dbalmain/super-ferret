@@ -370,7 +370,8 @@ impl Execution<'_> {
                     }
                 } else if let Some(pin) = pin {
                     let mut source =
-                        match sources::Directory::new(path, Some(pin.catalog()), cwd, false) {
+                        match sources::Directory::new(path, Some(pin.catalog()), cwd, false, false)
+                        {
                             Ok(source) => source,
                             Err(error) => return runtime.failure(&error.to_string()),
                         };

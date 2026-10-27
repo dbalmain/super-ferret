@@ -935,6 +935,7 @@ fn shared_policy_loader_rejects_growth_during_read() {
         None,
         Some("blocked\n"),
         Config::default(),
+        None,
         |event| {
             if let Event::Io { path, error, .. } = event {
                 faults.push((path.to_owned(), error.kind()));
