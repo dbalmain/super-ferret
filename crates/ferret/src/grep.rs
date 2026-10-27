@@ -590,7 +590,8 @@ fn failure(message: &str) -> Exit {
 
 fn open_index(index: Option<&Path>) -> Result<Engine, String> {
     let index = index_path(index)?;
-    let engine = Engine::open(&index)
+    // Grep reads content and names, never the name planner: no interning.
+    let engine = Engine::open_one_shot(&index)
         .map_err(|error| {
             format!(
                 "{}: {error}; re-index or use a direct file/stdin",

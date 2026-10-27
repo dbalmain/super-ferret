@@ -437,6 +437,15 @@ impl Catalog {
         base
     }
 
+    /// The interned names [`Catalog::into_resident`] would build for this
+    /// checkpoint, built without converting it: for a one-shot host that
+    /// keeps the raw heap and needs interned names only if a name query
+    /// runs. Needs [`Section::Names`] and [`Section::NameHeap`].
+    pub fn build_resident_names(&self) -> crate::ResidentNames {
+        let base = self.checkpoint_base();
+        crate::ResidentNames::build(base.name_reader(), self.base_name_count())
+    }
+
     /// The immutable epoch base; sparse effective names are in `delta_names`.
     pub fn resident_names(&self) -> Option<&crate::ResidentNames> {
         match self.source.as_ref() {
