@@ -376,10 +376,13 @@ impl Documents {
     /// Keeps each checked directory walk's descriptors for later paths
     /// through the same directories: each path still checks every directory
     /// on it, by a stat of its path, instead of opening it again
-    /// ([`hold_directory`]). For a reader that lives for one query: it holds
-    /// a descriptor per level of the last path, as far as the process's
-    /// budget for held descriptors allows ([`Budget`]), and opens the rest
-    /// of a path without holding them.
+    /// ([`hold_directory`]). For a reader that lives for one query or one
+    /// follow pass: it holds a descriptor per level of the last path, as far
+    /// as the process's budget for held descriptors allows ([`Budget`]), and
+    /// opens the rest of a path without holding them. A directory's read
+    /// permission is checked when its descriptor is opened, so one that loses
+    /// it while held still serves later paths through it; the next crawl
+    /// finds it unlistable and retires its children.
     pub fn holding_directories(self) -> Self {
         self.holding_within(Budget::process())
     }
