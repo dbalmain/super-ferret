@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ferret_verify::FindRegex;
 
+use super::printf::account_names;
 use super::{Entry, FileKind, glob};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,8 +402,8 @@ impl Test {
             Self::Gid(n) => compare(entry.stat()?.gid() as u64, n.value as u64, n.order),
             Self::User(uid) => entry.stat()?.uid() == *uid,
             Self::Group(gid) => entry.stat()?.gid() == *gid,
-            Self::NoUser => !user_exists(entry.stat()?.uid()),
-            Self::NoGroup => !group_exists(entry.stat()?.gid()),
+            Self::NoUser => !account_names(false).contains_key(&entry.stat()?.uid()),
+            Self::NoGroup => !account_names(true).contains_key(&entry.stat()?.gid()),
             Self::Newer { field, stamp } => {
                 let actual = if *field == TimeField::Birth {
                     entry.with_observed_at(birth_stamp).ok_or_else(|| {
@@ -625,18 +626,6 @@ fn has_entries(dir: std::os::fd::BorrowedFd<'_>, path: &std::path::Path) -> std:
         }
     }
     Ok(false)
-}
-fn user_exists(id: u32) -> bool {
-    fs::read_to_string("/etc/passwd").is_ok_and(|s| {
-        s.lines()
-            .any(|l| l.split(':').nth(2).and_then(|v| v.parse::<u32>().ok()) == Some(id))
-    })
-}
-fn group_exists(id: u32) -> bool {
-    fs::read_to_string("/etc/group").is_ok_and(|s| {
-        s.lines()
-            .any(|l| l.split(':').nth(2).and_then(|v| v.parse::<u32>().ok()) == Some(id))
-    })
 }
 
 pub(super) fn identity(primary: &[u8], name: &OsStr) -> Option<u32> {

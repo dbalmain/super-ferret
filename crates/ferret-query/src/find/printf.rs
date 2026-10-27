@@ -473,9 +473,17 @@ fn mode(value: u32, kind: u8) -> [u8; 10] {
 }
 
 fn owner(id: u32, group: bool) -> Cow<'static, str> {
+    account_names(group).get(&id).map_or_else(
+        || Cow::Owned(id.to_string()),
+        |name| Cow::Borrowed(name.as_str()),
+    )
+}
+
+/// Names by id from /etc/group or /etc/passwd, read once per process.
+pub(super) fn account_names(group: bool) -> &'static HashMap<u32, String> {
     static USERS: OnceLock<HashMap<u32, String>> = OnceLock::new();
     static GROUPS: OnceLock<HashMap<u32, String>> = OnceLock::new();
-    let names = if group { &GROUPS } else { &USERS }.get_or_init(|| {
+    if group { &GROUPS } else { &USERS }.get_or_init(|| {
         fs::read_to_string(if group { "/etc/group" } else { "/etc/passwd" })
             .unwrap_or_default()
             .lines()
@@ -486,11 +494,7 @@ fn owner(id: u32, group: bool) -> Cow<'static, str> {
                 Some((fields.next()?.parse().ok()?, name.to_owned()))
             })
             .collect()
-    });
-    names.get(&id).map_or_else(
-        || Cow::Owned(id.to_string()),
-        |name| Cow::Borrowed(name.as_str()),
-    )
+    })
 }
 
 pub(super) fn filesystem(path: &std::path::Path) -> io::Result<String> {
