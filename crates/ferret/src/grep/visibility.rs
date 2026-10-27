@@ -4,6 +4,7 @@
 //! selected file is its own.
 
 use ferret_query::find::Entry;
+use std::ffi::OsStr;
 
 use super::*;
 
@@ -43,16 +44,7 @@ impl Visibility<'_> {
         let kind = entry.kind()?;
         let rg = policy.as_ref().is_some_and(|policy| policy.rg());
         let path = entry.path().as_os_str().as_bytes();
-        // Only an absolute path can lie under the absolute cwd; skipping the
-        // component-wise strip for the usual relative path saves a parse per
-        // entry.
-        let relative = if entry.path().is_absolute() {
-            entry.path().strip_prefix(self.cwd).unwrap_or(entry.path())
-        } else {
-            entry.path()
-        }
-        .as_os_str()
-        .as_bytes();
+        let relative = relative_to(entry.path(), self.cwd).as_os_str().as_bytes();
         // rg shows a hidden name that an ignore file's `!` line reveals, as
         // the live walk does through `Policy::selects`. A catalogued entry
         // has no rules at hand; the crawl recorded the answer (D127). Only a
@@ -106,5 +98,76 @@ impl Visibility<'_> {
             policy.accepts(entry, self.content, stopped)?
         };
         Ok(if allowed { visit } else { Visit::Skip })
+    }
+}
+
+/// `path` under the absolute `cwd`, as `Path::strip_prefix` gives it, else
+/// `path` itself. Every walked entry asks, so a plain spelling (no empty or
+/// `.` component) is compared as bytes; any other takes the component-wise
+/// strip. Only an absolute path can lie under the absolute cwd.
+pub(super) fn relative_to<'p>(path: &'p Path, cwd: &Path) -> &'p Path {
+    if !path.is_absolute() {
+        return path;
+    }
+    let (bytes, base) = (path.as_os_str().as_bytes(), cwd.as_os_str().as_bytes());
+    if plain(base) {
+        if let Some(rest) = bytes.strip_prefix(base)
+            && (base == b"/" || rest.is_empty() || rest[0] == b'/')
+        {
+            let start = rest.iter().position(|&b| b != b'/').unwrap_or(rest.len());
+            let rest = &rest[start..];
+            if plain_relative(rest) {
+                return Path::new(OsStr::from_bytes(rest));
+            }
+        } else if plain(&bytes[..base.len().min(bytes.len())]) {
+            // The components that would have to equal cwd's are spelled
+            // plainly and differ from it as bytes.
+            return path;
+        }
+    }
+    path.strip_prefix(cwd).unwrap_or(path)
+}
+
+/// No empty or `.` component, and no trailing separator.
+fn plain(bytes: &[u8]) -> bool {
+    bytes == b"/"
+        || !(bytes.ends_with(b"/")
+            || bytes.ends_with(b"/.")
+            || bytes.windows(2).any(|pair| pair == b"//")
+            || bytes.windows(3).any(|triple| triple == b"/./"))
+}
+
+fn plain_relative(bytes: &[u8]) -> bool {
+    bytes.is_empty() || !(bytes == b"." || bytes.starts_with(b"./")) && plain(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_to_agrees_with_strip_prefix() {
+        let paths = [
+            "rel/x", "/", "/a", "/a/", "/a/b", "/a/b/", "/a/b/c", "/a/bc", "/a/b//c", "/a//b/c",
+            "/a/./b/c", "/a/b/./c", "/a/b/.", "/a/b/c/.", "/a/b/..", "//a/b/c", "/./a/b",
+            "/a/b/c/", "/ab/c", "/a/b\\c",
+        ];
+        for cwd in ["/", "/a", "/a/b", "/a/", "/a//b", "/a/./b"] {
+            for path in paths {
+                let (path, cwd) = (Path::new(path), Path::new(cwd));
+                let expected = if path.is_absolute() {
+                    path.strip_prefix(cwd).unwrap_or(path)
+                } else {
+                    path
+                };
+                assert_eq!(relative_to(path, cwd), expected, "{path:?} under {cwd:?}");
+                // `Path` equality ignores some spelling; the bytes must agree.
+                assert_eq!(
+                    relative_to(path, cwd).as_os_str(),
+                    expected.as_os_str(),
+                    "{path:?} under {cwd:?}"
+                );
+            }
+        }
     }
 }

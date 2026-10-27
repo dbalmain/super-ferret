@@ -515,33 +515,36 @@ impl Policy {
         if entry.depth() == 0 {
             return Ok(true);
         }
-        let path = self.real.join(
+        // The walk is depth first and each accepted directory pushed one
+        // level, so the entry's parent is the level at its depth less one. A
+        // lent walk's first entry unwinds its copy of the lender's stack.
+        self.stack.truncate(entry.depth());
+        let (parent, state) = self
+            .stack
+            .last()
+            .filter(|_| self.stack.len() == entry.depth())
+            .ok_or_else(|| io::Error::other("live policy stack lost its parent"))?;
+        debug_assert_eq!(
+            Some(parent.as_path()),
             entry
                 .path()
                 .strip_prefix(&self.spelling)
-                .map_err(io::Error::other)?,
+                .ok()
+                .and_then(|relative| self.real.join(relative).parent().map(Path::to_owned))
+                .as_deref(),
         );
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("live entry has no parent"))?;
-        while self
-            .stack
-            .last()
-            .is_some_and(|(directory, _)| directory != parent)
-        {
-            self.stack.pop();
-        }
-        let (_, state) = self
-            .stack
-            .last()
-            .ok_or_else(|| io::Error::other("live policy stack lost its parent"))?;
+        let name = std::ffi::OsStr::from_bytes(entry.name());
         let kind = entry.kind()?;
         let directory = kind == FileKind::Directory;
-        if directory
-            && !self.anchors.rg_rules()
-            && !matches!(state, State::Bypass)
-            && self.anchors.roots.contains(&path)
-        {
+        // Only a directory needs its real path: to match a nested root, and
+        // to load its rules.
+        let path = directory.then(|| parent.join(name));
+        if let Some(path) = path.as_ref().filter(|path| {
+            !self.anchors.rg_rules()
+                && !matches!(state, State::Bypass)
+                && self.anchors.roots.contains(path)
+        }) {
+            let path = path.clone();
             let state = self.anchors.root(&path, self.warnings.as_mut(), stopped)?;
             self.stack.push((path, state));
             return Ok(true);
@@ -559,9 +562,7 @@ impl Policy {
             _ => PolicyEntry::Other,
         };
         let local_rule = match state {
-            State::Rules { rules, .. } => {
-                rules.ignore_match(std::ffi::OsStr::from_bytes(entry.name()), directory)
-            }
+            State::Rules { rules, .. } => rules.ignore_match(name, directory),
             State::Bypass => None,
         };
         // Rg applies the global git excludes only inside a work tree.
@@ -579,10 +580,7 @@ impl Policy {
             )
         });
         let override_rule = if let Some((selection, cwd)) = selection {
-            let relative = entry
-                .path()
-                .strip_prefix(cwd)
-                .unwrap_or(entry.path())
+            let relative = super::visibility::relative_to(entry.path(), cwd)
                 .as_os_str()
                 .as_bytes();
             let whitelist = ignore_rule == Some(true);
@@ -609,9 +607,7 @@ impl Policy {
             Decision::Skip
         } else {
             match state {
-                State::Rules { root, rules } => {
-                    rules.decide(path.strip_prefix(root).map_err(io::Error::other)?, item)
-                }
+                State::Rules { rules, .. } => rules.decide_child(name, item),
                 State::Bypass => match item {
                     PolicyEntry::Dir => Decision::Descend,
                     PolicyEntry::File { size } if size <= Config::default().size_cap => {
@@ -621,7 +617,7 @@ impl Policy {
                 },
             }
         };
-        if directory {
+        if let Some(path) = path {
             let next = match (decision, state) {
                 (Decision::Descend, State::Rules { root, rules }) => State::Rules {
                     root: root.clone(),
@@ -633,7 +629,7 @@ impl Policy {
                 },
                 (Decision::Traverse, State::Rules { root, rules }) => State::Rules {
                     root: root.clone(),
-                    rules: rules.traverse(std::ffi::OsStr::from_bytes(entry.name())),
+                    rules: rules.traverse(name),
                 },
                 (Decision::Descend, State::Bypass) => State::Bypass,
                 _ => return Ok(false),
