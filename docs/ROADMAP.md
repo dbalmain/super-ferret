@@ -2071,6 +2071,17 @@ to route (6.5 MiB peak). D65's static dictionary replaces the parsed block
 index with a resident FST (17 MB for 10.3M terms); verifying the index
 sections at open is a separate choice, left as is.
 
+Remeasured at 4324ce4 (2026-10-27), that split does not hold: the 51% was
+`Segment::open` counted inclusive. BLAKE3 is 8.3% of instructions and about 6%
+of wall time (segments 3.3 ms, 0.56 ms of it re-hashing Sums sections the
+whole-Sums check already covers; catalog 1.0 ms). `parse_index` is 34.2 ms of
+the 67-70 ms (one thread) and 49 of 66 MB heap; a decode-and-validate pass that
+keeps nothing takes 10.5 ms, so most of it is building heap. `ResidentNames`
+is 6.2 ms. And grep looks up only trigram segments, yet opens the term half of
+every pair too: skipping it took the run from 70 to 45 ms at one thread (35.8
+to 30.5 at 16) and heap from 63.0 to 38.7 MiB, output byte-identical. Options
+are D129.
+
 ## S4 — Agent skill
 
 A Claude Code skill that routes AI agents' file and content search through
@@ -2123,8 +2134,35 @@ rather than the searched tree: the candidate set is sized to the whole
 index and postings are decoded for all of it before the operand's subtree
 cuts them; the first grep after a cross-epoch publication rebuilds
 `DocNames` over every name (D111 B's `st_nlink` check would remove it);
-and segments are read by `pread`, so "resident" means the page cache. Each
-needs a bench row at 1M names before it is worth doing.
+and segments are read by `pread`, so "resident" means the page cache.
+
+**Bench at 1M names (2026-10-27, 4324ce4, msa2).** The corpus is 21 copies of a
+cargo registry, each file tagged with its copy number. `idx1` indexes one copy
+(56,815 names, 35,821 documents, 80 MB). `idx21` indexes all 21 (1,193,136
+names, 752,241 documents, 1.1 GB; built in 715 s at 301 MB peak RSS). The same
+subtree of copy 0 is queried through each with `grep -c -F`, hyperfine median of
+10 after 2 warm-ups:
+
+```text
+literal    subtree (files)   in-process idx1 → idx21   warm daemon idx1 → idx21
+xylophone  regex (56)        14.0 → 142.0 ms           3.1 →  3.7 ms
+xylophone  tokio (564)       13.9 → 139.9              3.3 →  3.6
+xylophone  copy 0 (48k)      29.8 → 158.0             18.6 → 19.8
+unsafe     regex (56)        14.8 → 155.7              3.9 → 19.0
+unsafe     tokio (564)       15.1 → 155.4              4.2 → 18.9
+unsafe     copy 0 (48k)      44.8 → 189.6             34.6 → 49.6
+```
+
+In-process peak RSS rises from 15 to 103 MiB; the client through the daemon
+stays at 6 MiB. The daemon's own RSS is 22 MiB on idx1 and 131 MiB on idx21. Its
+first answer after start comes 73 ms (idx1) and 640 ms (idx21) after launch and
+takes 35 and 75 ms; later answers take 5 and 20 ms.
+
+So the daemon removes the index-size cost for a rare literal, but not for a
+common one: `unsafe` on 56 files costs 19 ms at 1M names against 3.9 ms at 48k,
+the whole-index posting decode above. That cut (postings restricted to the
+operand's subtree before decode) is the one worth doing first; the in-process
+cost is S3's "In-process setup" note and D129.
 
 ## S6 — Opt-in experiments and metrics
 

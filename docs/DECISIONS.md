@@ -7195,3 +7195,85 @@ are written against rg; the flag keeps the hard parity work where it pays.
 that rg hides. Then B is simpler and deletes code.
 
 > Dave: A (2026-10-27).
+
+## D129 — What opening the index costs a grep without the daemon
+
+**Question:** Which of the index-open costs should a one-shot `ferret grep`
+stop paying, and in what order?
+
+Context (2026-10-27, measured at 4324ce4; ROADMAP S3 "In-process setup"):
+on the 112k-document corpus, `grep -q -F the` without the daemon takes
+67-70 ms at one thread, 35.5 ms at the default 16. `parse_index` is 34.2 ms
+of it (term half 17.0, trigram half 16.3) and 49 of the 66 MB heap peak;
+`ResidentNames` 6.2 ms; BLAKE3 4.3 ms; section reads 3.1 ms. Grep looks up
+only trigram segments (20 lookups in a logged run, none in term segments),
+but `View::open` reads, hashes and parses both halves of every pair. Every
+query without the daemon pays this, and so does every daemon start.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep as is | Nothing | Nothing; 70 ms per one-shot grep on a 112k-document index |
+| B. Open each segment kind (term, trigram) the first time a query needs it | A lazy cell per kind in `View`; no format change | Measured with a temporary switch, output byte-identical: 70 → 45 ms at one thread, 35.8 → 30.5 ms at 16; heap 63.0 → 38.7 MiB |
+| C. B, then a lighter resident index: keep the verified Index bytes and one sample per 16 blocks instead of parsed `Block`s | A lookup decodes a block on demand; more code in `ferret-index` | Building it measured 12.0 against 34.2 ms; heap estimated 15 against 49 MB (not measured end to end). The only option that helps the trigram half grep uses |
+
+Separately, and with no tradeoff: drop the per-section re-hash of Sums
+(0.56 ms), which the whole-Sums and head checksums already cover, and have
+one-shot CLI opens skip the `ResidentNames` build as `find` already does
+(estimated −6 ms, needs a raw-heap path in `NameIndex`). Verifying only
+once, or only in the daemon, would save about 4 ms more and stop detecting
+silent media corruption of the Index or catalog until the next rebuild;
+not recommended.
+
+**Recommendation: C, built as B first.** B is small and measured; C is where
+the remaining parse time is, and D65's static dictionary (decided, not
+built) only replaces the term half.
+
+**Fact that would change it:** query logs showing most no-daemon queries are
+`text:` searches, which need both halves. Then B buys nothing and C goes
+first.
+
+## D130 — Whether `ferret grep --files` walks in parallel
+
+**Question:** Should an uncovered `--files` walk run on several threads, as
+content search already does, at the cost of a fixed output order?
+
+Context (2026-10-27): after 90cb8bc the default uncovered walk matches
+`--rg`'s speed at one thread, but `--files` is still a serial walk. On deep
+trees it is about 6× behind `rg -j32` (154 against ~25 ms), and ahead of
+`rg -j1`.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep it serial | 6× behind rg on deep trees | Deterministic order at any thread count |
+| B. Parallel when threads > 1 | Order becomes nondeterministic, as rg's `--files` and ferret's own content output already are; a second walker integration in `names.rs` | Probably close to rg (unmeasured) |
+| C. Parallel, reordered to serial order before printing | Holds every name (2.6 MB for 112k names) or needs an ordered merge; first output waits for the walk | Today's output, faster |
+
+**Recommendation: B**, matching content search and rg; `--sort path` stays
+the way to get a fixed order.
+
+**Fact that would change it:** any consumer (test, skill, script) relying on
+`--files` order without `--sort`.
+
+## D131 — Whether a crawl hands file bytes to the content index
+
+**Question:** Should the crawl hand the bytes it read for hashing straight
+to the content indexer, instead of the follow pass reading each document
+again?
+
+Context (2026-10-27, branch perf-t2-crawl): the crawl reads every file to
+hash it (53,816 under `~/w`), and the content follow then reopens and
+rereads the 11,912 documents. It is the largest remaining full-crawl cost
+after t2 cut the syscalls per directory from 43.2 to 34.2.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep the second read | 11,912 extra opens and reads per full crawl, mostly from page cache | The crawl and the content index stay independent; memory stays bounded by one file |
+| B. Hand bytes over for documents under a size bound (say 256 KiB), reread above it | Buffered bytes in flight between two stages; the handoff joins `ferret-crawl` to the indexer's pipeline | Most of the second read on a cold cache, where it is a disk read |
+| C. Index content inside the crawl's read | One pass; the crawl crate learns about tokens, against the crate graph | The whole second read |
+
+**Recommendation: A for now.** On a warm cache the reread is cheap and the
+wall-clock gain was inconclusive; B is worth it only if cold-cache crawls
+matter.
+
+**Fact that would change it:** a cold-cache full crawl (first index, or after
+reboot) where the reread shows as a measurable share of wall time.
