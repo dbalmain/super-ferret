@@ -3,7 +3,6 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -596,7 +595,7 @@ fn age_nanos(stamp: i128, now: SystemTime, daystart: bool) -> i128 {
 fn timestamp(sec: i64, nsec: i64) -> i128 {
     sec as i128 * 1_000_000_000 + nsec as i128
 }
-fn stat_stamp(stat: &fs::Metadata, field: TimeField) -> i128 {
+fn stat_stamp(stat: &super::walk::Metadata, field: TimeField) -> i128 {
     match field {
         TimeField::Access => timestamp(stat.atime(), stat.atime_nsec()),
         TimeField::Change => timestamp(stat.ctime(), stat.ctime_nsec()),

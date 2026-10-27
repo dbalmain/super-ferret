@@ -646,7 +646,7 @@ impl Policy {
             // stat.
             FileKind::File if self.anchors.fallback => PolicyEntry::File { size: 0 },
             FileKind::File => PolicyEntry::File {
-                size: entry.metadata()?.len(),
+                size: entry.metadata()?.size(),
             },
             FileKind::Symlink => PolicyEntry::Symlink,
             _ => PolicyEntry::Other,
