@@ -7380,6 +7380,19 @@ matter.
 **Fact that would change it:** a cold-cache full crawl (first index, or after
 reboot) where the reread shows as a measurable share of wall time.
 
+**Answered (Dave, 2026-10-28): A.** He asked whether a pipeline could
+replace the reread: the crawl reads files into memory up to a bound, a
+hasher keeps only bytes with a new hash and queues them for the indexer,
+and hashing never runs far ahead of indexing. Today "new hash" and DocIds
+are decided only when the catalog commits, and the index follows
+afterwards, so the pipeline needs a per-file hash lookup before commit and
+DocIds the indexer can use before the catalog publishes them. The shape that
+keeps D63's single path is a bounded byte cache in front of the follow
+pass's read, keyed by hash and evicting rather than blocking. A blocking
+queue would wait on a follow that cannot start before the commit. Not
+built; it is worth building only if a cold-cache first build shows the
+reread matters.
+
 ## D132 — A walked directory's rules load at its first entry
 
 **Decided (2026-10-27, branch perf-policy-listing):** grep's live walk loads a
