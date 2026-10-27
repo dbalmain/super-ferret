@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
+use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open, openat};
 
 use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
 
@@ -321,20 +321,26 @@ impl Entry {
     // A retained parent is the capability for every live re-resolution of
     // this observed name. /proc exposes it to std APIs without unsafe code.
     pub(super) fn with_observed_path<T>(&self, lookup: impl FnOnce(&Path) -> T) -> T {
-        if let Some(parent) = &self.state.directory {
-            // `name()` drops a trailing slash; restore it so the lookup keeps
-            // the operand's own directory requirement (GNU reports ENOTDIR
-            // for a non-directory named with a trailing `/`).
-            let mut joined = self.name().to_vec();
-            if self.path.ends_with(b"/") && joined != b"/" {
-                joined.push(b'/');
-            }
+        if let Some((parent, name)) = self.observed_at() {
             let path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
-                .join(OsStr::from_bytes(&joined));
+                .join(OsStr::from_bytes(&name));
             lookup(&path)
         } else {
             lookup(self.observed_path().as_ref())
         }
+    }
+
+    // The retained parent and this entry's name beneath it. `name()` drops a
+    // trailing slash; restore it so the lookup keeps the operand's own
+    // directory requirement (GNU reports ENOTDIR for a non-directory named
+    // with a trailing `/`).
+    fn observed_at(&self) -> Option<(&File, Vec<u8>)> {
+        let parent = self.state.directory.as_deref()?;
+        let mut joined = self.name().to_vec();
+        if self.path.ends_with(b"/") && joined != b"/" {
+            joined.push(b'/');
+        }
+        Some((parent, joined))
     }
 
     fn observed_path(&self) -> std::borrow::Cow<'_, Path> {
@@ -1806,9 +1812,13 @@ fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
     } else {
         flags | OFlags::NOFOLLOW
     };
-    Ok(Arc::new(File::from(entry.with_observed_path(|path| {
-        open(path, flags, Mode::empty())
-    })?)))
+    // Beneath a retained parent, `openat` resolves the name as /proc would,
+    // without a walk through procfs for every directory.
+    let opened = match entry.observed_at() {
+        Some((parent, name)) => openat(parent, OsStr::from_bytes(&name), flags, Mode::empty()),
+        None => entry.with_observed_path(|path| open(path, flags, Mode::empty())),
+    };
+    Ok(Arc::new(File::from(opened?)))
 }
 
 // Resolve links from the snapshot, including intermediate components. A ..
