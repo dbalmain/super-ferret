@@ -789,6 +789,35 @@ fn an_observed_lookup_keeps_the_operands_trailing_slash() {
 }
 
 #[test]
+fn a_start_at_the_symlink_limit_resolves_as_gnu_does() {
+    // Live lookups once went through /proc/self/fd/N/name, and the procfs
+    // hop used up one of Linux's 40 symlink expansions, so a chain of 40
+    // links failed with ELOOP where GNU resolves it.
+    let tree = Tree::new("symlink-limit-start");
+    fs::create_dir(tree.0.join("target")).unwrap();
+    let mut next = "target".to_owned();
+    for n in (1..=40).rev() {
+        std::os::unix::fs::symlink(&next, tree.0.join(format!("l{n}"))).unwrap();
+        next = format!("l{n}");
+    }
+    let args = [
+        "-L",
+        "l1",
+        "-maxdepth",
+        "0",
+        "-printf",
+        "%y\n",
+        "-empty",
+        "-print",
+    ];
+    let gnu = tree.run(true, &args);
+    assert_eq!(gnu.stdout, b"d\nl1\n".as_slice(), "{gnu:?}");
+    let ferret = tree.run(false, &args);
+    assert_eq!(ferret.status.code(), gnu.status.code(), "{ferret:?}");
+    assert_eq!(ferret.stdout, gnu.stdout, "{ferret:?}");
+}
+
+#[test]
 fn a_first_child_directory_observation_survives_an_ancestor_rename() {
     // R3 #3: the first child-directory stat taken while listing a directory
     // used the entry's pathname (`cached_metadata(entry.path(), follow)`)
