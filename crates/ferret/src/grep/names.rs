@@ -258,6 +258,11 @@ impl Listing<'_> {
                     )
                     .map_err(|e| e.to_string())?
                     .following_links(plan.traversal.follow);
+                    // Live policy reads each directory's ignore files through
+                    // the handle its listing used.
+                    if policy.is_some() {
+                        source = source.retaining_parents();
+                    }
                     let visibility = Visibility {
                         selection: &selection,
                         revealed: catalog.filter(|_| plan.traversal.rg),
@@ -301,11 +306,11 @@ impl Listing<'_> {
                                 }
                             }
                             Ok(Visit::Skip) => {}
-                            Err(error) => {
+                            Err(refusal) => {
                                 if diagnostic(
                                     writer,
                                     runtime,
-                                    &format!("grep: {}: {error}", entry.path().display()),
+                                    &format!("grep: {}: {}", refusal.path.display(), refusal.error),
                                 )? {
                                     return Ok(Exit::Ok);
                                 }

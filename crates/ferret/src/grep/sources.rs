@@ -38,8 +38,9 @@ impl Directory {
     }
 
     /// Keeps each listed directory open for the files listed in it, which
-    /// content searches open beneath it (D21). Names-only listings open no
-    /// file and leave it.
+    /// content searches open beneath it (D21), and through which live policy
+    /// reads a directory's ignore files. Names-only listings without live
+    /// policy open nothing beneath a directory and leave it.
     pub fn retaining_parents(self) -> Self {
         match self {
             Self::Catalog(source) => Self::Catalog(source.retaining_parents()),
@@ -50,7 +51,9 @@ impl Directory {
 
 /// A walk of the live tree below directory operand `path`.
 pub(super) fn live(path: &Path, cwd: &Path) -> LiveWalk {
-    LiveWalk::paths(vec![start(path)], cwd.to_owned()).lazy_directories()
+    LiveWalk::paths(vec![start(path)], cwd.to_owned())
+        .lazy_directories()
+        .keeping_hidden_names()
 }
 
 // Follow an explicit directory symlink only at its start. Descendant symlinks

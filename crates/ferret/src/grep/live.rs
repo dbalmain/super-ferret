@@ -7,8 +7,9 @@ use crate::config_file::Contents;
 use ferret_catalog::{Catalog, Section};
 use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry};
 use ferret_query::find::Entry;
+use std::os::fd::AsFd;
 use std::path::Component;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone)]
 pub(super) struct Anchors {
@@ -445,7 +446,23 @@ fn global() -> Result<Arc<str>, String> {
 
 #[derive(Clone)]
 enum State {
-    Rules { root: PathBuf, rules: DirRules },
+    Rules {
+        root: PathBuf,
+        rules: DirRules,
+    },
+    /// A descended directory whose rules load at its first entry
+    /// ([`Policy::reach`]), when the walk has listed it and holds it open:
+    /// its ignore files are then read through that handle, and only those
+    /// the listing held are opened. Clones share the load, so a directory
+    /// whose listing is split across workers loads, and warns, once.
+    Entering {
+        root: PathBuf,
+        parent: DirRules,
+        rules: Arc<OnceLock<Result<DirRules, Arc<io::Error>>>>,
+    },
+    /// Its rules failed to load; the failure was reported once, at the entry
+    /// that tried, and every entry of it is skipped.
+    Refused,
     Bypass,
 }
 
@@ -482,6 +499,76 @@ impl Policy {
             .unwrap_or_default()
     }
 
+    /// Loads the rules of the directory `entry` was listed in, if the walk
+    /// entered it without them. A walk calls this for every entry it yields,
+    /// before any selection that may skip it, so a directory's ignore files
+    /// load (and warn) whenever it has an entry at all, as eagerly loading
+    /// them did. An `Err` is this directory's failure, reported once.
+    pub fn reach(&mut self, entry: &Entry, stopped: &dyn Fn() -> bool) -> io::Result<()> {
+        if entry.depth() == 0 {
+            return Ok(());
+        }
+        // The walk is depth first and each accepted directory pushed one
+        // level, so the entry's parent is the level at its depth less one. A
+        // lent walk's first entry unwinds its copy of the lender's stack.
+        self.stack.truncate(entry.depth());
+        let Some((
+            path,
+            State::Entering {
+                root,
+                parent,
+                rules,
+            },
+        )) = self.stack.last()
+        else {
+            return Ok(());
+        };
+        let (path, root, parent, cell) =
+            (path.clone(), root.clone(), parent.clone(), rules.clone());
+        let handle = entry.directory_handle();
+        let contains = |name: &std::ffi::OsStr| entry.listed_beside(name.as_bytes()) != Some(false);
+        let listed = handle
+            .as_ref()
+            .filter(|_| entry.listed_beside(b".").is_some())
+            .map(|handle| ferret_crawl::Listed {
+                dir: handle.as_fd(),
+                contains: &contains,
+            });
+        let mut loaded = false;
+        let rules = cell.get_or_init(|| {
+            loaded = true;
+            let rg = self.anchors.rg_rules();
+            load_kind(
+                &path,
+                Some(&parent),
+                None,
+                self.warnings.as_mut(),
+                stopped,
+                rg,
+                listed,
+            )
+            .map_err(Arc::new)
+        });
+        let (state, result) = match rules {
+            Ok(rules) => (
+                State::Rules {
+                    root,
+                    rules: rules.clone(),
+                },
+                Ok(()),
+            ),
+            Err(error) if loaded => (
+                State::Refused,
+                Err(io::Error::new(error.kind(), error.to_string())),
+            ),
+            Err(_) => (State::Refused, Ok(())),
+        };
+        if let Some(top) = self.stack.last_mut() {
+            top.1 = state;
+        }
+        result
+    }
+
     pub fn selects(
         &mut self,
         entry: &Entry,
@@ -515,10 +602,7 @@ impl Policy {
         if entry.depth() == 0 {
             return Ok(true);
         }
-        // The walk is depth first and each accepted directory pushed one
-        // level, so the entry's parent is the level at its depth less one. A
-        // lent walk's first entry unwinds its copy of the lender's stack.
-        self.stack.truncate(entry.depth());
+        self.reach(entry, stopped)?;
         let (parent, state) = self
             .stack
             .last()
@@ -539,10 +623,15 @@ impl Policy {
         // Only a directory needs its real path: to match a nested root, and
         // to load its rules.
         let path = directory.then(|| parent.join(name));
+        let (root, rules) = match state {
+            State::Rules { root, rules } => (Some(root), Some(rules)),
+            State::Bypass => (None, None),
+            // `reach` resolved an entering directory; a refused one's
+            // entries are skipped.
+            State::Entering { .. } | State::Refused => return Ok(false),
+        };
         if let Some(path) = path.as_ref().filter(|path| {
-            !self.anchors.rg_rules()
-                && !matches!(state, State::Bypass)
-                && self.anchors.roots.contains(path)
+            !self.anchors.rg_rules() && rules.is_some() && self.anchors.roots.contains(path)
         }) {
             let path = path.clone();
             let state = self.anchors.root(&path, self.warnings.as_mut(), stopped)?;
@@ -561,12 +650,9 @@ impl Policy {
             FileKind::Symlink => PolicyEntry::Symlink,
             _ => PolicyEntry::Other,
         };
-        let local_rule = match state {
-            State::Rules { rules, .. } => rules.ignore_match(name, directory),
-            State::Bypass => None,
-        };
+        let local_rule = rules.and_then(|rules| rules.ignore_match(name, directory));
         // Rg applies the global git excludes only inside a work tree.
-        let in_work_tree = matches!(state, State::Rules { rules, .. } if rules.in_work_tree());
+        let in_work_tree = rules.is_some_and(DirRules::in_work_tree);
         let ignore_rule = local_rule.or_else(|| {
             let (_, cwd) = selection.filter(|_| in_work_tree)?;
             let absolute = cwd.join(entry.path());
@@ -606,9 +692,9 @@ impl Policy {
         } else if selection.is_some() && ignore_rule == Some(false) {
             Decision::Skip
         } else {
-            match state {
-                State::Rules { rules, .. } => rules.decide_child(name, item),
-                State::Bypass => match item {
+            match rules {
+                Some(rules) => rules.decide_child(name, item),
+                None => match item {
                     PolicyEntry::Dir => Decision::Descend,
                     PolicyEntry::File { size } if size <= Config::default().size_cap => {
                         Decision::Index
@@ -618,20 +704,17 @@ impl Policy {
             }
         };
         if let Some(path) = path {
-            let next = match (decision, state) {
-                (Decision::Descend, State::Rules { root, rules }) => State::Rules {
+            let next = match (decision, root.zip(rules)) {
+                (Decision::Descend, Some((root, rules))) => State::Entering {
                     root: root.clone(),
-                    rules: if self.anchors.rg_rules() {
-                        load_rg(&path, Some(rules), None, self.warnings.as_mut(), stopped)?
-                    } else {
-                        enter(rules, &path, self.warnings.as_mut(), stopped)?
-                    },
+                    parent: rules.clone(),
+                    rules: Arc::default(),
                 },
-                (Decision::Traverse, State::Rules { root, rules }) => State::Rules {
+                (Decision::Traverse, Some((root, rules))) => State::Rules {
                     root: root.clone(),
                     rules: rules.traverse(name),
                 },
-                (Decision::Descend, State::Bypass) => State::Bypass,
+                (Decision::Descend, None) => State::Bypass,
                 _ => return Ok(false),
             };
             self.stack.push((path, next));
@@ -665,7 +748,7 @@ fn load(
     warnings: Option<&mut Vec<String>>,
     stopped: &dyn Fn() -> bool,
 ) -> io::Result<DirRules> {
-    load_kind(path, parent, global, warnings, stopped, false)
+    load_kind(path, parent, global, warnings, stopped, false, None)
 }
 
 fn load_rg(
@@ -675,7 +758,7 @@ fn load_rg(
     warnings: Option<&mut Vec<String>>,
     stopped: &dyn Fn() -> bool,
 ) -> io::Result<DirRules> {
-    load_kind(path, parent, global, warnings, stopped, true)
+    load_kind(path, parent, global, warnings, stopped, true, None)
 }
 fn load_kind(
     path: &Path,
@@ -684,6 +767,7 @@ fn load_kind(
     mut warnings: Option<&mut Vec<String>>,
     stopped: &dyn Fn() -> bool,
     grep: bool,
+    listed: Option<ferret_crawl::Listed<'_>>,
 ) -> io::Result<DirRules> {
     if stopped() {
         return Err(io::ErrorKind::ConnectionAborted.into());
@@ -713,9 +797,9 @@ fn load_kind(
         _ => {}
     };
     let rules = if grep {
-        ferret_crawl::load_grep_policy(path, parent, global, &mut visit)
+        ferret_crawl::load_grep_policy(path, parent, global, listed, &mut visit)
     } else {
-        ferret_crawl::load_policy(path, parent, global, Config::default(), &mut visit)
+        ferret_crawl::load_policy(path, parent, global, Config::default(), listed, &mut visit)
     }?;
     if stopped() {
         return Err(io::ErrorKind::ConnectionAborted.into());

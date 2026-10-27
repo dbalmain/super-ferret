@@ -490,6 +490,64 @@ fn unreadable_policy_inputs_are_skipped_silently() {
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 
+// A walked directory's rules load at its first entry, from the walk's listing
+// (D132). Loading them must still look as it did when they loaded on entering
+// the directory: a fault names the directory, not the entry that found it,
+// and a bad pattern warns once even when no entry of the directory is
+// selected (here `-g` and hidden selection skip all of them before policy),
+// and once when its listing is split between workers.
+#[test]
+fn a_directory_s_rules_fault_and_warn_as_the_directory() {
+    let f = Fixture::new("lazy-rules");
+    f.write("src/keep.rs", b"hit\n");
+    f.write("src/sub/a.rs", b"hit\n");
+    f.write("src/sub/.ferretignore", b"a.rs\n");
+    f.write("wide/sub/.ignore", b"bad\\\n");
+    for index in 0..300 {
+        f.write(&format!("wide/sub/f{index}.txt"), b"hit\n");
+    }
+    let denied = f.tree.join("src/sub/.ferretignore");
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+    let faults = [
+        f.ferret_own(&f.tree, &["-l", "hit", "src"]),
+        f.ferret_own(&f.tree, &["--files", "src"]),
+    ];
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o644)).unwrap();
+    for output in faults {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(output.stdout, b"src/keep.rs\n", "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.starts_with("ferret: grep: src/sub: ") && stderr.contains(".ferretignore"),
+            "{stderr}"
+        );
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    }
+    let warning = "warning: ignore pattern skipped:";
+    for threads in ["1", "8"] {
+        for args in [
+            &["--files", "-g", "*.rs", "wide"][..],
+            &["-c", "hit", "wide"],
+        ] {
+            let output = f
+                .command(std::ffi::OsStr::new(env!("CARGO_BIN_EXE_ferret")), &f.tree)
+                .env("FERRET_SEARCH_THREADS", threads)
+                .arg("--index")
+                .arg(f.base.join("index"))
+                .args(["grep", "--rg"])
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr.matches(warning).count(),
+                1,
+                "{threads} {args:?}: {stderr}"
+            );
+        }
+    }
+}
+
 // The catalog follows a recorded symlink before applying the `..` after it,
 // so `root/link/../..` with `link -> deep/sub` names `root` itself: covered,
 // answered from the snapshot as find answers it, not walked live.

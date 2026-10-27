@@ -7311,3 +7311,38 @@ matter.
 
 **Fact that would change it:** a cold-cache full crawl (first index, or after
 reboot) where the reread shows as a measurable share of wall time.
+
+## D132 — A walked directory's rules load at its first entry
+
+**Decided (2026-10-27, branch perf-policy-listing):** grep's live walk loads a
+directory's ignore rules when the walk yields that directory's first entry,
+not when its parent accepts it. By then the walk has listed the directory and
+holds it open. Each ignore input is read through that handle, and only the
+inputs its listing held are opened. Before this, every walked directory cost
+an open of its path plus a probe per input name: four `newfstatat` calls, and
+five inside a work tree.
+
+**Measured** on `~/.cargo/registry/src` (8,533 directories), hyperfine medians
+in ms:
+
+| Row | Before | After |
+| --- | --- | --- |
+| `--files`, one thread | 107.3 | 81.8 |
+| `-c xylophone`, one thread | 427.1 | 399.2 |
+| `-c xylophone`, 8 threads | 83.6 | 76.8 |
+| `-c xylophone`, default threads | 63.6 | 58.6 |
+
+On content grep, syscalls fall from 283k to 232k, and the 34k `newfstatat`
+probes go entirely. `--files` now retains parent handles while a live policy
+is in force.
+
+**What stays as it was:**
+- A fault loading a directory's rules still names that directory and skips
+  its entries.
+- A bad pattern still warns once, even when no entry of the directory is
+  selected.
+- The load is shared between workers that split the directory's listing.
+
+Start operands and their ancestors are still probed by name, because grep may
+search an ancestor it cannot list.
+

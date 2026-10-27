@@ -170,6 +170,7 @@ impl Entry {
                 id: None,
                 catalog: None,
                 listed: None,
+                hidden: None,
             },
         }
     }
@@ -349,6 +350,18 @@ impl Entry {
     /// the directory by path checks it against this.
     pub fn directory_identity(&self) -> Option<(u64, u64)> {
         self.state.listed
+    }
+
+    /// Whether the directory this entry was listed in also listed `name`,
+    /// which begins with `.`, for a walk [keeping hidden
+    /// names](LiveWalk::keeping_hidden_names). A host loading that
+    /// directory's dot-file configuration opens only what the listing held,
+    /// rather than probing each name. `None` for a start operand, a
+    /// catalogued listing, any other walk, or a name not beginning with `.`.
+    pub fn listed_beside(&self, name: &[u8]) -> Option<bool> {
+        let hidden = self.state.hidden.as_deref()?;
+        name.starts_with(b".")
+            .then(|| hidden.split(|&b| b == 0).any(|listed| listed == name))
     }
 
     fn follow_catalog(&mut self) -> io::Result<()> {
@@ -632,6 +645,8 @@ struct Saved {
     /// The listing directory's `(dev, ino)`, where a walk bounded by
     /// [`Charge`] closed it instead of retaining it.
     listed: Option<(u64, u64)>,
+    /// The listing directory's hidden names; see [`Level::hidden`].
+    hidden: Option<Arc<[u8]>>,
 }
 
 impl Saved {
@@ -675,6 +690,11 @@ struct Level {
     /// The first child's metadata, observed while listing when it is a
     /// directory.
     first: Option<Result<Metadata, Arc<io::Error>>>,
+    /// Each name beginning with `.` and a NUL after it, for a live listing
+    /// by a walk [keeping hidden names](LiveWalk::keeping_hidden_names). A
+    /// loan clones it with the level, so a borrower's entries see the whole
+    /// listing, not just their half.
+    hidden: Option<Arc<[u8]>>,
     own: Saved,
 }
 
@@ -770,6 +790,13 @@ impl LiveWalk {
     pub fn retaining_parents(mut self) -> Self {
         self.options.retain_parent = true;
         self.options.bounded_parents = true;
+        self
+    }
+
+    /// Keeps each listed directory's hidden names for its entries to answer
+    /// [`Entry::listed_beside`]. Costs one small allocation per directory.
+    pub fn keeping_hidden_names(mut self) -> Self {
+        self.options.hidden_names = true;
         self
     }
 
@@ -1087,6 +1114,7 @@ impl LiveWalk {
                 end: self.children.len(),
                 names_start,
                 first: None,
+                hidden: None,
                 own,
             });
             return Ok(());
@@ -1106,6 +1134,7 @@ impl LiveWalk {
         let start = self.children.len();
         let names_start = self.names.len();
         let mut first = None;
+        let mut hidden = self.options.hidden_names.then(Vec::new);
         if self.buffer.is_empty() {
             self.buffer.resize(LISTING_BUFFER, MaybeUninit::uninit());
         }
@@ -1158,6 +1187,10 @@ impl LiveWalk {
                 let observed = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
                     .join(OsStr::from_bytes(name));
                 first = Some(cached_metadata(&observed, follow));
+            }
+            if let Some(hidden) = hidden.as_mut().filter(|_| name.starts_with(b".")) {
+                hidden.extend_from_slice(name);
+                hidden.push(0);
             }
             let name_start = self.names.len();
             self.names.extend_from_slice(name);
@@ -1222,6 +1255,7 @@ impl LiveWalk {
             end: self.children.len(),
             names_start,
             first,
+            hidden: hidden.map(Arc::from),
             own,
         });
         Ok(())
@@ -1357,6 +1391,7 @@ impl LiveWalk {
             entry.state.followed_symlink = false;
             entry.state.directory = level.handle.clone();
             entry.state.listed = level.identity;
+            entry.state.hidden = level.hidden.clone();
             entry.state.depth = level.own.depth + 1;
             entry.state.kind = child.kind;
             entry.check_directory = false;

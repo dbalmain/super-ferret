@@ -86,6 +86,9 @@ pub(crate) struct Options {
     pub retain_parent: bool,
     /// Retained parents are charged to a budget, closed past it.
     pub bounded_parents: bool,
+    /// Live listings keep their hidden names for
+    /// [`walk::Entry::listed_beside`].
+    pub hidden_names: bool,
     pub delete: bool,
     guard: Option<CandidateGuard>,
 }

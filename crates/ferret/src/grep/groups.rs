@@ -1576,9 +1576,9 @@ impl Filter<'_> {
                 *descend = false;
                 return None;
             }
-            Err(error) => {
+            Err(refusal) => {
                 *descend = false;
-                return Some((0, Job::Failed(entry.path().to_owned(), error.to_string())));
+                return Some((0, Job::Failed(refusal.path, refusal.error.to_string())));
             }
         }
         *searched = true;
