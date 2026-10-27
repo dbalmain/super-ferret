@@ -7441,6 +7441,8 @@ resolution through procfs per call.
 | `-readable`                                 |   90.3 |  17.9 |   — |
 
 Times are ms. `grep --files` at one thread went from 77.0 to 67.3 ms.
+Indexed `find` with an action (which checks each catalogued child is
+still there) went from 88.3 to 30.8 ms on `~/w`.
 
 `walk::Metadata` is now ferret's own struct, filled from `statx` or, where
 the kernel or a seccomp filter refuses `statx` with ENOSYS, from `fstatat`,
