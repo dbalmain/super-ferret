@@ -995,8 +995,16 @@ mod tests {
         assert_eq!(ok(&[(b"ab", 0, 0), (b"aa", 1, 0)]), None, "a smaller term");
         assert_eq!(ok(&[(b"ab", 0, 0), (b"abc", 0, 0)]), None, "an empty block");
         assert_eq!(ok(&[(b"ab", 1, 0)]), None, "block 0 with a step");
-        let overflow = index(&[(b"a", 0, 0), (b"b", u64::MAX, 0), (b"c", 2, 0)]);
-        assert_eq!(parsed(&overflow, 3, u64::MAX, 0), None, "a wrapping offset");
+        // Each second entry is in bounds, so only a checked sum rejects the
+        // third: a wrapping one lands back inside the section.
+        let overflow = index(&[(b"a", 0, 0), (b"b", u64::MAX - 1, 0), (b"c", 2, 0)]);
+        assert_eq!(parsed(&overflow, 3, u64::MAX, 0), None, "a wrapping start");
+        let overflow = index(&[(b"a", 0, 0), (b"b", 1, u64::MAX), (b"c", 1, 1)]);
+        assert_eq!(
+            parsed(&overflow, 3, 3, u64::MAX),
+            None,
+            "a wrapping postings base"
+        );
         let mut trailing = index(&[(b"ab", 0, 0)]);
         trailing.push(0);
         assert_eq!(parsed(&trailing, 1, 100, 50), None, "a trailing byte");
