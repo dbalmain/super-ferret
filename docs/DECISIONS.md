@@ -7341,8 +7341,14 @@ is in force.
   its entries.
 - A bad pattern still warns once, even when no entry of the directory is
   selected.
-- The load is shared between workers that split the directory's listing.
+- The load is guarded so workers that split a directory's listing would share
+  it. A review found no split today: a directory's first entry always reaches
+  the policy in the step that lists it, before any loan.
 
 Start operands and their ancestors are still probed by name, because grep may
 search an ancestor it cannot list.
+
+**What changed:** a directory the walk cannot list (mode `0311`, say) yields
+no entries, so its rules never load. A bad ignore pattern in it used to warn
+beside the listing fault; now only the fault is reported, as rg reports it.
 

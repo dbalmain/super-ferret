@@ -1335,7 +1335,7 @@ pub(super) fn walk<W: Write>(
                                 };
                                 schedule::run(
                                     &schedule,
-                                    sources::live(&path, &filter.cwd)
+                                    sources::live(&path, &filter.cwd, policy.is_some())
                                         .following_links(filter.traversal.follow)
                                         .retaining_parents(),
                                     Walked {
@@ -1801,7 +1801,8 @@ impl<'a> Source<'a> {
                         &path,
                         self.filter.catalog,
                         &self.filter.cwd,
-                        self.filter.traversal.unrestricted || self.policy.is_some(),
+                        self.filter.traversal.unrestricted,
+                        self.policy.is_some(),
                     ) {
                         Ok(source) => {
                             self.source = Some(

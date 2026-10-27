@@ -197,7 +197,7 @@ impl Listing<'_> {
                 if let Input::Directory(path) = input
                     && !live.is_some_and(|anchors| anchors.walks(path))
                     && let Some(Err(error)) =
-                        sources::Directory::new(path, Some(catalog), cwd, false)
+                        sources::Directory::new(path, Some(catalog), cwd, false, false)
                             .map_err(|e| e.to_string())?
                             .next(true)
                 {
@@ -254,15 +254,11 @@ impl Listing<'_> {
                         &path,
                         catalog,
                         cwd,
-                        plan.traversal.unrestricted || policy.is_some(),
+                        plan.traversal.unrestricted,
+                        policy.is_some(),
                     )
                     .map_err(|e| e.to_string())?
                     .following_links(plan.traversal.follow);
-                    // Live policy reads each directory's ignore files through
-                    // the handle its listing used.
-                    if policy.is_some() {
-                        source = source.retaining_parents();
-                    }
                     let visibility = Visibility {
                         selection: &selection,
                         revealed: catalog.filter(|_| plan.traversal.rg),

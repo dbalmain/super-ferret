@@ -19,8 +19,8 @@ use std::path::Path;
 pub use output::{OutputBuffer, spill_path};
 pub use parse::{ParseError, Plan};
 pub use walk::{
-    CatalogSource, DirectoryHandle, Entry, EntrySource, FileKind, LiveWalk, Namespace, WalkError,
-    resolve_in,
+    CatalogSource, DirectoryHandle, Entry, EntrySource, FileKind, Listing, LiveWalk, Namespace,
+    WalkError, resolve_in,
 };
 
 #[derive(Clone, Debug, PartialEq)]

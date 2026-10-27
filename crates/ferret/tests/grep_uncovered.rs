@@ -495,7 +495,8 @@ fn unreadable_policy_inputs_are_skipped_silently() {
 // the directory: a fault names the directory, not the entry that found it,
 // and a bad pattern warns once even when no entry of the directory is
 // selected (here `-g` and hidden selection skip all of them before policy),
-// and once when its listing is split between workers.
+// and once on several workers. A directory that cannot be listed is the one
+// change, and it now agrees with rg.
 #[test]
 fn a_directory_s_rules_fault_and_warn_as_the_directory() {
     let f = Fixture::new("lazy-rules");
@@ -546,6 +547,21 @@ fn a_directory_s_rules_fault_and_warn_as_the_directory() {
             );
         }
     }
+    // A directory the walk cannot list yields no entries, so its rules never
+    // load and its bad pattern does not warn: as in rg, only the listing
+    // fault is reported.
+    if running_as_root() {
+        return;
+    }
+    f.write("locked/sub/.ignore", b"bad\\\n");
+    f.write("locked/sub/x.txt", b"hit\n");
+    let _locked = ListingDenied::at(&f.tree.join("locked/sub"), 0o311);
+    f.compare(&f.tree, &["-l", "hit", "locked"], true);
+    let output = f.ferret(&f.tree, &["-l", "hit", "locked"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(!stderr.contains(warning), "{stderr}");
+    assert!(stderr.contains("locked/sub"), "{stderr}");
 }
 
 // The catalog follows a recorded symlink before applying the `..` after it,

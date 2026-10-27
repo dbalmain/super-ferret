@@ -7,7 +7,6 @@ use crate::config_file::Contents;
 use ferret_catalog::{Catalog, Section};
 use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry};
 use ferret_query::find::Entry;
-use std::os::fd::AsFd;
 use std::path::Component;
 use std::sync::{Arc, OnceLock};
 
@@ -453,8 +452,11 @@ enum State {
     /// A descended directory whose rules load at its first entry
     /// ([`Policy::reach`]), when the walk has listed it and holds it open:
     /// its ignore files are then read through that handle, and only those
-    /// the listing held are opened. Clones share the load, so a directory
-    /// whose listing is split across workers loads, and warns, once.
+    /// the listing held are opened. The walk yields a directory's first
+    /// entry in the step that lists it, before any loan can split the
+    /// listing, so clones never meet this state today; they share the load
+    /// anyway, so that a scheduler that lends earlier still loads, and
+    /// warns, once.
     Entering {
         root: PathBuf,
         parent: DirRules,
@@ -525,15 +527,14 @@ impl Policy {
         };
         let (path, root, parent, cell) =
             (path.clone(), root.clone(), parent.clone(), rules.clone());
-        let handle = entry.directory_handle();
-        let contains = |name: &std::ffi::OsStr| entry.listed_beside(name.as_bytes()) != Some(false);
-        let listed = handle
-            .as_ref()
-            .filter(|_| entry.listed_beside(b".").is_some())
-            .map(|handle| ferret_crawl::Listed {
-                dir: handle.as_fd(),
-                contains: &contains,
-            });
+        let listing = entry.listing();
+        let contains = |name: &std::ffi::OsStr| {
+            listing.is_none_or(|listing| listing.holds(name.as_bytes()) != Some(false))
+        };
+        let listed = listing.map(|listing| ferret_crawl::Listed {
+            dir: listing.dir(),
+            contains: &contains,
+        });
         let mut loaded = false;
         let rules = cell.get_or_init(|| {
             loaded = true;
@@ -934,7 +935,7 @@ mod tests {
         let anchors = Anchors::load(&index, "".into()).unwrap();
         for content in [false, true] {
             let mut policy = anchors.start(&root, &|| false).unwrap();
-            let mut source = sources::Directory::new(&root, None, &root, true).unwrap();
+            let mut source = sources::Directory::new(&root, None, &root, false, true).unwrap();
             let mut descend = true;
             let mut files = Vec::new();
             while let Some(entry) = source.next(descend) {
