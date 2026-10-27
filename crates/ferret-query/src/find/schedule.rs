@@ -303,7 +303,11 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                 }
                 let cadence = steps.is_multiple_of(STEPS_PER_LOAN);
                 let workers = self.schedule.workers;
-                let offer = steps >= next_offer && self.active.load(Ordering::Relaxed) < workers;
+                // A visitor about to hold its worker on one long step offers
+                // whatever the backoff, so an idle worker is not left asleep
+                // through it.
+                let offer = self.active.load(Ordering::Relaxed) < workers
+                    && (steps >= next_offer || visitor.holding(&lent.task));
                 if cadence || offer {
                     let mut queue = self.lock();
                     // Workers with no task, less those a runnable queued task
