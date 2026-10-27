@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 

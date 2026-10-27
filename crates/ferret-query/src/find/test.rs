@@ -3,7 +3,6 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -276,7 +275,7 @@ impl Test {
                             let stat = super::walk::metadata(observed.as_ref(), *follow)?;
                             stat_stamp(&stat, TimeField::Access)
                         }
-                        TimeField::Birth => birth_stamp(entry.path())
+                        TimeField::Birth => birth_stamp(rustix::fs::CWD, entry.path())
                             .ok_or_else(|| std::io::Error::other("birth time unavailable"))?,
                     };
                     Self::Newer {
@@ -297,7 +296,7 @@ impl Test {
             Self::Newer {
                 field: *field,
                 stamp: if *reference_field == TimeField::Birth {
-                    birth_stamp(entry.path())
+                    birth_stamp(rustix::fs::CWD, entry.path())
                         .ok_or_else(|| std::io::Error::other("birth time unavailable"))?
                 } else {
                     stat_stamp(&stat, *reference_field)
@@ -406,7 +405,7 @@ impl Test {
             Self::NoGroup => !group_exists(entry.stat()?.gid()),
             Self::Newer { field, stamp } => {
                 let actual = if *field == TimeField::Birth {
-                    entry.with_observed_path(birth_stamp).ok_or_else(|| {
+                    entry.with_observed_at(birth_stamp).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
                             "birth time unavailable",
@@ -427,16 +426,14 @@ impl Test {
                 // directories have no count and use their live listing.
                 FileKind::Directory => match entry.has_children() {
                     Some(has_children) => !has_children,
-                    None => entry
-                        .with_observed_path(|path| fs::read_dir(path))?
-                        .next()
-                        .transpose()?
-                        .is_none(),
+                    None => !entry.with_observed_at(has_entries)?,
                 },
                 _ => false,
             },
             Self::Access(access) => entry
-                .with_observed_path(|path| rustix::fs::access(path, *access))
+                .with_observed_at(|dir, path| {
+                    rustix::fs::accessat(dir, path, *access, rustix::fs::AtFlags::empty())
+                })
                 .is_ok(),
             Self::FsType(wanted) => filesystem_type(entry.stat()?.dev()) == Some(wanted.as_str()),
         })
@@ -596,23 +593,38 @@ fn age_nanos(stamp: i128, now: SystemTime, daystart: bool) -> i128 {
 fn timestamp(sec: i64, nsec: i64) -> i128 {
     sec as i128 * 1_000_000_000 + nsec as i128
 }
-fn stat_stamp(stat: &fs::Metadata, field: TimeField) -> i128 {
+fn stat_stamp(stat: &super::walk::Metadata, field: TimeField) -> i128 {
     match field {
         TimeField::Access => timestamp(stat.atime(), stat.atime_nsec()),
         TimeField::Change => timestamp(stat.ctime(), stat.ctime_nsec()),
         _ => timestamp(stat.mtime(), stat.mtime_nsec()),
     }
 }
-fn birth_stamp(path: &std::path::Path) -> Option<i128> {
+fn birth_stamp(dir: std::os::fd::BorrowedFd<'_>, path: &std::path::Path) -> Option<i128> {
     let stat = rustix::fs::statx(
-        rustix::fs::CWD,
+        dir,
         path,
-        rustix::fs::AtFlags::empty(),
+        rustix::fs::AtFlags::NO_AUTOMOUNT,
         rustix::fs::StatxFlags::BTIME,
     )
     .ok()?;
     (stat.stx_mask & rustix::fs::StatxFlags::BTIME.bits() != 0)
         .then(|| timestamp(stat.stx_btime.tv_sec, i64::from(stat.stx_btime.tv_nsec)))
+}
+// Whether the directory at `path` beneath `dir` lists anything besides `.`
+// and `..`.
+fn has_entries(dir: std::os::fd::BorrowedFd<'_>, path: &std::path::Path) -> std::io::Result<bool> {
+    use rustix::fs::{Dir, Mode, OFlags, openat};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // `Dir::new` lists the fresh descriptor itself; `read_from` would reopen
+    // `.` beneath it, which needs search permission GNU does not.
+    let mut listing = Dir::new(openat(dir, path, flags, Mode::empty())?)?;
+    while let Some(entry) = listing.read() {
+        if !matches!(entry?.file_name().to_bytes(), b"." | b"..") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn user_exists(id: u32) -> bool {
     fs::read_to_string("/etc/passwd").is_ok_and(|s| {

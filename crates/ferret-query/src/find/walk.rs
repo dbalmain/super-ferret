@@ -12,18 +12,21 @@
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::fs::{self, File, FileType, Metadata};
+use std::fs::{self, File};
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
+use rustix::fs::{
+    AtFlags, CWD, FileType as RawType, Mode, OFlags, RawDir, Stat as RawStat, Statx, StatxFlags,
+    makedev, open, openat, readlinkat, statat, statx,
+};
 
 use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
 
@@ -125,24 +128,6 @@ impl AsFd for DirectoryHandle {
     }
 }
 
-pub(super) fn kind(value: FileType) -> FileKind {
-    if value.is_dir() {
-        FileKind::Directory
-    } else if value.is_symlink() {
-        FileKind::Symlink
-    } else if value.is_fifo() {
-        FileKind::Fifo
-    } else if value.is_socket() {
-        FileKind::Socket
-    } else if value.is_block_device() {
-        FileKind::Block
-    } else if value.is_char_device() {
-        FileKind::Character
-    } else {
-        FileKind::File
-    }
-}
-
 #[derive(Default)]
 struct Removals {
     children: BTreeMap<InoId, u32>,
@@ -240,7 +225,7 @@ impl Entry {
         } else {
             self.state.kind
         })
-        .map_or_else(|| self.metadata().map(|stat| kind(stat.file_type())), Ok)
+        .map_or_else(|| self.metadata().map(Metadata::kind), Ok)
     }
     /// Final path component as bytes, including `.` and `..` in start operands.
     /// Trailing slashes are omitted, except for an all-slash root operand.
@@ -262,7 +247,8 @@ impl Entry {
         self.state
             .metadata
             .get_or_init(|| {
-                self.with_observed_path(|path| cached_metadata(path, self.state.follow))
+                self.with_observed_at(|dir, path| metadata_at(dir, path, self.state.follow))
+                    .map_err(Arc::new)
             })
             .as_ref()
             .map_err(|error| {
@@ -314,27 +300,45 @@ impl Entry {
             return Ok(catalog.link_target(id).unwrap_or_default().to_vec());
         }
         Ok(self
-            .with_observed_path(|path| fs::read_link(path))?
-            .into_os_string()
-            .into_vec())
+            .with_observed_at(|dir, path| readlinkat(dir, path, Vec::new()))?
+            .into_bytes())
     }
     // A retained parent is the capability for every live re-resolution of
     // this observed name. /proc exposes it to std APIs without unsafe code.
     pub(super) fn with_observed_path<T>(&self, lookup: impl FnOnce(&Path) -> T) -> T {
-        if let Some(parent) = &self.state.directory {
-            // `name()` drops a trailing slash; restore it so the lookup keeps
-            // the operand's own directory requirement (GNU reports ENOTDIR
-            // for a non-directory named with a trailing `/`).
-            let mut joined = self.name().to_vec();
-            if self.path.ends_with(b"/") && joined != b"/" {
-                joined.push(b'/');
-            }
+        if let Some((parent, name)) = self.observed_at() {
             let path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
-                .join(OsStr::from_bytes(&joined));
+                .join(OsStr::from_bytes(&name));
             lookup(&path)
         } else {
             lookup(self.observed_path().as_ref())
         }
+    }
+
+    // As `with_observed_path`, but as a directory handle and a path beneath
+    // it, for `*at` calls: they resolve the same name without a walk through
+    // procfs.
+    pub(super) fn with_observed_at<T>(&self, lookup: impl FnOnce(BorrowedFd<'_>, &Path) -> T) -> T {
+        if let Some((parent, name)) = self.observed_at() {
+            return lookup(parent.as_fd(), Path::new(OsStr::from_bytes(&name)));
+        }
+        match &self.cwd_handle {
+            Some(handle) if self.path().is_relative() => lookup(handle.as_fd(), self.path()),
+            _ => lookup(CWD, &self.lookup_path()),
+        }
+    }
+
+    // The retained parent and this entry's name beneath it. `name()` drops a
+    // trailing slash; restore it so the lookup keeps the operand's own
+    // directory requirement (GNU reports ENOTDIR for a non-directory named
+    // with a trailing `/`).
+    fn observed_at(&self) -> Option<(&File, Vec<u8>)> {
+        let parent = self.state.directory.as_deref()?;
+        let mut joined = self.name().to_vec();
+        if self.path.ends_with(b"/") && joined != b"/" {
+            joined.push(b'/');
+        }
+        Some((parent, joined))
     }
 
     fn observed_path(&self) -> std::borrow::Cow<'_, Path> {
@@ -447,8 +451,8 @@ impl Entry {
                 return entry.kind();
             }
         }
-        self.with_observed_path(|path| fs::metadata(path))
-            .map(|stat| kind(stat.file_type()))
+        self.with_observed_at(|dir, path| stat_at(dir, path, AtFlags::empty()))
+            .map(|stat| stat.kind())
     }
 
     pub(super) fn opposite_kind(&self) -> io::Result<FileKind> {
@@ -469,16 +473,16 @@ impl Entry {
                 }
             });
         }
-        self.with_observed_path(|path| {
-            metadata(path, !self.state.follow).or_else(|error| {
+        self.with_observed_at(|dir, path| {
+            metadata_at(dir, path, !self.state.follow).or_else(|error| {
                 if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
-                    fs::symlink_metadata(path)
+                    stat_at(dir, path, AtFlags::SYMLINK_NOFOLLOW)
                 } else {
                     Err(error)
                 }
             })
         })
-        .map(|stat| kind(stat.file_type()))
+        .map(|stat| stat.kind())
     }
 
     fn error(&self, error: io::Error) -> WalkError {
@@ -564,18 +568,156 @@ impl Stat<'_> {
 }
 
 pub(super) fn metadata(path: &Path, follow: bool) -> io::Result<Metadata> {
+    metadata_at(CWD, path, follow)
+}
+
+/// A followed lookup falls back to the link itself when its target is
+/// missing, as find reports a dangling link.
+fn metadata_at(dir: BorrowedFd<'_>, path: &Path, follow: bool) -> io::Result<Metadata> {
     if follow {
-        match fs::metadata(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::symlink_metadata(path),
+        match stat_at(dir, path, AtFlags::empty()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                stat_at(dir, path, AtFlags::SYMLINK_NOFOLLOW)
+            }
             result => result,
         }
     } else {
-        fs::symlink_metadata(path)
+        stat_at(dir, path, AtFlags::SYMLINK_NOFOLLOW)
     }
 }
 
-fn cached_metadata(path: &Path, follow: bool) -> Result<Metadata, Arc<io::Error>> {
-    metadata(path, follow).map_err(Arc::new)
+// statx, as GNU's fstatat behaves: a terminal automount point is not
+// triggered. Where statx is unavailable (old kernels, seccomp filters), fall
+// back to fstatat as std does.
+fn stat_at(dir: BorrowedFd<'_>, path: &Path, flags: AtFlags) -> io::Result<Metadata> {
+    match statx(
+        dir,
+        path,
+        flags | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::BASIC_STATS,
+    ) {
+        Ok(stat) => Ok(Metadata::from(stat)),
+        Err(rustix::io::Errno::NOSYS) => Ok(Metadata::from(statat(dir, path, flags)?)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// One live stat of an entry. The accessors keep std's `MetadataExt` names
+/// and values.
+#[derive(Clone, Copy, Debug)]
+pub struct Metadata {
+    mode: u32,
+    size: u64,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    dev: u64,
+    rdev: u64,
+    ino: u64,
+    blocks: u64,
+    atime: (i64, i64),
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl From<Statx> for Metadata {
+    fn from(stat: Statx) -> Self {
+        Self {
+            mode: u32::from(stat.stx_mode),
+            size: stat.stx_size,
+            uid: stat.stx_uid,
+            gid: stat.stx_gid,
+            nlink: u64::from(stat.stx_nlink),
+            dev: makedev(stat.stx_dev_major, stat.stx_dev_minor),
+            rdev: makedev(stat.stx_rdev_major, stat.stx_rdev_minor),
+            ino: stat.stx_ino,
+            blocks: stat.stx_blocks,
+            atime: (stat.stx_atime.tv_sec, i64::from(stat.stx_atime.tv_nsec)),
+            mtime: (stat.stx_mtime.tv_sec, i64::from(stat.stx_mtime.tv_nsec)),
+            ctime: (stat.stx_ctime.tv_sec, i64::from(stat.stx_ctime.tv_nsec)),
+        }
+    }
+}
+
+// `struct stat`'s field widths vary by architecture, so the casts are
+// conversions on some targets and no-ops on others, as in std.
+#[allow(clippy::unnecessary_cast)]
+impl From<RawStat> for Metadata {
+    fn from(stat: RawStat) -> Self {
+        Self {
+            mode: stat.st_mode as u32,
+            size: stat.st_size as u64,
+            uid: stat.st_uid as u32,
+            gid: stat.st_gid as u32,
+            nlink: stat.st_nlink as u64,
+            dev: stat.st_dev as u64,
+            rdev: stat.st_rdev as u64,
+            ino: stat.st_ino as u64,
+            blocks: stat.st_blocks as u64,
+            atime: (stat.st_atime as i64, stat.st_atime_nsec as i64),
+            mtime: (stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+            ctime: (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        }
+    }
+}
+
+impl Metadata {
+    pub fn kind(&self) -> FileKind {
+        match RawType::from_raw_mode(self.mode) {
+            RawType::Directory => FileKind::Directory,
+            RawType::Symlink => FileKind::Symlink,
+            RawType::Fifo => FileKind::Fifo,
+            RawType::Socket => FileKind::Socket,
+            RawType::BlockDevice => FileKind::Block,
+            RawType::CharacterDevice => FileKind::Character,
+            RawType::RegularFile | RawType::Unknown => FileKind::File,
+        }
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+    pub fn nlink(&self) -> u64 {
+        self.nlink
+    }
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+    pub fn rdev(&self) -> u64 {
+        self.rdev
+    }
+    pub fn blocks(&self) -> u64 {
+        self.blocks
+    }
+    pub fn atime(&self) -> i64 {
+        self.atime.0
+    }
+    pub fn atime_nsec(&self) -> i64 {
+        self.atime.1
+    }
+    pub fn mtime(&self) -> i64 {
+        self.mtime.0
+    }
+    pub fn mtime_nsec(&self) -> i64 {
+        self.mtime.1
+    }
+    pub fn ctime(&self) -> i64 {
+        self.ctime.0
+    }
+    pub fn ctime_nsec(&self) -> i64 {
+        self.ctime.1
+    }
 }
 
 /// An I/O error with its path. The evaluator reports it and keeps walking.
@@ -1225,9 +1367,8 @@ impl LiveWalk {
                 // listing, not the entry's pathname: an action run while
                 // listing (e.g. `-exec` renaming an ancestor) can make the
                 // pathname stale before this first child is even visited.
-                let observed = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
-                    .join(OsStr::from_bytes(name));
-                first = Some(cached_metadata(&observed, follow));
+                let name = Path::new(OsStr::from_bytes(name));
+                first = Some(metadata_at(handle.as_fd(), name, follow).map_err(Arc::new));
             }
             if let Some(hidden) = hidden.as_mut().filter(|_| name.starts_with(b".")) {
                 hidden.extend_from_slice(name);
@@ -1411,12 +1552,15 @@ impl LiveWalk {
                     }
                 }
                 let follow = follow || self.entry.path.ends_with(b"/");
-                let stat = match self.entry.with_observed_path(|path| metadata(path, follow)) {
+                let stat = match self
+                    .entry
+                    .with_observed_at(|dir, path| metadata_at(dir, path, follow))
+                {
                     Ok(stat) => stat,
                     Err(error) => return Some(Err(self.entry.error(error))),
                 };
                 self.root_dev = stat.dev();
-                self.entry.state.kind = Some(kind(stat.file_type()));
+                self.entry.state.kind = Some(stat.kind());
                 self.entry.state.follow = follow;
                 self.entry.state.metadata = OnceCell::from(Ok(stat));
                 return Some(Ok(Loaded::Entry));
@@ -1529,7 +1673,10 @@ impl LiveWalk {
                     level
                         .own
                         .metadata
-                        .get_or_init(|| handle.metadata().map_err(Arc::new))
+                        .get_or_init(|| {
+                            stat_at(handle.as_fd(), Path::new(""), AtFlags::EMPTY_PATH)
+                                .map_err(Arc::new)
+                        })
                         .as_ref()
                         .is_ok_and(|ancestor| {
                             ancestor.dev() == stat.dev() && ancestor.ino() == stat.ino()
@@ -1806,9 +1953,8 @@ fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
     } else {
         flags | OFlags::NOFOLLOW
     };
-    Ok(Arc::new(File::from(entry.with_observed_path(|path| {
-        open(path, flags, Mode::empty())
-    })?)))
+    let opened = entry.with_observed_at(|dir, path| openat(dir, path, flags, Mode::empty()))?;
+    Ok(Arc::new(File::from(opened)))
 }
 
 // Resolve links from the snapshot, including intermediate components. A ..
@@ -2008,21 +2154,68 @@ mod tests {
     }
 
     #[test]
-    fn cloning_an_entry_preserves_cached_os_and_non_os_metadata_errors() {
-        // Caching only errno turned std's NUL-path InvalidInput into EIO.
-        for path in [
-            PathBuf::from("/ferret-r1-missing-metadata-entry"),
-            PathBuf::from(OsStr::from_bytes(b"bad\0path")),
-        ] {
-            let expected = fs::symlink_metadata(&path).unwrap_err();
+    fn the_fstatat_fallback_reads_what_statx_does() {
+        // Where statx is unavailable, stat_at falls back to fstatat. Both
+        // conversions must give the same fields, and std's values. /dev/null
+        // carries a device number; its times move when anything writes it.
+        use std::os::unix::fs::MetadataExt;
+        let exe = std::env::current_exe().unwrap();
+        for path in [exe.as_path(), Path::new("/"), Path::new("/dev/null")] {
+            let flags = AtFlags::SYMLINK_NOFOLLOW;
+            let new = Metadata::from(statx(CWD, path, flags, StatxFlags::BASIC_STATS).unwrap());
+            let old = Metadata::from(statat(CWD, path, flags).unwrap());
+            let std = fs::symlink_metadata(path).unwrap();
+            for metadata in [new, old] {
+                let fields = |m: &Metadata| (m.dev(), m.ino(), m.rdev(), m.mode(), m.nlink());
+                assert_eq!(
+                    fields(&metadata),
+                    (std.dev(), std.ino(), std.rdev(), std.mode(), std.nlink()),
+                    "{path:?}"
+                );
+                assert_eq!(metadata.kind(), kind_of(std.file_type()));
+            }
+            if path != Path::new("/dev/null") {
+                assert_eq!(format!("{new:?}"), format!("{old:?}"), "{path:?}");
+                assert_eq!(
+                    (new.size(), new.blocks(), new.uid(), new.gid()),
+                    (std.size(), std.blocks(), std.uid(), std.gid())
+                );
+                assert_eq!(
+                    (new.mtime(), new.mtime_nsec()),
+                    (std.mtime(), std.mtime_nsec())
+                );
+            }
+        }
+        fn kind_of(kind: fs::FileType) -> FileKind {
+            if kind.is_dir() {
+                FileKind::Directory
+            } else if kind.is_file() {
+                FileKind::File
+            } else {
+                FileKind::Character
+            }
+        }
+    }
+
+    #[test]
+    fn cloning_an_entry_preserves_cached_metadata_errors() {
+        // Caching only errno once turned a NUL path's InvalidInput into EIO.
+        // A live stat reports what std does for a missing file; a NUL path,
+        // which no operand can spell, is EINVAL from the kernel's side.
+        let missing = PathBuf::from("/ferret-r1-missing-metadata-entry");
+        let std = fs::symlink_metadata(&missing).unwrap_err();
+        for path in [missing, PathBuf::from(OsStr::from_bytes(b"bad\0path"))] {
             let entry = Entry::new(path, 0, FileKind::File);
             let observed = entry.metadata().unwrap_err();
-            let copied = entry.clone();
-            let cached = copied.metadata().unwrap_err();
-            for error in [observed, cached] {
-                assert_eq!(error.raw_os_error(), expected.raw_os_error());
-                assert_eq!(error.kind(), expected.kind());
-                assert_eq!(error.to_string(), expected.to_string());
+            let cached = entry.clone().metadata().unwrap_err();
+            assert_eq!(cached.raw_os_error(), observed.raw_os_error());
+            assert_eq!(cached.kind(), observed.kind());
+            assert_eq!(cached.to_string(), observed.to_string());
+            if entry.path() == Path::new("/ferret-r1-missing-metadata-entry") {
+                assert_eq!(observed.raw_os_error(), std.raw_os_error());
+                assert_eq!(observed.to_string(), std.to_string());
+            } else {
+                assert_eq!(observed.kind(), io::ErrorKind::InvalidInput);
             }
         }
     }

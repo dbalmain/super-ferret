@@ -577,9 +577,9 @@ fn metadata_observations_and_failures_are_cached_and_name_tests_are_lazy() {
             );
         }
         if entry.path() == tree.0.join("b.txt") {
-            let size = entry.metadata().unwrap().len();
+            let size = entry.metadata().unwrap().size();
             fs::remove_file(entry.path()).unwrap();
-            assert_eq!(entry.metadata().unwrap().len(), size);
+            assert_eq!(entry.metadata().unwrap().size(), size);
         }
     }
     let entry = Entry::new(tree.0.join("missing"), 1, FileKind::File);
