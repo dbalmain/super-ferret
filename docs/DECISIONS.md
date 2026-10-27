@@ -7450,6 +7450,6 @@ at that limit now resolves as GNU's does. Astra's two review rounds found
 the missing fallback and a listing that needed search permission; both are
 fixed and tested.
 
-**Still through /proc:** `%F` (statfs) and `-newer` reference operands,
-both once per operand rather than per entry.
+**Still through /proc:** `-printf %F` (statfs, per printed entry) and the
+`-newer` family's reference operands (once per operand).
 
