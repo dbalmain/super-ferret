@@ -682,7 +682,9 @@ fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
     };
     let mut writer = IndexWriter::open(&path.join(crate::engine::CONTENT_DIR), &view)
         .map_err(|e| e.to_string())?;
-    let mut documents = ferret_crawl::Documents::new(catalog).map_err(|e| e.to_string())?;
+    let mut documents = ferret_crawl::Documents::new(catalog)
+        .map_err(|e| e.to_string())?
+        .holding_directories();
     let mut read = |doc, bytes: &mut Vec<u8>| {
         documents
             .read(catalog, ferret_catalog::DocId(doc), bytes)

@@ -388,7 +388,9 @@ impl Engine {
         let pin = self.pin();
         let live = pin.live();
         let names = pin.doc_names().map_err(Error::Catalog)?;
-        let mut documents = ferret_crawl::Documents::by_name(view).map_err(Error::Catalog)?;
+        let mut documents = ferret_crawl::Documents::by_name(view)
+            .map_err(Error::Catalog)?
+            .holding_directories();
         if let Some(limiter) = limiter {
             documents = documents.with_limiter(limiter);
         }

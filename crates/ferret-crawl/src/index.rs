@@ -1881,6 +1881,12 @@ impl EventVisitor for Hasher<'_> {
         }
     }
 
+    fn policy_inputs(&mut self, fd: std::os::fd::BorrowedFd<'_>, names: &[&OsStr]) {
+        if let Some(watch) = self.watch {
+            watch.policy_inputs(self.root, fd, names);
+        }
+    }
+
     fn observing(&mut self, fd: std::os::fd::BorrowedFd<'_>, path: &Path) {
         if let Some(watch) = self.watch {
             watch.arm(self.root, path, fd);

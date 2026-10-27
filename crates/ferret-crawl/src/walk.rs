@@ -530,6 +530,13 @@ pub trait EventVisitor {
 
     fn policy_input(&mut self, _parent: BorrowedFd<'_>, _name: &OsStr) {}
 
+    /// [`EventVisitor::policy_input`] for each of `names`, all in `parent`.
+    fn policy_inputs(&mut self, parent: BorrowedFd<'_>, names: &[&OsStr]) {
+        for name in names {
+            self.policy_input(parent, name);
+        }
+    }
+
     fn observing(&mut self, _fd: BorrowedFd<'_>, _path: &Path) {}
 
     /// Selects work before child stat/open. A false result deliberately keeps
@@ -1719,12 +1726,20 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         in_work_tree: bool,
         token: V::Dir,
     ) -> Ignores {
-        for name in [".ferretignore", ".ignore", ".rgignore", DOT_GIT] {
-            self.visit.policy_input(dir, OsStr::new(name));
-        }
-        if in_work_tree {
-            self.visit.policy_input(dir, OsStr::new(".gitignore"));
-        }
+        let inputs = [
+            ".ferretignore",
+            ".ignore",
+            ".rgignore",
+            DOT_GIT,
+            ".gitignore",
+        ]
+        .map(OsStr::new);
+        // `.gitignore` counts only inside a work tree; see below for a root.
+        let inputs = match in_work_tree {
+            true => &inputs[..],
+            false => &inputs[..4],
+        };
+        self.visit.policy_inputs(dir, inputs);
         let [ferretignore, ignore, rgignore] =
             [".ferretignore", ".ignore", ".rgignore"].map(|name| {
                 listed(name)
