@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rustix::fs::{
     AtFlags, CWD, FileType as RawType, Mode, OFlags, RawDir, Statx, StatxFlags, makedev, open,
-    openat, statx,
+    openat, readlinkat, statx,
 };
 
 use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
@@ -300,9 +300,8 @@ impl Entry {
             return Ok(catalog.link_target(id).unwrap_or_default().to_vec());
         }
         Ok(self
-            .with_observed_path(|path| fs::read_link(path))?
-            .into_os_string()
-            .into_vec())
+            .with_observed_at(|dir, path| readlinkat(dir, path, Vec::new()))?
+            .into_bytes())
     }
     // A retained parent is the capability for every live re-resolution of
     // this observed name. /proc exposes it to std APIs without unsafe code.
@@ -319,7 +318,7 @@ impl Entry {
     // As `with_observed_path`, but as a directory handle and a path beneath
     // it, for `*at` calls: they resolve the same name without a walk through
     // procfs.
-    fn with_observed_at<T>(&self, lookup: impl FnOnce(BorrowedFd<'_>, &Path) -> T) -> T {
+    pub(super) fn with_observed_at<T>(&self, lookup: impl FnOnce(BorrowedFd<'_>, &Path) -> T) -> T {
         if let Some((parent, name)) = self.observed_at() {
             return lookup(parent.as_fd(), Path::new(OsStr::from_bytes(&name)));
         }
