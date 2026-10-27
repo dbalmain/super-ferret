@@ -837,6 +837,18 @@ fn empty_lists_a_directory_it_may_read_but_not_search() {
 }
 
 #[test]
+fn printf_names_the_filesystem_from_the_mount_table() {
+    // A live %F once named statfs's magic number, so devtmpfs read as
+    // tmpfs and vfat as UNKNOWN; GNU names the mount holding the device.
+    let tree = Tree::new("printf-filesystem");
+    let args = ["/", "/dev", "/proc", "-maxdepth", "0", "-printf", "%F\n"];
+    let gnu = tree.run(true, &args);
+    let ferret = tree.run(false, &args);
+    assert_eq!(ferret.status.code(), gnu.status.code(), "{ferret:?}");
+    assert_eq!(ferret.stdout, gnu.stdout, "{ferret:?}");
+}
+
+#[test]
 fn a_first_child_directory_observation_survives_an_ancestor_rename() {
     // R3 #3: the first child-directory stat taken while listing a directory
     // used the entry's pathname (`cached_metadata(entry.path(), follow)`)

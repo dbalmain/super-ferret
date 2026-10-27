@@ -353,11 +353,13 @@ fn field(
             }
         }
         b'F' => {
-            if entry.catalog().is_some() {
-                let dev = entry.stat()?.dev();
-                let name = super::test::filesystem_type(dev)
-                    .ok_or_else(|| io::Error::other("indexed filesystem is no longer mounted"))?;
+            // GNU names the mount whose device holds the entry; statfs's
+            // magic number is the fallback for a device no mount lists.
+            let dev = entry.stat()?.dev();
+            if let Some(name) = super::test::filesystem_type(dev) {
                 out.extend_from_slice(name.as_bytes());
+            } else if entry.catalog().is_some() {
+                return Err(io::Error::other("indexed filesystem is no longer mounted"));
             } else {
                 out.extend_from_slice(entry.with_observed_path(filesystem)?.as_bytes());
             }
