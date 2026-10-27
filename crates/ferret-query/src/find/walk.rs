@@ -1209,14 +1209,16 @@ impl LiveWalk {
                         entry.path.push(b'/');
                     }
                     entry.path.extend_from_slice(child.bytes);
-                    let observed = handle.as_ref().map(|directory| {
-                        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-                            .join(OsStr::from_bytes(child.bytes))
-                    });
-                    let missing = fs::symlink_metadata(
-                        observed.as_deref().unwrap_or(entry.lookup_path().as_ref()),
-                    )
-                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+                    let missing = match &handle {
+                        Some(directory) => statat(
+                            directory,
+                            OsStr::from_bytes(child.bytes),
+                            AtFlags::SYMLINK_NOFOLLOW,
+                        )
+                        .is_err_and(|error| error == rustix::io::Errno::NOENT),
+                        None => fs::symlink_metadata(entry.lookup_path().as_ref())
+                            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                    };
                     entry.path.truncate(own_len);
                     let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| removed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.contains(&id)));
                     if missing && (child.kind != Kind::Dir || removed_here) {
