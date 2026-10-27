@@ -6206,8 +6206,15 @@ fn swap_after_listing(fixture: &Fixture, dir: &str, limit: Option<u32>) -> Vec<S
     fixture.write(".ferretignore", b"/d/\n");
     fixture.write("outside", b"hit OUTSIDE\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
-    // Walk order is directory order, so ask a walk for it.
-    let listed = fixture.ferret(&["grep", "--files", "-uu", "d"], None);
+    // Walk order is directory order, so ask a one-thread walk for it; a
+    // parallel `--files` lists in no fixed order (D130).
+    let mut listing = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    listing
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "--files", "-uu", "d"])
+        .env("FERRET_SEARCH_THREADS", "1");
+    let listed = run(listing, None);
     let order = String::from_utf8(listed.stdout).unwrap();
     let names: Vec<_> = order.lines().collect();
     let Some((victim, before)) = names.split_last() else {

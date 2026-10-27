@@ -185,19 +185,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     };
     let pin = engine.as_ref().map(Engine::pin);
     let threads = pin.as_ref().map_or_else(
-        || {
-            live.as_ref().map_or_else(
-                || {
-                    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
-                    engine::search_threads(
-                        engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()),
-                        None,
-                        available,
-                    )
-                },
-                live::Anchors::search_threads,
-            )
-        },
+        || local_threads(live.as_ref()),
         engine::QuerySession::search_threads,
     );
     let cancelled = AtomicBool::new(false);
@@ -741,6 +729,22 @@ fn resolve_each(paths: &[PathBuf], names_only: bool, cwd: &Path) -> Vec<Input> {
             }
         })
         .collect()
+}
+
+/// Search threads for a walk with no index pinned: the policy index's
+/// setting under live anchors, else the environment's or the default.
+fn local_threads(live: Option<&live::Anchors>) -> usize {
+    live.map_or_else(
+        || {
+            let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+            engine::search_threads(
+                engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()),
+                None,
+                available,
+            )
+        },
+        live::Anchors::search_threads,
+    )
 }
 
 /// D111 routes a request through ferretd only when every operand is a

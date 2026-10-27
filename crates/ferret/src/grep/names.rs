@@ -12,6 +12,8 @@ use std::{panic, thread};
 use super::visibility::{Visibility, Visit};
 use super::*;
 
+mod parallel;
+
 pub(super) fn run(
     plan: &Names,
     index: Option<&Path>,
@@ -123,6 +125,7 @@ fn execute_routed(
         selection,
         inputs,
         catalog: catalog.as_ref(),
+        threads: local_threads(live.as_ref()),
         live: live.as_ref(),
         cwd: &cwd,
         runtime: &runtime,
@@ -155,6 +158,7 @@ pub(super) fn pinned(
         inputs: resolve_inputs_at(paths, true, cwd),
         catalog: Some(catalog),
         live: None,
+        threads: 1,
         cwd,
         runtime,
     }
@@ -167,6 +171,9 @@ struct Listing<'a> {
     inputs: Vec<Input>,
     catalog: Option<&'a Catalog>,
     live: Option<&'a live::Anchors>,
+    /// Workers for a live-walked directory; names from more than one
+    /// arrive in no fixed order (D130).
+    threads: usize,
     cwd: &'a Path,
     runtime: &'a Runtime<'a>,
 }
@@ -178,6 +185,7 @@ impl Listing<'_> {
             inputs,
             catalog,
             live,
+            threads,
             cwd,
             runtime,
         } = self;
@@ -266,6 +274,38 @@ impl Listing<'_> {
                         max_depth: plan.traversal.max_depth,
                         content: false,
                     };
+                    // A sort or `-q` needs every name, or only the first, in
+                    // walk order; anything else may list a live walk on
+                    // several workers.
+                    if threads > 1
+                        && listed.held.is_none()
+                        && !plan.quiet
+                        && let sources::Directory::Live(walk) = source
+                    {
+                        let parallel = parallel::Walk {
+                            plan,
+                            visibility: &visibility,
+                            threads,
+                            flush_each,
+                            cancelled,
+                        };
+                        match parallel.run(walk, policy.take(), writer, runtime)? {
+                            parallel::Listed::Done {
+                                any,
+                                errors: failed,
+                            } => {
+                                listed.any |= any;
+                                errors |= failed;
+                                continue;
+                            }
+                            parallel::Listed::Closed => return Ok(Exit::Ok),
+                            parallel::Listed::Refused(refused) => {
+                                let (walk, refused) = *refused;
+                                source = sources::Directory::Live(walk);
+                                policy = refused;
+                            }
+                        }
+                    }
                     let mut descend = true;
                     while let Some(entry) =
                         source.next_with_cancel(descend, &mut || Ok(()), &mut || {
