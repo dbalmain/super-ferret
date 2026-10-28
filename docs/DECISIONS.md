@@ -7304,6 +7304,40 @@ rather than fixing it. B is archived as tag `archive/perf-d129-open`. The
 C follow-up was not put to Dave; main keeps its option A, so a segment
 still checks term order when it opens.
 
+**Reopened (Dave, 2026-10-27, on the decisions page):** "If B has benefits
+when the daemon _is_ running, I'll reconsider. That does change how I feel
+about C."
+
+Checked 2026-10-28 at 544424b. The daemon opens segments through the same
+`ferret-index` code as one-shot grep (`Engine::attach_content` calls
+`IndexWriter::open_with_threads`), so C already cuts daemon memory and is
+not no-daemon debt. B as built does not reach the daemon: only a reader's
+`View` opens its halves lazily, and every view the daemon publishes comes
+from its writer, which opens both halves. Measured per half, single-threaded
+open, best of 7, warm:
+
+| Index | Term half resident | Trigram half resident | Term half open |
+| --- | --- | --- | --- |
+| `~/w` (12k documents, live daemon index) | 0.39 MB | 0.12 MB | 0.33 ms |
+| corpus (112k documents) | 9.6 MB | 7.2 MB | 8.5 ms |
+
+The live msa2 daemon's RSS is 24 MB, so the term half is 1.6% of it.
+
+**Question:** Should B be extended so the daemon's writer opens the term half
+only when a query needs it?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Leave B dropped | The daemon keeps the term half resident: 0.39 MB on `~/w`, 9.6 MB on the 112k corpus (32-85 bytes a document) | Nothing to build; diagnostics stay eager |
+| B. Lazy halves in the writer's views too | A lazy half that survives each view swap, opened by any merge or follow that reads term segments; B's narrower damage reporting (above) for the daemon too | The term half's memory and open time until the first `text:` query or term merge. Merges run after follows, so the saving erodes on an active tree |
+
+**Recommendation: A.** The saving is under half a megabyte on the real index
+and lasts only until the next term merge.
+
+**Fact that would change it:** an index around 1M documents or more (up to
+85 MB of term half) where `text:` queries are rare. D65's static dictionary
+replaces the term half's index in any case and should be judged first.
+
 ## D130 — Whether `ferret grep --files` walks in parallel
 
 **Question:** Should an uncovered `--files` walk run on several threads, as
