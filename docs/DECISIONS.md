@@ -7427,6 +7427,25 @@ queue would wait on a follow that cannot start before the commit. Not
 built; it is worth building only if a cold-cache first build shows the
 reread matters.
 
+**Measured (2026-10-29, msa2, deployed 8b0eda6):** a first build of `~/w`
+into an empty scratch index, straight after
+`sync; echo 3 > /proc/sys/vm/drop_caches`, then again warm as the control.
+51,600 files and 682 MB read; 11,995 documents.
+
+| Run | Total | Walk | Hash (summed over workers) | Commit |
+| --- | --- | --- | --- | --- |
+| cold | 6.99 s | 1.49 s | 18.9 s | 0.07 s |
+| warm | 5.51 s | 0.06 s | 0.41 s | 0.06 s |
+
+The cold run is 1.48 s slower, and the walk alone accounts for 1.43 s of
+that, so the follow pass's cold penalty is within about 50 ms: under 1% of
+the cold build, against the 10% bar. The crawl has just read every document
+into the page cache, and 682 MB stays cached on any machine with memory to
+spare, so the reread is a cache hit even on a cold build. Most of the warm
+build is the follow pass's tokenising and indexing, not its reads. **A
+stands; the byte cache is not built.** It would matter only where the
+documents a crawl reads do not fit in the page cache.
+
 ## D132 — A walked directory's rules load at its first entry
 
 **Decided (2026-10-27, branch perf-policy-listing):** grep's live walk loads a
