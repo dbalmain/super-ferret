@@ -7338,6 +7338,9 @@ and lasts only until the next term merge.
 85 MB of term half) where `text:` queries are rare. D65's static dictionary
 replaces the term half's index in any case and should be judged first.
 
+**Answered (Dave, 2026-10-29): A.** B stays dropped; the daemon keeps
+both halves resident.
+
 ## D130 — Whether `ferret grep --files` walks in parallel
 
 **Question:** Should an uncovered `--files` walk run on several threads, as
