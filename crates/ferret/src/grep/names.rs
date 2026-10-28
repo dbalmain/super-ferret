@@ -27,7 +27,12 @@ pub(super) fn run(
         Ok(selection) => selection,
         Err(error) => return failure(&error),
     };
-    let routed = match routing::route(resolve_inputs(&plan.paths, true), plan.traversal, index) {
+    let routed = match routing::route(
+        resolve_inputs(&plan.paths, true),
+        plan.traversal,
+        index,
+        selection.positive(),
+    ) {
         Ok(routed) => routed,
         Err(refusal) => return refusal.exit(args, consumed),
     };
@@ -85,8 +90,13 @@ fn execute(
     cancelled: &AtomicBool,
 ) -> Result<Exit, String> {
     let selection = selection(plan)?;
-    let routed = routing::route(resolve_inputs(&plan.paths, true), plan.traversal, index)
-        .map_err(Refusal::into_message)?;
+    let routed = routing::route(
+        resolve_inputs(&plan.paths, true),
+        plan.traversal,
+        index,
+        selection.positive(),
+    )
+    .map_err(Refusal::into_message)?;
     execute_routed(plan, selection, index, routed, writer, cancelled)
 }
 

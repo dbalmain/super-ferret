@@ -546,13 +546,27 @@ only by the live and uncovered walks. The crawl never reads them, so a `!` line
 there does not reveal an indexed hidden name, although rg, and `--rg` over an
 uncovered directory, would show it.
 
+**Positive globs under `--rg` (2026-10-29):** rg lets a positive `-g`
+override its ignore rules. A matching file is searched although
+`.gitignore`, `info/exclude` or `.ignore` excludes it, and an ignored
+directory whose own path matches is entered. The index keeps no content
+below an ignored name, so under `--rg` a request with any positive glob
+walks every directory operand live under rg's rules, as an uncovered
+operand does, and never asks the daemon. Negative globs and `-t` types
+override nothing and keep the indexed path. Found by replaying the shadow
+log: `-g '*.{rs,md}'` in a repository listed an excluded `HANDOVER.md`. On
+`~/w` such requests run in about 30 ms live, against 50 ms indexed and 19 ms
+for rg. Without `--rg`, a positive glob still cannot restore an excluded
+name (below).
+
 **D74 A (confirmed 2026-10-16):** indexed visibility is D47/D13, with rg hidden/glob filters
 on top. It uses ferret global rules, `.gitignore`/`info/exclude` inside worktrees
 at/below indexed roots, and higher-priority `.ferretignore`. Ignore-file changes
 require refresh; a query does not read a second policy hierarchy.
 
 Cases where rg can search what indexed grep cannot: ferret-only global or
-`.ferretignore` exclusions; positive `-g` that overrides an index exclusion;
+`.ferretignore` exclusions; positive `-g` that overrides an index exclusion
+(without `--rg`);
 `--hidden` when the hidden tree was ferret-excluded (notably `.git`);
 rg reinclusion that ferret's traversal did not retain (including different
 negation precedence); new names; and catalogued binary content without `-a`.

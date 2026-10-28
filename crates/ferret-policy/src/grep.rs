@@ -98,6 +98,13 @@ impl GrepSelection {
         self
     }
 
+    /// Whether some `-g` admits paths. rg lets such a glob override its
+    /// ignore rules, which the index cannot do for a name it keeps no content
+    /// under.
+    pub fn positive(&self) -> bool {
+        self.positive
+    }
+
     /// Adds one `-g` operand. Leading `!` excludes; the last matching rule
     /// wins. Invalid globs fail before any content is searched.
     pub fn push(&mut self, glob: &str) -> Result<(), GrepGlobError> {

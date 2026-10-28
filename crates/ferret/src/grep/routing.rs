@@ -19,17 +19,21 @@ pub(super) struct Routed {
     pub daemon: bool,
 }
 
+/// `whitelists`: under `--rg`, a positive glob overrides ignore rules, so
+/// every directory operand walks live under rg's rules, as an uncovered one
+/// does.
 pub(super) fn route(
     inputs: Vec<Input>,
     traversal: Traversal,
     index: Option<&Path>,
+    whitelists: bool,
 ) -> Result<Routed, Refusal> {
     let recursive = inputs
         .iter()
         .any(|input| matches!(input, Input::Directory(_)));
     let indexed = recursive && !traversal.unrestricted && !traversal.live;
     let anchors = indexed
-        .then(|| live::Anchors::routing(index, &inputs))
+        .then(|| live::Anchors::routing(index, &inputs, traversal.rg && whitelists))
         .transpose()
         .map_err(Refusal::Failed)?;
     let catalog = indexed

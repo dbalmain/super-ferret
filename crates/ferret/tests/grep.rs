@@ -759,6 +759,39 @@ fn a_whitelist_reveals_nothing_without_rg() {
     assert!(shows_env(&["--rg"]));
 }
 
+// rg's positive `-g` overrides ignore rules: a matching file is searched
+// although `.gitignore`, `info/exclude` or `.ignore` excludes it, and an
+// ignored directory whose own path matches is entered. The index keeps no
+// content below an ignored name, so under `--rg` these requests walk live.
+// A negative glob or a `-t` type overrides nothing.
+#[test]
+fn a_positive_glob_reveals_ignored_files_under_rg() {
+    let fixture = Fixture::new("glob-overrides-ignore");
+    fixture.write("app/.git/HEAD", b"ref: refs/heads/main\n");
+    fixture.write("app/.git/info/exclude", b"excluded.md\n");
+    fixture.write("app/.gitignore", b"ignored.md\nbuild/\n");
+    fixture.write("app/.ignore", b"dotignored.md\n");
+    fixture.write("app/ignored.md", b"lantern\n");
+    fixture.write("app/excluded.md", b"lantern\n");
+    fixture.write("app/dotignored.md", b"lantern\n");
+    fixture.write("app/kept.md", b"lantern\n");
+    fixture.write("app/kept.rs", b"lantern\n");
+    fixture.write("app/build/out.md", b"lantern\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let md = fixture.compare(&["-l", "-g", "*.md", "lantern"], None);
+    let md = String::from_utf8(md.stdout).unwrap();
+    assert!(md.contains("ignored.md") && !md.contains("out.md"), "{md}");
+    let all = fixture.compare(&["-l", "-g", "*", "lantern"], None);
+    let all = String::from_utf8(all.stdout).unwrap();
+    assert!(all.contains("out.md"), "{all}");
+    fixture.compare(&["--files", "-g", "*.{md,rs}"], None);
+    fixture.compare(&["-c", "-g", "app/**", "lantern", "app"], None);
+    let typed = fixture.compare(&["-l", "-t", "md", "lantern"], None);
+    let typed = String::from_utf8(typed.stdout).unwrap();
+    assert!(!typed.contains("ignored.md"), "{typed}");
+    fixture.compare(&["-l", "-g", "!*.rs", "lantern"], None);
+}
+
 #[test]
 fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     let fixture = Fixture::new("spill");

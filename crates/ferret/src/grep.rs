@@ -159,7 +159,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(cwd) => cwd,
         Err(error) => return failure(&error.to_string()),
     };
-    let routed = match routing::route(inputs, plan.traversal, index) {
+    let routed = match routing::route(inputs, plan.traversal, index, selection.positive()) {
         Ok(routed) => routed,
         Err(refusal) => return refusal.exit(args, consumed),
     };

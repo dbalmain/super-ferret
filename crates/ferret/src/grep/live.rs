@@ -94,7 +94,8 @@ impl Anchors {
         }
     }
     /// Resolves coverage before either the engine or the daemon is opened.
-    pub fn routing(index: Option<&Path>, inputs: &[Input]) -> Result<Self, String> {
+    /// `walk_all` leaves every directory operand uncovered.
+    pub fn routing(index: Option<&Path>, inputs: &[Input], walk_all: bool) -> Result<Self, String> {
         let index = index_path(index)?;
         let catalog = Catalog::open(&index).map_err(|e| e.to_string())?;
         let paths = catalog
@@ -122,7 +123,8 @@ impl Anchors {
         for input in inputs {
             if let Input::Directory(path) = input {
                 let real = fs::canonicalize(path).map_err(|e| e.to_string())?;
-                if !anchors.roots.iter().any(|root| real.starts_with(root))
+                if walk_all
+                    || !anchors.roots.iter().any(|root| real.starts_with(root))
                     || !spellings.resolves(path, catalog.as_ref())?
                 {
                     uncovered.push(path.clone());
