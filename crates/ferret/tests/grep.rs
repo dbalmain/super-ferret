@@ -838,6 +838,29 @@ fn a_pruned_walk_still_reaches_what_it_must() {
     assert_eq!(excluded.status.code(), Some(2), "{excluded:?}");
 }
 
+// A nested root indexed while unreadable has no name row and no catalogued
+// contents: the pruned walk must still list it live, for its error while it
+// stays unreadable and for its matches once it is readable again.
+#[test]
+fn a_pruned_walk_lists_an_opaque_nested_root() {
+    let fixture = Fixture::new("pruned-opaque-root");
+    fixture.write("held/needle.txt", b"zebra\n");
+    for i in 0..8 {
+        fixture.write(&format!("empty{i}/file.txt"), b"nothing\n");
+    }
+    fixture.write("branch/inner/match.txt", b"zebra\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let inner = fixture.tree().join("branch/inner");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o000)).unwrap();
+    fixture.ferret(&["index", "branch/inner"], None);
+    let denied = fixture.compare(&["-l", "zebra", "."], None);
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(denied.status.code(), Some(2), "{denied:?}");
+    let listed = fixture.compare(&["-l", "zebra", "."], None);
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("match.txt"), "{listed}");
+}
+
 #[test]
 fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     let fixture = Fixture::new("spill");

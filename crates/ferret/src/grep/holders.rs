@@ -23,9 +23,9 @@ impl Holders {
     /// One pass over the catalog's names, a run at a time. Holds the
     /// directory of each candidate document's names; of each file the index
     /// cannot vouch for (oversized, or binary under `text`), which is
-    /// searched live; and each directory whose contents are not catalogued,
-    /// which the walk lists live or reports as unreadable. Then each held
-    /// directory's ancestors. `Ok(None)` when cancelled.
+    /// searched live; and each directory or root whose contents are not
+    /// catalogued, which the walk lists live or reports as unreadable. Then
+    /// each held directory's ancestors. `Ok(None)` when cancelled.
     pub fn new(
         catalog: &Catalog,
         candidates: &dyn Candidates,
@@ -70,8 +70,12 @@ impl Holders {
             }
         }
         // A nested root has no name row in the outer root (D34): the walk
-        // reaches it from the directory holding its path.
+        // reaches it from the directory holding its path. One whose contents
+        // are not catalogued is held itself, as a directory's would be.
         for (root, path) in catalog.roots() {
+            if catalog.contents(Target::Inode(root)) != Some(Contents::Catalogued) {
+                held.push(root);
+            }
             let parent = std::path::Path::new(std::ffi::OsStr::from_bytes(path)).parent();
             if let Some(ferret_catalog::Resolved {
                 target: Target::Inode(parent),
