@@ -559,6 +559,24 @@ log: `-g '*.{rs,md}'` in a repository listed an excluded `HANDOVER.md`. On
 for rg. Without `--rg`, a positive glob still cannot restore an excluded
 name (below).
 
+**Pruned indexed walks (2026-10-30):** an indexed walk listed every
+catalogued name below its operand, about 0.7 µs a name, however few
+candidates the index returned. On `~/w` (57k names) that was 38 ms of a
+52 ms answer for a three-file term, with or without a glob. When the operand
+is too large to probe (S5), one pass over the names (5 ms on `~/w`) now marks
+the directories holding a candidate document, a file the index cannot vouch
+for (over the size cap, or binary under `-a`), or a directory listed live,
+plus their ancestors and nested roots' parents; the walk enters no other
+directory. Skipped directories hold only non-candidates, so output is
+unchanged. Only D99's "no files were searched" depends on them: with no path
+and nothing selected, the walk is repeated unpruned until it selects a file.
+Not used for `-v`, `--files-without-match`, `--include-zero` counts, `-L`,
+live walks, or a bound of at least one candidate a document. Through the
+daemon on `~/w` (`-l`, msa2): a three-file term 56 → 20 ms (rg 59), `tokio`
+57 → 15 ms, `unwrap` (~1k candidates) 59 → 23 ms, `lantern` (~2.8k) 60 →
+41 ms, `-t md` 70 → 12 ms (rg 24); `fn` (every document) is not pruned,
+122 → 127 ms within noise (rg 56).
+
 **D74 A (confirmed 2026-10-16):** indexed visibility is D47/D13, with rg hidden/glob filters
 on top. It uses ferret global rules, `.gitignore`/`info/exclude` inside worktrees
 at/below indexed roots, and higher-priority `.ferretignore`. Ignore-file changes

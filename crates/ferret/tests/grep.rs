@@ -792,6 +792,52 @@ fn a_positive_glob_reveals_ignored_files_under_rg() {
     fixture.compare(&["-l", "-g", "!*.rs", "lantern"], None);
 }
 
+// A walk too large to probe lists only the directories holding a candidate.
+// It must still reach every name of a hard-linked candidate, a nested root,
+// and the files the index cannot vouch for: one over the size cap, and a
+// binary one under `-a`. With no path, D99 still finds the files below the
+// directories it skipped: `-t md` with no match exits 1, not 2. (A positive
+// `-g` walks live under `--rg`, so it never prunes.)
+#[test]
+fn a_pruned_walk_still_reaches_what_it_must() {
+    let fixture = Fixture::new("pruned-walk");
+    fixture.write("held/needle.txt", b"zebra\n");
+    fs::create_dir_all(fixture.tree().join("linked")).unwrap();
+    fs::hard_link(
+        fixture.tree().join("held/needle.txt"),
+        fixture.tree().join("linked/needle.txt"),
+    )
+    .unwrap();
+    for i in 0..8 {
+        fixture.write(&format!("empty{i}/deep/file.txt"), b"nothing\n");
+    }
+    fixture.write(
+        "big/deep/large.txt",
+        &[vec![b'x'; 9 << 20], b"\nzebra\n".to_vec()].concat(),
+    );
+    fixture.write("binary/deep/blob", b"\0\0zebra\n");
+    fixture.write("nested/root/inner.txt", b"zebra\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    assert!(
+        fixture
+            .ferret(&["index", "nested/root"], None)
+            .status
+            .success()
+    );
+    let listed = fixture.compare(&["-l", "zebra"], None);
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    for path in ["held/", "linked/", "large.txt", "inner.txt"] {
+        assert!(listed.contains(path), "{path}: {listed}");
+    }
+    let text = fixture.compare(&["-a", "-l", "zebra"], None);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("blob"));
+    fixture.compare(&["-c", "zebra", "."], None);
+    let none = fixture.compare(&["-l", "-t", "md", "zebra"], None);
+    assert_eq!(none.status.code(), Some(1), "{none:?}");
+    let excluded = fixture.compare(&["-l", "-t", "c", "zebra"], None);
+    assert_eq!(excluded.status.code(), Some(2), "{excluded:?}");
+}
+
 #[test]
 fn spill_output_preserves_a_large_group_and_unterminated_last_line() {
     let fixture = Fixture::new("spill");

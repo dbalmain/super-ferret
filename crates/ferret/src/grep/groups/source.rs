@@ -1,6 +1,7 @@
 //! Which entries a walk searches: the per-entry filter, and the serial operand
 //! source that feeds [`run`](super::run).
 
+use super::super::holders::Holders;
 use super::super::visibility::{Visibility, Visit};
 use super::job::Job;
 use super::*;
@@ -28,6 +29,7 @@ impl Candidates for engine::GrepCandidates<'_> {
 pub(in super::super) struct Filter<'a> {
     catalog: Option<&'a ferret_catalog::Catalog>,
     candidates: Option<&'a dyn Candidates>,
+    holders: Option<&'a Holders>,
     emit_absent: bool,
     pub(super) traversal: line_grep::Traversal,
     text: bool,
@@ -74,7 +76,19 @@ impl Filter<'_> {
         match visit {
             Ok(Visit::File) => {}
             Ok(Visit::Descend) => {
-                *descend = true;
+                *descend = self
+                    .holders
+                    .zip(self.catalog)
+                    .is_none_or(|(holders, catalog)| {
+                        entry.catalog_name().is_none_or(|name| {
+                            match ferret_catalog::Target::from_child(catalog.name(name).child) {
+                                ferret_catalog::Target::Inode(directory) => {
+                                    holders.holds(directory)
+                                }
+                                ferret_catalog::Target::Ignored(_) => true,
+                            }
+                        })
+                    });
                 return None;
             }
             Ok(Visit::Skip) => {
@@ -169,6 +183,7 @@ pub(in super::super) struct Source<'a> {
     pub(super) live: Option<&'a live::Anchors>,
     policy: Option<live::Policy>,
     searched: bool,
+    until_searched: bool,
     #[cfg(test)]
     pub(super) on_entry: Option<Box<OnEntry>>,
     #[cfg(test)]
@@ -189,6 +204,7 @@ impl<'a> Source<'a> {
             filter: Filter {
                 catalog,
                 candidates,
+                holders: None,
                 emit_absent: false,
                 traversal: Default::default(),
                 text: false,
@@ -198,6 +214,7 @@ impl<'a> Source<'a> {
             live: None,
             policy: None,
             searched: false,
+            until_searched: false,
             #[cfg(test)]
             on_entry: None,
             #[cfg(test)]
@@ -217,6 +234,19 @@ impl<'a> Source<'a> {
     ) -> Self {
         self.filter.traversal = traversal;
         self.filter.text = text;
+        self
+    }
+
+    /// Leaves catalogued directories that `holders` does not hold unlisted.
+    pub(in super::super) fn with_holders(mut self, holders: Option<&'a Holders>) -> Self {
+        self.filter.holders = holders;
+        self
+    }
+
+    /// Ends the walk at the first file it selects, yielding no job: the
+    /// question is only whether any file passes the filters (D99).
+    pub(in super::super) fn until_searched(mut self) -> Self {
+        self.until_searched = true;
         self
     }
 
@@ -276,15 +306,19 @@ impl<'a> Source<'a> {
                     if let Some(hook) = &mut self.on_entry {
                         hook(entry.path());
                     }
-                    if let Some(job) = self.filter.entry(
+                    let job = self.filter.entry(
                         entry,
                         &mut self.descend,
                         self.policy.as_mut(),
                         &mut self.searched,
                         None,
                         stopped,
-                    ) {
-                        return Some(job);
+                    );
+                    if self.until_searched && self.searched {
+                        return None;
+                    }
+                    if job.is_some() {
+                        return job;
                     }
                 }
                 self.source = None;

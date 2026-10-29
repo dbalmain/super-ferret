@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod groups;
+mod holders;
 mod json;
 mod live;
 mod names;
@@ -386,11 +387,42 @@ impl Execution<'_> {
                 }
             }
         }
+        // A walk too large to probe lists only the directories holding a
+        // candidate. Absent files, followed links and live walks need every
+        // directory.
+        let prune = reachable.is_none()
+            && plan.universe() == line_grep::Universe::Candidates
+            && !plan.traversal.follow
+            && !plan.traversal.unrestricted;
         if let (Some(candidates), Some((reachable, _))) = (&mut candidates, reachable)
             && let Err(error) = candidates.probe(reachable, &stopped)
         {
             return runtime.failure(&error.to_string());
         }
+        // Past one candidate a document, every directory may hold one.
+        let holders = match candidates.as_ref().zip(pin).filter(|(candidates, pin)| {
+            prune && candidates.bound() < u64::from(pin.catalog().doc_count())
+        }) {
+            Some((candidates, pin)) => {
+                match holders::Holders::new(pin.catalog(), candidates, plan.text, &stopped) {
+                    Ok(holders) => holders,
+                    Err(error) => return runtime.failure(&error.to_string()),
+                }
+            }
+            None => None,
+        };
+        // D99 asks whether the walk selected any file; pruning can skip
+        // the only ones. Kept to ask again without it.
+        let operands: Option<Vec<PathBuf>> =
+            (holders.is_some() && plan.paths.is_empty()).then(|| {
+                inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        Input::Directory(path) => Some(path.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            });
         let mut host = Host {
             plan,
             filename: plan
@@ -459,6 +491,7 @@ impl Execution<'_> {
                 )
                 .with_traversal(plan.traversal, plan.text)
                 .with_live(live)
+                .with_holders(holders.as_ref())
                 .with_absence(plan.universe() == line_grep::Universe::Searchable);
                 let walked = (threads > 1 && source.walks_live()).then(|| {
                     groups::walk(&mut host, &mut source, threads, cancelled, &mut searched)
@@ -527,6 +560,20 @@ impl Execution<'_> {
                     break 'inputs;
                 }
             }
+        }
+        if let Some(operands) = operands.filter(|_| !searched && !stopped()) {
+            let mut source = groups::Source::new(
+                operands.into_iter().map(Input::Directory).collect(),
+                pin.map(|p| p.catalog()),
+                None,
+                selection,
+                cwd.to_owned(),
+            )
+            .with_traversal(plan.traversal, plan.text)
+            .with_live(live)
+            .until_searched();
+            while source.next(&stopped).is_some() {}
+            searched = source.searched();
         }
         if plan.json
             && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start)
