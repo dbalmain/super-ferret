@@ -1101,17 +1101,22 @@ impl Catalog {
     /// [`Section::Names`].
     pub fn children(&self, dir: InoId) -> impl Iterator<Item = NameId> + '_ {
         let (start, end) = self.child_range(dir);
-        // Checkpoint children are already sorted by basename. Effective
-        // overlays merge sparse names with their surviving base range.
-        let merged = self.overlay.as_ref().map(|o| {
-            let mut ids: Vec<_> = (start as u32..end as u32)
-                .map(NameId)
-                .filter(|&id| self.base_name_live(id))
-                .collect();
-            ids.extend(o.namespace().children(dir.0).map(NameId));
-            ids.sort_unstable_by(|&a, &b| self.name(a).bytes.cmp(self.name(b).bytes));
-            ids
-        });
+        // Checkpoint children are already sorted by basename. An overlay that
+        // touches `dir` merges its sparse names with the surviving base
+        // range; an untouched directory, most of them, lists the range.
+        let merged = self
+            .overlay
+            .as_ref()
+            .filter(|o| o.namespace().touches(dir.0))
+            .map(|o| {
+                let mut ids: Vec<_> = (start as u32..end as u32)
+                    .map(NameId)
+                    .filter(|&id| self.base_name_live(id))
+                    .collect();
+                ids.extend(o.namespace().children(dir.0).map(NameId));
+                ids.sort_unstable_by(|&a, &b| self.name(a).bytes.cmp(self.name(b).bytes));
+                ids
+            });
         let base = if merged.is_none() {
             start as u32..end as u32
         } else {

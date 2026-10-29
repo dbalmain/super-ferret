@@ -1,9 +1,11 @@
 //! Sparse, immutable replacements over a pinned checkpoint. Payload families
 //! stay independent: namespace graph checks wait for a name/path consumer.
+mod ids;
 mod runs;
 use crate::generation::Manifest;
 use crate::log::{Family, Log, Record};
 use crate::{Catalog, DecodeError, InoId, Kind, Name, NameId, OpenError, Section, Target};
+use ids::Ids;
 use runs::{Row, Runs};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -17,6 +19,7 @@ pub(crate) const INODE: u64 = 5;
 pub(crate) const LINK: u64 = 6;
 pub(crate) const WORKTREE: u64 = 7;
 pub(crate) const DOC: u64 = 8;
+const CATEGORIES: usize = 9;
 fn key(category: u64, id: u32) -> u64 {
     category << 32 | u64::from(id)
 }
@@ -40,11 +43,15 @@ fn bad(label: &'static str) -> OpenError {
 #[derive(Clone, Default)]
 pub(crate) struct Projection {
     rows: Runs<u64, Arc<Record>>,
-    categories: u16,
+    /// The ids each category holds a row for. Most lookups miss, and a miss
+    /// answers from one bit rather than probing every run: on a 57k-name
+    /// tree, a 13k-record overlay otherwise made a daemon grep twice as
+    /// slow (2026-10-30).
+    present: [Ids; CATEGORIES],
 }
 impl Projection {
     pub(crate) fn get(&self, category: u64, id: u32) -> Option<&Record> {
-        if self.categories & (1 << category) == 0 {
+        if !self.present[category as usize].contains(id) {
             return None;
         }
         self.rows.get(&key(category, id)).map(Arc::as_ref)
@@ -90,9 +97,10 @@ impl Projection {
         self.rows.insert(
             records
                 .map(|r| {
-                    self.categories |= 1 << (record_key(&r) >> 32);
+                    let key = record_key(&r);
+                    self.present[(key >> 32) as usize].insert(key as u32);
                     Row {
-                        key: record_key(&r),
+                        key,
                         sequence,
                         value: r,
                     }
@@ -120,6 +128,9 @@ pub(crate) struct Overlay {
 pub(crate) struct Namespace {
     pub(crate) rows: Projection,
     keys: Runs<(u32, Vec<u8>), Option<u32>>,
+    /// Directories with any child key row: every other directory's children
+    /// are its checkpoint range, unchanged and still in basename order.
+    touched: BTreeSet<u32>,
     pub(crate) suppressed: Vec<u32>,
     pub(crate) names: Vec<u32>,
     pub(crate) heap: Vec<u8>,
@@ -770,6 +781,10 @@ impl Overlay {
         } else {
             Runs::default()
         };
+        let mut touched = self
+            .parent
+            .as_ref()
+            .map_or_else(BTreeSet::new, |p| p.namespace().touched.clone());
         let mut references = self
             .parent
             .as_ref()
@@ -884,6 +899,7 @@ impl Overlay {
             // Coalesce one transaction into one run: removals and additions
             // have the same sequence, so separate runs cannot order them.
             key_rows.extend(additions);
+            touched.extend(key_rows.iter().map(|r| r.key.0));
             keys.insert(key_rows);
             validate_graph(&self.base, &rows, &changed, old_dirs)?;
             let mut affected: BTreeSet<_> = ref_changes
@@ -970,6 +986,7 @@ impl Overlay {
         let _ = self.namespace.set(Arc::new(Namespace {
             rows,
             keys,
+            touched,
             suppressed,
             names,
             heap,
@@ -991,6 +1008,10 @@ impl Namespace {
             .latest_range((parent, Vec::new()), (parent + 1, Vec::new()))
             .into_iter()
             .filter_map(|r| r.value)
+    }
+    /// Whether `dir`'s children differ from its checkpoint range.
+    pub(crate) fn touches(&self, dir: u32) -> bool {
+        self.touched.contains(&dir)
     }
     pub(crate) fn suppresses(&self, id: u32) -> bool {
         self.suppressed.binary_search(&id).is_ok()

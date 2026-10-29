@@ -374,6 +374,74 @@ fn same_sequence_key_removals_and_additions_form_one_run() {
 }
 
 #[test]
+fn listings_follow_the_overlay_only_in_directories_it_touched() {
+    let s = Scratch::new("overlay-touched-directories");
+    commit(&s.path, |tx| {
+        let mut b = tx.batch();
+        let r = b.root(b"/r", dir_stat(1));
+        let tree: [(&[u8], [&[u8]; 2]); 3] = [
+            (b"a", [b"x", b"y"]),
+            (b"b", [b"z", b"zz"]),
+            (b"c", [b"w", b"ww"]),
+        ];
+        for (i, (dir, files)) in tree.into_iter().enumerate() {
+            let d = b.dir(r, dir, dir_stat(10 + i as u64));
+            for (j, file) in files.into_iter().enumerate() {
+                let stat = file_stat(20 + 2 * i as u64 + j as u64);
+                b.file(d, file, stat, Content::Hashed(hash(i as u8 * 2 + j as u8)));
+            }
+            b.entry_count(d, 2);
+        }
+        b.entry_count(r, 3);
+        tx.add(b);
+    });
+    let mut w = Writer::open(&s.path).unwrap();
+    let view = w.view();
+    view.load_all().unwrap();
+    let dir = |name: &[u8]| view.name(view.lookup(InoId(0), name).unwrap()).child;
+    let (a, b, c) = (dir(b"a"), dir(b"b"), dir(b"c"));
+    let x = view.lookup(a, b"x").unwrap();
+    let w_name = view.lookup(c, b"w").unwrap();
+    let names = |view: &Catalog, dir: InoId| -> Vec<Vec<u8>> {
+        view.children(dir)
+            .map(|id| view.name(id).bytes.to_vec())
+            .collect()
+    };
+    // `a` only loses a name: its sole key row is the removal.
+    let moved = Record::NamePut {
+        revealed: false,
+        id: x.0,
+        parent: b.0,
+        child: view.name(x).child.0,
+        name: b"x".to_vec(),
+    };
+    w.commit(w.generation(), &changes(&s, vec![moved])).unwrap();
+    // A later transaction touches only `c`; `a` and `b` stay touched.
+    let renamed = Record::NamePut {
+        revealed: false,
+        id: w_name.0,
+        parent: c.0,
+        child: w.view().name(w_name).child.0,
+        name: b"wx".to_vec(),
+    };
+    w.commit(w.generation(), &changes(&s, vec![renamed]))
+        .unwrap();
+    for view in [w.view(), Catalog::open(&s.path).unwrap().unwrap()] {
+        view.load_all().unwrap();
+        assert_eq!(names(&view, a), [b"y".to_vec()]);
+        assert_eq!(
+            names(&view, b),
+            [b"x".to_vec(), b"z".to_vec(), b"zz".to_vec()]
+        );
+        assert_eq!(names(&view, c), [b"ww".to_vec(), b"wx".to_vec()]);
+        assert_eq!(
+            names(&view, InoId(0)),
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+    }
+}
+
+#[test]
 fn removing_a_directory_incoming_edge_requires_retiring_or_reparenting_it() {
     let s = Scratch::new("overlay-dir-orphan");
     commit(&s.path, |tx| {
