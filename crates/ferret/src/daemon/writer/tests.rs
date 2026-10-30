@@ -63,6 +63,7 @@ fn command(host: &Host, root: &std::path::Path) -> Result<ferret_crawl::Report, 
     let (reply, receive) = mpsc::sync_channel(1);
     host.writer_pending.fetch_add(1, Ordering::AcqRel);
     host.writer_send
+        .send
         .send(Message::Command(Box::new(Command {
             request: Request {
                 id: "index".into(),
@@ -110,7 +111,7 @@ fn deferred_writer(reason: Blocked) {
         Box::new(source.clone()),
         clock.clone(),
     ));
-    let (send, receive) = mpsc::sync_channel(32);
+    let (send, receive) = super::Queue::new(32);
     let (server_send, server_receive) = mpsc::channel();
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
@@ -166,7 +167,7 @@ fn deferred_writer(reason: Blocked) {
         assert!(result.is_ok(), "command was politely deferred: {result:?}");
         assert_ne!(engine.generation(), old.generation());
         host.stop.store(true, Ordering::Release);
-        let _ = host.writer_send.send(Message::Intake);
+        host.writer_send.wake();
         writer
             .join()
             .unwrap_or_else(|_| panic!("writer panic"))
@@ -217,9 +218,7 @@ fn deferred_writer(reason: Blocked) {
     }
     scheduler.sample();
     clock.sleep(Duration::from_secs(2));
-    host.writer_send
-        .send(Message::Intake)
-        .unwrap_or_else(|_| panic!("wake writer"));
+    host.writer_send.wake();
     loop {
         let event = server_receive
             .recv_timeout(Duration::from_secs(5))
@@ -236,7 +235,7 @@ fn deferred_writer(reason: Blocked) {
             .is_none()
     );
     host.stop.store(true, Ordering::Release);
-    let _ = host.writer_send.send(Message::Intake);
+    host.writer_send.wake();
     writer
         .join()
         .unwrap_or_else(|_| panic!("writer panic"))
@@ -355,4 +354,29 @@ fn a_writer_panic_names_its_message_in_the_stopped_cause() {
     let failed = Ok(Err(std::io::Error::other("Is a directory")));
     assert_eq!(stopped_cause(failed).as_deref(), Some("Is a directory"));
     assert_eq!(stopped_cause(Ok(Ok(()))), None);
+}
+
+#[test]
+fn a_burst_of_wakeups_queues_one_and_leaves_room_for_commands() {
+    let (queue, receive) = super::Queue::new(2);
+    for _ in 0..100 {
+        queue.wake();
+    }
+    // A command still fits beside the one queued wakeup.
+    queue
+        .send
+        .try_send(Message::Intake)
+        .unwrap_or_else(|_| panic!("the burst filled the queue"));
+    let first = receive
+        .try_recv()
+        .map_err(|_| mpsc::RecvTimeoutError::Timeout);
+    assert!(matches!(first, Ok(Message::Intake)));
+    queue.received(&first);
+    assert!(matches!(receive.try_recv(), Ok(Message::Intake)));
+    assert!(receive.try_recv().is_err());
+    // Taken, a wakeup queues again.
+    queue.wake();
+    queue.wake();
+    assert!(matches!(receive.try_recv(), Ok(Message::Intake)));
+    assert!(receive.try_recv().is_err());
 }

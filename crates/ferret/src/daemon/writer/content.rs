@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use ferret_catalog::bulk::Control;
 
-use super::{Host, Message, Operation};
+use super::{Host, Operation};
 use crate::engine::Engine;
 
 #[derive(Default)]
@@ -153,7 +153,7 @@ impl Drop for MergeOperation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .merge_running = false;
-        let _ = self.0.writer_send.try_send(Message::Intake);
+        self.0.writer_send.wake();
         super::super::wake_listener(&self.0);
     }
 }

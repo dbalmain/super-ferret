@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +57,51 @@ impl Drop for CommandLane {
 pub(super) enum Message {
     Command(Box<Command>),
     Intake,
+}
+
+/// The writer's inbox. Each command takes a slot; wakeups coalesce into at
+/// most one queued [`Message::Intake`]. Intake wakes the writer once per
+/// inotify event, so uncoalesced, a burst of saves while the writer was busy
+/// filled the queue and turned the next command away as `WriterUnavailable`.
+pub(super) struct Queue {
+    send: mpsc::SyncSender<Message>,
+    /// Whether an `Intake` is queued and not yet received.
+    woken: AtomicBool,
+}
+
+impl Queue {
+    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<Message>) {
+        let (send, receive) = mpsc::sync_channel(capacity);
+        let queue = Self {
+            send,
+            woken: AtomicBool::new(false),
+        };
+        (queue, receive)
+    }
+
+    /// Wakes the writer, unless a wakeup is already queued.
+    pub fn wake(&self) {
+        if !self.woken.swap(true, Ordering::AcqRel) && self.send.try_send(Message::Intake).is_err()
+        {
+            self.woken.store(false, Ordering::Release);
+        }
+    }
+
+    /// Queues a command; it is refused when the queue is full or the writer
+    /// has stopped.
+    pub fn command(&self, command: Command) -> Result<(), ()> {
+        self.send
+            .try_send(Message::Command(Box::new(command)))
+            .map_err(|_| ())
+    }
+
+    /// Marks a queued wakeup taken: an event after this wakes the writer
+    /// again.
+    fn received(&self, message: &Result<Message, mpsc::RecvTimeoutError>) {
+        if let Ok(Message::Intake) = message {
+            self.woken.store(false, Ordering::Release);
+        }
+    }
 }
 #[derive(Default)]
 pub(super) struct Status {
@@ -261,7 +306,6 @@ fn serve(
     drop(loading);
     if let Some(watch) = &watch {
         let watch = watch.clone();
-        let send = host.writer_send.clone();
         let intake_host = host.clone();
         std::thread::Builder::new()
             .name("ferret-intake".into())
@@ -271,7 +315,7 @@ fn serve(
                 // read error stops the host as a failed writer does.
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     watch.run_intake(|| {
-                        let _ = send.try_send(Message::Intake);
+                        intake_host.writer_send.wake();
                         !intake_host.stop.load(Ordering::Acquire)
                     })
                 }));
@@ -369,6 +413,7 @@ fn serve(
         } else {
             receive.recv_timeout(deadline.saturating_duration_since(now))
         };
+        host.writer_send.received(&message);
         match message {
             Ok(Message::Command(command)) => {
                 let mut command_options = options.clone();
@@ -911,10 +956,10 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
     host.writer_pending.fetch_add(1, Ordering::AcqRel);
     if host
         .writer_send
-        .try_send(Message::Command(Box::new(Command {
+        .command(Command {
             request: request.clone(),
             reply,
-        })))
+        })
         .is_err()
     {
         release_pending(&host.writer_pending);

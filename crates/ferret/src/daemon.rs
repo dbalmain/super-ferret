@@ -64,7 +64,7 @@ struct Host {
     query_limit: usize,
     permits: Permits,
     format: u64,
-    writer_send: mpsc::SyncSender<writer::Message>,
+    writer_send: writer::Queue,
     writer_status: Mutex<writer::Status>,
     writer_running: AtomicBool,
     writer_pending: AtomicUsize,
@@ -253,7 +253,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             }
         }
     });
-    let (writer_send, writer_receive) = mpsc::sync_channel(32);
+    let (writer_send, writer_receive) = writer::Queue::new(32);
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
         engine_ready: Condvar::new(),
@@ -353,7 +353,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         }
     }
     host.stop.store(true, Ordering::Release);
-    let _ = host.writer_send.try_send(writer::Message::Intake);
+    host.writer_send.wake();
     let _ = writer.join();
     if let Loaded::Ready(engine) = &*host
         .engine
