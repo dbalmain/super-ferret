@@ -955,7 +955,9 @@ impl IndexWriter {
             let temp = dir.join(format!("tmp-{number}.{extension}"));
             let file = regular::replace(&temp)?;
             let sizes = fill(&file, tri)?;
-            file.sync_all()?;
+            Ok((temp, file, sizes))
+        };
+        let open = |tri: bool, file: File, sizes: Sizes| -> Result<_, Error> {
             let segment = Segment::open(file)?;
             let info = segment.info();
             let version = if tri { TRIGRAM_VERSION } else { TERM_VERSION };
@@ -970,11 +972,27 @@ impl IndexWriter {
             {
                 return Err(ReadError::Head.into());
             }
-            Ok((temp, sizes, Arc::new(segment)))
+            Ok(Arc::new(segment))
         };
-        let (temp, sizes, segment) = write(false, &mut fill)?;
+        let (temp, file, sizes) = write(false, &mut fill)?;
+        // The term file syncs while the trigram file is written: the two
+        // are independent until both are renamed.
+        let (synced, trigram_written) = std::thread::scope(|scope| {
+            let synced = scope.spawn(|| file.sync_all());
+            let written = write(true, &mut fill).and_then(|(temp, file, sizes)| {
+                file.sync_all()?;
+                Ok((temp, file, sizes))
+            });
+            let synced = synced
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (synced, written)
+        });
+        synced?;
         hit(Point::TermSynced)?;
-        let (trigram_temp, trigram_sizes, trigram) = write(true, &mut fill)?;
+        let (trigram_temp, trigram_file, trigram_sizes) = trigram_written?;
+        let segment = open(false, file, sizes)?;
+        let trigram = open(true, trigram_file, trigram_sizes)?;
         let entry = SegmentEntry {
             number,
             first,
