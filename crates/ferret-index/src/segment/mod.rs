@@ -94,6 +94,8 @@ mod h_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use fingerprint::inherit as inherit_fingerprint;
 pub use fingerprint::{RECORD_BLOCK, fingerprint};
 pub use invert::Inverter;
 pub use read::{Hit, Info, PostingCursor, Postings, ReadAt, Segment, TermEntry, Terms};

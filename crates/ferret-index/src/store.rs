@@ -744,9 +744,25 @@ impl IndexWriter {
 
         let mut opened = None;
         if let Some((first, last)) = range {
-            let terms = inverter.drain_into_codec(first, last, self.codec)?;
+            // The two drains share nothing: terms sort on a second thread
+            // while the trigram pairs radix-sort here.
+            let codec = self.codec;
+            let (terms, trigrams) = std::thread::scope(|scope| {
+                #[cfg(test)]
+                let inherit = crate::segment::inherit_fingerprint();
+                let terms = scope.spawn(|| {
+                    #[cfg(test)]
+                    inherit();
+                    inverter.drain_into_codec(first, last, codec)
+                });
+                let trigrams = self.trigrams.drain_into(first, last);
+                let terms = terms
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (terms, trigrams)
+            });
+            let mut writers = [Some(terms?), Some(trigrams?)];
             drop(inverter);
-            let mut terms = Some(terms);
             let (entry, segment, trigram) = Self::write_pair(
                 &self.dir,
                 &mut manifest,
@@ -758,13 +774,9 @@ impl IndexWriter {
                 // Merge checks cancellation while writing its output pair.
                 &|| false,
                 |file, tri| {
-                    let writer = if tri {
-                        self.trigrams.drain_into(first, last)?
-                    } else {
-                        terms
-                            .take()
-                            .ok_or_else(|| io::Error::other("pair output already consumed"))?
-                    };
+                    let writer = writers[usize::from(tri)]
+                        .take()
+                        .ok_or_else(|| io::Error::other("pair output already consumed"))?;
                     let mut out = BufWriter::new(Paced {
                         file,
                         pace: budget.pace,

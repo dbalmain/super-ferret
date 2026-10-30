@@ -34,6 +34,13 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// This thread's forced fingerprint, to set on a thread that writes for it.
+#[cfg(test)]
+pub(crate) fn inherit() -> impl FnOnce() + Send {
+    let forced = FORCED.get();
+    move || FORCED.set(forced)
+}
+
 /// Lays out records pushed in strictly increasing `(fingerprint, doc)`
 /// order. The section's bytes leave through [`Encoder::bytes`] and
 /// [`Encoder::drain`]; its block index is built beside them.
