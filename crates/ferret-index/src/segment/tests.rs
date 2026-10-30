@@ -92,6 +92,8 @@ fn check(bytes: &[u8], first: u32, last: u32, terms: &Terms, rng: &mut Rng) {
         assert_eq!(term, want_term.as_slice());
         assert_eq!(entry.df as usize, want_docs.len());
         assert_eq!(&documents(segment.read(&entry).unwrap()), want_docs);
+        // The stream's read-ahead window reads the same list.
+        assert_eq!(&documents(iter.read(&entry).unwrap()), want_docs);
     }
     assert!(expected.next().is_none());
 
@@ -428,6 +430,7 @@ fn exercise(bytes: &[u8]) -> Result<(), ReadError> {
     while let Some((term, entry)) = iter.next_term()? {
         terms.push(term.to_vec());
         documents(segment.read(&entry)?);
+        documents(iter.read(&entry)?);
     }
     for term in &terms {
         segment.lookup(term)?;

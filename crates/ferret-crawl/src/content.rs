@@ -274,7 +274,8 @@ fn check_read_name(
 /// One catalog view's documents, each with one of its names.
 pub struct Documents {
     /// `name[doc]` is the name to read `doc` through, plus one; 0 for none.
-    names: Vec<u32>,
+    /// Shared with forks.
+    names: Arc<[u32]>,
     /// With [`Documents::holding_directories`]: the last checked walk, root
     /// first, each directory with its descriptor, kept for the next path.
     /// Locked while this reader opens through it, and otherwise free for a
@@ -320,7 +321,7 @@ impl Documents {
             }
         }
         Ok(Self {
-            names,
+            names: names.into(),
             held: None,
             #[cfg(test)]
             pause: None,
@@ -338,7 +339,7 @@ impl Documents {
         catalog.load(&Section::INODE)?;
         catalog.load(&[Section::Names, Section::Roots, Section::Doc, Section::Docs])?;
         Ok(Self {
-            names: Vec::new(),
+            names: Arc::new([]),
             held: None,
             #[cfg(test)]
             pause: None,
@@ -349,13 +350,13 @@ impl Documents {
         })
     }
 
-    /// Another reader by name with this one's policy and limiter, for a
-    /// second thread: [`Documents::by_name`] without loading again. Counts
-    /// start at zero, and it holds directories if this one does, from the
-    /// same budget, holding none yet.
+    /// Another reader with this one's documents, policy and limiter, for a
+    /// second thread, without loading again. Counts start at zero, and it
+    /// holds directories if this one does, from the same budget, holding
+    /// none yet.
     pub fn fork(&self) -> Self {
         Self {
-            names: Vec::new(),
+            names: self.names.clone(),
             held: self.held.as_ref().map(|held| Held::new(lock(held).budget)),
             #[cfg(test)]
             pause: None,

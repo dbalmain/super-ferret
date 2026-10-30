@@ -431,7 +431,7 @@ impl<R: ReadAt> Segment<R> {
                 return Err(ReadError::Cancelled);
             }
             let mut done = false;
-            self.record_block(b, |key, doc| {
+            self.record_block(b, None, |key, doc| {
                 if key == fp {
                     docs.push(doc);
                 }
@@ -445,9 +445,12 @@ impl<R: ReadAt> Segment<R> {
         Ok(docs)
     }
 
+    /// Decodes restart block `b`, read through `window` when a stream
+    /// holds one.
     fn record_block(
         &self,
         b: usize,
+        window: Option<&mut Window>,
         mut each: impl FnMut(u32, u32) -> bool,
     ) -> Result<(), ReadError> {
         let start = u64::from(self.fingerprints.starts[b]);
@@ -460,9 +463,16 @@ impl<R: ReadAt> Segment<R> {
             .unwrap_or(self.fingerprints_at.1);
         #[cfg(test)]
         fingerprint::BLOCK_READS.with(|reads| reads.set(reads.get() + 1));
-        let (bytes, at) = self.read_checked(Section::Fingerprints, start, end)?;
+        let checked;
+        let bytes = match window {
+            Some(window) => self.read_through(Section::Fingerprints, start, end, window)?,
+            None => {
+                checked = self.read_checked(Section::Fingerprints, start, end)?;
+                &checked.0[checked.1..checked.1 + (end - start) as usize]
+            }
+        };
         fingerprint::decode_block(
-            &bytes[at..at + (end - start) as usize],
+            bytes,
             self.fingerprints.firsts[b],
             self.fingerprints.count(b),
             self.info.last - self.info.first,
@@ -475,6 +485,7 @@ impl<R: ReadAt> Segment<R> {
     pub fn records(&self) -> Records<'_, R> {
         Records {
             segment: self,
+            window: Window::default(),
             block: 0,
             records: Vec::new(),
             at: 0,
@@ -511,6 +522,7 @@ impl<R: ReadAt> Segment<R> {
     pub fn terms(&self) -> Terms<'_, R> {
         Terms {
             segment: self,
+            window: Window::default(),
             next: self.samples.first().map(|&place| (0, place)),
             entries: None,
         }
@@ -526,6 +538,7 @@ impl<R: ReadAt> Segment<R> {
             .or_else(|| self.samples.first().map(|&place| (0, place)));
         Terms {
             segment: self,
+            window: Window::default(),
             next,
             entries: None,
         }
@@ -606,17 +619,35 @@ impl<R: ReadAt> Segment<R> {
         Ok((entries, next))
     }
 
-    /// Reads `[start, end)` of a chunked section, verifying every chunk it
-    /// touches. Returns the chunks and where `start` is in them.
-    fn read_checked(
+    /// `[start, end)` of a chunked section, from `window` when it holds
+    /// them, else checked into it with up to [`AHEAD`] bytes more.
+    fn read_through<'w>(
         &self,
         section: Section,
         start: u64,
         end: u64,
-    ) -> Result<(Vec<u8>, usize), ReadError> {
+        window: &'w mut Window,
+    ) -> Result<&'w [u8], ReadError> {
+        if start > end {
+            return Err(ReadError::Corrupt(section));
+        }
+        let held = window.from..window.from + window.bytes.len() as u64;
+        if start < held.start || end > held.end {
+            let len = self.extent(section)?.0.1;
+            let ahead = end.max(start.saturating_add(AHEAD).min(len));
+            let (bytes, at) = self.read_checked(section, start, ahead)?;
+            window.from = start - at as u64;
+            window.bytes = bytes;
+        }
+        let at = (start - window.from) as usize;
+        Ok(&window.bytes[at..at + (end - start) as usize])
+    }
+
+    /// A chunked section's offset and length in the file, and its sums.
+    fn extent(&self, section: Section) -> Result<((u64, u64), &[u8]), ReadError> {
         let blocks_sums = chunks(self.blocks_at.1) as usize * 16;
         let postings_sums = chunks(self.postings_at.1) as usize * 16;
-        let ((offset, len), sums) = match section {
+        Ok(match section {
             Section::Blocks => (self.blocks_at, &self.sums[..blocks_sums]),
             Section::Postings => (
                 self.postings_at,
@@ -627,7 +658,18 @@ impl<R: ReadAt> Segment<R> {
                 &self.sums[blocks_sums + postings_sums..],
             ),
             _ => return Err(ReadError::Corrupt(section)),
-        };
+        })
+    }
+
+    /// Reads `[start, end)` of a chunked section, verifying every chunk it
+    /// touches. Returns the chunks and where `start` is in them.
+    fn read_checked(
+        &self,
+        section: Section,
+        start: u64,
+        end: u64,
+    ) -> Result<(Vec<u8>, usize), ReadError> {
+        let ((offset, len), sums) = self.extent(section)?;
         if start > end || end > len {
             return Err(ReadError::Corrupt(section));
         }
@@ -804,6 +846,8 @@ impl Entries {
 /// Every term of a segment, in order.
 pub struct Terms<'s, R> {
     segment: &'s Segment<R>,
+    /// The postings this stream's lists are read through.
+    window: Window,
     /// The next block to read and its place; `None` after the last.
     next: Option<(usize, Place)>,
     entries: Option<Entries>,
@@ -829,12 +873,47 @@ impl<R: ReadAt> Terms<'_, R> {
             return entries.next_entry();
         }
     }
+
+    /// [`Segment::read`] for an entry of this stream. Lists lie in term
+    /// order, so a stream reading each term's list reads the postings front
+    /// to back, and checks each chunk once rather than once a list.
+    pub fn read(&mut self, entry: &TermEntry) -> Result<Hit, ReadError> {
+        match entry.location {
+            Location::Single(doc) => Ok(Hit::Single(doc)),
+            Location::List { offset, len } => {
+                let bytes = self.segment.read_through(
+                    Section::Postings,
+                    offset,
+                    offset + len,
+                    &mut self.window,
+                )?;
+                Ok(Hit::Postings(Postings {
+                    first: self.segment.info.first,
+                    df: entry.df,
+                    bytes: bytes.to_vec(),
+                    start: 0,
+                }))
+            }
+        }
+    }
 }
+
+/// Checked chunks of one section, held for a stream reading it front to
+/// back.
+#[derive(Debug, Default)]
+struct Window {
+    from: u64,
+    bytes: Vec<u8>,
+}
+
+/// Bytes a [`Window`] reads ahead of the read that misses it.
+const AHEAD: u64 = 16 * CHUNK as u64;
 
 /// A segment's fingerprint records in `(fingerprint, DocId)` order.
 /// Holds at most one restart block at a time.
 pub struct Records<'a, R> {
     segment: &'a Segment<R>,
+    window: Window,
     block: usize,
     records: Vec<(u32, u32)>,
     at: usize,
@@ -847,10 +926,11 @@ impl<R: ReadAt> Records<'_, R> {
                 return Ok(None);
             }
             self.records.clear();
-            self.segment.record_block(self.block, |fp, doc| {
-                self.records.push((fp, doc));
-                true
-            })?;
+            self.segment
+                .record_block(self.block, Some(&mut self.window), |fp, doc| {
+                    self.records.push((fp, doc));
+                    true
+                })?;
             self.block += 1;
             self.at = 0;
         }

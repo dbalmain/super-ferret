@@ -33,7 +33,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ferret_text::{Scratch, TERM_VERSION, TRIGRAM_VERSION, cap, tokenize_terms};
+use ferret_text::{TERM_VERSION, TRIGRAM_VERSION};
 
 use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
@@ -66,11 +66,11 @@ impl PairBuffer {
     fn admit(
         trigrams: &mut TrigramInverter,
         doc: u32,
-        bytes: &[u8],
+        keys: &[u32],
     ) -> Result<Option<usize>, WriteError> {
         let buffered = trigrams.len();
         let remaining = Self::CAPACITY.saturating_sub(buffered);
-        let admitted = trigrams.add_limited(doc, bytes, remaining)?;
+        let admitted = trigrams.add_keys(doc, keys, remaining, |_| {})?;
         if let Some(distinct) = admitted {
             debug_assert!(Self::fits(buffered, distinct));
         }
@@ -140,7 +140,7 @@ pub enum Fault {
 
 /// The host's document reader: fills the buffer with document `doc`'s
 /// bytes, or says why it cannot.
-pub type Reader<'a> = dyn FnMut(u32, &mut Vec<u8>) -> Result<(), Fault> + 'a;
+pub type Reader<'a> = dyn FnMut(u32, &mut Vec<u8>) -> Result<(), Fault> + Send + 'a;
 
 /// Why a follow pass ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -556,7 +556,19 @@ impl IndexWriter {
         budget: &Budget,
         read: &mut Reader<'_>,
     ) -> Result<Followed, Error> {
-        self.guard(|writer| writer.follow_inner(catalog, budget, read))
+        self.follow_with(catalog, budget, &mut [read])
+    }
+
+    /// [`IndexWriter::follow`] with a thread per reader reading and
+    /// tokenizing documents ahead of this one, which writes the same segment
+    /// as one reader would. Readers past a stop have read for nothing.
+    pub fn follow_with(
+        &mut self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        readers: &mut [&mut Reader<'_>],
+    ) -> Result<Followed, Error> {
+        self.guard(|writer| writer.follow_inner(catalog, budget, readers))
     }
 
     /// One merge step if the policy wants one (adjacent levels, or a segment
@@ -638,7 +650,7 @@ impl IndexWriter {
         &mut self,
         catalog: &CatalogView,
         budget: &Budget,
-        read: &mut Reader<'_>,
+        readers: &mut [&mut Reader<'_>],
     ) -> Result<Followed, Error> {
         self.reconcile(catalog)?;
         let live = catalog.live;
@@ -657,54 +669,48 @@ impl IndexWriter {
         };
 
         let mut inverter = Inverter::new(budget.buffer);
-        let (mut scratch, mut bytes) = (Scratch::default(), Vec::new());
         let mut range: Option<(u32, u32)> = None;
         let mut frontier = live.bound();
         let mut oversized = false;
-        for doc in live.range(manifest.frontier, live.bound()) {
+        let trigrams = &mut self.trigrams;
+        let docs = live.range(manifest.frontier, live.bound());
+        crate::extract::in_order(docs, readers, |doc, extracted| -> Result<bool, Error> {
             if followed.docs != 0
                 && (followed.bytes >= budget.bytes
-                    || PairBuffer::full(&inverter, &self.trigrams, budget.buffer))
+                    || PairBuffer::full(&inverter, trigrams, budget.buffer))
             {
-                followed.stopped = if PairBuffer::full(&inverter, &self.trigrams, budget.buffer) {
+                followed.stopped = if PairBuffer::full(&inverter, trigrams, budget.buffer) {
                     Stopped::Buffer
                 } else {
                     Stopped::Bytes
                 };
                 frontier = doc;
-                break;
+                return Ok(false);
             }
             if (budget.cancelled)() {
                 followed.stopped = Stopped::Asked;
                 frontier = doc;
-                break;
+                return Ok(false);
             }
-            bytes.clear();
-            match read(doc, &mut bytes) {
-                Ok(()) => {
-                    match PairBuffer::admit(&mut self.trigrams, doc, &bytes)? {
+            match extracted {
+                Ok(extracted) => {
+                    match PairBuffer::admit(trigrams, doc, &extracted.keys)? {
                         Some(_) => {}
                         None if followed.docs != 0 => {
                             followed.stopped = Stopped::Buffer;
                             frontier = doc;
-                            break;
+                            return Ok(false);
                         }
                         None => {
-                            self.trigrams.add(doc, &bytes)?;
+                            trigrams.add_keys(doc, &extracted.keys, usize::MAX, |_| {})?;
                             oversized = true;
                         }
                     }
-                    let mut failed = None;
-                    tokenize_terms(&bytes, &mut scratch, |token| {
-                        if let Err(error) = inverter.add(doc, cap(token.bytes)) {
-                            failed = Some(error);
-                        }
-                    });
-                    if let Some(error) = failed {
-                        return Err(error.into());
+                    for term in extracted.terms() {
+                        inverter.add(doc, term)?;
                     }
                     followed.docs += 1;
-                    followed.bytes += bytes.len() as u64;
+                    followed.bytes += extracted.len;
                 }
                 Err(Fault::Unreadable) => {
                     manifest.unreadable.push(doc);
@@ -713,16 +719,17 @@ impl IndexWriter {
                 Err(Fault::Stop) => {
                     followed.stopped = Stopped::Asked;
                     frontier = doc;
-                    break;
+                    return Ok(false);
                 }
             }
             range = Some((range.map_or(doc, |(first, _)| first), doc));
             if oversized {
                 followed.stopped = Stopped::Buffer;
                 frontier = doc + 1;
-                break;
+                return Ok(false);
             }
-        }
+            Ok(true)
+        })?;
         if range.is_none() && frontier == manifest.frontier && followed.pruned == 0 {
             followed.remaining = live.count(frontier, live.bound()).into();
             return Ok(followed);

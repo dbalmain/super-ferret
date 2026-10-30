@@ -1161,15 +1161,19 @@ fn follow_pause_commits_the_completed_pair() {
         live: &live,
     };
     let mut writer = IndexWriter::open(&dir.0, &catalog).unwrap();
-    let paused = std::cell::Cell::new(false);
+    let paused = std::sync::atomic::AtomicBool::new(false);
     let budget = Budget {
-        cancelled: &|| paused.get(),
+        cancelled: &|| paused.load(std::sync::atomic::Ordering::Relaxed),
         ..Budget::unbounded()
     };
     let followed = writer
-        .follow(&catalog, &budget, &mut |_, bytes| {
+        .follow(&catalog, &budget, &mut |doc, bytes| {
             bytes.extend_from_slice(b"amber");
-            paused.set(true);
+            // Readers run ahead of the writer: a pause seen after a read
+            // discards that document, and commits those consumed before it.
+            if doc == 1 {
+                paused.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(())
         })
         .unwrap();
@@ -1612,4 +1616,86 @@ fn symlinked_regular_index_files_still_open() {
     }
     let view = View::open(&dir.0, &catalog.view()).unwrap().unwrap();
     assert_eq!(raw(&view), catalog.truth(&corpus));
+}
+
+/// Each pass of a follow to coverage with `readers` readers, and the bytes
+/// of every segment it leaves.
+fn follow_with_readers(
+    name: &str,
+    readers: usize,
+    catalog: &Catalog,
+    corpus: &Corpus,
+    budget: &Budget,
+) -> (Vec<Followed>, Vec<Vec<u8>>) {
+    let dir = Dir::new(name);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let read = |doc: u32, bytes: &mut Vec<u8>| {
+        if catalog.unreadable.contains(&doc) {
+            return Err(Fault::Unreadable);
+        }
+        bytes.extend_from_slice(&corpus.text(doc));
+        Ok(())
+    };
+    let mut reads: Vec<_> = (0..readers).map(|_| read).collect();
+    let mut passes = Vec::new();
+    loop {
+        let mut readers: Vec<&mut Reader<'_>> =
+            reads.iter_mut().map(|r| r as &mut Reader<'_>).collect();
+        let followed = writer
+            .follow_with(&catalog.view(), budget, &mut readers)
+            .unwrap();
+        passes.push(Followed {
+            segment: None,
+            ..followed
+        });
+        if followed.stopped == Stopped::Covered {
+            break;
+        }
+    }
+    let files = dir
+        .files()
+        .into_iter()
+        .filter(|name| name != manifest::FILE)
+        .map(|name| fs::read(dir.0.join(name)).unwrap())
+        .collect();
+    (passes, files)
+}
+
+#[test]
+fn several_readers_follow_exactly_as_one_does() {
+    let corpus = Corpus::new(17, 80);
+    let mut catalog = Catalog::new(80, &[3, 40, 41, 79]);
+    catalog.unreadable = [0, 7, 50].into();
+    // The writer consults the pause between documents, on its own thread.
+    let asked = std::cell::Cell::new(0);
+    let pause = || {
+        asked.set(asked.get() + 1);
+        asked.get() % 23 == 0
+    };
+    let budgets = [
+        ("unbounded", Budget::unbounded()),
+        ("bytes", budget(200)),
+        (
+            "buffer",
+            Budget {
+                buffer: 0,
+                ..Budget::unbounded()
+            },
+        ),
+        (
+            "paused",
+            Budget {
+                cancelled: &pause,
+                ..Budget::unbounded()
+            },
+        ),
+    ];
+    for (name, budget) in &budgets {
+        asked.set(0);
+        let one = follow_with_readers(&format!("readers-1-{name}"), 1, &catalog, &corpus, budget);
+        asked.set(0);
+        let four = follow_with_readers(&format!("readers-4-{name}"), 4, &catalog, &corpus, budget);
+        assert!(one.0.len() > 1 || *name == "unbounded", "{name}: one pass");
+        assert_eq!(one, four, "{name}");
+    }
 }

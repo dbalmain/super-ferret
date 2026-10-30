@@ -6,14 +6,58 @@ use ferret_text::{TRIGRAM_VERSION, trigram_key};
 
 use super::{WriteError, Writer};
 
+/// The distinct folded keys of one document at a time: a bit per key,
+/// cleared through the keys found, so a document costs its own length.
+#[derive(Debug)]
+pub struct KeySet {
+    seen: Vec<u64>,
+}
+
+impl Default for KeySet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeySet {
+    pub fn new() -> Self {
+        Self {
+            seen: vec![0; (1 << 24) / 64],
+        }
+    }
+
+    /// Replaces `out` with the distinct folded keys of `bytes`, each as its
+    /// big-endian number, in order of first occurrence.
+    pub fn distinct(&mut self, bytes: &[u8], out: &mut Vec<u32>) {
+        out.clear();
+        for window in bytes.windows(3) {
+            let key = trigram_key([window[0], window[1], window[2]]);
+            let number = u32::from_be_bytes([0, key[0], key[1], key[2]]);
+            let word = &mut self.seen[number as usize / 64];
+            let bit = 1u64 << (number % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                out.push(number);
+            }
+        }
+        for &number in out.iter() {
+            self.seen[number as usize / 64] &= !(1u64 << (number % 64));
+        }
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.seen.capacity() * size_of::<u64>()
+    }
+}
+
 /// Pair-buffer inverter for ASCII-folded three-byte keys. Add each document
 /// once, in strictly ascending DocId order, including empty documents.
 #[derive(Debug)]
 pub struct TrigramInverter {
     pairs: Vec<u64>,
     scratch: Vec<u64>,
-    seen: Vec<u64>,
-    dirty_words: Vec<u64>,
+    keys: KeySet,
+    found: Vec<u32>,
     documents: Vec<u32>,
     last: Option<u32>,
 }
@@ -29,8 +73,8 @@ impl TrigramInverter {
         Self {
             pairs: Vec::new(),
             scratch: Vec::new(),
-            seen: vec![0; (1 << 24) / 64],
-            dirty_words: vec![0; (1 << 24) / 64 / 64],
+            keys: KeySet::new(),
+            found: Vec::new(),
             documents: Vec::new(),
             last: None,
         }
@@ -57,36 +101,11 @@ impl TrigramInverter {
         self.pairs.is_empty()
     }
 
-    /// Counts this document's distinct folded keys using the inverter's
-    /// bitmap, without adding postings to the segment.
+    /// Counts this document's distinct folded keys, without adding postings
+    /// to the segment.
     pub fn distinct_count(&mut self, bytes: &[u8]) -> usize {
-        let mut count = 0;
-        for window in bytes.windows(3) {
-            let key = trigram_key([window[0], window[1], window[2]]);
-            let number = u32::from_be_bytes([0, key[0], key[1], key[2]]) as usize;
-            let word = &mut self.seen[number / 64];
-            let bit = 1u64 << (number % 64);
-            if *word & bit == 0 {
-                if *word == 0 {
-                    let dirty = number / 64;
-                    self.dirty_words[dirty / 64] |= 1u64 << (dirty % 64);
-                }
-                *word |= bit;
-                count += 1;
-            }
-        }
-        for (dirty_index, dirty) in self.dirty_words.iter_mut().enumerate() {
-            while *dirty != 0 {
-                let bit = dirty.trailing_zeros() as usize;
-                let index = dirty_index * 64 + bit;
-                let word = &mut self.seen[index];
-                while *word != 0 {
-                    *word &= *word - 1;
-                }
-                *dirty &= *dirty - 1;
-            }
-        }
-        count
+        self.keys.distinct(bytes, &mut self.found);
+        self.found.len()
     }
 
     /// Adds raw document bytes and returns its distinct-key count.
@@ -107,6 +126,7 @@ impl TrigramInverter {
 
     /// Adds a document if its distinct keys fit the caller's remaining
     /// capacity. A rejected document leaves ordering and postings unchanged.
+    #[cfg(test)]
     pub(crate) fn add_limited(
         &mut self,
         doc: u32,
@@ -121,58 +141,54 @@ impl TrigramInverter {
         doc: u32,
         bytes: &[u8],
         limit: usize,
+        emit: impl FnMut([u8; 3]),
+    ) -> Result<Option<usize>, WriteError> {
+        let mut found = std::mem::take(&mut self.found);
+        self.keys.distinct(bytes, &mut found);
+        let added = self.add_keys(doc, &found, limit, emit);
+        self.found = found;
+        added
+    }
+
+    /// [`Self::add_limited`] for keys already found by a [`KeySet`].
+    pub(crate) fn add_keys(
+        &mut self,
+        doc: u32,
+        keys: &[u32],
+        limit: usize,
         mut emit: impl FnMut([u8; 3]),
     ) -> Result<Option<usize>, WriteError> {
         if self.last.is_some_and(|last| doc <= last) {
             return Err(WriteError::DocOrder);
         }
-        let start = self.pairs.len();
-        let mut count = 0;
-        let mut rejected = false;
-        for window in bytes.windows(3) {
-            let key = trigram_key([window[0], window[1], window[2]]);
-            let number = u32::from_be_bytes([0, key[0], key[1], key[2]]) as usize;
-            let bit = 1u64 << (number % 64);
-            if self.seen[number / 64] & bit == 0 {
-                if count == limit {
-                    rejected = true;
-                    break;
-                }
-                self.seen[number / 64] |= bit;
-                self.pairs.push((number as u64) << 32 | u64::from(doc));
-                emit(key);
-                count += 1;
-            }
-        }
-        for pair in &self.pairs[start..] {
-            let number = (pair >> 32) as usize;
-            self.seen[number / 64] &= !(1u64 << (number % 64));
-        }
-        if rejected {
-            self.pairs.truncate(start);
+        if keys.len() > limit {
             return Ok(None);
         }
+        self.pairs.reserve(keys.len());
+        for &number in keys {
+            self.pairs.push(u64::from(number) << 32 | u64::from(doc));
+            let [_, a, b, c] = number.to_be_bytes();
+            emit([a, b, c]);
+        }
         self.last = Some(doc);
-        Ok(Some(count))
+        Ok(Some(keys.len()))
     }
 
     /// Buffer capacities, including bitmap, radix and document-list scratch.
     pub fn allocated_bytes(&self) -> usize {
-        (self.pairs.capacity() + self.scratch.capacity() + self.seen.capacity()) * size_of::<u64>()
-            + self.documents.capacity() * size_of::<u32>()
-            + self.dirty_words.capacity() * size_of::<u64>()
+        (self.pairs.capacity() + self.scratch.capacity()) * size_of::<u64>()
+            + self.keys.allocated_bytes()
+            + (self.documents.capacity() + self.found.capacity()) * size_of::<u32>()
     }
 
     /// Capacity charge at the next flush, reserving radix scratch for every
     /// allocated pair slot and a document list bounded by buffered pairs.
     pub fn flush_bytes(&self) -> usize {
         let docs = self.pairs.len();
-        (self.pairs.capacity()
-            + self.scratch.capacity().max(self.pairs.capacity())
-            + self.seen.capacity())
+        (self.pairs.capacity() + self.scratch.capacity().max(self.pairs.capacity()))
             * size_of::<u64>()
-            + self.documents.capacity().max(docs) * size_of::<u32>()
-            + self.dirty_words.capacity() * size_of::<u64>()
+            + self.keys.allocated_bytes()
+            + (self.documents.capacity().max(docs) + self.found.capacity()) * size_of::<u32>()
     }
 
     /// Discards pairs and ordering state, retaining allocated buffers.
@@ -291,6 +307,8 @@ mod tests {
         let baseline = inverter.allocated_bytes();
         inverter.add(0, b"abc").unwrap();
         inverter.add(1_000_000_000, b"abc").unwrap();
+        // The found-key list keeps its capacity across documents.
+        let baseline = baseline + inverter.found.capacity() * size_of::<u32>();
         assert_eq!(inverter.flush_bytes(), baseline + 2 * (8 + 4));
         let mut peak = 0;
         let writer = inverter
@@ -324,7 +342,7 @@ mod tests {
         assert_eq!(inverter.pairs.capacity(), 4);
         assert_eq!(inverter.pairs, pairs);
         assert_eq!(inverter.last, Some(7));
-        assert!(inverter.seen.iter().all(|word| *word == 0));
+        assert!(inverter.keys.seen.iter().all(|word| *word == 0));
         assert_eq!(inverter.add_limited(8, b"yza", 1).unwrap(), Some(1));
         let pairs = inverter.pairs.clone();
         assert_eq!(inverter.add_limited(9, b"xyz", 0).unwrap(), None);
@@ -332,7 +350,7 @@ mod tests {
         assert_eq!(inverter.pairs.capacity(), 4);
         assert_eq!(inverter.pairs, pairs);
         assert_eq!(inverter.last, Some(8));
-        assert!(inverter.seen.iter().all(|word| *word == 0));
+        assert!(inverter.keys.seen.iter().all(|word| *word == 0));
     }
 
     #[test]

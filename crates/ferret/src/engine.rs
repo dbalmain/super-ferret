@@ -412,17 +412,28 @@ impl Engine {
         let mut documents = ferret_crawl::Documents::by_name(view)
             .map_err(Error::Catalog)?
             .holding_directories();
-        if let Some(limiter) = limiter {
-            documents = documents.with_limiter(limiter);
-        }
-        let followed = index.follow(&catalog_view(view, live), budget, &mut |doc, bytes| {
-            let Some(&name) = names.names(doc).first() else {
-                return Err(Fault::Unreadable);
-            };
-            documents
-                .read_name(view, name, bytes)
-                .map_err(|_| Fault::Unreadable)
-        });
+        // Paced background work reads one document at a time. An explicit
+        // `ferret index` reads and tokenizes with a reader per walk worker.
+        let readers = match limiter {
+            Some(limiter) => {
+                documents = documents.with_limiter(limiter);
+                1
+            }
+            None => ferret_crawl::default_workers(),
+        };
+        let followed = follow_reading(
+            index,
+            &catalog_view(view, live),
+            budget,
+            &documents,
+            readers,
+            |documents, doc, bytes| {
+                let Some(&name) = names.names(doc).first() else {
+                    return Err(ferret_crawl::ContentFault::Changed);
+                };
+                documents.read_name(view, name, bytes)
+            },
+        );
         let published = index.view();
         self.select_content(published);
         followed.map_err(Error::Content)
@@ -549,6 +560,39 @@ fn live_documents_until(view: &Catalog, cancelled: impl Fn() -> bool) -> Option<
         |doc| live.insert(doc.0),
     );
     finished.then_some(live)
+}
+
+/// One follow pass with `readers` forks of `documents`, each on a thread
+/// of its own when there are several, reading a document through `read`.
+/// A document `read` cannot return is unreadable.
+pub(crate) fn follow_reading(
+    index: &mut IndexWriter,
+    view: &CatalogView<'_>,
+    budget: &Budget,
+    documents: &ferret_crawl::Documents,
+    readers: usize,
+    read: impl Fn(
+        &mut ferret_crawl::Documents,
+        u32,
+        &mut Vec<u8>,
+    ) -> Result<(), ferret_crawl::ContentFault>
+    + Sync,
+) -> Result<Followed, ferret_index::Error> {
+    let mut forks: Vec<_> = (0..readers.max(1)).map(|_| documents.fork()).collect();
+    let read = &read;
+    let mut reads: Vec<_> = forks
+        .iter_mut()
+        .map(|documents| {
+            move |doc, bytes: &mut Vec<u8>| {
+                read(documents, doc, bytes).map_err(|_| Fault::Unreadable)
+            }
+        })
+        .collect();
+    let mut readers: Vec<&mut ferret_index::Reader<'_>> = reads
+        .iter_mut()
+        .map(|read| read as &mut ferret_index::Reader<'_>)
+        .collect();
+    index.follow_with(view, budget, &mut readers)
 }
 
 fn catalog_view<'a>(view: &Catalog, live: &'a DocSet) -> CatalogView<'a> {

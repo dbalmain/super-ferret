@@ -97,7 +97,7 @@ mod tests;
 pub use fingerprint::{RECORD_BLOCK, fingerprint};
 pub use invert::Inverter;
 pub use read::{Hit, Info, PostingCursor, Postings, ReadAt, Segment, TermEntry, Terms};
-pub use trigram::TrigramInverter;
+pub use trigram::{KeySet, TrigramInverter};
 pub use write::{Sizes, Writer};
 
 const MAGIC: [u8; 8] = *b"ferretsg";

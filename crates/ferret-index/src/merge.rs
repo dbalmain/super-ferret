@@ -136,7 +136,7 @@ pub fn stream<R: ReadAt>(
             let Some(entry) = entries[j].take() else {
                 continue;
             };
-            match inputs[j].read(&entry)? {
+            match cursors[j].read(&entry)? {
                 Hit::Single(doc) => list.push(doc),
                 Hit::Postings(postings) => postings.decode(&mut list),
             }

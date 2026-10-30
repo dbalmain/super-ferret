@@ -24,6 +24,7 @@
 
 pub mod candidate;
 pub mod cursor;
+mod extract;
 pub mod live;
 pub mod manifest;
 pub mod merge;

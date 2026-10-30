@@ -673,7 +673,7 @@ fn write_settings(index: &Path) {
 }
 
 fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
-    use ferret_index::{Budget, CatalogView, Fault, IndexWriter};
+    use ferret_index::{Budget, CatalogView, IndexWriter};
     catalog.load_all().map_err(|e| e.to_string())?;
     let live = crate::engine::live_documents(catalog);
     let view = CatalogView {
@@ -682,19 +682,20 @@ fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
     };
     let mut writer = IndexWriter::open(&path.join(crate::engine::CONTENT_DIR), &view)
         .map_err(|e| e.to_string())?;
-    let mut documents = ferret_crawl::Documents::new(catalog)
+    let documents = ferret_crawl::Documents::new(catalog)
         .map_err(|e| e.to_string())?
         .holding_directories();
-    let mut read = |doc, bytes: &mut Vec<u8>| {
-        documents
-            .read(catalog, ferret_catalog::DocId(doc), bytes)
-            .map_err(|_| Fault::Unreadable)
-    };
     let budget = Budget::unbounded();
-    while writer
-        .follow(&view, &budget, &mut read)
-        .map_err(|e| e.to_string())?
-        .remaining
+    while crate::engine::follow_reading(
+        &mut writer,
+        &view,
+        &budget,
+        &documents,
+        ferret_crawl::default_workers(),
+        |documents, doc, bytes| documents.read(catalog, ferret_catalog::DocId(doc), bytes),
+    )
+    .map_err(|e| e.to_string())?
+    .remaining
         > 0
     {}
     while writer
