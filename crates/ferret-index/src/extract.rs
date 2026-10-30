@@ -26,7 +26,7 @@ pub(crate) struct Extracted {
     pub len: u64,
     pub keys: Vec<u32>,
     text: Vec<u8>,
-    ends: Vec<u32>,
+    ends: Vec<usize>,
 }
 
 impl Extracted {
@@ -34,8 +34,8 @@ impl Extracted {
     pub fn terms(&self) -> impl Iterator<Item = &[u8]> {
         let mut start = 0;
         self.ends.iter().map(move |&end| {
-            let term = &self.text[start..end as usize];
-            start = end as usize;
+            let term = &self.text[start..end];
+            start = end;
             term
         })
     }
@@ -91,7 +91,7 @@ impl Extractor {
             };
             if fresh {
                 out.text.extend_from_slice(term);
-                out.ends.push(out.text.len() as u32);
+                out.ends.push(out.text.len());
             }
         });
         Ok(())
@@ -132,6 +132,10 @@ pub(crate) fn in_order<'a, E>(
             let sender = sender.clone();
             let (claims, moved) = (&claims, &moved);
             scope.spawn(move || {
+                // Ends every claim when this reader finishes, or unwinds:
+                // the writer then sees the channel close, and the scope
+                // re-raises a panic.
+                let _stop = Stop(claims, moved);
                 let mut extractor = Extractor::new();
                 while let Some((seq, doc)) = Claims::claim(claims, moved, window) {
                     let mut extracted = Extracted::default();
@@ -148,13 +152,12 @@ pub(crate) fn in_order<'a, E>(
             });
         }
         drop(sender);
-        let finish = |claims: &Mutex<Claims<_>>| {
-            claims.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
-            moved.notify_all();
-        };
+        // Releases waiting readers however the writer leaves, panics
+        // included, so the scope can join them.
+        let _stop = Stop(&claims, &moved);
         let mut ready = BTreeMap::new();
         let mut next = 0;
-        let result = loop {
+        loop {
             let Some((doc, result)) = ready.remove(&next) else {
                 match receiver.recv() {
                     Ok((seq, doc, result)) => {
@@ -175,11 +178,18 @@ pub(crate) fn in_order<'a, E>(
                 Ok(false) => break Ok(()),
                 Err(error) => break Err(error),
             }
-        };
-        finish(&claims);
-        drop(receiver);
-        result
+        }
     })
+}
+
+/// Stops all claims when dropped.
+struct Stop<'a, I>(&'a Mutex<Claims<I>>, &'a Condvar);
+
+impl<I> Drop for Stop<'_, I> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+        self.1.notify_all();
+    }
 }
 
 /// The documents readers have yet to claim, and how far the writer has

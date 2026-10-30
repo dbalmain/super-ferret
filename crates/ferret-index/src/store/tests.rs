@@ -1167,13 +1167,9 @@ fn follow_pause_commits_the_completed_pair() {
         ..Budget::unbounded()
     };
     let followed = writer
-        .follow(&catalog, &budget, &mut |doc, bytes| {
+        .follow(&catalog, &budget, &mut |_, bytes| {
             bytes.extend_from_slice(b"amber");
-            // Readers run ahead of the writer: a pause seen after a read
-            // discards that document, and commits those consumed before it.
-            if doc == 1 {
-                paused.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            paused.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         })
         .unwrap();
@@ -1698,4 +1694,56 @@ fn several_readers_follow_exactly_as_one_does() {
         assert!(one.0.len() > 1 || *name == "unbounded", "{name}: one pass");
         assert_eq!(one, four, "{name}");
     }
+}
+
+#[test]
+fn a_pass_that_is_always_out_of_time_still_advances() {
+    // The daemon's pause includes a deadline a slow document can outlast.
+    let dir = Dir::new("always-paused");
+    let catalog = Catalog::new(6, &[]);
+    let corpus = Corpus::new(5, 6);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let budget = Budget {
+        cancelled: &|| true,
+        ..Budget::unbounded()
+    };
+    for remaining in (0..6).rev() {
+        let followed = writer
+            .follow(&catalog.view(), &budget, &mut |doc, bytes| {
+                bytes.extend_from_slice(&corpus.text(doc));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!((followed.docs, followed.remaining), (1, remaining));
+    }
+    assert_eq!(answers(&writer.view(), &catalog), catalog.truth(&corpus));
+}
+
+#[test]
+fn a_reader_panic_reaches_the_caller() {
+    let dir = Dir::new("reader-panic");
+    let catalog = Catalog::new(40, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    // Reader 0 panics on the first document it claims; reader 1 runs on
+    // until the claim window fills.
+    let mut panics = |_, _: &mut Vec<u8>| -> Result<(), Fault> { panic!("reader") };
+    let mut reads = |_, bytes: &mut Vec<u8>| {
+        bytes.extend_from_slice(b"amber");
+        Ok(())
+    };
+    let mut readers: [&mut Reader<'_>; 2] = [&mut panics, &mut reads];
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        writer.follow_with(&catalog.view(), &Budget::unbounded(), &mut readers)
+    }));
+    assert!(caught.is_err());
+    assert_eq!(writer.view().manifest().frontier, 0);
+}
+
+#[test]
+#[should_panic(expected = "a follow pass needs a reader")]
+fn a_pass_without_readers_is_refused() {
+    let dir = Dir::new("no-readers");
+    let catalog = Catalog::new(4, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let _ = writer.follow_with(&catalog.view(), &Budget::unbounded(), &mut []);
 }

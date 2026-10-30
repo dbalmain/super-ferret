@@ -562,12 +562,17 @@ impl IndexWriter {
     /// [`IndexWriter::follow`] with a thread per reader reading and
     /// tokenizing documents ahead of this one, which writes the same segment
     /// as one reader would. Readers past a stop have read for nothing.
+    ///
+    /// # Panics
+    ///
+    /// If `readers` is empty.
     pub fn follow_with(
         &mut self,
         catalog: &CatalogView,
         budget: &Budget,
         readers: &mut [&mut Reader<'_>],
     ) -> Result<Followed, Error> {
+        assert!(!readers.is_empty(), "a follow pass needs a reader");
         self.guard(|writer| writer.follow_inner(catalog, budget, readers))
     }
 
@@ -687,7 +692,9 @@ impl IndexWriter {
                 frontier = doc;
                 return Ok(false);
             }
-            if (budget.cancelled)() {
+            // The first document is read before the pause is consulted, so
+            // a pass that keeps outlasting its time still makes progress.
+            if range.is_some() && (budget.cancelled)() {
                 followed.stopped = Stopped::Asked;
                 frontier = doc;
                 return Ok(false);
