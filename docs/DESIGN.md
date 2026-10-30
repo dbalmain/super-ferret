@@ -844,6 +844,9 @@ explicit index/root commands are ordering barriers in one writer queue. Each
 runs on a thread spawned before the writer lowers itself to nice 19, so the
 crawl and the unpaced content follow keep the nice the process started with.
 Workers of that crawl inherit it; background workers still lower themselves.
+That follow reads and tokenizes on a thread per walk worker, each at most four
+documents ahead of the thread writing segments, which consumes them in DocId
+order; background follow reads on the writer alone.
 The command replies only after that follow finishes. An unprivileged process
 cannot raise a thread's nice (RLIMIT_NICE is a hard ceiling), so the writer
 stays at nice 19 for its whole life. A merge already holding the content
