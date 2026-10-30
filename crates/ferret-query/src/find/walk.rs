@@ -918,6 +918,9 @@ pub struct LiveWalk {
     removed_children: Option<Arc<Mutex<Removals>>>,
     nested_roots: Vec<(InoId, InoId, Vec<u8>)>,
     paths: std::vec::IntoIter<PathBuf>,
+    /// The catalog target of each start, where the caller already knows it,
+    /// in step with `paths`; empty when none is known.
+    known: std::vec::IntoIter<Option<Target>>,
     options: Options,
     entry: Entry,
     slot: Slot,
@@ -989,6 +992,7 @@ impl LiveWalk {
             removed_children: None,
             nested_roots: Vec::new(),
             paths: paths.into_iter(),
+            known: Vec::new().into_iter(),
             options,
             entry: Entry::new(PathBuf::new(), 0, FileKind::File),
             slot: Slot::Empty,
@@ -1010,8 +1014,13 @@ impl LiveWalk {
     // Five warm samples on the 300k fixture: 16 workers win live stat-heavy
     // rows (48 ms versus 69 ms at 8); 8 win typical catalog scans (21–23 ms
     // versus 23–24). Shallow live traversal also avoids the extra startup.
+    // Catalogued starts at depth zero, a name test answered from postings,
+    // read no directory: one worker beats handing each start to another
+    // (`-name '*.md'` over 3.5k hits on ~/w: 6.2 ms versus 12.8 ms).
     pub(super) fn worker_limit(&self, workers: usize) -> usize {
-        if self.catalog.is_some() || self.options.max_depth.is_some_and(|depth| depth <= 2) {
+        if self.catalog.is_some() && self.options.max_depth == Some(0) {
+            1
+        } else if self.catalog.is_some() || self.options.max_depth.is_some_and(|depth| depth <= 2) {
             workers.min(8)
         } else {
             workers
@@ -1046,6 +1055,7 @@ impl LiveWalk {
     pub(super) fn split_start(&mut self) -> Option<Self> {
         let path = self.paths.next()?;
         let mut walk = Self::new(vec![path], self.options.clone());
+        walk.known = vec![self.known.next().flatten()].into_iter();
         walk.catalog = self.catalog.clone();
         walk.removed_children = self.removed_children.clone();
         walk.nested_roots = self.nested_roots.clone();
@@ -1478,6 +1488,7 @@ impl LiveWalk {
             }
             let Some(level) = self.levels.last_mut() else {
                 let path = self.paths.next()?;
+                let known = self.known.next().flatten();
                 let follow = self.options.follow != Follow::Physical;
                 self.entry = Entry::new(path, 0, FileKind::File);
                 self.entry.cwd = self.options.cwd.clone();
@@ -1508,10 +1519,10 @@ impl LiveWalk {
                                     _ => None,
                                 });
                     }
-                    let resolved = match resolve(
-                        catalog,
-                        self.entry.lookup_path().as_ref(),
-                        follow || self.entry.path.ends_with(b"/"),
+                    let follow = follow || self.entry.path.ends_with(b"/");
+                    let resolved = match known.filter(|_| !follow).map_or_else(
+                        || resolve(catalog, self.entry.lookup_path().as_ref(), follow),
+                        |target| Ok(Some((target, false))),
                     ) {
                         Ok(Some(resolved)) => resolved,
                         Ok(None) => {
@@ -1525,9 +1536,10 @@ impl LiveWalk {
                         self.entry.state.target = Some(resolved.0);
                         self.entry.state.catalog = Some(catalog.clone());
                         self.entry.state.kind = Some(catalog_kind(catalog.kind(id)));
-                        self.entry.state.follow = follow || self.entry.path.ends_with(b"/");
-                        self.entry.state.followed_symlink =
-                            resolve(catalog, self.entry.lookup_path().as_ref(), false)
+                        self.entry.state.follow = follow;
+                        // A physical resolution followed no final symlink.
+                        self.entry.state.followed_symlink = follow
+                            && resolve(catalog, self.entry.lookup_path().as_ref(), false)
                                 .ok()
                                 .flatten()
                                 .is_some_and(|(target, _)| target != resolved.0);
@@ -1839,7 +1851,19 @@ impl CatalogSource {
     }
 
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
+        Self::known(catalog, paths, Vec::new(), options)
+    }
+
+    /// As [`CatalogSource::new`], with each start's physical catalog target
+    /// where the caller already resolved it, in step with `paths`.
+    pub(super) fn known(
+        catalog: Catalog,
+        paths: Vec<PathBuf>,
+        known: Vec<Option<Target>>,
+        options: Options,
+    ) -> Self {
         let mut walk = LiveWalk::new(paths, options);
+        walk.known = known.into_iter();
         walk.removed_children = walk
             .options
             .delete

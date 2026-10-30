@@ -149,12 +149,15 @@ impl NameIndex {
         for id in catalog.suppressed_base_names() {
             *out.counts.entry(names.key(id)).or_default() -= 1;
             let edge = checkpoint.name(id);
+            // A deleted directory's rows are counted where the checkpoint had
+            // them (see `propagate_scope_changes`); only a live directory
+            // that moved takes an uncounted subtree with it.
             if let Target::Inode(child) = edge.target()
                 && checkpoint.is_directory(child)
-                && (!catalog.is_live_inode(child)
-                    || catalog
-                        .dir_name(child)
-                        .is_none_or(|id| catalog.name(id).parent != edge.parent))
+                && catalog.is_live_inode(child)
+                && catalog
+                    .dir_name(child)
+                    .is_none_or(|id| catalog.name(id).parent != edge.parent)
             {
                 out.mark_unknown(&checkpoint, edge.parent);
             }
@@ -166,11 +169,12 @@ impl NameIndex {
             if let Target::Inode(child) = edge.target()
                 && catalog.is_directory(child)
             {
-                let parent = (child.0 < checkpoint.base_dir_count())
-                    .then(|| checkpoint.dir_name(child))
-                    .flatten()
-                    .map(|id| checkpoint.name(id).parent);
-                if parent != Some(edge.parent) {
+                // A new directory's rows are all delta names, counted below.
+                let moved = child.0 < checkpoint.base_dir_count()
+                    && checkpoint
+                        .dir_name(child)
+                        .is_none_or(|id| checkpoint.name(id).parent != edge.parent);
+                if moved {
                     out.mark_unknown(catalog, edge.parent);
                 }
             }

@@ -515,6 +515,7 @@ impl Plan {
             return fallback();
         }
         let mut paths = Vec::new();
+        let mut known = Vec::new();
         for start in &self.paths {
             let logical = self.options.logical_path(start);
             let Some(resolved) = catalog.resolve(logical.as_os_str().as_bytes()) else {
@@ -545,11 +546,13 @@ impl Plan {
             };
             // Include the starting entry even when its own basename matches.
             paths.push(start.clone());
+            known.push(None);
             let mut prefix = Vec::new();
             catalog.dir_path(dir, &mut prefix);
             let mut full = Vec::new();
             for row in rows {
-                if !matches!(catalog.name(row).target(), Target::Inode(_)) {
+                let target = catalog.name(row).target();
+                if !matches!(target, Target::Inode(_)) {
                     continue;
                 }
                 full.clear();
@@ -561,11 +564,12 @@ impl Plan {
                     return fallback();
                 };
                 paths.push(start.join(OsString::from_vec(suffix.to_vec())));
+                known.push(Some(target));
             }
         }
         let mut options = self.options.clone();
         options.max_depth = Some(0);
-        CatalogSource::new(catalog, paths, options).walk
+        CatalogSource::known(catalog, paths, known, options).walk
     }
 
     /// Creates a catalog walk. Load `catalog_sections()` before construction.

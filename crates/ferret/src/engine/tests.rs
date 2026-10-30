@@ -792,6 +792,55 @@ fn a_removed_checkpoint_directory_publishes_and_reopens() {
     assert_eq!(text_files(&reopened.pin()), 200);
 }
 
+/// A new directory and a removed checkpoint directory leave every scope's
+/// row count known: the new one's rows are all overlay names, and the removed
+/// one's are counted where the checkpoint had them. Only a directory that
+/// moved hides an uncounted subtree, so a selective name test under the root
+/// still plans postings, against the exact row count.
+#[test]
+fn new_and_removed_directories_keep_scope_counts_known() {
+    let tree = Tree::with_files(300);
+    let engine = tree.compacted_engine();
+    let checkpoint = engine.pin().generation().checkpoint;
+    fs::create_dir_all(tree.0.join("root/fresh/deeper")).unwrap();
+    fs::write(tree.0.join("root/fresh/deeper/needle.txt"), b"alpha").unwrap();
+    fs::remove_dir_all(tree.0.join("root/d2")).unwrap();
+    tree.refresh(&engine);
+    let after = engine.pin();
+    assert_eq!(after.generation().checkpoint, checkpoint, "compacted");
+    let catalog = after.catalog();
+    let path = tree.0.join("root");
+    let root = catalog
+        .resolve(path.as_os_str().as_encoded_bytes())
+        .unwrap();
+    let Target::Inode(root) = root.target else {
+        panic!("root is an inode");
+    };
+    fn below(catalog: &Catalog, dir: ferret_catalog::InoId) -> u64 {
+        catalog
+            .children(dir)
+            .map(|id| match catalog.name(id).target() {
+                Target::Inode(child) if catalog.is_directory(child) => 1 + below(catalog, child),
+                _ => 1,
+            })
+            .sum()
+    }
+    let selection = after
+        .name_index()
+        .select(
+            catalog,
+            Some(ferret_catalog::Handle {
+                generation: catalog.generation(),
+                id: root,
+            }),
+            &[],
+            |name| name == b"needle.txt",
+        )
+        .unwrap();
+    assert_eq!(selection.estimate.plan, ferret_query::NamePlan::Postings);
+    assert_eq!(selection.estimate.scope_rows, Some(below(catalog, root)));
+}
+
 /// Rows a name search for `.txt` finds through the session's name index.
 fn text_files(session: &QuerySession) -> usize {
     let query = Query::from_args([b".txt".as_slice()], SystemTime::now()).unwrap();
