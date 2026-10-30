@@ -222,11 +222,13 @@ impl NameIndex {
                     .flatten()
                     .map(|edge| checkpoint.name(edge).parent)
             };
-            // Reparented directories make both affected ancestor chains
-            // unknown; their approximate counts are never used to plan.
-            if let Some(parent) = parent
-                && parent < dir
-            {
+            // A parent can have the higher id: a directory created over the
+            // overlay and moved under a newer one. Taking the highest id
+            // first then reaches that parent again, carrying only the late
+            // change, so the sums do not depend on id order. Both trees the
+            // climb reads are acyclic, and a live directory never climbs to a
+            // deleted one, so it ends.
+            if let Some(parent) = parent {
                 *pending.entry(parent).or_default() += change;
             }
         }

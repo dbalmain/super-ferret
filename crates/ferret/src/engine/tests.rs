@@ -808,7 +808,37 @@ fn new_and_removed_directories_keep_scope_counts_known() {
     tree.refresh(&engine);
     let after = engine.pin();
     assert_eq!(after.generation().checkpoint, checkpoint, "compacted");
-    let catalog = after.catalog();
+    let (plan, estimated, counted) = root_scope(&tree, &after);
+    assert_eq!(plan, ferret_query::NamePlan::Postings);
+    assert_eq!(estimated, Some(counted));
+}
+
+/// A directory created over the overlay and then moved under a directory
+/// created after it has a parent with a higher id. Its rows still reach the
+/// root's estimate.
+#[test]
+fn a_new_directory_moved_under_a_newer_one_keeps_its_rows_counted() {
+    let tree = Tree::with_files(300);
+    let engine = tree.compacted_engine();
+    let checkpoint = engine.pin().generation().checkpoint;
+    fs::create_dir(tree.0.join("root/early")).unwrap();
+    for i in 0..40 {
+        fs::write(tree.0.join(format!("root/early/f{i}.txt")), b"alpha").unwrap();
+    }
+    tree.refresh(&engine);
+    fs::create_dir(tree.0.join("root/late")).unwrap();
+    fs::rename(tree.0.join("root/early"), tree.0.join("root/late/early")).unwrap();
+    tree.refresh(&engine);
+    let after = engine.pin();
+    assert_eq!(after.generation().checkpoint, checkpoint, "compacted");
+    let (_, estimated, counted) = root_scope(&tree, &after);
+    assert_eq!(estimated, Some(counted));
+}
+
+/// The plan and estimated scope of a `needle.txt` name search under
+/// `root`, and the rows actually below it.
+fn root_scope(tree: &Tree, view: &QuerySession) -> (ferret_query::NamePlan, Option<u64>, u64) {
+    let catalog = view.catalog();
     let path = tree.0.join("root");
     let root = catalog
         .resolve(path.as_os_str().as_encoded_bytes())
@@ -825,7 +855,7 @@ fn new_and_removed_directories_keep_scope_counts_known() {
             })
             .sum()
     }
-    let selection = after
+    let selection = view
         .name_index()
         .select(
             catalog,
@@ -837,8 +867,11 @@ fn new_and_removed_directories_keep_scope_counts_known() {
             |name| name == b"needle.txt",
         )
         .unwrap();
-    assert_eq!(selection.estimate.plan, ferret_query::NamePlan::Postings);
-    assert_eq!(selection.estimate.scope_rows, Some(below(catalog, root)));
+    (
+        selection.estimate.plan,
+        selection.estimate.scope_rows,
+        below(catalog, root),
+    )
 }
 
 /// Rows a name search for `.txt` finds through the session's name index.
