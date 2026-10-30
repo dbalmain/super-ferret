@@ -128,6 +128,9 @@ pub(crate) fn in_order<'a, E>(
     let moved = Condvar::new();
     let (sender, receiver) = mpsc::channel();
     std::thread::scope(|scope| {
+        // Releases waiting readers however the writer leaves, a failed spawn
+        // or a panic included, so the scope can join them.
+        let _stop = Stop(&claims, &moved);
         for read in readers.iter_mut() {
             let sender = sender.clone();
             let (claims, moved) = (&claims, &moved);
@@ -152,9 +155,6 @@ pub(crate) fn in_order<'a, E>(
             });
         }
         drop(sender);
-        // Releases waiting readers however the writer leaves, panics
-        // included, so the scope can join them.
-        let _stop = Stop(&claims, &moved);
         let mut ready = BTreeMap::new();
         let mut next = 0;
         loop {
