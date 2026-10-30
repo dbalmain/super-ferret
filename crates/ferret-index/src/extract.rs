@@ -11,8 +11,12 @@ use ferret_text::{Scratch, cap, tokenize_terms};
 use crate::segment::KeySet;
 use crate::store::{Fault, Reader};
 
-/// Documents a reader thread may run ahead of the writer, per reader.
-const AHEAD: usize = 4;
+/// Documents a reader thread may run ahead of the writer, per reader. The
+/// window is shared, so one slow document holds back the rest: at four a
+/// reader, the writer of a fresh 48k-file index waited on readers for 1.3 s
+/// of its 3.5 s consuming; sixteen took the index from 6.9 s to 6.0 s, and
+/// 64 bought nothing more (2026-10-31).
+const AHEAD: usize = 16;
 
 /// Distinct terms a reader remembers across documents before it forgets
 /// them all: enough for a project's vocabulary, small beside the document
