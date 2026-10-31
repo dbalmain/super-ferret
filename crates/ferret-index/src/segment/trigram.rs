@@ -211,23 +211,26 @@ impl TrigramInverter {
             self.scratch.reserve_exact(count - self.scratch.len());
         }
         self.scratch.resize(count, 0);
-        for shift in [32, 40, 48] {
-            let mut offsets = [0usize; 256];
-            for pair in &self.pairs {
-                offsets[((pair >> shift) & 255) as usize] += 1;
-            }
+        // Two stable passes of twelve bits sort the 24-bit keys, documents
+        // already rising within each. Each pass scatters into the other
+        // buffer, so the second leaves the pairs where they started.
+        const DIGIT: u32 = 12;
+        let mut offsets = [[0usize; 1 << DIGIT]; 2];
+        for &pair in &self.pairs {
+            offsets[0][(pair >> 32) as usize & 0xfff] += 1;
+            offsets[1][(pair >> 44) as usize & 0xfff] += 1;
+        }
+        for (offsets, shift) in offsets.iter_mut().zip([32, 44]) {
             let mut sum = 0;
-            for offset in &mut offsets {
-                let frequency = *offset;
-                *offset = sum;
-                sum += frequency;
+            for offset in offsets.iter_mut() {
+                (*offset, sum) = (sum, sum + *offset);
             }
             for &pair in &self.pairs {
-                let bucket = ((pair >> shift) & 255) as usize;
+                let bucket = (pair >> shift) as usize & 0xfff;
                 self.scratch[offsets[bucket]] = pair;
                 offsets[bucket] += 1;
             }
-            self.pairs.copy_from_slice(&self.scratch[..count]);
+            std::mem::swap(&mut self.pairs, &mut self.scratch);
         }
         observe(self.allocated_bytes() + writer.allocated_bytes());
         // D70 charges radix scratch by this flush's length. Retaining its
