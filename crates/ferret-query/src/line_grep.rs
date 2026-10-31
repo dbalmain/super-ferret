@@ -400,6 +400,31 @@ pub fn scan_lines_progress(
     outcome.map(|()| result).map_err(|error| (result, error))
 }
 
+/// Where a record sits in the source: what every [`Line`] the plain scan
+/// emits for one source line shares.
+#[derive(Clone, Copy)]
+struct Position {
+    offset: u64,
+    terminated: bool,
+    number: u64,
+}
+impl Position {
+    /// A record at this position, with no replacement line counts and its
+    /// highlights left to line-local matching.
+    fn line(self, bytes: &[u8], kind: LineKind, fragment: bool) -> Line<'_> {
+        Line {
+            offset: self.offset,
+            source_lines: None,
+            terminated: self.terminated,
+            number: self.number,
+            bytes,
+            kind,
+            fragment,
+            highlights: None,
+        }
+    }
+}
+
 fn scan_records(
     plan: &Plan,
     input: &mut dyn Read,
@@ -618,6 +643,11 @@ fn scan_records(
                 offset += line.len() as u64 + u64::from(line_terminated);
                 result.bytes_searched = offset;
                 number += 1;
+                let at = Position {
+                    offset: line_offset,
+                    terminated: line_terminated,
+                    number,
+                };
                 if stopped() {
                     return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                 }
@@ -625,14 +655,8 @@ fn scan_records(
                     // Lines after `-m` are context and are never searched.
                     if rendering {
                         emit(Line {
-                            offset: line_offset,
-                            source_lines: None,
-                            terminated: line_terminated,
-                            number,
-                            bytes: line,
-                            kind: LineKind::Context,
-                            fragment: false,
                             highlights: Some(&[]),
+                            ..at.line(line, LineKind::Context, false)
                         })
                         .map_err(ScanError::Output)?;
                     }
@@ -673,61 +697,25 @@ fn scan_records(
                             // D79 D: `-o` never prints an empty record.
                             if fragments && !span.is_empty() {
                                 printed = true;
-                                emit(Line {
-                                    offset: line_offset,
-                                    source_lines: None,
-                                    terminated: line_terminated,
-                                    number,
-                                    bytes: &line[span],
-                                    kind: LineKind::Match,
-                                    fragment: true,
-                                    highlights: None,
-                                })
-                                .map_err(ScanError::Output)?;
+                                emit(at.line(&line[span], LineKind::Match, true))
+                                    .map_err(ScanError::Output)?;
                             }
                         }
                         if fragments && !printed {
                             // An empty fragment prints nothing; it keeps this
                             // selected line in the context window.
-                            emit(Line {
-                                offset: line_offset,
-                                source_lines: None,
-                                terminated: line_terminated,
-                                number,
-                                bytes: &line[..0],
-                                kind: LineKind::Match,
-                                fragment: true,
-                                highlights: None,
-                            })
-                            .map_err(ScanError::Output)?;
+                            emit(at.line(&line[..0], LineKind::Match, true))
+                                .map_err(ScanError::Output)?;
                         }
                         if plan.output == Output::Lines && plan.replacement.is_some() {
-                            emit(Line {
-                                offset: line_offset,
-                                source_lines: None,
-                                terminated: line_terminated,
-                                number,
-                                bytes: line,
-                                kind: LineKind::Match,
-                                fragment: false,
-                                highlights: None,
-                            })
-                            .map_err(ScanError::Output)?;
+                            emit(at.line(line, LineKind::Match, false))
+                                .map_err(ScanError::Output)?;
                         }
                     } else {
                         result.count += 1;
                         if plan.output == Output::Lines {
-                            emit(Line {
-                                offset: line_offset,
-                                source_lines: None,
-                                terminated: line_terminated,
-                                number,
-                                bytes: line,
-                                kind: LineKind::Match,
-                                fragment: false,
-                                highlights: None,
-                            })
-                            .map_err(ScanError::Output)?;
+                            emit(at.line(line, LineKind::Match, false))
+                                .map_err(ScanError::Output)?;
                         }
                     }
                     if plan.max_count.is_some_and(|limit| selected_lines >= limit) {
@@ -737,17 +725,7 @@ fn scan_records(
                         }
                     }
                 } else if rendering && number <= trailing {
-                    emit(Line {
-                        offset: line_offset,
-                        source_lines: None,
-                        terminated: line_terminated,
-                        number,
-                        bytes: line,
-                        kind: LineKind::Context,
-                        fragment: false,
-                        highlights: None,
-                    })
-                    .map_err(ScanError::Output)?;
+                    emit(at.line(line, LineKind::Context, false)).map_err(ScanError::Output)?;
                 } else if rendering {
                     before
                         .push_at(number, line_offset, line)
