@@ -7684,3 +7684,38 @@ c6cea11, mean of three, same corpus and setup:
 
 B now buys 16% (0.42 s) for 98 MB (29% more peak). Recommendation unchanged:
 A, by a wider margin than at f29075c.
+
+## D137 — Whether a build's closing merges run side by side
+
+**Question:** Should the merges that follow a large build run several at
+once, or overlap the reading itself, rather than one after another once
+reading has finished?
+
+`ferret index` reads every document, then calls `merge_if_needed` until the
+policy is satisfied. Each merge runs on two threads (term half and trigram
+half) and they run in sequence, so a build's tail grows with the tree while
+the machine sits nearly idle. Measured on 77313b4 with intpack 4d1a64c, the
+tree corpus copied four times with a line appended to each file so that no
+copy deduplicates (192,824 files, 3.9 GB), index on tmpfs, one profiled run:
+
+| Phase                         | Span          | Cores busy |
+| ----------------------------- | ------------- | ---------- |
+| Reading, drains, file writes  | 0.0 to 8.6 s  | about 8    |
+| Seven merges, in sequence     | 8.6 to 11.7 s | about 1.7  |
+
+The seven merges took 0.32, 0.58, 0.38, 0.35, 0.35, 0.40 and 0.28 s. On the
+single tree corpus the one closing merge is 0.3 of 2.36 s (13%); at four
+times the corpus it is 3.0 of 11.6 s (26%), and its share grows with the
+tree.
+
+| Option | Costs | Buys |
+| ------ | ----- | ---- |
+| A. Keep: merge after reading, one at a time | Nothing. | Simplest; one writer, one publisher. |
+| B. After reading, merge disjoint runs at once, publishing in order | Merge splits into a pure step (inputs to an unnamed output file) and a publish; the policy must name every disjoint run it would have picked in sequence, or accept a different but valid layout. Each merge's output buffers are held at once. | Estimated, not built: the seven merges become about one merge plus the last, roughly 3.0 to 0.9 s here, 18% of the build. Serves the daemon's post-pass merges too. |
+| C. Merge while reading: a background thread merges runs as they fill, and the writer publishes each at its next segment boundary | A concurrent publish beside follow's appends; crash cleanup must spare an in-flight merge's file; merges compete with readers for cores (about 24 of 32 idle here). | Most of the tail on any tree, as early merges finish under reading. |
+
+**Recommendation:** B. It keeps follow the only writer and the manifest
+publisher single-threaded, and takes most of the measured tail. The fact
+that would change it: if large first builds mostly run through the daemon
+and its pass-end publication is what users wait on, C, because only C
+moves merge work under the reading.
