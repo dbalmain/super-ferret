@@ -8,6 +8,7 @@ use crate::{Catalog, DecodeError, InoId, Kind, Name, NameId, OpenError, Section,
 use ids::Ids;
 use runs::{Row, Runs};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 /// Child keys `(parent, basename)` mapped to a name id, `None` for a removal.
@@ -40,6 +41,19 @@ fn record_key(r: &Record) -> u64 {
         Record::DocPut { id, .. } | Record::DocDelete { id } => (DOC, *id),
     };
     key(category, id)
+}
+/// Fails unless a transaction's `births` are exactly the ids it allocated.
+fn check_births(
+    births: &BTreeSet<u32>,
+    allocated: Range<u32>,
+    label: &'static str,
+) -> Result<(), OpenError> {
+    if births.len() as u64 != u64::from(allocated.end - allocated.start)
+        || births.iter().copied().ne(allocated)
+    {
+        return Err(bad(label));
+    }
+    Ok(())
 }
 fn bad(label: &'static str) -> OpenError {
     OpenError::Decode(DecodeError::Corrupt(label))
@@ -238,111 +252,12 @@ impl Overlay {
             .as_ref()
             .map_or(self.base.manifest().counts, |p| p.manifest.counts);
         for (seq, next, records) in self.transactions(family) {
-            if family == Family::Namespace {
-                // Only LifePut/InodeDelete affect liveness and counts below;
-                // most touched Namespace records are NamePut/DirPut and
-                // never match. Key the last-wins map on id alone instead of
-                // building a generic map over every touched record.
-                let mut final_rows: BTreeMap<u32, &Record> = BTreeMap::new();
-                for r in &records {
-                    if let Record::LifePut { id, .. } | Record::InodeDelete { id } = r.as_ref() {
-                        final_rows.insert(*id, r.as_ref());
-                    }
+            match family {
+                Family::Namespace => {
+                    self.check_inodes(&p, &records, counters, next, &mut counts)?
                 }
-                let mut births = BTreeSet::new();
-                for r in final_rows.values() {
-                    match r {
-                        Record::LifePut { id, kind, .. } => {
-                            if matches!(p.get(LIFE, *id), Some(Record::InodeDelete { .. })) {
-                                return Err(bad("retired inode reused"));
-                            }
-                            if *id >= counters[0] {
-                                births.insert(*id);
-                                counts[0] += 1;
-                                counts[2] += u32::from(*kind == Kind::Dir);
-                            } else if let Some(Record::LifePut { kind: old, .. }) = p.get(LIFE, *id)
-                            {
-                                if old != kind {
-                                    return Err(bad("inode lifetime type changed"));
-                                }
-                            } else if (*id < self.base.base_dir_count()) != (*kind == Kind::Dir) {
-                                return Err(bad("base directory type changed"));
-                            }
-                        }
-                        Record::InodeDelete { id } => {
-                            if *id >= counters[0]
-                                || matches!(p.get(LIFE, *id), Some(Record::InodeDelete { .. }))
-                            {
-                                return Err(bad("delete absent inode"));
-                            }
-                            let dir = match p.get(LIFE, *id) {
-                                Some(Record::LifePut { kind, .. }) => *kind == Kind::Dir,
-                                _ => *id < self.base.base_dir_count(),
-                            };
-                            counts[0] = counts[0]
-                                .checked_sub(1)
-                                .ok_or_else(|| bad("inode counts"))?;
-                            counts[2] = counts[2]
-                                .checked_sub(u32::from(dir))
-                                .ok_or_else(|| bad("directory counts"))?;
-                        }
-                        _ => {}
-                    }
-                }
-                if births.len() as u64 != u64::from(next[0] - counters[0])
-                    || births.iter().copied().ne(counters[0]..next[0])
-                {
-                    return Err(bad("inode allocation gaps"));
-                }
-            }
-            if family == Family::Docs {
-                self.base.load(&[Section::Docs])?;
-                let mut final_rows = BTreeMap::new();
-                for r in &records {
-                    final_rows.insert(record_key(r), r.as_ref());
-                }
-                let mut births = BTreeSet::new();
-                for r in final_rows.values() {
-                    match r {
-                        Record::DocPut { id, hash, .. } => {
-                            let previous = match p.get(DOC, *id) {
-                                Some(Record::DocPut { hash, .. }) => Some(*hash),
-                                Some(Record::DocDelete { .. }) => {
-                                    return Err(bad("retired document reused"));
-                                }
-                                _ => self.base.doc_hash(crate::DocId(*id)),
-                            };
-                            if *id >= counters[2] {
-                                births.insert(*id);
-                                counts[3] += 1;
-                            } else if previous.is_none() {
-                                return Err(bad("unassigned/retired document reused"));
-                            }
-                            if previous.is_some_and(|old| old != *hash) {
-                                return Err(bad("document hash changed"));
-                            }
-                        }
-                        Record::DocDelete { id } => {
-                            let existed = match p.get(DOC, *id) {
-                                Some(Record::DocPut { .. }) => true,
-                                Some(Record::DocDelete { .. }) => false,
-                                _ => self.base.doc_hash(crate::DocId(*id)).is_some(),
-                            };
-                            if !existed {
-                                return Err(bad("delete absent document"));
-                            }
-                            counts[3] = counts[3]
-                                .checked_sub(1)
-                                .ok_or_else(|| bad("document counts"))?;
-                        }
-                        _ => {}
-                    }
-                }
-                if births.len() as u64 != u64::from(next[2] - counters[2])
-                    || births.iter().copied().ne(counters[2]..next[2])
-                {
-                    return Err(bad("document allocation gaps"));
-                }
+                Family::Docs => self.check_docs(&p, &records, counters, next, &mut counts)?,
+                _ => {}
             }
             p.apply(seq, records.into_iter());
             counters = next;
@@ -357,6 +272,121 @@ impl Overlay {
         }
         let _ = self.families[family as usize].set(p);
         Ok(())
+    }
+    /// Checks a transaction's inode lifetimes against the projection
+    /// before it, and counts its births and deaths into `counts`.
+    fn check_inodes(
+        &self,
+        p: &Projection,
+        records: &[Arc<Record>],
+        counters: [u32; 3],
+        next: [u32; 3],
+        counts: &mut [u32; 4],
+    ) -> Result<(), OpenError> {
+        // Only LifePut/InodeDelete affect liveness and counts below;
+        // most touched Namespace records are NamePut/DirPut and
+        // never match. Key the last-wins map on id alone instead of
+        // building a generic map over every touched record.
+        let mut final_rows: BTreeMap<u32, &Record> = BTreeMap::new();
+        for r in records {
+            if let Record::LifePut { id, .. } | Record::InodeDelete { id } = r.as_ref() {
+                final_rows.insert(*id, r.as_ref());
+            }
+        }
+        let mut births = BTreeSet::new();
+        for r in final_rows.values() {
+            match r {
+                Record::LifePut { id, kind, .. } => {
+                    if matches!(p.get(LIFE, *id), Some(Record::InodeDelete { .. })) {
+                        return Err(bad("retired inode reused"));
+                    }
+                    if *id >= counters[0] {
+                        births.insert(*id);
+                        counts[0] += 1;
+                        counts[2] += u32::from(*kind == Kind::Dir);
+                    } else if let Some(Record::LifePut { kind: old, .. }) = p.get(LIFE, *id) {
+                        if old != kind {
+                            return Err(bad("inode lifetime type changed"));
+                        }
+                    } else if (*id < self.base.base_dir_count()) != (*kind == Kind::Dir) {
+                        return Err(bad("base directory type changed"));
+                    }
+                }
+                Record::InodeDelete { id } => {
+                    if *id >= counters[0]
+                        || matches!(p.get(LIFE, *id), Some(Record::InodeDelete { .. }))
+                    {
+                        return Err(bad("delete absent inode"));
+                    }
+                    let dir = match p.get(LIFE, *id) {
+                        Some(Record::LifePut { kind, .. }) => *kind == Kind::Dir,
+                        _ => *id < self.base.base_dir_count(),
+                    };
+                    counts[0] = counts[0]
+                        .checked_sub(1)
+                        .ok_or_else(|| bad("inode counts"))?;
+                    counts[2] = counts[2]
+                        .checked_sub(u32::from(dir))
+                        .ok_or_else(|| bad("directory counts"))?;
+                }
+                _ => {}
+            }
+        }
+        check_births(&births, counters[0]..next[0], "inode allocation gaps")
+    }
+    /// Checks a transaction's documents against the projection before it,
+    /// and counts its births and deaths into `counts`.
+    fn check_docs(
+        &self,
+        p: &Projection,
+        records: &[Arc<Record>],
+        counters: [u32; 3],
+        next: [u32; 3],
+        counts: &mut [u32; 4],
+    ) -> Result<(), OpenError> {
+        self.base.load(&[Section::Docs])?;
+        let mut final_rows = BTreeMap::new();
+        for r in records {
+            final_rows.insert(record_key(r), r.as_ref());
+        }
+        let mut births = BTreeSet::new();
+        for r in final_rows.values() {
+            match r {
+                Record::DocPut { id, hash, .. } => {
+                    let previous = match p.get(DOC, *id) {
+                        Some(Record::DocPut { hash, .. }) => Some(*hash),
+                        Some(Record::DocDelete { .. }) => {
+                            return Err(bad("retired document reused"));
+                        }
+                        _ => self.base.doc_hash(crate::DocId(*id)),
+                    };
+                    if *id >= counters[2] {
+                        births.insert(*id);
+                        counts[3] += 1;
+                    } else if previous.is_none() {
+                        return Err(bad("unassigned/retired document reused"));
+                    }
+                    if previous.is_some_and(|old| old != *hash) {
+                        return Err(bad("document hash changed"));
+                    }
+                }
+                Record::DocDelete { id } => {
+                    let existed = match p.get(DOC, *id) {
+                        Some(Record::DocPut { .. }) => true,
+                        Some(Record::DocDelete { .. }) => false,
+                        _ => self.base.doc_hash(crate::DocId(*id)).is_some(),
+                    };
+                    if !existed {
+                        return Err(bad("delete absent document"));
+                    }
+                    counts[3] = counts[3]
+                        .checked_sub(1)
+                        .ok_or_else(|| bad("document counts"))?;
+                }
+                _ => {}
+            }
+        }
+        check_births(&births, counters[2]..next[2], "document allocation gaps")
     }
     pub(crate) fn loaded(&self, section: Section) -> bool {
         if self.families[Family::Namespace as usize].get().is_none() {
