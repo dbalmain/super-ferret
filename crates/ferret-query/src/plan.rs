@@ -188,6 +188,88 @@ const ADOPT_FANOUT: usize = 4;
 /// a small overlay touching a few multi-name rows still adopts.
 const ADOPT_FLOOR: usize = 64;
 
+/// The document a live name counts toward, as in the full build.
+fn owner(view: &Catalog, name: NameId) -> Option<u32> {
+    if !view.is_live_name(name) {
+        return None;
+    }
+    match view.name(name).target() {
+        Target::Inode(inode) if view.is_live_inode(inode) => view.doc(inode).map(|doc| doc.0),
+        _ => None,
+    }
+}
+
+/// What an overlay changed, for [`DocNames::adopt`].
+struct Changes {
+    /// A row changes only when one of its names or their inodes does, so the
+    /// documents of changed names and inodes, before and after, are every
+    /// row to rebuild.
+    affected: HashSet<u32>,
+    /// The changed names still live.
+    rewritten: Vec<NameId>,
+    /// Inodes live before that had no document then and have one now.
+    gained: Vec<InoId>,
+    /// Changed names and inodes.
+    overlay_rows: usize,
+}
+
+impl Changes {
+    fn between(previous: &Catalog, catalog: &Catalog) -> Self {
+        let mut affected = HashSet::new();
+        let mut rewritten = Vec::new();
+        let mut overlay_rows = 0usize;
+        for (name, live) in catalog.changed_names() {
+            overlay_rows += 1;
+            affected.extend(owner(previous, name));
+            if live {
+                affected.extend(owner(catalog, name));
+                rewritten.push(name);
+            }
+        }
+        let mut gained = Vec::new();
+        for inode in catalog.changed_inodes() {
+            overlay_rows += 1;
+            let before = previous
+                .is_live_inode(inode)
+                .then(|| previous.doc(inode))
+                .flatten();
+            let after = catalog
+                .is_live_inode(inode)
+                .then(|| catalog.doc(inode))
+                .flatten();
+            if before != after {
+                affected.extend(before.into_iter().chain(after).map(|doc| doc.0));
+                if before.is_none() && previous.is_live_inode(inode) {
+                    gained.push(inode);
+                }
+            }
+        }
+        Self {
+            affected,
+            rewritten,
+            gained,
+            overlay_rows,
+        }
+    }
+
+    /// Whether every name of each inode that gained a document was
+    /// rewritten, so that no previous row's name is missing from its row.
+    fn gained_names_rewritten(&self, catalog: &Catalog) -> bool {
+        if self.gained.is_empty() {
+            return true;
+        }
+        let mut found: HashMap<InoId, u32> = HashMap::new();
+        for &name in &self.rewritten {
+            if let Target::Inode(inode) = catalog.name(name).target() {
+                *found.entry(inode).or_default() += 1;
+            }
+        }
+        self.gained.iter().all(|inode| {
+            found.get(inode).copied().unwrap_or(0) == catalog.indexed_name_count(*inode)
+        })
+    }
+}
+
 /// The rows one full build placed, shared by the views that adopt it.
 #[derive(Debug)]
 struct DocNameBase {
@@ -321,81 +403,38 @@ impl DocNames {
     ) -> Result<Option<Self>, OpenError> {
         catalog.load(&Section::INODE)?;
         catalog.load(&[Section::Names, Section::Doc])?;
-        // A name counts toward its inode's document as in the full build.
-        let owner = |view: &Catalog, name: NameId| {
-            if !view.is_live_name(name) {
-                return None;
-            }
-            match view.name(name).target() {
-                Target::Inode(inode) if view.is_live_inode(inode) => {
-                    view.doc(inode).map(|doc| doc.0)
-                }
-                _ => None,
-            }
-        };
-        // A row changes only when one of its names or their inodes does, so
-        // the documents of changed names and inodes, before and after, are
-        // every row to rebuild.
-        let mut affected = HashSet::new();
-        let mut rewritten = Vec::new();
-        let mut overlay_rows = 0usize;
-        for (name, live) in catalog.changed_names() {
-            overlay_rows += 1;
-            affected.extend(owner(previous_catalog, name));
-            if live {
-                affected.extend(owner(catalog, name));
-                rewritten.push(name);
-            }
+        let changes = Changes::between(previous_catalog, catalog);
+        if !changes.gained_names_rewritten(catalog) {
+            return Ok(None);
         }
-        let mut gained = Vec::new();
-        for inode in catalog.changed_inodes() {
-            overlay_rows += 1;
-            let before = previous_catalog
-                .is_live_inode(inode)
-                .then(|| previous_catalog.doc(inode))
-                .flatten();
-            let after = catalog
-                .is_live_inode(inode)
-                .then(|| catalog.doc(inode))
-                .flatten();
-            if before != after {
-                affected.extend(before.into_iter().chain(after).map(|doc| doc.0));
-                if before.is_none() && previous_catalog.is_live_inode(inode) {
-                    gained.push(inode);
-                }
-            }
-        }
-        if !gained.is_empty() {
-            let mut found: HashMap<InoId, u32> = HashMap::new();
-            for &name in &rewritten {
-                if let Target::Inode(inode) = catalog.name(name).target() {
-                    *found.entry(inode).or_default() += 1;
-                }
-            }
-            if gained.into_iter().any(|inode| {
-                found.get(&inode).copied().unwrap_or(0) != catalog.indexed_name_count(inode)
-            }) {
-                return Ok(None);
-            }
-        }
-
         // Placing the candidates and carrying the replaced rows is the rest
         // of the work; refuse it before doing it.
-        let work = affected
+        let work = changes
+            .affected
             .iter()
             .map(|&doc| previous.names(doc).len())
             .sum::<usize>()
-            + rewritten.len()
+            + changes.rewritten.len()
             + previous.overrides.len();
-        if work > overlay_rows.saturating_mul(ADOPT_FANOUT) + ADOPT_FLOOR {
+        if work > changes.overlay_rows.saturating_mul(ADOPT_FANOUT) + ADOPT_FLOOR {
             return Ok(None);
         }
+        Ok(Some(previous.rebuild(catalog, changes)))
+    }
 
+    /// `self` with the rows of `changes`' affected documents rebuilt from
+    /// their previous names and the rewritten ones.
+    fn rebuild(&self, catalog: &Catalog, changes: Changes) -> Self {
+        let Changes {
+            affected,
+            rewritten,
+            ..
+        } = changes;
         let mut rows: HashMap<u32, Vec<NameId>> =
             affected.iter().map(|&doc| (doc, Vec::new())).collect();
         let candidates = affected
             .iter()
-            .flat_map(|&doc| previous.names(doc))
+            .flat_map(|&doc| self.names(doc))
             .copied()
             .chain(rewritten);
         for name in candidates {
@@ -403,16 +442,16 @@ impl DocNames {
                 row.push(name);
             }
         }
-        let mut overrides = (*previous.overrides).clone();
+        let mut overrides = (*self.overrides).clone();
         for (doc, mut names) in rows {
             names.sort_unstable();
             names.dedup();
             overrides.insert(doc, Arc::from(names));
         }
-        Ok(Some(Self {
-            base: previous.base.clone(),
+        Self {
+            base: self.base.clone(),
             overrides: Arc::new(overrides),
-        }))
+        }
     }
 
     /// The document's live names, ascending; empty for an id it never saw.
