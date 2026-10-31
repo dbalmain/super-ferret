@@ -5,6 +5,8 @@
 //! [`STOP`], which fails the operation there as a crash would stop it.
 
 use std::collections::BTreeSet;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 use crate::manifest;
@@ -710,12 +712,12 @@ fn a_cooperatively_cancelled_merge_can_retry_without_reopening() {
     let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
     follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
     let before = writer.view();
-    let paused = std::cell::Cell::new(false);
+    let paused = AtomicBool::new(false);
     let pace = |_: usize| {
-        paused.set(true);
+        paused.store(true, Ordering::Relaxed);
         Ok(())
     };
-    let cancelled = || paused.get();
+    let cancelled = || paused.load(Ordering::Relaxed);
     let budget = Budget {
         pace: &pace,
         cancelled: &cancelled,
@@ -1320,14 +1322,14 @@ fn a_merge_charges_the_pacer_for_input_pages_it_reads() {
     let dir = Dir::new("charge-once");
     let catalog = Catalog::new(2400, &[]);
     let mut writer = wide_index(&dir, &catalog, 80_000);
-    let (input, other) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let (input, other) = (AtomicU64::new(0), AtomicU64::new(0));
     let pace = |bytes: usize| {
         let counter = if input_trace::charging() {
             &input
         } else {
             &other
         };
-        counter.set(counter.get() + bytes as u64);
+        counter.fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(())
     };
     let budget = Budget {
@@ -1352,7 +1354,7 @@ fn a_merge_charges_the_pacer_for_input_pages_it_reads() {
     // window, are charged within an eighth of their distinct pages (3% over
     // when written); charging every read was 240 times them.
     let touched = touched_bytes(&reads);
-    let (input, other) = (input.get(), other.get());
+    let (input, other) = (input.into_inner(), other.into_inner());
     assert!(
         touched <= input && input <= touched + touched / 8,
         "input paced {input} for {touched} touched"
@@ -1376,9 +1378,9 @@ fn a_merge_input_charges_a_page_again_once_it_leaves_the_window() {
     let path = dir.0.join("input");
     fs::write(&path, vec![7; size as usize]).unwrap();
     let file = File::open(&path).unwrap();
-    let paced = RefCell::new(Vec::new());
+    let paced = Mutex::new(Vec::new());
     let pace = |bytes: usize| {
-        paced.borrow_mut().push(bytes as u64);
+        paced.lock().unwrap().push(bytes as u64);
         Ok(())
     };
     let input = PacedInput::new(&file, &pace).unwrap();
@@ -1386,7 +1388,7 @@ fn a_merge_input_charges_a_page_again_once_it_leaves_the_window() {
         let mut buf = vec![0; len];
         input.read_exact_at(&mut buf, offset).unwrap();
         assert_eq!(buf, vec![7; len]);
-        paced.borrow_mut().drain(..).collect::<Vec<_>>()
+        paced.lock().unwrap().drain(..).collect::<Vec<_>>()
     };
     // An unaligned span charges both whole pages it touches; a repeat is
     // free but still calls the pacer.
@@ -1663,11 +1665,8 @@ fn several_readers_follow_exactly_as_one_does() {
     let mut catalog = Catalog::new(80, &[3, 40, 41, 79]);
     catalog.unreadable = [0, 7, 50].into();
     // The writer consults the pause between documents, on its own thread.
-    let asked = std::cell::Cell::new(0);
-    let pause = || {
-        asked.set(asked.get() + 1);
-        asked.get() % 23 == 0
-    };
+    let asked = AtomicU64::new(0);
+    let pause = || (asked.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(23);
     let budgets = [
         ("unbounded", Budget::unbounded()),
         ("bytes", budget(200)),
@@ -1687,9 +1686,9 @@ fn several_readers_follow_exactly_as_one_does() {
         ),
     ];
     for (name, budget) in &budgets {
-        asked.set(0);
+        asked.store(0, Ordering::Relaxed);
         let one = follow_with_readers(&format!("readers-1-{name}"), 1, &catalog, &corpus, budget);
-        asked.set(0);
+        asked.store(0, Ordering::Relaxed);
         let four = follow_with_readers(&format!("readers-4-{name}"), 4, &catalog, &corpus, budget);
         assert!(one.0.len() > 1 || *name == "unbounded", "{name}: one pass");
         assert_eq!(one, four, "{name}");

@@ -97,12 +97,12 @@ pub struct Budget<'a> {
     /// Follow's postings buffer, [`BUFFER`] by default.
     pub buffer: usize,
     /// Cooperative pause checked between documents and merge terms.
-    pub cancelled: &'a dyn Fn() -> bool,
+    pub cancelled: &'a (dyn Fn() -> bool + Sync),
     /// Called before each bounded index-file transfer: the shared background
     /// pacer, or a no-op for explicit commands. An error aborts the transfer.
     /// A merge charges an input page once per run of nearby reads of it.
     /// Document reads are paced separately by the host's reader.
-    pub pace: &'a dyn Fn(usize) -> io::Result<()>,
+    pub pace: &'a (dyn Fn(usize) -> io::Result<()> + Sync),
 }
 
 impl Budget<'static> {
@@ -296,8 +296,9 @@ impl View {
 
     /// Headroom for the next policy-selected merge, absent when no merge is
     /// due. Memory includes growable decoded lists and spilling scratch;
-    /// disk includes output plus postings scratch while the committed
-    /// inputs still exist.
+    /// the term and trigram outputs merge at once, and their two lists each
+    /// reach 8 bytes a document. Disk includes output plus postings scratch
+    /// while the committed inputs still exist.
     pub fn merge_resources(&self, live: &DocSet) -> Option<(u64, u64)> {
         let entries = self.merge_selection(live)?;
         let bytes = entries.iter().map(SegmentEntry::total_bytes).sum::<u64>();
@@ -761,8 +762,17 @@ impl IndexWriter {
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 (terms, trigrams)
             });
-            let mut writers = [Some(terms?), Some(trigrams?)];
+            let (terms, trigrams) = (terms?, trigrams?);
             drop(inverter);
+            let finish = |writer: Writer, file: &File| -> Result<Sizes, Error> {
+                let mut out = BufWriter::new(Paced {
+                    file,
+                    pace: budget.pace,
+                });
+                let sizes = writer.finish(&mut out)?;
+                out.flush()?;
+                Ok(sizes)
+            };
             let (entry, segment, trigram) = Self::write_pair(
                 &self.dir,
                 &mut manifest,
@@ -773,18 +783,7 @@ impl IndexWriter {
                 // completed range, as its Stopped::Asked contract requires.
                 // Merge checks cancellation while writing its output pair.
                 &|| false,
-                |file, tri| {
-                    let writer = writers[usize::from(tri)]
-                        .take()
-                        .ok_or_else(|| io::Error::other("pair output already consumed"))?;
-                    let mut out = BufWriter::new(Paced {
-                        file,
-                        pace: budget.pace,
-                    });
-                    let sizes = writer.finish(&mut out)?;
-                    out.flush()?;
-                    Ok(sizes)
-                },
+                (|file| finish(terms, file), |file| finish(trigrams, file)),
             )?;
             followed.segment = Some(entry);
             followed.written = entry.total_bytes();
@@ -884,8 +883,22 @@ impl IndexWriter {
             .map(|segment| PacedInput::open(segment.source(), &merge_pace))
             .collect::<Result<Vec<_>, _>>()?;
         let number = manifest.next_number;
-        let scratch = self.dir.join(format!("tmp-{number}.postings"));
         let codec = self.codec;
+        let dir = &self.dir;
+        // Each output spills its postings to its own scratch file.
+        let fill = |inputs: &[Segment<PacedInput<'_>>], file: &File, tri: bool| {
+            let extension = if tri { "tri-postings" } else { "postings" };
+            let scratch = dir.join(format!("tmp-{number}.{extension}"));
+            let postings = regular::replace(&scratch)?;
+            let writer = if tri {
+                Writer::keyed_spilling(first, last, TRIGRAM_VERSION, file.try_clone()?, postings)?
+            } else {
+                Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?
+            };
+            let result = merge::stream(inputs, catalog.live, writer, &merge_pace, budget.cancelled);
+            let _ = fs::remove_file(&scratch);
+            result
+        };
         let mut changes = (0, 0);
         let result = Self::write_pair(
             &self.dir,
@@ -894,33 +907,14 @@ impl IndexWriter {
             first,
             last,
             budget.cancelled,
-            |file, tri| {
-                let postings = regular::replace(&scratch)?;
-                let writer = if tri {
-                    Writer::keyed_spilling(
-                        first,
-                        last,
-                        TRIGRAM_VERSION,
-                        file.try_clone()?,
-                        postings,
-                    )?
-                } else {
-                    Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?
-                };
-                let result = merge::stream(
-                    if tri { &trigram_inputs } else { &inputs },
-                    catalog.live,
-                    writer,
-                    &merge_pace,
-                    budget.cancelled,
-                );
-                let _ = fs::remove_file(&scratch);
-                let sizes = result?;
-                if !tri {
+            (
+                |file| {
+                    let sizes = fill(&inputs, file, false)?;
                     changes = (sizes.records_added, sizes.records_removed);
-                }
-                Ok(sizes)
-            },
+                    Ok(sizes)
+                },
+                move |file| fill(&trigram_inputs, file, true),
+            ),
         );
         let (entry, segment, trigram) = result?;
 
@@ -946,29 +940,22 @@ impl IndexWriter {
     }
 
     /// Writes, checks and installs both outputs before manifest publication.
+    /// The term file is written here while the trigram file is written on a
+    /// second thread: the two are independent until both are renamed.
     fn write_pair(
         dir: &Path,
         manifest: &mut Manifest,
         docs: u32,
         first: u32,
         last: u32,
-        cancelled: &dyn Fn() -> bool,
-        mut fill: impl FnMut(&File, bool) -> Result<Sizes, Error>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        (terms, trigrams): (
+            impl FnOnce(&File) -> Result<Sizes, Error>,
+            impl FnOnce(&File) -> Result<Sizes, Error> + Send,
+        ),
     ) -> Result<WrittenPair, Error> {
         let number = manifest.next_number;
         manifest.next_number += 1;
-        let write = |tri: bool,
-                     fill: &mut dyn FnMut(&File, bool) -> Result<Sizes, Error>|
-         -> Result<_, Error> {
-            if cancelled() {
-                return Err(Error::Cancelled);
-            }
-            let extension = if tri { "tri" } else { "seg" };
-            let temp = dir.join(format!("tmp-{number}.{extension}"));
-            let file = regular::replace(&temp)?;
-            let sizes = fill(&file, tri)?;
-            Ok((temp, file, sizes))
-        };
         let open = |tri: bool, file: File, sizes: Sizes| -> Result<_, Error> {
             let segment = Segment::open(file)?;
             let info = segment.info();
@@ -986,21 +973,27 @@ impl IndexWriter {
             }
             Ok(Arc::new(segment))
         };
-        let (temp, file, sizes) = write(false, &mut fill)?;
-        // The term file syncs while the trigram file is written: the two
-        // are independent until both are renamed.
-        let (synced, trigram_written) = std::thread::scope(|scope| {
-            let synced = scope.spawn(|| file.sync_all());
-            let written = write(true, &mut fill).and_then(|(temp, file, sizes)| {
-                file.sync_all()?;
-                Ok((temp, file, sizes))
+        let (term_written, trigram_written) = std::thread::scope(|scope| {
+            #[cfg(test)]
+            let inherit = (
+                crate::segment::inherit_fingerprint(),
+                input_trace::inherit(),
+            );
+            let trigram = scope.spawn(|| {
+                #[cfg(test)]
+                {
+                    inherit.0();
+                    inherit.1();
+                }
+                write_output(dir, number, true, cancelled, trigrams)
             });
-            let synced = synced
+            let term = write_output(dir, number, false, cancelled, terms);
+            let trigram = trigram
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (synced, written)
+            (term, trigram)
         });
-        synced?;
+        let (temp, file, sizes) = term_written?;
         hit(Point::TermSynced)?;
         let (trigram_temp, trigram_file, trigram_sizes) = trigram_written?;
         let segment = open(false, file, sizes)?;
@@ -1101,6 +1094,25 @@ fn alive(segment: &SegmentEntry, live: &DocSet, unreadable: &[u32]) -> u32 {
         .filter(|&&doc| doc >= segment.first && doc < end && live.contains(doc))
         .count() as u32;
     live.count(segment.first, end) - skipped
+}
+
+/// Writes and syncs one output of a pair to its temporary name.
+fn write_output(
+    dir: &Path,
+    number: u64,
+    tri: bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    fill: impl FnOnce(&File) -> Result<Sizes, Error>,
+) -> Result<(PathBuf, File, Sizes), Error> {
+    if cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let extension = if tri { "tri" } else { "seg" };
+    let temp = dir.join(format!("tmp-{number}.{extension}"));
+    let file = regular::replace(&temp)?;
+    let sizes = fill(&file)?;
+    file.sync_all()?;
+    Ok((temp, file, sizes))
 }
 
 type OpenPair = (Arc<Segment<File>>, Arc<Segment<File>>);
@@ -1272,14 +1284,14 @@ const RECENT_PAGES: usize = 16;
 /// last 64 KiB read from that input.
 struct PacedInput<'a> {
     file: &'a File,
-    pace: &'a dyn Fn(usize) -> io::Result<()>,
+    pace: &'a (dyn Fn(usize) -> io::Result<()> + Sync),
     size: u64,
     /// The most recently touched pages, newest first; [`u64::MAX`] is empty.
     recent: RefCell<[u64; RECENT_PAGES]>,
 }
 
 impl<'a> PacedInput<'a> {
-    fn new(file: &'a File, pace: &'a dyn Fn(usize) -> io::Result<()>) -> io::Result<Self> {
+    fn new(file: &'a File, pace: &'a (dyn Fn(usize) -> io::Result<()> + Sync)) -> io::Result<Self> {
         Ok(Self {
             file,
             pace,
@@ -1290,7 +1302,7 @@ impl<'a> PacedInput<'a> {
 
     fn open(
         file: &'a File,
-        pace: &'a dyn Fn(usize) -> io::Result<()>,
+        pace: &'a (dyn Fn(usize) -> io::Result<()> + Sync),
     ) -> Result<Segment<Self>, ReadError> {
         Segment::open(Self::new(file, pace)?)
     }
@@ -1343,6 +1355,7 @@ impl ReadAt for PacedInput<'_> {
 pub(crate) mod input_trace {
     use std::cell::{Cell, RefCell};
     use std::fs::File;
+    use std::sync::{Arc, Mutex};
 
     /// One input read: the file (by address and size) and the span.
     #[derive(Clone, Copy, Debug)]
@@ -1354,15 +1367,15 @@ pub(crate) mod input_trace {
     }
 
     thread_local! {
-        static READS: RefCell<Option<Vec<Read>>> = const { RefCell::new(None) };
+        static READS: RefCell<Option<Arc<Mutex<Vec<Read>>>>> = const { RefCell::new(None) };
         static CHARGING: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(super) fn record(file: &File, size: u64, offset: u64, len: usize) {
-        READS.with_borrow_mut(|reads| {
+        READS.with_borrow(|reads| {
             if let Some(reads) = reads {
                 let file = std::ptr::from_ref(file) as usize;
-                reads.push(Read {
+                reads.lock().unwrap().push(Read {
                     file,
                     size,
                     offset,
@@ -1393,11 +1406,20 @@ pub(crate) mod input_trace {
         CHARGING.get()
     }
 
-    /// Runs `f`, returning its result and every input read on this thread.
+    /// Runs `f`, returning its result and every input read on this thread
+    /// or a thread that inherited its trace.
     pub(crate) fn during<T>(f: impl FnOnce() -> T) -> (T, Vec<Read>) {
-        READS.set(Some(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        READS.set(Some(reads.clone()));
         let result = f();
-        (result, READS.take().unwrap_or_default())
+        READS.set(None);
+        (result, std::mem::take(&mut *reads.lock().unwrap()))
+    }
+
+    /// This thread's trace, to set on a thread that reads for it.
+    pub(crate) fn inherit() -> impl FnOnce() + Send {
+        let reads = READS.with_borrow(Clone::clone);
+        move || READS.set(reads)
     }
 }
 

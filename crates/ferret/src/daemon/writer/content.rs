@@ -64,12 +64,12 @@ pub(super) fn turn(
                 .is_some_and(|due| due <= Instant::now())
     };
     #[cfg(debug_assertions)]
-    let checks = std::cell::Cell::new(0u64);
+    let checks = std::sync::atomic::AtomicU64::new(0);
     let cancelled = || {
         #[cfg(debug_assertions)]
         {
-            checks.set(checks.get() + 1);
-            content_checkpoint(host, "follow", checks.get(), &should_interrupt);
+            let checks = checks.fetch_add(1, Ordering::Relaxed) + 1;
+            content_checkpoint(host, "follow", checks, &should_interrupt);
         }
         should_interrupt() || started.elapsed() >= Duration::from_millis(100)
     };
@@ -167,12 +167,12 @@ fn merge(
 ) -> io::Result<()> {
     let should_interrupt = || cancelled.load(Ordering::Acquire) || urgent(host, scheduler);
     #[cfg(debug_assertions)]
-    let checks = std::cell::Cell::new(0u64);
+    let checks = std::sync::atomic::AtomicU64::new(0);
     let interrupted = || {
         #[cfg(debug_assertions)]
         {
-            checks.set(checks.get() + 1);
-            content_checkpoint(host, "merge", checks.get(), &should_interrupt);
+            let checks = checks.fetch_add(1, Ordering::Relaxed) + 1;
+            content_checkpoint(host, "merge", checks, &should_interrupt);
         }
         should_interrupt()
     };
@@ -251,12 +251,12 @@ pub(super) fn follow_explicit(host: &Host, engine: &Engine) -> Result<(), String
         // A fresh counter per pass. The background follow's gate is a
         // different phase, and this command must not park in it.
         #[cfg(debug_assertions)]
-        let checks = std::cell::Cell::new(0u64);
+        let checks = std::sync::atomic::AtomicU64::new(0);
         let cancelled = || {
             #[cfg(debug_assertions)]
             {
-                checks.set(checks.get() + 1);
-                content_checkpoint(host, "explicit", checks.get(), &stop);
+                let checks = checks.fetch_add(1, Ordering::Relaxed) + 1;
+                content_checkpoint(host, "explicit", checks, &stop);
             }
             stop()
         };

@@ -1186,13 +1186,19 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
                 reply.send(answer(&old)).unwrap();
             }
         });
-        let queried = std::cell::Cell::new(false);
+        // The pacer is shared by the merge's term and trigram threads.
+        let queried = std::sync::atomic::AtomicBool::new(false);
+        let replies = std::sync::Mutex::new(replies);
         let merged = {
             let pace = |_: usize| {
-                if !queried.replace(true) {
+                if !queried.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     send.send(()).unwrap();
                     assert_eq!(
-                        replies.recv_timeout(Duration::from_secs(5)).unwrap(),
+                        replies
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap(),
                         before_merge
                     );
                 }
@@ -1207,7 +1213,7 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
                 .unwrap()
         };
         assert!(
-            queried.get(),
+            queried.into_inner(),
             "old pin must answer while the merge owns the writer"
         );
         assert!(
@@ -1219,7 +1225,11 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
         );
         send.send(()).unwrap();
         assert_eq!(
-            replies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            replies
+                .into_inner()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
             before_merge
         );
         drop(send);
