@@ -57,12 +57,6 @@ impl Filter<'_> {
             max_depth: self.traversal.max_depth,
             content: true,
         };
-        // The listing already read a catalogued name's target.
-        let target = |catalog: &ferret_catalog::Catalog, name| {
-            entry
-                .catalog_target()
-                .unwrap_or_else(|| ferret_catalog::Target::from_child(catalog.name(name).child))
-        };
         let uncovered = policy.as_ref().is_some_and(|policy| policy.uncovered());
         // A `-u` walk never consults the index, so it reads once as an
         // uncovered scan does; `--live` keeps the checked read (D123).
@@ -82,19 +76,7 @@ impl Filter<'_> {
         match visit {
             Ok(Visit::File) => {}
             Ok(Visit::Descend) => {
-                *descend = self
-                    .holders
-                    .zip(self.catalog)
-                    .is_none_or(|(holders, catalog)| {
-                        entry
-                            .catalog_name()
-                            .is_none_or(|name| match target(catalog, name) {
-                                ferret_catalog::Target::Inode(directory) => {
-                                    holders.holds(directory)
-                                }
-                                ferret_catalog::Target::Ignored(_) => true,
-                            })
-                    });
+                *descend = self.holds(entry);
                 return None;
             }
             Ok(Visit::Skip) => {
@@ -108,73 +90,121 @@ impl Filter<'_> {
         }
         *searched = true;
         if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
-            let inode = match target(catalog, name) {
-                ferret_catalog::Target::Inode(inode) => inode,
-                ferret_catalog::Target::Ignored(_) => catalog.name(name).child,
-            };
-            let Some(doc) = catalog.doc(inode) else {
-                if catalog.size(inode) > ferret_policy::DEFAULT_SIZE_CAP
-                    || self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary
-                {
-                    return Some((
-                        catalog.size(inode),
-                        Job::Unindexed(JobPath::new(entry.path()), name),
-                    ));
-                }
-                return None;
-            };
-            if self
-                .candidates
-                .is_some_and(|candidates| !candidates.contains(doc.0, stopped))
+            return self.catalogued(entry, catalog, name, stopped);
+        }
+        listed(entry, self.traversal.follow, uncovered, once)
+    }
+
+    /// Whether to descend into a directory: only one holding a candidate,
+    /// when the search has candidates.
+    fn holds(&self, entry: &ferret_query::find::Entry) -> bool {
+        self.holders
+            .zip(self.catalog)
+            .is_none_or(|(holders, catalog)| {
+                entry
+                    .catalog_name()
+                    .is_none_or(|name| match target(entry, catalog, name) {
+                        ferret_catalog::Target::Inode(directory) => holders.holds(directory),
+                        ferret_catalog::Target::Ignored(_) => true,
+                    })
+            })
+    }
+
+    /// The job for a selected file the catalog names.
+    fn catalogued(
+        &self,
+        entry: &ferret_query::find::Entry,
+        catalog: &ferret_catalog::Catalog,
+        name: ferret_catalog::NameId,
+        stopped: &dyn Fn() -> bool,
+    ) -> Option<(u64, Job)> {
+        let inode = match target(entry, catalog, name) {
+            ferret_catalog::Target::Inode(inode) => inode,
+            ferret_catalog::Target::Ignored(_) => catalog.name(name).child,
+        };
+        let Some(doc) = catalog.doc(inode) else {
+            if catalog.size(inode) > ferret_policy::DEFAULT_SIZE_CAP
+                || self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary
             {
-                if self.emit_absent {
-                    return Some((0, Job::Absent(JobPath::new(entry.path()))));
-                }
-                return None;
-            }
-            return Some((
-                catalog.size(inode),
-                Job::Checked(JobPath::new(entry.path()), name, doc.0),
-            ));
-        }
-        if self.traversal.follow {
-            return Some((
-                0,
-                Job::Listed(
-                    JobPath::new(entry.path()),
-                    engine::reader::Parent::Followed,
-                    true,
-                    once,
-                ),
-            ));
-        }
-        // Content walks retain parents or, past their budget, the parent's
-        // identity; every name a catalogued listing, which opens no
-        // directory, yields is catalogued.
-        let parent = match (entry.directory_handle(), entry.directory_identity()) {
-            (Some(directory), _) => engine::reader::Parent::Open(directory),
-            (None, Some((dev, ino))) => engine::reader::Parent::Closed(dev, ino),
-            (None, None) => {
                 return Some((
-                    0,
-                    Job::Failed(
-                        entry.path().to_owned(),
-                        "walked without its directory".into(),
-                    ),
+                    catalog.size(inode),
+                    Job::Unindexed(JobPath::new(entry.path()), name),
                 ));
             }
+            return None;
         };
+        if self
+            .candidates
+            .is_some_and(|candidates| !candidates.contains(doc.0, stopped))
+        {
+            if self.emit_absent {
+                return Some((0, Job::Absent(JobPath::new(entry.path()))));
+            }
+            return None;
+        }
         Some((
+            catalog.size(inode),
+            Job::Checked(JobPath::new(entry.path()), name, doc.0),
+        ))
+    }
+}
+
+/// The catalog target of `name`, which the listing may already have read.
+fn target(
+    entry: &ferret_query::find::Entry,
+    catalog: &ferret_catalog::Catalog,
+    name: ferret_catalog::NameId,
+) -> ferret_catalog::Target {
+    entry
+        .catalog_target()
+        .unwrap_or_else(|| ferret_catalog::Target::from_child(catalog.name(name).child))
+}
+
+/// The job for a selected file read live, from a followed path or through
+/// its parent directory.
+fn listed(
+    entry: &ferret_query::find::Entry,
+    follow: bool,
+    uncovered: bool,
+    once: bool,
+) -> Option<(u64, Job)> {
+    if follow {
+        return Some((
             0,
             Job::Listed(
                 JobPath::new(entry.path()),
-                parent,
-                uncovered,
-                // Uncovered scans read once, as rg does (D123).
+                engine::reader::Parent::Followed,
+                true,
                 once,
             ),
-        ))
+        ));
     }
+    // Content walks retain parents or, past their budget, the parent's
+    // identity; every name a catalogued listing, which opens no
+    // directory, yields is catalogued.
+    let parent = match (entry.directory_handle(), entry.directory_identity()) {
+        (Some(directory), _) => engine::reader::Parent::Open(directory),
+        (None, Some((dev, ino))) => engine::reader::Parent::Closed(dev, ino),
+        (None, None) => {
+            return Some((
+                0,
+                Job::Failed(
+                    entry.path().to_owned(),
+                    "walked without its directory".into(),
+                ),
+            ));
+        }
+    };
+    Some((
+        0,
+        Job::Listed(
+            JobPath::new(entry.path()),
+            parent,
+            uncovered,
+            // Uncovered scans read once, as rg does (D123).
+            once,
+        ),
+    ))
 }
 
 #[cfg(test)]
