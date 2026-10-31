@@ -174,18 +174,8 @@ impl Overlay {
     }
     pub(crate) fn new(base: Catalog, manifest: Manifest, log: Log) -> Self {
         Self {
-            base,
-            manifest,
             log: Some(Arc::new(log)),
-            parent: None,
-            delta: Vec::new(),
-            families: Default::default(),
-            namespace: OnceLock::new(),
-            checked: OnceLock::new(),
-            fields_checked: OnceLock::new(),
-            aux_checked: OnceLock::new(),
-            kinds_checked: OnceLock::new(),
-            docs_checked: OnceLock::new(),
+            ..Self::empty(base, manifest)
         }
     }
     pub(crate) fn advance(
@@ -562,6 +552,24 @@ impl Overlay {
             return Ok(());
         }
         self.base.load(&[Section::DocRefs])?;
+        let doc_delta = self.base_reference_deltas(view)?;
+        let mut affected: BTreeSet<_> = doc_delta.keys().copied().collect();
+        self.check_doc_records(&mut affected)?;
+        for id in affected {
+            let actual = i64::from(self.base.doc_references(crate::DocId(id)).unwrap_or(0))
+                + doc_delta.get(&id).copied().unwrap_or(0);
+            let declared = i64::from(view.doc_references(crate::DocId(id)).unwrap_or(0));
+            if actual != declared {
+                return Err(bad("document reference count"));
+            }
+        }
+        let _ = self.docs_checked.set(());
+        Ok(())
+    }
+    /// The reference each changed inode moved from its base document to its
+    /// document in `view`, per document; rejects an inode naming an absent
+    /// document.
+    fn base_reference_deltas(&self, view: &Catalog) -> Result<BTreeMap<u32, i64>, OpenError> {
         let mut doc_delta = BTreeMap::<u32, i64>::new();
         let mut changed = BTreeSet::new();
         for r in self.projection(Family::Inodes).records(INODE) {
@@ -589,7 +597,12 @@ impl Overlay {
                 *doc_delta.entry(doc.0).or_default() += 1;
             }
         }
-        let mut affected: BTreeSet<_> = doc_delta.keys().copied().collect();
+        Ok(doc_delta)
+    }
+    /// Checks the document records against the base: no hash changes, no
+    /// retired id reused, and the live document count. Adds each document a
+    /// record names to `affected`.
+    fn check_doc_records(&self, affected: &mut BTreeSet<u32>) -> Result<(), OpenError> {
         let mut live_docs = i64::from(self.base.doc_count());
         for r in self.projection(Family::Docs).records(DOC) {
             match r {
@@ -618,15 +631,6 @@ impl Overlay {
         if live_docs != i64::from(self.manifest.counts[3]) {
             return Err(bad("live document count"));
         }
-        for id in affected {
-            let actual = i64::from(self.base.doc_references(crate::DocId(id)).unwrap_or(0))
-                + doc_delta.get(&id).copied().unwrap_or(0);
-            let declared = i64::from(view.doc_references(crate::DocId(id)).unwrap_or(0));
-            if actual != declared {
-                return Err(bad("document reference count"));
-            }
-        }
-        let _ = self.docs_checked.set(());
         Ok(())
     }
     pub(crate) fn validate_all(&self, view: &Catalog) -> Result<(), OpenError> {
