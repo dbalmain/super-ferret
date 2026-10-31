@@ -103,31 +103,15 @@ enum Input {
 /// including output failures.
 pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let start = std::time::Instant::now();
-    let mut pattern_files = Vec::new();
-    // A pattern source rg could not read again: stdin, or any pipe or device
-    // spelling of it (`/dev/stdin`, `/proc/self/fd/0`). Falling back to rg
-    // after reading one would hand rg an exhausted source.
-    let mut consumed = false;
-    let command = match line_grep::parse_with(args, &mut |path| {
-        let bytes = if path == Path::new("-") {
-            consumed = true;
-            let mut bytes = Vec::new();
-            io::stdin().lock().read_to_end(&mut bytes)?;
-            bytes
-        } else {
-            consumed |= !fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
-            fs::read(path)?
-        };
-        pattern_files.push(bytes.clone());
-        Ok(bytes)
-    }) {
-        Ok(command) => command,
-        Err(error @ line_grep::ParseError::Unsupported(_)) => {
-            return unsupported(args, &error.to_string(), false);
-        }
-        Err(error) => return failure(&error.to_string()),
+    let Parsed {
+        command,
+        pattern_files,
+        consumed,
+    } = match parse(args) {
+        Ok(parsed) => parsed,
+        Err(exit) => return exit,
     };
-    let mut plan = match command {
+    let plan = match command {
         line_grep::Command::Help => return print(HELP.as_bytes()),
         line_grep::Command::Version => {
             return print(format!("ferret grep {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
@@ -144,6 +128,60 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     if let Some(exit) = context_error(args, global_json, consumed) {
         return exit;
     }
+    search(args, index, plan, &pattern_files, consumed, start)
+}
+
+/// A parsed command line, with the bytes of every pattern file it read.
+struct Parsed {
+    command: line_grep::Command,
+    pattern_files: Vec<Vec<u8>>,
+    /// Whether it read a pattern source rg could not read again: stdin, or
+    /// any pipe or device spelling of it (`/dev/stdin`, `/proc/self/fd/0`).
+    /// Falling back to rg after reading one would hand rg an exhausted
+    /// source.
+    consumed: bool,
+}
+
+/// Parses `args`, reading pattern files as it meets them.
+fn parse(args: &[OsString]) -> Result<Parsed, Exit> {
+    let mut pattern_files = Vec::new();
+    let mut consumed = false;
+    let command = match line_grep::parse_with(args, &mut |path| {
+        let bytes = if path == Path::new("-") {
+            consumed = true;
+            let mut bytes = Vec::new();
+            io::stdin().lock().read_to_end(&mut bytes)?;
+            bytes
+        } else {
+            consumed |= !fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
+            fs::read(path)?
+        };
+        pattern_files.push(bytes.clone());
+        Ok(bytes)
+    }) {
+        Ok(command) => command,
+        Err(error @ line_grep::ParseError::Unsupported(_)) => {
+            return Err(unsupported(args, &error.to_string(), false));
+        }
+        Err(error) => return Err(failure(&error.to_string())),
+    };
+    Ok(Parsed {
+        command,
+        pattern_files,
+        consumed,
+    })
+}
+
+/// Runs a content search: through the daemon when routing allows, else in
+/// this process.
+fn search(
+    args: &[OsString],
+    index: Option<&Path>,
+    mut plan: line_grep::Plan,
+    pattern_files: &[Vec<u8>],
+    consumed: bool,
+    start: std::time::Instant,
+) -> Exit {
     let tty = presentation::resolve(&mut plan.presentation);
     plan.line_number = plan.presentation.numbers.unwrap_or(tty || plan.json);
     let selection = match preflight::prepare(&plan) {
@@ -166,7 +204,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     };
     if routed.daemon
         && let Ok(index) = index_path(index)
-        && let Some(exit) = remote::run(args, &pattern_files, &plan, tty, &index)
+        && let Some(exit) = remote::run(args, pattern_files, &plan, tty, &index)
     {
         return exit;
     }
