@@ -224,6 +224,16 @@ impl Watch {
     }
     /// One input of a parent whose `identity` was just read through `proc`.
     fn input_of(&self, root: &Path, proc: &Path, identity: (u64, u64), name: &OsStr, hops: u32) {
+        self.watch_input(root, proc, identity, name);
+        if !matches!(name.as_bytes(), b".git" | b".gitignore" | b"commondir")
+            && std::fs::symlink_metadata(proc.join(name)).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            self.follow_input(root, proc, name, hops);
+        }
+    }
+
+    /// Watches the parent of input `name` for it, or records a failure.
+    fn watch_input(&self, root: &Path, proc: &Path, identity: (u64, u64), name: &OsStr) {
         let mut s = lock(&self.state);
         let mask = WatchFlags::CREATE
             | WatchFlags::DELETE
@@ -252,31 +262,7 @@ impl Watch {
                     || s.policies.contains_key(&wd)
                     || s.descriptors.contains_key(&wd) =>
             {
-                if s.removed.remove(&wd) {
-                    loss(&mut s, RefreshReason::Overflow);
-                }
-                s.identities.insert(identity, wd);
-                let (shared, epoch) = root_epoch(&mut s, root);
-                let inputs = s
-                    .policies
-                    .entry(wd)
-                    .or_insert_with(|| Vec::with_capacity(3));
-                match inputs
-                    .iter_mut()
-                    .find(|i| *i.root == *root && i.name.as_bytes() == name.as_bytes())
-                {
-                    Some(input) => input.epoch = epoch,
-                    None => inputs.push(Input {
-                        root: shared,
-                        name: Name::new(name.as_bytes()),
-                        epoch,
-                    }),
-                }
-                if let Some(record) = s.failures.get_mut(root)
-                    && record.exact() > 0
-                {
-                    record.repair_policy(&input_key(proc, name));
-                }
+                add_input(&mut s, wd, identity, root, proc, name);
             }
             Ok(wd) => {
                 let _ = inotify::remove_watch(&self.fd, wd);
@@ -285,38 +271,67 @@ impl Watch {
             }
             Err(_) => failure(&mut s, root, || input_key(proc, name)),
         }
-        drop(s);
-        if !matches!(name.as_bytes(), b".git" | b".gitignore" | b"commondir")
-            && std::fs::symlink_metadata(proc.join(name)).is_ok_and(|m| m.file_type().is_symlink())
-        {
-            // Only a followed symlink needs the input's own path.
-            let key = input_key(proc, name);
-            match std::fs::read_link(proc.join(name)) {
-                // A link chain longer than the kernel follows, a cycle
-                // included, cannot resolve: the input is a failure, as when
-                // canonicalizing it fails, not a deeper walk.
-                Ok(_) if hops >= MAX_HOPS => failure(&mut lock(&self.state), root, || key),
-                Ok(target) => {
-                    let target = if target.is_absolute() {
-                        target
-                    } else {
-                        key.parent().unwrap_or(Path::new("/")).join(target)
-                    };
-                    // Keep the link spelling for ancestor watches;
-                    // canonicalizing first would lose a
-                    // symlinked parent that can be retargeted.
-                    self.ancestors(root, &target, hops + 1);
-                    // A dangling link is an absent input, not a failure: its
-                    // target can be missing for a moment while a link on the
-                    // way is replaced, and watching where it would appear sees
-                    // it come back.
-                    match canonical_or_missing(&target) {
-                        Ok(target) if target != key => self.path_input(root, &target, hops + 1),
-                        _ => failure(&mut lock(&self.state), root, || key),
-                    }
+    }
+
+    /// Watches the target of input `name`, a symlink reached in `hops`
+    /// links, and the ancestors on the way to it.
+    fn follow_input(&self, root: &Path, proc: &Path, name: &OsStr, hops: u32) {
+        // Only a followed symlink needs the input's own path.
+        let key = input_key(proc, name);
+        match std::fs::read_link(proc.join(name)) {
+            // A link chain longer than the kernel follows, a cycle included,
+            // cannot resolve: the input is a failure, as when canonicalizing
+            // it fails, not a deeper walk.
+            Ok(_) if hops >= MAX_HOPS => failure(&mut lock(&self.state), root, || key),
+            Ok(target) => {
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    key.parent().unwrap_or(Path::new("/")).join(target)
+                };
+                // Keep the link spelling for ancestor watches; canonicalizing
+                // first would lose a symlinked parent that can be retargeted.
+                self.ancestors(root, &target, hops + 1);
+                // A dangling link is an absent input, not a failure: its
+                // target can be missing for a moment while a link on the way
+                // is replaced, and watching where it would appear sees it
+                // come back.
+                match canonical_or_missing(&target) {
+                    Ok(target) if target != key => self.path_input(root, &target, hops + 1),
+                    _ => failure(&mut lock(&self.state), root, || key),
                 }
-                _ => failure(&mut lock(&self.state), root, || key),
             }
+            _ => failure(&mut lock(&self.state), root, || key),
         }
+    }
+}
+
+/// Records watch `wd`, on the parent with `identity`, as watching input
+/// `name` of `root` in the root's current epoch.
+fn add_input(s: &mut State, wd: i32, identity: (u64, u64), root: &Path, proc: &Path, name: &OsStr) {
+    if s.removed.remove(&wd) {
+        loss(s, RefreshReason::Overflow);
+    }
+    s.identities.insert(identity, wd);
+    let (shared, epoch) = root_epoch(s, root);
+    let inputs = s
+        .policies
+        .entry(wd)
+        .or_insert_with(|| Vec::with_capacity(3));
+    match inputs
+        .iter_mut()
+        .find(|i| *i.root == *root && i.name.as_bytes() == name.as_bytes())
+    {
+        Some(input) => input.epoch = epoch,
+        None => inputs.push(Input {
+            root: shared,
+            name: Name::new(name.as_bytes()),
+            epoch,
+        }),
+    }
+    if let Some(record) = s.failures.get_mut(root)
+        && record.exact() > 0
+    {
+        record.repair_policy(&input_key(proc, name));
     }
 }
