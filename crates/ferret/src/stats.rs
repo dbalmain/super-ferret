@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use ferret_catalog::{BudgetUsage, Catalog, CompactionLimits, ContentState, Kind, NameId, Target};
+use ferret_catalog::{
+    BudgetUsage, Catalog, CompactionLimits, ContentState, InoId, Kind, NameId, Target,
+};
 
 use crate::cli::{Context, Exit, error};
 use crate::index::bytes;
@@ -159,11 +161,21 @@ struct Census {
 impl Census {
     fn of(catalog: &Catalog) -> Census {
         let mut census = Census::default();
+        let depth = census.walk_directories(catalog);
+        let names_of = census.count_names(catalog, &depth);
+        let held = census.count_inodes(catalog, &names_of);
+        census.count_duplicates(held);
+        census
+    }
+
+    /// Counts traversed directories, returning each directory's depth below
+    /// its root.
+    fn walk_directories(&mut self, catalog: &Catalog) -> HashMap<InoId, u32> {
         let mut depth = HashMap::new();
         let mut pending: Vec<_> = catalog.roots().map(|(id, _)| (id, 0u32)).collect();
         while let Some((dir, d)) = pending.pop() {
             depth.insert(dir, d);
-            census.traversed += u64::from(catalog.is_traversed(dir));
+            self.traversed += u64::from(catalog.is_traversed(dir));
             pending.extend(catalog.children(dir).filter_map(
                 |id| match catalog.name(id).target() {
                     Target::Inode(child) if catalog.is_directory(child) => Some((child, d + 1)),
@@ -171,7 +183,12 @@ impl Census {
                 },
             ));
         }
+        depth
+    }
 
+    /// Counts names by kind, depth, length and extension, returning how many
+    /// names each inode has.
+    fn count_names(&mut self, catalog: &Catalog, depth: &HashMap<InoId, u32>) -> Vec<u32> {
         let mut names_of = vec![0u32; catalog.next_inode().0 as usize];
         for (_, name) in catalog.name_reader().runs_from(NameId(0)) {
             let kind = match name.target() {
@@ -180,62 +197,71 @@ impl Census {
                     catalog.kind(inode)
                 }
                 Target::Ignored(kind) => {
-                    census.ignored += 1;
+                    self.ignored += 1;
                     kind
                 }
             };
-            census.names_by_kind[kind as usize] += 1;
-            census.depth.add_kept(depth[&name.parent] + 1);
-            census.name_len.add_kept(name.bytes.len() as u32);
+            self.names_by_kind[kind as usize] += 1;
+            self.depth.add_kept(depth[&name.parent] + 1);
+            self.name_len.add_kept(name.bytes.len() as u32);
             if kind == Kind::File && matches!(name.target(), Target::Inode(_)) {
                 let size = catalog.size(name.child);
-                let entry = census.extensions.entry(extension(name.bytes)).or_default();
+                let entry = self.extensions.entry(extension(name.bytes)).or_default();
                 entry.0 += 1;
                 entry.1 += size;
             }
         }
+        names_of
+    }
 
-        // (document, bytes) per holding inode, in inode order. Counted by
-        // sorting, not by an array indexed by DocId: ids are sparse after
-        // churn, and nothing is sized by `next_doc` (D36 B).
+    /// Counts non-directory inodes by kind, size, content state and links,
+    /// returning (document, bytes) per holding inode, in inode order. Counted
+    /// by sorting, not by an array indexed by DocId: ids are sparse after
+    /// churn, and nothing is sized by `next_doc` (D36 B).
+    fn count_inodes(&mut self, catalog: &Catalog, names_of: &[u32]) -> Vec<(u32, u64)> {
         let mut held = Vec::new();
         for id in catalog.inode_ids().filter(|&id| !catalog.is_directory(id)) {
             match catalog.kind(id) {
                 Kind::Symlink => {
-                    census.symlinks += 1;
+                    self.symlinks += 1;
                     continue;
                 }
                 Kind::File => {}
                 _ => {
-                    census.specials += 1;
+                    self.specials += 1;
                     continue;
                 }
             }
-            census.files += 1;
+            self.files += 1;
             let size = catalog.size(id);
-            census.file_size.add(size);
-            let state = &mut census.states[catalog.state(id) as usize];
+            self.file_size.add(size);
+            let state = &mut self.states[catalog.state(id) as usize];
             state.0 += 1;
             state.1 += size;
             let names = names_of[id.0 as usize];
             if names > 1 {
-                census.linked.0 += 1;
-                census.linked.1 += u64::from(names - 1);
+                self.linked.0 += 1;
+                self.linked.1 += u64::from(names - 1);
             }
             match catalog.doc(id) {
                 Some(doc) if catalog.doc_hash(doc).is_some() => held.push((doc.0, size)),
-                Some(_) => census.dangling += 1,
+                Some(_) => self.dangling += 1,
                 None => {}
             }
         }
+        held
+    }
+
+    /// Counts documents `held` by more than one inode, and the extra holders
+    /// and bytes.
+    fn count_duplicates(&mut self, mut held: Vec<(u32, u64)>) {
         // Stable, so each document's first holder stays first.
         held.sort_by_key(|&(doc, _)| doc);
         for group in held.chunk_by(|a, b| a.0 == b.0).filter(|g| g.len() > 1) {
-            census.duplicates.0 += 1;
-            census.duplicates.1 += group.len() as u64 - 1;
-            census.duplicates.2 += group[1..].iter().map(|&(_, size)| size).sum::<u64>();
+            self.duplicates.0 += 1;
+            self.duplicates.1 += group.len() as u64 - 1;
+            self.duplicates.2 += group[1..].iter().map(|&(_, size)| size).sum::<u64>();
         }
-        census
     }
 }
 
