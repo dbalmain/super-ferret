@@ -718,146 +718,184 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     };
     let id = registration.1;
     let input = stream.try_clone()?;
-    let reader_host = host.clone();
-    let reader_cancel = cancelled.clone();
-    let reader = std::thread::spawn(move || {
-        let mut reader = BufReader::new(input);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match crate::batch::read_line_bounded(&mut reader, &mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            let op = protocol::parse_object(&line).and_then(|value| {
-                value
-                    .field("op")
-                    .and_then(protocol::Value::text)
-                    .map(str::to_owned)
-            });
-            match op.as_deref() {
-                Some("cancel") => {
-                    cancel(&reader_host, &reader_cancel);
-                    let _ = reader.get_ref().shutdown(std::net::Shutdown::Write);
-                    break;
-                }
-                Some("drain") => {
-                    drain(&reader_host);
-                }
-                _ => {
-                    if send.try_send(ClientMessage::Line(line.clone())).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        cancel(&reader_host, &reader_cancel);
-        // Release the drain registry's sender with this one, so the handler's
-        // channel disconnects once it has taken any queued line. A wake alone
-        // is lost when that line fills the channel, and the handler would
-        // then answer it and block forever.
-        unregister(&reader_host, id);
-        drop(send);
-        // Widens the window in which the handler can still answer a queued
-        // line before the socket shuts down.
-        #[cfg(debug_assertions)]
-        std::thread::sleep(duration("FERRET_DAEMON_TEST_READER_EXIT_DELAY_MS", 0));
-        // Wake a blocked writer on hangup/cancel; a partial frame is a broken
-        // transport and cannot be followed by a fabricated successful end.
-        let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
-    });
-    let result = (|| {
-        if !hello(&destination, host)? {
-            let mut loaded = lock(&host.engine);
-            while matches!(*loaded, Loaded::Loading)
-                && !cancelled.load(Ordering::Acquire)
-                && !lock(&host.lifecycle).draining
-            {
-                loaded = host
-                    .engine_ready
-                    .wait(loaded)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            if cancelled.load(Ordering::Acquire) || lock(&host.lifecycle).draining {
-                return Ok(());
-            }
-            drop(loaded);
-            hello(&destination, host)?;
-        }
-        loop {
-            if lock(&host.lifecycle).draining {
-                break;
-            }
-            let line = match receive.recv() {
-                Ok(ClientMessage::Line(line)) => line,
-                Ok(ClientMessage::Wake) => {
-                    if cancelled.load(Ordering::Acquire) || lock(&host.lifecycle).draining {
-                        break;
-                    }
-                    continue;
-                }
-                Err(_) => break,
-            };
-            if line.len() > protocol::MAX_LINE_BYTES {
-                let id = protocol::recover_id(&line);
-                crate::batch::request_error(&destination, id.as_deref(), "LineTooLong")?;
-                continue;
-            }
-            let request = match protocol::parse_request(&line) {
-                Ok(request) => request,
-                Err(error) => {
-                    crate::batch::request_error(
-                        &destination,
-                        error.id.as_deref(),
-                        &error.kind.to_string(),
-                    )?;
-                    continue;
-                }
-            };
-            let _permit = if matches!(request.op, Op::Search | Op::Find | Op::Grep) {
-                let Some(permit) = admit(host, &cancelled) else {
-                    break;
-                };
-                Some(permit)
-            } else {
-                None
-            };
-            let output = destination.clone().with_raw_output(
-                matches!(request.op, Op::Find | Op::Grep | Op::Search)
-                    && request
-                        .capabilities
-                        .iter()
-                        .any(|capability| capability == "raw-output-v1"),
-            );
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute(host, &request, &output)
-            }));
-            match result {
-                Ok(result) => result?,
-                Err(_) => emit_to(&destination, &request.id, "end", |o| {
-                    o.int("exit", runtime_status(&request))
-                        .bool("cancelled", false)
-                        .str("error", "RuntimeError")
-                        .str("message", "query panicked");
-                })?,
-            }
-            if cancelled.load(Ordering::Acquire) {
-                break;
-            }
-        }
-        Ok(())
-    })();
+    let reader = {
+        let (host, cancelled) = (host.clone(), cancelled.clone());
+        std::thread::spawn(move || read_requests(&host, &cancelled, input, send, id))
+    };
+    let result = answer_requests(host, &destination, &receive, &cancelled);
     drop(receive);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = reader.join();
     result
 }
+/// Reads a connection's request lines until hangup or `cancel`, handing
+/// each to the handler; `cancel` and `drain` act at once.
+fn read_requests(
+    host: &Arc<Host>,
+    cancelled: &AtomicBool,
+    input: UnixStream,
+    send: mpsc::SyncSender<ClientMessage>,
+    id: usize,
+) {
+    let mut reader = BufReader::new(input);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match crate::batch::read_line_bounded(&mut reader, &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let op = protocol::parse_object(&line).and_then(|value| {
+            value
+                .field("op")
+                .and_then(protocol::Value::text)
+                .map(str::to_owned)
+        });
+        match op.as_deref() {
+            Some("cancel") => {
+                cancel(host, cancelled);
+                let _ = reader.get_ref().shutdown(std::net::Shutdown::Write);
+                break;
+            }
+            Some("drain") => {
+                drain(host);
+            }
+            _ => {
+                if send.try_send(ClientMessage::Line(line.clone())).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    cancel(host, cancelled);
+    // Release the drain registry's sender with this one, so the handler's
+    // channel disconnects once it has taken any queued line. A wake alone
+    // is lost when that line fills the channel, and the handler would
+    // then answer it and block forever.
+    unregister(host, id);
+    drop(send);
+    // Widens the window in which the handler can still answer a queued
+    // line before the socket shuts down.
+    #[cfg(debug_assertions)]
+    std::thread::sleep(duration("FERRET_DAEMON_TEST_READER_EXIT_DELAY_MS", 0));
+    // Wake a blocked writer on hangup/cancel; a partial frame is a broken
+    // transport and cannot be followed by a fabricated successful end.
+    let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
+}
+
+/// Greets the client, then answers its requests in order until it hangs
+/// up, cancels or the daemon drains.
+fn answer_requests(
+    host: &Host,
+    destination: &Destination,
+    receive: &mpsc::Receiver<ClientMessage>,
+    cancelled: &AtomicBool,
+) -> io::Result<()> {
+    if !greet(host, destination, cancelled)? {
+        return Ok(());
+    }
+    loop {
+        if lock(&host.lifecycle).draining {
+            break;
+        }
+        let line = match receive.recv() {
+            Ok(ClientMessage::Line(line)) => line,
+            Ok(ClientMessage::Wake) => {
+                if cancelled.load(Ordering::Acquire) || lock(&host.lifecycle).draining {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
+        };
+        if !answer(host, destination, cancelled, &line)? {
+            break;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Says hello, waiting for a loading engine when the first hello could
+/// not; `false` when cancel or drain came first.
+fn greet(host: &Host, destination: &Destination, cancelled: &AtomicBool) -> io::Result<bool> {
+    if !hello(destination, host)? {
+        let mut loaded = lock(&host.engine);
+        while matches!(*loaded, Loaded::Loading)
+            && !cancelled.load(Ordering::Acquire)
+            && !lock(&host.lifecycle).draining
+        {
+            loaded = host
+                .engine_ready
+                .wait(loaded)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if cancelled.load(Ordering::Acquire) || lock(&host.lifecycle).draining {
+            return Ok(false);
+        }
+        drop(loaded);
+        hello(destination, host)?;
+    }
+    Ok(true)
+}
+
+/// Answers one request line; `false` when the connection must stop.
+fn answer(
+    host: &Host,
+    destination: &Destination,
+    cancelled: &AtomicBool,
+    line: &[u8],
+) -> io::Result<bool> {
+    if line.len() > protocol::MAX_LINE_BYTES {
+        let id = protocol::recover_id(line);
+        crate::batch::request_error(destination, id.as_deref(), "LineTooLong")?;
+        return Ok(true);
+    }
+    let request = match protocol::parse_request(line) {
+        Ok(request) => request,
+        Err(error) => {
+            crate::batch::request_error(destination, error.id.as_deref(), &error.kind.to_string())?;
+            return Ok(true);
+        }
+    };
+    let _permit = if matches!(request.op, Op::Search | Op::Find | Op::Grep) {
+        let Some(permit) = admit(host, cancelled) else {
+            return Ok(false);
+        };
+        Some(permit)
+    } else {
+        None
+    };
+    let output = destination.clone().with_raw_output(
+        matches!(request.op, Op::Find | Op::Grep | Op::Search)
+            && request
+                .capabilities
+                .iter()
+                .any(|capability| capability == "raw-output-v1"),
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute(host, &request, &output)
+    }));
+    match result {
+        Ok(result) => result?,
+        Err(_) => emit_to(destination, &request.id, "end", |o| {
+            o.int("exit", runtime_status(&request))
+                .bool("cancelled", false)
+                .str("error", "RuntimeError")
+                .str("message", "query panicked");
+        })?,
+    }
+    Ok(true)
+}
+
 fn runtime_status(request: &Request) -> u8 {
     match request.op {
         Op::Find => 1,
