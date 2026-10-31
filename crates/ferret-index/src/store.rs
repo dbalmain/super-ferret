@@ -702,12 +702,27 @@ impl IndexWriter {
             let trigrams = &mut trigrams;
             let order = live.range(manifest.frontier, live.bound());
             crate::extract::in_order(order, readers, |doc, extracted| -> Result<bool, Error> {
-                if docs != 0
+                let full = docs != 0 && PairBuffer::full(&inverter, trigrams, budget.buffer);
+                let hand_off = full
                     && followed.bytes < budget.bytes
-                    && PairBuffer::full(&inverter, trigrams, budget.buffer)
-                    && published + usize::from(writing.is_some()) + 1 < budget.segments
-                    && let Some((first, last)) = range.take()
-                {
+                    && published + usize::from(writing.is_some()) + 1 < budget.segments;
+                if docs != 0 && followed.bytes >= budget.bytes || full && !hand_off {
+                    followed.stopped = if full {
+                        Stopped::Buffer
+                    } else {
+                        Stopped::Bytes
+                    };
+                    frontier = doc;
+                    return Ok(false);
+                }
+                // The first document is read before the pause is consulted, so
+                // a pass that keeps outlasting its time still makes progress.
+                if followed.docs + followed.unreadable != 0 && (budget.cancelled)() {
+                    followed.stopped = Stopped::Asked;
+                    frontier = doc;
+                    return Ok(false);
+                }
+                if hand_off && let Some((first, last)) = range.take() {
                     if let Some(written) = writing.take() {
                         self.publish_written(&mut manifest, &mut followed, live, written)?;
                         published += 1;
@@ -734,25 +749,6 @@ impl IndexWriter {
                         )
                     });
                     writing = Some((handle, doc));
-                }
-                if docs != 0
-                    && (followed.bytes >= budget.bytes
-                        || PairBuffer::full(&inverter, trigrams, budget.buffer))
-                {
-                    followed.stopped = if PairBuffer::full(&inverter, trigrams, budget.buffer) {
-                        Stopped::Buffer
-                    } else {
-                        Stopped::Bytes
-                    };
-                    frontier = doc;
-                    return Ok(false);
-                }
-                // The first document is read before the pause is consulted, so
-                // a pass that keeps outlasting its time still makes progress.
-                if range.is_some() && (budget.cancelled)() {
-                    followed.stopped = Stopped::Asked;
-                    frontier = doc;
-                    return Ok(false);
                 }
                 match extracted {
                     Ok(extracted) => {
@@ -1224,10 +1220,12 @@ fn seams() -> impl FnOnce() + Send {
     let inherit = (
         crate::segment::inherit_fingerprint(),
         input_trace::inherit(),
+        STOP.with_borrow(Arc::clone),
     );
     move || {
         inherit.0();
         inherit.1();
+        STOP.set(inherit.2);
     }
 }
 
@@ -1588,8 +1586,10 @@ pub(crate) enum Point {
 
 pub(crate) fn hit(point: Point) -> io::Result<()> {
     #[cfg(test)]
-    if STOP.get() == Some(point) {
-        STOP.set(None);
+    if STOP.with_borrow(|stop| {
+        let mut stop = stop.lock().unwrap_or_else(|e| e.into_inner());
+        stop.take_if(|stop| *stop == point).is_some()
+    }) {
         return Err(io::Error::other(InjectedStop(point)));
     }
     #[cfg(test)]
@@ -1607,7 +1607,10 @@ thread_local! {
     /// The next [`hit`] of this point fails, once.
     static CANCEL_AT: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
     static CANCELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    pub(crate) static STOP: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
+    /// Shared with a thread that writes for this one, so that the point
+    /// fails once, on whichever thread reaches it first.
+    pub(crate) static STOP: RefCell<Arc<std::sync::Mutex<Option<Point>>>> =
+        RefCell::new(Arc::default());
     /// The segment-open thread whose spawn fails.
     static FAIL_OPEN_SPAWN_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Segment-open threads started on this thread.

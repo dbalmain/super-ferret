@@ -192,7 +192,7 @@ fn named(view: &View) -> BTreeSet<String> {
 }
 
 fn stop_at(point: Point) {
-    STOP.set(Some(point));
+    STOP.with_borrow(|stop| *stop.lock().unwrap() = Some(point));
 }
 
 #[test]
@@ -1821,6 +1821,69 @@ fn a_failed_pass_of_many_segments_keeps_what_it_published() {
     assert_eq!(answers(&writer.view(), &catalog), catalog.truth(&corpus));
     let unreadable: Vec<u32> = catalog.unreadable.iter().copied().collect();
     assert_eq!(writer.view().manifest().unreadable, unreadable);
+}
+
+/// Review of p15: the first document after a handoff starts a new segment,
+/// not a new pass, so the pause is still consulted before it.
+#[test]
+fn a_pass_of_many_segments_still_stops_when_asked() {
+    let dir = Dir::new("many-segments-asked");
+    let corpus = Corpus::new(1249, 40);
+    let catalog = Catalog::new(40, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let budget = Budget {
+        buffer: 0,
+        segments: usize::MAX,
+        cancelled: &|| true,
+        ..Budget::unbounded()
+    };
+    let followed = writer
+        .follow(&catalog.view(), &budget, &mut |doc, bytes| {
+            bytes.extend_from_slice(&corpus.text(doc));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        (
+            followed.stopped,
+            followed.docs,
+            writer.view().manifest().frontier
+        ),
+        (Stopped::Asked, 1, 1)
+    );
+}
+
+/// A crash after the writing thread renames a segment pair into place, but
+/// before the pass publishes it, leaves files no manifest names; reopening
+/// removes them and the index resumes.
+#[test]
+fn a_crash_on_the_writing_thread_leaves_a_resumable_index() {
+    let dir = Dir::new("many-segments-crash");
+    let corpus = Corpus::new(1259, 40);
+    let catalog = Catalog::new(40, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let budget = Budget {
+        buffer: 0,
+        segments: usize::MAX,
+        ..Budget::unbounded()
+    };
+    // The first segment pair a pass of one-document segments writes is
+    // written on the second thread, so the crash happens there.
+    stop_at(Point::PairRenamed);
+    let error = writer
+        .follow(&catalog.view(), &budget, &mut |doc, bytes| {
+            bytes.extend_from_slice(&corpus.text(doc));
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(injected_crash(&error), "{error}");
+    let orphans = dir.files().len() - named(&writer.view()).len();
+    assert!(orphans >= 2, "the renamed pair is on disk, unnamed");
+    drop(writer);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    assert_eq!(dir.files(), named(&writer.view()));
+    follow_all(&mut writer, &catalog, &corpus, &budget).unwrap();
+    assert_eq!(answers(&writer.view(), &catalog), catalog.truth(&corpus));
 }
 
 #[test]
