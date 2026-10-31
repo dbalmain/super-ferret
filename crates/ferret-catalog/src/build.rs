@@ -39,7 +39,7 @@ use std::io::{self, Write};
 
 use crate::batch::{Batch, Content, DirToken, Stat};
 use crate::format::{
-    self, At, Bits, COLUMNS, Coding, Column, ColumnWriter, Descriptor, HASH_ROW, Head, NONE,
+    self, Bits, COLUMNS, Coding, Column, ColumnWriter, Descriptor, HASH_ROW, Head, NONE, Output,
     PAIR_ROW, Range, SECTIONS, Section, WORK_TREE_ROW,
 };
 use crate::packed::BlockSizer;
@@ -952,6 +952,54 @@ fn split_hash(hash: &Hash) -> (u64, u64) {
     (u64::from_be_bytes(hi), u64::from_be_bytes(lo))
 }
 
+/// The inode stat columns, filled a row at a time. A column of width 0 holds
+/// nothing per row, so it is only started and finished.
+pub(crate) struct StatColumns<'f> {
+    live: Vec<(Column, ColumnWriter<'f>)>,
+    idle: Vec<ColumnWriter<'f>>,
+}
+
+impl<'f> StatColumns<'f> {
+    pub(crate) fn start(out: &Output<'f>) -> io::Result<Self> {
+        let (mut live, mut idle) = (Vec::new(), Vec::new());
+        for field in STAT_COLUMNS {
+            let column = out.column(field)?;
+            if field.coding().is_blocked() || out.layout.columns[field as usize].desc.width > 0 {
+                live.push((field, column));
+            } else {
+                idle.push(column);
+            }
+        }
+        Ok(Self { live, idle })
+    }
+
+    /// One inode's row, a dictionary column storing the value's index in
+    /// `dicts`.
+    pub(crate) fn row(&mut self, stat: &Stat, dicts: &[Vec<u64>; COLUMNS.len()]) -> io::Result<()> {
+        for (field, column) in &mut self.live {
+            let value = stat_field(*field, stat);
+            match field.coding() {
+                Coding::Dictionary => {
+                    let dict = &dicts[*field as usize];
+                    column.index(dict.partition_point(|&known| known < value))?;
+                }
+                _ => column.value(value)?,
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> io::Result<()> {
+        for (_, column) in self.live {
+            column.finish()?;
+        }
+        for column in self.idle {
+            column.finish()?;
+        }
+        Ok(())
+    }
+}
+
 /// Writes the planned generation to `out`: the head, then each section at the
 /// place the head gives it. Each table's columns fill in one pass over its
 /// rows, each column through its own bounded buffer (D40). Frees each batch's
@@ -966,15 +1014,15 @@ pub(crate) fn write(
 ) -> io::Result<()> {
     let (mut head, dicts) = plan.head(&batches);
     head.generation = generation;
-    let (bytes, len) = head.encode();
-    crate::bulk::write_at(out, &bytes, 0)?;
-    // The reader's placement of every section and column, from the head just
-    // made: the writer puts each exactly where a reader will look.
-    let layout = format::decode_table(&bytes, len).map_err(io::Error::other)?;
-    let column = |c: Column| ColumnWriter::start(out, &layout, c, &dicts[c as usize]);
-    let section = |s: Section| At::new(out, layout.range(s).0 as u64);
-    let (mut parents, mut children) = (column(Column::NameParent)?, column(Column::NameChild)?);
-    let (mut offsets, mut heap) = (column(Column::NameOffset)?, section(Section::NameHeap));
+    let file = Output::start(out, &head, dicts)?;
+    let (mut parents, mut children) = (
+        file.column(Column::NameParent)?,
+        file.column(Column::NameChild)?,
+    );
+    let (mut offsets, mut heap) = (
+        file.column(Column::NameOffset)?,
+        file.section(Section::NameHeap),
+    );
     let mut offset = 0;
     for (id, &dir) in plan.order.iter().enumerate() {
         for &entry in plan.children(dir) {
@@ -999,9 +1047,10 @@ pub(crate) fn write(
     batches.iter_mut().for_each(Batch::drop_structure);
 
     let known = |id: u32| (id != NONE).then_some(u64::from(id));
-    let (mut dir_names, mut entries) = (column(Column::DirName)?, column(Column::Entries)?);
-    let mut retained = column(Column::RetainedAt)?;
-    let (mut traversed, mut bits) = (section(Section::Traversed), Bits::new(1));
+    let (mut dir_names, mut entries) =
+        (file.column(Column::DirName)?, file.column(Column::Entries)?);
+    let mut retained = file.column(Column::RetainedAt)?;
+    let (mut traversed, mut bits) = (file.section(Section::Traversed), Bits::new(1));
     for &dir in &plan.order {
         dir_names.nullable(known(plan.name_of_dir[dir as usize]))?;
         let (b, d) = plan.index.dir(dir as usize);
@@ -1016,74 +1065,57 @@ pub(crate) fn write(
     bits.finish(&mut traversed)?;
     traversed.finish()?;
     plan.entry_count = Vec::new();
-    let mut roots = section(Section::Roots);
+    let mut roots = file.section(Section::Roots);
     for &(dir, offset) in &plan.roots {
         format::put_pair(&mut roots, dir, offset)?;
     }
     roots.finish()?;
-    let mut strings = section(Section::Strings);
+    let mut strings = file.section(Section::Strings);
     strings.write_all(&plan.strings)?;
     strings.finish()?;
 
     // Every inode column in one pass over the rows, each row's stat found
-    // once. A column of width 0 holds nothing per row, so it is only started
-    // and finished.
-    let mut stat_columns = Vec::new();
-    for field in STAT_COLUMNS {
-        stat_columns.push((field, column(field)?));
-    }
-    let (mut doc, mut states, mut state_bits) =
-        (column(Column::Doc)?, section(Section::States), Bits::new(2));
-    let live =
-        |field: Column| field.coding().is_blocked() || head.columns[field as usize].width > 0;
-    let (mut live_columns, mut idle): (Vec<_>, Vec<_>) = stat_columns
-        .into_iter()
-        .partition(|&(field, _)| live(field));
+    // once.
+    let mut stat_columns = StatColumns::start(&file)?;
+    let (mut doc, mut states, mut state_bits) = (
+        file.column(Column::Doc)?,
+        file.section(Section::States),
+        Bits::new(2),
+    );
     let mut references = vec![0u32; plan.docs.len()];
     for (stat, doc_id, state) in plan.inode_rows(&batches) {
         if doc_id != NONE {
             let row = plan.docs.partition_point(|&(_, id)| id < doc_id);
             references[row] += 1;
         }
-        for (field, column) in &mut live_columns {
-            let value = stat_field(*field, stat);
-            match field.coding() {
-                Coding::Dictionary => {
-                    let dict = &dicts[*field as usize];
-                    column.index(dict.partition_point(|&known| known < value))?;
-                }
-                _ => column.value(value)?,
-            }
-        }
+        stat_columns.row(stat, &file.dicts)?;
         doc.nullable(known(doc_id))?;
         state_bits.push(&mut states, state as u8)?;
     }
-    for (_, column) in live_columns.drain(..).chain(idle.drain(..)) {
-        column.finish()?;
-    }
+    stat_columns.finish()?;
     doc.finish()?;
     state_bits.finish(&mut states)?;
     states.finish()?;
     drop(batches);
 
-    let mut links = section(Section::Links);
+    let mut links = file.section(Section::Links);
     for &(inode, offset) in &plan.links {
         format::put_pair(&mut links, inode, offset)?;
     }
     links.finish()?;
-    let mut work_trees = section(Section::WorkTrees);
+    let mut work_trees = file.section(Section::WorkTrees);
     for &(dir, offset, common_id, kind) in &plan.work_trees {
         format::put_work_tree(&mut work_trees, dir, offset, common_id, kind)?;
     }
     work_trees.finish()?;
-    let mut specials = section(Section::Specials);
+    let mut specials = file.section(Section::Specials);
     for &(inode, kind) in &plan.specials {
         specials.write_all(&inode.to_le_bytes())?;
         specials.write_all(&kind.to_le_bytes())?;
     }
     specials.finish()?;
-    let mut ids = column(Column::DocId)?;
-    let mut hashes = At::new(out, (layout.range(Section::Docs).0 + layout.hashes) as u64);
+    let mut ids = file.column(Column::DocId)?;
+    let mut hashes = file.hashes();
     for &((hi, lo), id) in &plan.docs {
         ids.value(u64::from(id))?;
         hashes.write_all(&hi.to_be_bytes())?;
@@ -1091,15 +1123,15 @@ pub(crate) fn write(
     }
     ids.finish()?;
     hashes.finish()?;
-    let mut refs = section(Section::DocRefs);
+    let mut refs = file.section(Section::DocRefs);
     for count in references {
         format::put_u32(&mut refs, count)?;
     }
     refs.finish()?;
-    let mut fingerprint = section(Section::Policy);
+    let mut fingerprint = file.section(Section::Policy);
     fingerprint.write_all(&policy)?;
     fingerprint.finish()?;
-    let mut revealed = section(Section::Revealed);
+    let mut revealed = file.section(Section::Revealed);
     for &name in &plan.revealed {
         format::put_u32(&mut revealed, name)?;
     }

@@ -725,6 +725,54 @@ impl<'f> ColumnWriter<'f> {
     }
 }
 
+/// A generation file being filled: each column and section starts where the
+/// head already written to it places them.
+pub(crate) struct Output<'f> {
+    pub(crate) file: &'f File,
+    pub(crate) layout: Layout,
+    pub(crate) dicts: [Vec<u64>; COLUMNS.len()],
+}
+
+impl<'f> Output<'f> {
+    /// Writes `head` at the start of `file`, then places the rest as a reader
+    /// will look for it: by the table just written.
+    pub(crate) fn start(
+        file: &'f File,
+        head: &Head,
+        dicts: [Vec<u64>; COLUMNS.len()],
+    ) -> io::Result<Self> {
+        let (bytes, len) = head.encode();
+        crate::bulk::write_at(file, &bytes, 0)?;
+        let layout = decode_table(&bytes, len).map_err(io::Error::other)?;
+        Ok(Self {
+            file,
+            layout,
+            dicts,
+        })
+    }
+
+    pub(crate) fn column(&self, column: Column) -> io::Result<ColumnWriter<'f>> {
+        ColumnWriter::start(
+            self.file,
+            &self.layout,
+            column,
+            &self.dicts[column as usize],
+        )
+    }
+
+    pub(crate) fn section(&self, section: Section) -> At<'f> {
+        At::new(self.file, self.layout.range(section).0 as u64)
+    }
+
+    /// The document hashes, after the docs section's id column.
+    pub(crate) fn hashes(&self) -> At<'f> {
+        At::new(
+            self.file,
+            (self.layout.range(Section::Docs).0 + self.layout.hashes) as u64,
+        )
+    }
+}
+
 pub(crate) fn put_u32(out: &mut impl Write, v: u32) -> io::Result<()> {
     out.write_all(&v.to_le_bytes())
 }

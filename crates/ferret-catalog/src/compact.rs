@@ -4,9 +4,9 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Write};
 
-use crate::build::{STAT_COLUMNS, stat_field};
+use crate::build::{STAT_COLUMNS, StatColumns, stat_field};
 use crate::format::{
-    self, At, Bits, COLUMNS, Coding, Column, ColumnWriter, Descriptor, Head, NONE, Range, SECTIONS,
+    self, At, Bits, COLUMNS, Coding, Column, Descriptor, Head, NONE, Output, Range, SECTIONS,
     Section,
 };
 use crate::packed::BlockSizer;
@@ -248,14 +248,7 @@ impl Plan {
 pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::Result<()> {
     let mut plan = Plan::new(view)?;
     let (head, dicts) = plan.head(view, generation)?;
-    let (bytes, len) = head.encode();
-    crate::bulk::write_at(out, &bytes, 0)?;
-    let layout = format::decode_table(&bytes, len).map_err(io::Error::other)?;
-    let file = Output {
-        file: out,
-        layout,
-        dicts,
-    };
+    let file = Output::start(out, &head, dicts)?;
     plan.write_names(view, &file)?;
     plan.write_dirs(view, &file, head.lens[Section::Traversed as usize])?;
     plan.dir_names = Vec::new();
@@ -268,28 +261,6 @@ pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::R
     policy.write_all(&view.policy())?;
     policy.finish()?;
     format::seal(out)
-}
-
-/// The file `write` fills, placed by the head it wrote first.
-struct Output<'f> {
-    file: &'f File,
-    layout: format::Layout,
-    dicts: [Vec<u64>; COLUMNS.len()],
-}
-
-impl<'f> Output<'f> {
-    fn column(&self, column: Column) -> io::Result<ColumnWriter<'f>> {
-        ColumnWriter::start(
-            self.file,
-            &self.layout,
-            column,
-            &self.dicts[column as usize],
-        )
-    }
-
-    fn section(&self, section: Section) -> At<'f> {
-        At::new(self.file, self.layout.range(section).0 as u64)
-    }
 }
 
 impl Plan {
@@ -421,10 +392,7 @@ impl Plan {
 
     /// The inode stat columns, document bindings and states.
     fn write_inodes(&self, view: &Catalog, out: &Output) -> io::Result<()> {
-        let mut stat_columns: Vec<_> = STAT_COLUMNS
-            .into_iter()
-            .map(|field| out.column(field).map(|writer| (field, writer)))
-            .collect::<io::Result<_>>()?;
+        let mut stat_columns = StatColumns::start(out)?;
         let (mut doc, mut states, mut bits) = (
             out.column(Column::Doc)?,
             out.section(Section::States),
@@ -432,21 +400,11 @@ impl Plan {
         );
         for &old in &self.order {
             let inode = view.inode(old);
-            for (field, writer) in &mut stat_columns {
-                let value = stat_field(*field, &inode.stat);
-                match field.coding() {
-                    Coding::Dictionary => writer.index(
-                        out.dicts[*field as usize].partition_point(|&known| known < value),
-                    )?,
-                    _ => writer.value(value)?,
-                }
-            }
+            stat_columns.row(&inode.stat, &out.dicts)?;
             doc.nullable(inode.doc.map(|id| u64::from(id.0)))?;
             bits.push(&mut states, inode.state as u8)?;
         }
-        for (_, writer) in stat_columns {
-            writer.finish()?;
-        }
+        stat_columns.finish()?;
         doc.finish()?;
         bits.finish(&mut states)?;
         states.finish()?;
