@@ -573,39 +573,45 @@ fn query(
         tally: &mut tally,
     }
     .run(&mut reader, &request);
-    let Tally {
-        rows,
-        first_row,
-        summary,
-        output_failure,
-    } = tally;
     let exit = match result {
         Ok(exit) => exit,
         Err(error) => {
             cancel(reader.get_mut());
-            failure_exit(op, json, rows, output_failure, &error)
+            failure_exit(op, json, tally.rows, tally.output_failure, &error)
         }
     };
     if let Some(context) = context.filter(|_| op == "search") {
         let run = crate::search::Run {
             limit,
             exit: exit as u8,
-            rows,
-            first_row_us: first_row,
+            rows: tally.rows,
+            first_row_us: tally.first_row,
             total_us: started.elapsed().as_micros() as i128,
         };
-        let line = crate::search::log_line(now, args.iter().map(|a| a.as_bytes()), &run, |o| {
-            o.str("host", "socket");
-            if let Some(end) = &summary {
-                o.int("server_us", field_number(end, "elapsed_us").unwrap_or(0));
-                crate::search::copy_summary(o, end);
-            } else {
-                o.str("error", "transport");
-            }
-        });
-        context.log(&line);
+        log_search(context, args, now, &run, tally.summary.as_ref());
     }
     Some(exit)
+}
+
+/// Logs a search the daemon answered, with its `end` summary, or as a
+/// transport error when none arrived.
+fn log_search(
+    context: &Context,
+    args: &[OsString],
+    now: SystemTime,
+    run: &crate::search::Run,
+    summary: Option<&Value>,
+) {
+    let line = crate::search::log_line(now, args.iter().map(|a| a.as_bytes()), run, |o| {
+        o.str("host", "socket");
+        if let Some(end) = summary {
+            o.int("server_us", field_number(end, "elapsed_us").unwrap_or(0));
+            crate::search::copy_summary(o, end);
+        } else {
+            o.str("error", "transport");
+        }
+    });
+    context.log(&line);
 }
 
 /// What a query's relay records for the search log.
