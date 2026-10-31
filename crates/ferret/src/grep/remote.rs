@@ -96,16 +96,10 @@ pub(crate) fn serve(
     let Some(options) = &request.grep else {
         return Ok(runtime.failure("missing resolved grep environment"));
     };
-    let Some(cwd) = request
-        .cwd
-        .as_ref()
-        .map(|bytes| PathBuf::from(OsString::from_vec(bytes.clone())))
-    else {
-        return Ok(runtime.failure("missing grep cwd"));
+    let cwd = match request_cwd(request) {
+        Ok(cwd) => cwd,
+        Err(message) => return Ok(runtime.failure(message)),
     };
-    if !cwd.is_absolute() {
-        return Ok(runtime.failure("grep cwd must be absolute"));
-    }
     let args: Vec<_> = request
         .args
         .iter()
@@ -132,35 +126,13 @@ pub(crate) fn serve(
     let mut plan = match parsed {
         Ok(line_grep::Command::Search(plan)) => *plan,
         Ok(line_grep::Command::Files(mut plan)) => {
-            plan.presentation.color = if options.color {
-                line_grep::Color::Always
-            } else {
-                line_grep::Color::Never
-            };
-            plan.presentation.heading = Some(options.heading);
-            if plan.traversal.live || plan.traversal.unrestricted {
-                return Ok(runtime.failure("socket grep requires indexed directory operands"));
-            }
-            let Some(pin) = pin else {
-                return Ok(runtime.failure("no index available"));
-            };
-            let block = !plan.presentation.null;
-            return Ok(with_writer(writer, block && !options.tty, |mut writer| {
-                match super::names::pinned(&plan, pin.catalog(), &cwd, &mut writer, &runtime) {
-                    Ok(exit) => exit,
-                    Err(error) => runtime.failure(&error),
-                }
-            }));
+            present(&mut plan.presentation, options);
+            return Ok(list(&plan, pin, &cwd, options.tty, writer, &runtime));
         }
         Ok(_) => return Ok(runtime.failure("socket grep requires a search or file listing")),
         Err(error) => return Ok(runtime.failure(&error.to_string())),
     };
-    plan.presentation.color = if options.color {
-        line_grep::Color::Always
-    } else {
-        line_grep::Color::Never
-    };
-    plan.presentation.heading = Some(options.heading);
+    present(&mut plan.presentation, options);
     plan.line_number = options.numbers;
     plan.spill_dir = Some(Arc::from(Path::new(std::ffi::OsStr::from_bytes(
         &options.temp_dir,
@@ -213,6 +185,56 @@ pub(crate) fn serve(
         block_stdout(&plan) && !options.tty,
         |writer| execution.run(inputs, writer),
     ))
+}
+
+/// Applies the client's resolved colour and heading choices.
+fn present(presentation: &mut line_grep::Presentation, options: &GrepOptions) {
+    presentation.color = if options.color {
+        line_grep::Color::Always
+    } else {
+        line_grep::Color::Never
+    };
+    presentation.heading = Some(options.heading);
+}
+
+/// The client's working directory, which must be absolute.
+fn request_cwd(request: &Request) -> Result<PathBuf, &'static str> {
+    let cwd = request
+        .cwd
+        .as_ref()
+        .map(|bytes| PathBuf::from(OsString::from_vec(bytes.clone())))
+        .ok_or("missing grep cwd")?;
+    if cwd.is_absolute() {
+        Ok(cwd)
+    } else {
+        Err("grep cwd must be absolute")
+    }
+}
+
+/// Answers `--files` from the pinned catalog.
+fn list(
+    plan: &line_grep::Names,
+    pin: Option<&engine::QuerySession>,
+    cwd: &Path,
+    tty: bool,
+    writer: FrameWriter<'_>,
+    runtime: &Runtime<'_>,
+) -> Exit {
+    if plan.traversal.live || plan.traversal.unrestricted {
+        return runtime.failure("socket grep requires indexed directory operands");
+    }
+    let Some(pin) = pin else {
+        return runtime.failure("no index available");
+    };
+    let block = !plan.presentation.null;
+    with_writer(
+        writer,
+        block && !tty,
+        |mut writer| match super::names::pinned(plan, pin.catalog(), cwd, &mut writer, runtime) {
+            Ok(exit) => exit,
+            Err(error) => runtime.failure(&error),
+        },
+    )
 }
 
 // Discard failed publication buffers instead of retrying from Drop. Both grep
