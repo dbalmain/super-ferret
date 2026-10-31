@@ -318,32 +318,13 @@ impl Watch {
         let parent_identity = if relative.as_os_str().is_empty() {
             None
         } else {
-            openat(
-                fd,
-                "..",
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .and_then(fstat)
-            .ok()
-            .map(|s| (s.st_dev, s.st_ino))
+            Some(parent_identity(fd))
         };
         let mut state = lock(&self.state);
         let path = root.join(relative);
-        let parent = if relative.as_os_str().is_empty() {
-            None
-        } else {
-            state
-                .identities
-                .get(&parent_identity.unwrap_or_default())
-                .and_then(|wd| state.descriptors.get(wd))
-                .and_then(|ds| {
-                    ds.iter().find(|d| {
-                        Some(d.path().as_path()) == path.parent() && d.root.as_path() == root
-                    })
-                })
-                .cloned()
-        };
+        let parent = parent_identity.and_then(|identity| {
+            parent_directory(&state, identity.unwrap_or_default(), &path, root)
+        });
         if !relative.as_os_str().is_empty() && parent.is_none() {
             fail(
                 &mut state,
@@ -353,12 +334,7 @@ impl Watch {
             return;
         }
         let basename = relative.file_name().map_or(&b""[..], OsStr::as_bytes);
-        if let Some(wd) = state.identities.get(&identity)
-            && state
-                .descriptors
-                .get(wd)
-                .is_some_and(|ds| ds.iter().any(|d| d.path() == path))
-        {
+        if watched(&state, identity, &path) {
             return;
         }
         if state.identities.len() >= self.config.watch_cap
@@ -388,37 +364,7 @@ impl Watch {
             | WatchFlags::ONLYDIR
             | WatchFlags::MASK_ADD;
         match inotify::add_watch(&self.fd, path.as_str(), mask) {
-            Ok(wd) => {
-                if state.removed.remove(&wd) {
-                    loss(&mut state, RefreshReason::Overflow);
-                }
-                if state
-                    .descriptors
-                    .get(&wd)
-                    .is_some_and(|ds| ds.iter().any(|d| d.identity != identity))
-                {
-                    state.descriptors.remove(&wd);
-                    state.identities.retain(|_, value| *value != wd);
-                    loss(&mut state, RefreshReason::Overflow);
-                }
-                let shared = parent
-                    .as_ref()
-                    .map_or_else(|| Arc::new(root.to_owned()), |p| p.root.clone());
-                state
-                    .descriptors
-                    .entry(wd)
-                    .or_default()
-                    .push(Arc::new(Directory {
-                        identity,
-                        parent,
-                        basename: basename.to_vec(),
-                        root: shared,
-                    }));
-                state.identities.insert(identity, wd);
-                if let Some(record) = state.failures.get_mut(root) {
-                    record.repair_directory(&identity);
-                }
-            }
+            Ok(wd) => add_directory(&mut state, wd, identity, parent, basename, root),
             Err(_) => fail(
                 &mut state,
                 root,
@@ -962,6 +908,85 @@ impl Watch {
         }
     }
 }
+/// The `(dev, ino)` of `fd`'s parent, if it can be read.
+fn parent_identity(fd: BorrowedFd<'_>) -> Option<(u64, u64)> {
+    openat(
+        fd,
+        "..",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .and_then(fstat)
+    .ok()
+    .map(|s| (s.st_dev, s.st_ino))
+}
+
+/// The watched directory under `root` with `identity` that is `path`'s
+/// parent.
+fn parent_directory(
+    s: &State,
+    identity: (u64, u64),
+    path: &Path,
+    root: &Path,
+) -> Option<Arc<Directory>> {
+    s.identities
+        .get(&identity)
+        .and_then(|wd| s.descriptors.get(wd))
+        .and_then(|ds| {
+            ds.iter()
+                .find(|d| Some(d.path().as_path()) == path.parent() && d.root.as_path() == root)
+        })
+        .cloned()
+}
+
+/// Whether the directory with `identity` is already watched at `path`.
+fn watched(s: &State, identity: (u64, u64), path: &Path) -> bool {
+    s.identities.get(&identity).is_some_and(|wd| {
+        s.descriptors
+            .get(wd)
+            .is_some_and(|ds| ds.iter().any(|d| d.path() == path))
+    })
+}
+
+/// Records watch `wd` on the directory with `identity`, named `basename`
+/// in `parent`, or a root when it has none.
+fn add_directory(
+    s: &mut State,
+    wd: i32,
+    identity: (u64, u64),
+    parent: Option<Arc<Directory>>,
+    basename: &[u8],
+    root: &Path,
+) {
+    if s.removed.remove(&wd) {
+        loss(s, RefreshReason::Overflow);
+    }
+    if s.descriptors
+        .get(&wd)
+        .is_some_and(|ds| ds.iter().any(|d| d.identity != identity))
+    {
+        s.descriptors.remove(&wd);
+        s.identities.retain(|_, value| *value != wd);
+        loss(s, RefreshReason::Overflow);
+    }
+    let shared = parent
+        .as_ref()
+        .map_or_else(|| Arc::new(root.to_owned()), |p| p.root.clone());
+    s.descriptors
+        .entry(wd)
+        .or_default()
+        .push(Arc::new(Directory {
+            identity,
+            parent,
+            basename: basename.to_vec(),
+            root: shared,
+        }));
+    s.identities.insert(identity, wd);
+    if let Some(record) = s.failures.get_mut(root) {
+        record.repair_directory(&identity);
+    }
+}
+
 /// Records a failed watch. Past the exact bound it keeps nothing new, and it
 /// computes a policy key only while one can be kept or an earlier epoch holds
 /// policy keys it may repeat.
