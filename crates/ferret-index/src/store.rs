@@ -702,6 +702,15 @@ impl IndexWriter {
             let trigrams = &mut trigrams;
             let order = live.range(manifest.frontier, live.bound());
             crate::extract::in_order(order, readers, |doc, extracted| -> Result<bool, Error> {
+                // The first document is read before the pause is consulted, so
+                // a pass that keeps outlasting its time still makes progress.
+                // The pause comes before a full buffer's stop: a caller that
+                // goes straight on after a full buffer must still see it.
+                if followed.docs + followed.unreadable != 0 && (budget.cancelled)() {
+                    followed.stopped = Stopped::Asked;
+                    frontier = doc;
+                    return Ok(false);
+                }
                 // A document whose trigrams the buffer has no room left for
                 // fills it as surely as the bound does.
                 let overflows = extracted
@@ -718,13 +727,6 @@ impl IndexWriter {
                     } else {
                         Stopped::Bytes
                     };
-                    frontier = doc;
-                    return Ok(false);
-                }
-                // The first document is read before the pause is consulted, so
-                // a pass that keeps outlasting its time still makes progress.
-                if followed.docs + followed.unreadable != 0 && (budget.cancelled)() {
-                    followed.stopped = Stopped::Asked;
                     frontier = doc;
                     return Ok(false);
                 }
@@ -760,12 +762,10 @@ impl IndexWriter {
                     Ok(extracted) => {
                         match PairBuffer::admit(trigrams, doc, &extracted.keys)? {
                             Some(_) => {}
-                            None if docs != 0 => {
-                                followed.stopped = Stopped::Buffer;
-                                frontier = doc;
-                                return Ok(false);
-                            }
                             None => {
+                                // A document that overflows a buffer holding
+                                // others stopped or handed off above.
+                                debug_assert_eq!(docs, 0);
                                 trigrams.add_keys(doc, &extracted.keys, usize::MAX, |_| {})?;
                                 oversized = true;
                             }

@@ -1139,6 +1139,22 @@ fn a_pass_of_many_segments_hands_off_a_trigram_overflow() {
         .map(|s| (s.first, s.last))
         .collect();
     assert_eq!(ranges, [(0, 0), (1, 2)]);
+
+    // A pass of one segment stops at the overflow; asked to stop as well, it
+    // says so, since its caller goes straight on after a full buffer.
+    let dir = Dir::new("one-segment-overflow-asked");
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let budget = Budget {
+        cancelled: &|| true,
+        ..Budget::unbounded()
+    };
+    let followed = writer
+        .follow(&catalog.view(), &budget, &mut |doc, out| {
+            out.extend_from_slice(if doc == 0 { &first[..] } else { &second[..] });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((followed.stopped, followed.docs), (Stopped::Asked, 1));
 }
 
 #[test]
