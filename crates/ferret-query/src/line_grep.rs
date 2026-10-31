@@ -1115,9 +1115,6 @@ fn scan_records(
                 let line = if fast {
                     let Some(start) = next.take() else { break };
                     let remaining = &text[start..];
-                    if stopped() {
-                        return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
-                    }
                     if remaining.is_empty() && !terminated && binary.is_none() {
                         break;
                     }
