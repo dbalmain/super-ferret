@@ -38,6 +38,15 @@ enum Found {
     Warnings(Vec<String>),
 }
 
+/// What the writing thread has made of a listing so far.
+#[derive(Default)]
+struct Written {
+    any: bool,
+    errors: bool,
+    closed: bool,
+    failed: Option<String>,
+}
+
 impl Walk<'_> {
     pub(super) fn run(
         &self,
@@ -49,100 +58,124 @@ impl Walk<'_> {
         let (sender, receiver) = mpsc::sync_channel(self.threads * 4);
         let mut start = Some((source, policy));
         let quit = AtomicBool::new(false);
-        let mut any = false;
-        let mut errors = false;
-        let mut failed = None;
-        let closed = thread::scope(|scope| -> Result<bool, String> {
+        let mut written = Written::default();
+        thread::scope(|scope| -> Result<(), String> {
             let start = &mut start;
             let quit = &quit;
             let walked = thread::Builder::new().spawn_scoped(scope, move || {
-                let Some((source, policy)) = start.take() else {
-                    return;
-                };
-                let policy = policy.map(live::Policy::deferring);
-                let schedule = Schedule {
-                    workers: self.threads,
-                    starts: false,
-                    quit,
-                    on_panic: None,
-                    on_refused: None,
-                };
-                let lister = |_| Lister {
-                    walk: self,
-                    quit,
-                    sender: sender.clone(),
-                    buffer: Vec::new(),
-                };
-                let mut first = lister(0);
-                schedule::run(
-                    &schedule,
-                    source,
-                    Task {
-                        descend: true,
-                        policy,
-                    },
-                    &mut first,
-                    |_| true,
-                    lister,
-                );
+                if let Some((source, policy)) = start.take() {
+                    self.list(source, policy, quit, &sender);
+                }
             });
             if walked.is_err() {
-                return Ok(false);
+                return Ok(());
             }
-            let mut closed = false;
             for found in receiver {
-                if closed || failed.is_some() {
+                if written.closed || written.failed.is_some() {
                     continue;
                 }
-                match found {
-                    Found::Names(bytes) => {
-                        any = true;
-                        let written = writer.write_all(&bytes).and_then(|()| {
-                            if self.flush_each {
-                                writer.flush()
-                            } else {
-                                Ok(())
-                            }
-                        });
-                        match written {
-                            Ok(()) => {}
-                            // D94: a closed pipe stops the listing quietly.
-                            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                                closed = true;
-                            }
-                            Err(error) => failed = Some(format!("writing stdout: {error}")),
-                        }
-                    }
-                    Found::Diagnostic(message) => {
-                        errors = true;
-                        closed = diagnostic(writer, runtime, &message)?;
-                    }
-                    Found::Warnings(warnings) => {
-                        closed = flush_output(writer, self.cancelled)?.is_some();
-                        if !closed {
-                            for warning in warnings {
-                                eprintln!("{warning}");
-                            }
-                        }
-                    }
-                }
-                if closed || failed.is_some() {
+                self.write(found, writer, runtime, &mut written)?;
+                if written.closed || written.failed.is_some() {
                     self.cancelled.store(true, Ordering::Release);
                 }
             }
-            Ok(closed)
+            Ok(())
         })?;
         if let Some((source, policy)) = start {
             return Ok(Listed::Refused(Box::new((source, policy))));
         }
-        if let Some(error) = failed {
+        if let Some(error) = written.failed {
             return Err(error);
         }
-        Ok(if closed {
+        Ok(if written.closed {
             Listed::Closed
         } else {
-            Listed::Done { any, errors }
+            Listed::Done {
+                any: written.any,
+                errors: written.errors,
+            }
         })
+    }
+
+    /// Walks `source` on the schedule's workers, sending what they find.
+    fn list(
+        &self,
+        source: LiveWalk,
+        policy: Option<live::Policy>,
+        quit: &AtomicBool,
+        sender: &SyncSender<Found>,
+    ) {
+        let policy = policy.map(live::Policy::deferring);
+        let schedule = Schedule {
+            workers: self.threads,
+            starts: false,
+            quit,
+            on_panic: None,
+            on_refused: None,
+        };
+        let lister = |_| Lister {
+            walk: self,
+            quit,
+            sender: sender.clone(),
+            buffer: Vec::new(),
+        };
+        let mut first = lister(0);
+        schedule::run(
+            &schedule,
+            source,
+            Task {
+                descend: true,
+                policy,
+            },
+            &mut first,
+            |_| true,
+            lister,
+        );
+    }
+
+    /// Writes one worker's `found` to `writer`, or its diagnostic or
+    /// warnings after the names before them, noting the outcome in
+    /// `written`.
+    fn write(
+        &self,
+        found: Found,
+        writer: &mut impl Write,
+        runtime: &Runtime<'_>,
+        written: &mut Written,
+    ) -> Result<(), String> {
+        match found {
+            Found::Names(bytes) => {
+                written.any = true;
+                let result = writer.write_all(&bytes).and_then(|()| {
+                    if self.flush_each {
+                        writer.flush()
+                    } else {
+                        Ok(())
+                    }
+                });
+                match result {
+                    Ok(()) => {}
+                    // D94: a closed pipe stops the listing quietly.
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                        written.closed = true;
+                    }
+                    Err(error) => written.failed = Some(format!("writing stdout: {error}")),
+                }
+            }
+            Found::Diagnostic(message) => {
+                written.errors = true;
+                written.closed = diagnostic(writer, runtime, &message)?;
+            }
+            Found::Warnings(warnings) => {
+                written.closed = flush_output(writer, self.cancelled)?.is_some();
+                if !written.closed {
+                    for warning in warnings {
+                        eprintln!("{warning}");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn stopped(&self) -> bool {
