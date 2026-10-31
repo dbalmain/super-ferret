@@ -804,114 +804,145 @@ impl Overlay {
         self.load(Family::Namespace)?;
         self.base
             .load(&[Section::Names, Section::DirNames, Section::Roots])?;
-        let (mut rows, mut keys, mut touched, mut references, mut counter, mut count) =
-            match &self.parent {
-                Some(parent) => {
-                    parent.load_namespace()?;
-                    let ns = parent.namespace();
-                    (
-                        ns.rows.clone(),
-                        ns.keys.clone(),
-                        ns.touched.clone(),
-                        ns.references.clone(),
-                        parent.manifest.counters[1],
-                        parent.manifest.counts[1],
-                    )
+        let mut replay = match &self.parent {
+            Some(parent) => {
+                parent.load_namespace()?;
+                let ns = parent.namespace();
+                NameReplay {
+                    rows: ns.rows.clone(),
+                    keys: ns.keys.clone(),
+                    touched: ns.touched.clone(),
+                    references: ns.references.clone(),
+                    counter: parent.manifest.counters[1],
+                    count: parent.manifest.counts[1],
                 }
-                None => (
-                    Projection::default(),
-                    Runs::default(),
-                    BTreeSet::new(),
-                    BTreeMap::new(),
-                    self.base.next_name().0,
-                    self.base.name_count(),
-                ),
-            };
+            }
+            None => NameReplay {
+                rows: Projection::default(),
+                keys: Runs::default(),
+                touched: BTreeSet::new(),
+                references: BTreeMap::new(),
+                counter: self.base.next_name().0,
+                count: self.base.name_count(),
+            },
+        };
         for (seq, next, records) in self.transactions(Family::Namespace) {
-            let mut final_rows: BTreeMap<u64, Arc<Record>> = BTreeMap::new();
-            for r in records {
-                final_rows.insert(record_key(&r), r);
-            }
-            let mut key_rows = Vec::new();
-            let mut old_dirs = BTreeSet::new();
-            let mut ref_changes = BTreeMap::<u32, i64>::new();
-            let mut births = BTreeSet::new();
-            for r in final_rows.values() {
-                let id = match r.as_ref() {
-                    Record::NamePut { id, .. } | Record::NameDelete { id } => *id,
-                    _ => continue,
-                };
-                if id >= counter {
-                    if !matches!(r.as_ref(), Record::NamePut { .. }) {
-                        return Err(bad("delete unassigned name"));
-                    }
-                    births.insert(id);
-                    count += 1;
-                } else {
-                    let old =
-                        name(&self.base, &rows, id).ok_or_else(|| bad("retired name reused"))?;
-                    if let Target::Inode(child) = old.target() {
-                        *references.entry(child.0).or_default() -= 1;
-                        *ref_changes.entry(child.0).or_default() -= 1;
-                        if kind(&self.base, &rows, child.0) == Some(Kind::Dir) {
-                            old_dirs.insert(child.0);
-                        }
-                    }
-                    key_rows.push(Row {
-                        key: (old.parent.0, old.bytes.to_vec()),
-                        sequence: seq,
-                        value: None,
-                    });
-                    if matches!(r.as_ref(), Record::NameDelete { .. }) {
-                        count = count.checked_sub(1).ok_or_else(|| bad("name counts"))?;
-                    }
-                }
-            }
-            if births.len() as u64 != u64::from(next[1] - counter)
-                || births.iter().copied().ne(counter..next[1])
-            {
-                return Err(bad("name allocation gaps"));
-            }
-            for r in final_rows.values() {
-                if let Record::NamePut { child, .. } = r.as_ref()
-                    && Kind::from_ignored_child(*child).is_none()
-                {
-                    *references.entry(*child).or_default() += 1;
-                    *ref_changes.entry(*child).or_default() += 1;
-                }
-            }
-            let changed: Vec<_> = final_rows.into_values().collect();
-            rows.apply(seq, changed.iter().cloned());
-            let mut removed = keys.clone();
-            removed.insert(key_rows.clone());
-            // Coalesce one transaction into one run: removals and additions
-            // have the same sequence, so separate runs cannot order them.
-            key_rows.extend(added_keys(&self.base, &rows, &removed, &changed, seq)?);
-            touched.extend(key_rows.iter().map(|r| r.key.0));
-            keys.insert(key_rows);
-            validate_graph(&self.base, &rows, &changed, old_dirs)?;
-            let mut affected: BTreeSet<_> = ref_changes
-                .into_iter()
-                .filter(|(_, delta)| *delta != 0)
-                .map(|(id, _)| id)
-                .collect();
-            for r in &changed {
-                if let Record::LifePut { id, .. } | Record::InodeDelete { id } = r.as_ref() {
-                    affected.insert(*id);
-                }
-            }
-            check_references(&self.base, &rows, &keys, &references, affected)?;
-            references.retain(|_, delta| *delta != 0);
-            counter = next[1];
+            replay.apply(&self.base, seq, next, records)?;
         }
-        if count != self.manifest.counts[1] {
+        if replay.count != self.manifest.counts[1] {
             return Err(bad("live name count"));
         }
+        let NameReplay {
+            rows,
+            keys,
+            touched,
+            references,
+            ..
+        } = replay;
         let namespace = Namespace::new(&self.base, rows, keys, touched, references);
         let _ = self.namespace.set(Arc::new(namespace));
         Ok(())
     }
 }
+/// A namespace as the log's transactions replay over it.
+struct NameReplay {
+    rows: Projection,
+    keys: ChildKeys,
+    touched: BTreeSet<u32>,
+    references: BTreeMap<u32, i64>,
+    /// The next name id to allocate.
+    counter: u32,
+    /// Live names.
+    count: u32,
+}
+
+impl NameReplay {
+    /// Applies transaction `seq`, which allocates names up to `next`,
+    /// checking its names, keys, graph and references.
+    fn apply(
+        &mut self,
+        base: &Catalog,
+        seq: u64,
+        next: [u32; 3],
+        records: Vec<Arc<Record>>,
+    ) -> Result<(), OpenError> {
+        let mut final_rows: BTreeMap<u64, Arc<Record>> = BTreeMap::new();
+        for r in records {
+            final_rows.insert(record_key(&r), r);
+        }
+        let mut key_rows = Vec::new();
+        let mut old_dirs = BTreeSet::new();
+        let mut ref_changes = BTreeMap::<u32, i64>::new();
+        let mut births = BTreeSet::new();
+        for r in final_rows.values() {
+            let id = match r.as_ref() {
+                Record::NamePut { id, .. } | Record::NameDelete { id } => *id,
+                _ => continue,
+            };
+            if id >= self.counter {
+                if !matches!(r.as_ref(), Record::NamePut { .. }) {
+                    return Err(bad("delete unassigned name"));
+                }
+                births.insert(id);
+                self.count += 1;
+            } else {
+                let old = name(base, &self.rows, id).ok_or_else(|| bad("retired name reused"))?;
+                if let Target::Inode(child) = old.target() {
+                    *self.references.entry(child.0).or_default() -= 1;
+                    *ref_changes.entry(child.0).or_default() -= 1;
+                    if kind(base, &self.rows, child.0) == Some(Kind::Dir) {
+                        old_dirs.insert(child.0);
+                    }
+                }
+                key_rows.push(Row {
+                    key: (old.parent.0, old.bytes.to_vec()),
+                    sequence: seq,
+                    value: None,
+                });
+                if matches!(r.as_ref(), Record::NameDelete { .. }) {
+                    self.count = self
+                        .count
+                        .checked_sub(1)
+                        .ok_or_else(|| bad("name counts"))?;
+                }
+            }
+        }
+        check_births(&births, self.counter..next[1], "name allocation gaps")?;
+        for r in final_rows.values() {
+            if let Record::NamePut { child, .. } = r.as_ref()
+                && Kind::from_ignored_child(*child).is_none()
+            {
+                *self.references.entry(*child).or_default() += 1;
+                *ref_changes.entry(*child).or_default() += 1;
+            }
+        }
+        let changed: Vec<_> = final_rows.into_values().collect();
+        self.rows.apply(seq, changed.iter().cloned());
+        let mut removed = self.keys.clone();
+        removed.insert(key_rows.clone());
+        // Coalesce one transaction into one run: removals and additions
+        // have the same sequence, so separate runs cannot order them.
+        key_rows.extend(added_keys(base, &self.rows, &removed, &changed, seq)?);
+        self.touched.extend(key_rows.iter().map(|r| r.key.0));
+        self.keys.insert(key_rows);
+        validate_graph(base, &self.rows, &changed, old_dirs)?;
+        let mut affected: BTreeSet<_> = ref_changes
+            .into_iter()
+            .filter(|(_, delta)| *delta != 0)
+            .map(|(id, _)| id)
+            .collect();
+        for r in &changed {
+            if let Record::LifePut { id, .. } | Record::InodeDelete { id } = r.as_ref() {
+                affected.insert(*id);
+            }
+        }
+        check_references(base, &self.rows, &self.keys, &self.references, affected)?;
+        self.references.retain(|_, delta| *delta != 0);
+        self.counter = next[1];
+        Ok(())
+    }
+}
+
 impl Namespace {
     fn new(
         base: &Catalog,
