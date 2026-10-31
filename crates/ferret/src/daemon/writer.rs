@@ -254,11 +254,13 @@ fn release_freed_memory() {
         }
     }
 }
-fn serve(
+/// Opens the catalog, or creates it, as this writer's session, attaches
+/// the content index and starts the watch, then publishes the engine to
+/// waiting clients. The host reports loading throughout.
+fn load(
     host: &Arc<Host>,
-    receive: mpsc::Receiver<Message>,
-    scheduler: Arc<crate::scheduler::Scheduler>,
-) -> io::Result<()> {
+    scheduler: &crate::scheduler::Scheduler,
+) -> io::Result<(Arc<Engine>, Option<Arc<Watch>>)> {
     let loading = Operation::start(host, "loading");
     #[cfg(debug_assertions)]
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
@@ -288,6 +290,14 @@ fn serve(
     *lock(&host.engine) = Loaded::Ready(engine.clone());
     host.engine_ready.notify_all();
     drop(loading);
+    Ok((engine, watch))
+}
+fn serve(
+    host: &Arc<Host>,
+    receive: mpsc::Receiver<Message>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+) -> io::Result<()> {
+    let (engine, watch) = load(host, &scheduler)?;
     if let Some(watch) = &watch {
         spawn_intake(host, watch.clone())?;
     }
