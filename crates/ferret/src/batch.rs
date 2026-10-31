@@ -231,123 +231,23 @@ pub(crate) fn search_request(
         .map(OsString::from_vec)
         .collect();
     let parsed = Query::from_args(atoms.iter().map(|atom| atom.as_bytes()), now);
-    let mut rows = 0u64;
-    let mut status = 3u8;
-    let mut query_error = None;
-    let mut read_error = false;
-    let mut first_row = None;
-    let mut stats = None;
-    let mut bytes_read = 0u64;
-    let mut refused = None;
-    if let Ok(query) = &parsed {
-        if let Some(session) = session.as_ref() {
-            let catalog = session.catalog();
-            bytes_read = catalog.bytes_read();
-            let mut output_error = None;
-            // JSON rows reuse these buffers. Plain search appends `path\n`
-            // to find's 64 KiB frame buffer and does not build a row object.
-            // `rows` counts paths; a newline inside a path is not a row.
-            let mut encoded = Vec::with_capacity(256);
-            let mut framed = Vec::with_capacity(320);
-            let mut raw_out = RawStdout::new(1);
-            let raw = destination.raw_output();
-            let result = if request.limit == Some(0) {
-                Ok(ferret_query::Stats::default())
-            } else {
-                let bound = (!request
-                    .capabilities
-                    .iter()
-                    .any(|c| c == "scan" || c == "scan-uncovered"))
-                .then_some(ferret_query::UNCOVERED_BOUND);
-                let threads = workers.unwrap_or_else(|| session.search_threads());
-                session.search_content_threads(
-                    query,
-                    bound,
-                    threads,
-                    destination.cancellation(),
-                    |row: &Row<'_>| {
-                        if destination.cancelled() {
-                            return ControlFlow::Break(());
-                        }
-                        #[cfg(debug_assertions)]
-                        if request.capabilities.iter().any(|c| c == "test-panic") {
-                            panic!("injected query panic");
-                        }
-                        if raw {
-                            if let Err(error) = raw_out
-                                .write(destination, &request.id, row.path)
-                                .and_then(|()| raw_out.write(destination, &request.id, b"\n"))
-                                // The first path goes out alone, as the first
-                                // JSON row does; later paths fill parts.
-                                .and_then(|()| {
-                                    if rows == 0 {
-                                        raw_out.send_pending(destination, &request.id)
-                                    } else {
-                                        Ok(())
-                                    }
-                                })
-                            {
-                                output_error = Some(error);
-                                return ControlFlow::Break(());
-                            }
-                        } else {
-                            encoded.clear();
-                            json_row(&mut encoded, catalog, row);
-                            framed.clear();
-                            let mut object = Object::new(&mut framed);
-                            object.str("id", &request.id).str("event", "row");
-                            object.raw_fields(&encoded[1..encoded.len() - 1]);
-                            object.end();
-                            if let Err(error) = destination.send(&framed) {
-                                output_error = Some(error);
-                                return ControlFlow::Break(());
-                            }
-                        }
-                        first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                        rows += 1;
-                        if request.limit.is_some_and(|limit| rows >= limit) {
-                            ControlFlow::Break(())
-                        } else {
-                            ControlFlow::Continue(())
-                        }
-                    },
-                )
-            };
-            if raw
-                && output_error.is_none()
-                && let Err(error) = raw_out.finish(destination, &request.id)
-            {
-                return Err(error);
-            }
-            if let Some(error) = output_error {
-                return Err(error);
-            }
-            match result {
-                Ok(result) => {
-                    stats = Some(result);
-                    status = if rows == 0 { 1 } else { 0 };
-                }
-                Err(error @ ferret_query::RunError::ScanRequired { .. }) => {
-                    refused = session.explain_content(query).ok();
-                    query_error = Some(error.to_string());
-                }
-                Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
-                    query_error = Some(crate::search::incomplete_message(uncovered, live));
-                }
-                Err(error) => {
-                    read_error = true;
-                    query_error = Some(error.to_string());
-                }
-            }
-        } else {
-            query_error = Some("cannot open index".to_owned());
+    let outcome = match (&parsed, session.as_ref()) {
+        (Ok(query), Some(session)) => {
+            search_session(request, query, session, destination, workers, started)?
         }
-    } else {
-        status = 2;
-        if let Err(error) = &parsed {
-            query_error = Some(error.to_string());
-        }
-    }
+        (Ok(_), None) => Outcome::failed(3, "cannot open index".to_owned()),
+        (Err(error), _) => Outcome::failed(2, error.to_string()),
+    };
+    let Outcome {
+        rows,
+        status,
+        error: query_error,
+        read_error,
+        first_row,
+        stats,
+        bytes_read,
+        refused,
+    } = outcome;
     let elapsed = started.elapsed().as_micros() as i128;
     let summary = Summary {
         plan: parsed.as_ref().map_or_else(
@@ -390,6 +290,176 @@ pub(crate) fn search_request(
             o.int("workers", workers as u64);
         }
     })
+}
+
+/// What a search request reports in its `end` event and log line, besides
+/// the rows it sent.
+struct Outcome {
+    rows: u64,
+    status: u8,
+    error: Option<String>,
+    read_error: bool,
+    first_row: Option<i128>,
+    stats: Option<ferret_query::Stats>,
+    bytes_read: u64,
+    refused: Option<ferret_query::ContentPlan>,
+}
+
+impl Outcome {
+    fn new(status: u8) -> Self {
+        Self {
+            rows: 0,
+            status,
+            error: None,
+            read_error: false,
+            first_row: None,
+            stats: None,
+            bytes_read: 0,
+            refused: None,
+        }
+    }
+
+    fn failed(status: u8, error: String) -> Self {
+        Self {
+            error: Some(error),
+            ..Self::new(status)
+        }
+    }
+}
+
+/// Runs a parsed query against an open session, sending each row as it
+/// comes. An output error ends the request; a query error is reported.
+fn search_session(
+    request: &Request,
+    query: &Query,
+    session: &QuerySession,
+    destination: &Destination,
+    workers: Option<usize>,
+    started: Instant,
+) -> io::Result<Outcome> {
+    let catalog = session.catalog();
+    let mut outcome = Outcome {
+        bytes_read: catalog.bytes_read(),
+        ..Outcome::new(3)
+    };
+    let mut output_error = None;
+    let mut sink = RowSink {
+        request,
+        destination,
+        catalog,
+        raw: destination.raw_output(),
+        raw_out: RawStdout::new(1),
+        encoded: Vec::with_capacity(256),
+        framed: Vec::with_capacity(320),
+    };
+    let result = if request.limit == Some(0) {
+        Ok(ferret_query::Stats::default())
+    } else {
+        let bound = (!request
+            .capabilities
+            .iter()
+            .any(|c| c == "scan" || c == "scan-uncovered"))
+        .then_some(ferret_query::UNCOVERED_BOUND);
+        let threads = workers.unwrap_or_else(|| session.search_threads());
+        session.search_content_threads(
+            query,
+            bound,
+            threads,
+            destination.cancellation(),
+            |row: &Row<'_>| {
+                if destination.cancelled() {
+                    return ControlFlow::Break(());
+                }
+                #[cfg(debug_assertions)]
+                if request.capabilities.iter().any(|c| c == "test-panic") {
+                    panic!("injected query panic");
+                }
+                if let Err(error) = sink.send(row, outcome.rows == 0) {
+                    output_error = Some(error);
+                    return ControlFlow::Break(());
+                }
+                outcome
+                    .first_row
+                    .get_or_insert_with(|| started.elapsed().as_micros() as i128);
+                outcome.rows += 1;
+                if request.limit.is_some_and(|limit| outcome.rows >= limit) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+    };
+    if output_error.is_none() {
+        sink.finish()?;
+    }
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    match result {
+        Ok(result) => {
+            outcome.stats = Some(result);
+            outcome.status = if outcome.rows == 0 { 1 } else { 0 };
+        }
+        Err(error @ ferret_query::RunError::ScanRequired { .. }) => {
+            outcome.refused = session.explain_content(query).ok();
+            outcome.error = Some(error.to_string());
+        }
+        Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
+            outcome.error = Some(crate::search::incomplete_message(uncovered, live));
+        }
+        Err(error) => {
+            outcome.read_error = true;
+            outcome.error = Some(error.to_string());
+        }
+    }
+    Ok(outcome)
+}
+
+/// Sends a search's rows: plain search appends `path\n` to find's 64 KiB
+/// frame buffer and builds no row object; JSON rows reuse two buffers.
+/// A newline inside a path is not a row.
+struct RowSink<'a> {
+    request: &'a Request,
+    destination: &'a Destination,
+    catalog: &'a ferret_catalog::Catalog,
+    raw: bool,
+    raw_out: RawStdout,
+    encoded: Vec<u8>,
+    framed: Vec<u8>,
+}
+
+impl RowSink<'_> {
+    fn send(&mut self, row: &Row<'_>, first: bool) -> io::Result<()> {
+        let (destination, id) = (self.destination, &self.request.id);
+        if self.raw {
+            self.raw_out.write(destination, id, row.path)?;
+            self.raw_out.write(destination, id, b"\n")?;
+            // The first path goes out alone, as the first JSON row does;
+            // later paths fill parts.
+            if first {
+                self.raw_out.send_pending(destination, id)?;
+            }
+            Ok(())
+        } else {
+            self.encoded.clear();
+            json_row(&mut self.encoded, self.catalog, row);
+            self.framed.clear();
+            let mut object = Object::new(&mut self.framed);
+            object.str("id", id).str("event", "row");
+            object.raw_fields(&self.encoded[1..self.encoded.len() - 1]);
+            object.end();
+            destination.send(&self.framed)
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if self.raw {
+            self.raw_out.finish(self.destination, &self.request.id)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn find_request(
