@@ -330,155 +330,180 @@ impl LiveWalk {
             && let Some(target @ Target::Inode(dir)) = entry.state.target
             && catalog.contents(target) == Some(Contents::Catalogued)
         {
-            let handle = if self.options.live_checks {
-                match open_directory(entry) {
-                    Ok(handle) => Some(handle),
-                    Err(error) => {
-                        if self.options.depth_first {
-                            self.slot = Slot::After;
-                        }
-                        return Err(entry.error(error));
+            return self.list_catalogued(dir, before_directory, cancelled);
+        }
+        self.list_directory(before_directory, cancelled)
+    }
+
+    /// Lists catalogued directory `dir` from its stored entries, checking
+    /// each name live where the walk's actions can remove one.
+    fn list_catalogued(
+        &mut self,
+        dir: InoId,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<(), WalkError> {
+        let entry = &mut self.entry;
+        let Some(catalog) = &self.catalog else {
+            unreachable!("descend found the catalog")
+        };
+        let handle = if self.options.live_checks {
+            match open_directory(entry) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    if self.options.depth_first {
+                        self.slot = Slot::After;
                     }
+                    return Err(entry.error(error));
                 }
-            } else {
-                None
-            };
-            let start = self.children.len();
-            let names_start = self.names.len();
-            let mut seen = 0usize;
-            for child in catalog.entries(dir) {
-                seen += 1;
-                #[cfg(test)]
-                if let Some(listed) = &self.on_listed {
-                    listed();
-                }
-                if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                    self.children.truncate(start);
-                    self.names.truncate(names_start);
-                    self.cancelled = true;
-                    return Ok(());
-                }
-                if matches!(child.target, Target::Ignored(_)) {
-                    continue;
-                }
-                if child.kind != Kind::Dir
-                    && !(self.options.follow == Follow::All && child.kind == Kind::Symlink)
-                    && self
-                        .options
-                        .guard
-                        .as_ref()
-                        .is_some_and(|guard| !guard.matches(catalog_kind(child.kind), child.bytes))
-                {
-                    continue;
-                }
-                // Test membership before child actions. A later sibling
-                // removal must not erase a name already observed here. This
-                // applies to a cataloged directory child too (#7's repro):
-                // an earlier explicit start's own `-delete` can remove a
-                // directory another start is about to descend into, and the
-                // catalog's stored listing has no way to know that already
-                // happened - GNU's live readdir simply never lists it.
-                if self.options.live_checks {
-                    let own_len = entry.path.len();
-                    if !entry.path.ends_with(b"/") {
-                        entry.path.push(b'/');
-                    }
-                    entry.path.extend_from_slice(child.bytes);
-                    let missing = match &handle {
-                        Some(directory) => statat(
-                            directory,
-                            OsStr::from_bytes(child.bytes),
-                            AtFlags::SYMLINK_NOFOLLOW,
-                        )
-                        .is_err_and(|error| error == rustix::io::Errno::NOENT),
-                        None => fs::symlink_metadata(entry.lookup_path().as_ref())
-                            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
-                    };
-                    entry.path.truncate(own_len);
-                    let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| lock(removed).entries.contains(&id)));
-                    if missing && (child.kind != Kind::Dir || removed_here) {
-                        continue;
-                    }
-                }
-                let name_start = self.names.len();
-                self.names.extend_from_slice(child.bytes);
-                self.children.push(Child {
-                    name: (name_start, self.names.len()),
-                    kind: Some(catalog_kind(child.kind)),
-                    target: Some(child.target),
-                    parent: Some(dir),
-                    id: Some(child.name),
-                });
             }
-            // Nested roots have no name row in the outer crawl (D34).
-            let first = self
-                .nested_roots
-                .partition_point(|(parent, _, _)| *parent < dir);
-            let roots = self.nested_roots[first..]
-                .iter()
-                .take_while(|(parent, _, _)| *parent == dir);
-            let mut added = false;
-            for (_, id, name) in roots {
-                seen += 1;
-                #[cfg(test)]
-                if let Some(listed) = &self.on_listed {
-                    listed();
-                }
-                if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                    self.children.truncate(start);
-                    self.names.truncate(names_start);
-                    self.cancelled = true;
-                    return Ok(());
-                }
-                added = true;
-                let name_start = self.names.len();
-                self.names.extend_from_slice(name);
-                self.children.push(Child {
-                    name: (name_start, self.names.len()),
-                    kind: Some(FileKind::Directory),
-                    target: Some(Target::Inode(*id)),
-                    parent: Some(dir),
-                    id: None,
-                });
+        } else {
+            None
+        };
+        let start = self.children.len();
+        let names_start = self.names.len();
+        let mut seen = 0usize;
+        for child in catalog.entries(dir) {
+            seen += 1;
+            #[cfg(test)]
+            if let Some(listed) = &self.on_listed {
+                listed();
             }
-            if cancelled() {
+            if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
                 self.children.truncate(start);
                 self.names.truncate(names_start);
                 self.cancelled = true;
                 return Ok(());
             }
-            if added {
-                self.children[start..].sort_unstable_by(|a, b| {
-                    self.names[a.name.0..a.name.1].cmp(&self.names[b.name.0..b.name.1])
-                });
+            if matches!(child.target, Target::Ignored(_)) {
+                continue;
             }
-            if catalog.has_children(dir) == Some(true) || added {
-                before_directory().map_err(|error| entry.error(error))?;
+            if child.kind != Kind::Dir
+                && !(self.options.follow == Follow::All && child.kind == Kind::Symlink)
+                && self
+                    .options
+                    .guard
+                    .as_ref()
+                    .is_some_and(|guard| !guard.matches(catalog_kind(child.kind), child.bytes))
+            {
+                continue;
             }
-            let path_len = entry.path.len();
-            let separator = !entry.path.ends_with(b"/");
-            let own = Saved::take(entry);
-            self.levels.push(Level {
-                catalogued: true,
-                pending: None,
-                handle: if self.options.retain_parent {
-                    handle.map(DirectoryHandle::uncharged)
-                } else {
-                    None
-                },
-                identity: None,
-                path_len,
-                separator,
-                start,
-                next: start,
-                end: self.children.len(),
-                names_start,
-                first: None,
-                hidden: Hidden::Unrecorded,
-                own,
+            // Test membership before child actions. A later sibling
+            // removal must not erase a name already observed here. This
+            // applies to a cataloged directory child too (#7's repro):
+            // an earlier explicit start's own `-delete` can remove a
+            // directory another start is about to descend into, and the
+            // catalog's stored listing has no way to know that already
+            // happened - GNU's live readdir simply never lists it.
+            if self.options.live_checks {
+                let own_len = entry.path.len();
+                if !entry.path.ends_with(b"/") {
+                    entry.path.push(b'/');
+                }
+                entry.path.extend_from_slice(child.bytes);
+                let missing = match &handle {
+                    Some(directory) => statat(
+                        directory,
+                        OsStr::from_bytes(child.bytes),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .is_err_and(|error| error == rustix::io::Errno::NOENT),
+                    None => fs::symlink_metadata(entry.lookup_path().as_ref())
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                };
+                entry.path.truncate(own_len);
+                let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| lock(removed).entries.contains(&id)));
+                if missing && (child.kind != Kind::Dir || removed_here) {
+                    continue;
+                }
+            }
+            let name_start = self.names.len();
+            self.names.extend_from_slice(child.bytes);
+            self.children.push(Child {
+                name: (name_start, self.names.len()),
+                kind: Some(catalog_kind(child.kind)),
+                target: Some(child.target),
+                parent: Some(dir),
+                id: Some(child.name),
             });
+        }
+        // Nested roots have no name row in the outer crawl (D34).
+        let first = self
+            .nested_roots
+            .partition_point(|(parent, _, _)| *parent < dir);
+        let roots = self.nested_roots[first..]
+            .iter()
+            .take_while(|(parent, _, _)| *parent == dir);
+        let mut added = false;
+        for (_, id, name) in roots {
+            seen += 1;
+            #[cfg(test)]
+            if let Some(listed) = &self.on_listed {
+                listed();
+            }
+            if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
+                self.children.truncate(start);
+                self.names.truncate(names_start);
+                self.cancelled = true;
+                return Ok(());
+            }
+            added = true;
+            let name_start = self.names.len();
+            self.names.extend_from_slice(name);
+            self.children.push(Child {
+                name: (name_start, self.names.len()),
+                kind: Some(FileKind::Directory),
+                target: Some(Target::Inode(*id)),
+                parent: Some(dir),
+                id: None,
+            });
+        }
+        if cancelled() {
+            self.children.truncate(start);
+            self.names.truncate(names_start);
+            self.cancelled = true;
             return Ok(());
         }
+        if added {
+            self.children[start..].sort_unstable_by(|a, b| {
+                self.names[a.name.0..a.name.1].cmp(&self.names[b.name.0..b.name.1])
+            });
+        }
+        if catalog.has_children(dir) == Some(true) || added {
+            before_directory().map_err(|error| entry.error(error))?;
+        }
+        let path_len = entry.path.len();
+        let separator = !entry.path.ends_with(b"/");
+        let own = Saved::take(entry);
+        self.levels.push(Level {
+            catalogued: true,
+            pending: None,
+            handle: if self.options.retain_parent {
+                handle.map(DirectoryHandle::uncharged)
+            } else {
+                None
+            },
+            identity: None,
+            path_len,
+            separator,
+            start,
+            next: start,
+            end: self.children.len(),
+            names_start,
+            first: None,
+            hidden: Hidden::Unrecorded,
+            own,
+        });
+        Ok(())
+    }
+
+    /// Lists the lent entry's directory with getdents.
+    fn list_directory(
+        &mut self,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<(), WalkError> {
+        let entry = &mut self.entry;
         let handle = match open_directory(entry) {
             Ok(handle) => handle,
             Err(error) => {
