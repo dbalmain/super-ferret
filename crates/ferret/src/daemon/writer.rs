@@ -513,37 +513,9 @@ impl<'h> Background<'h> {
         #[cfg(debug_assertions)]
         std::thread::sleep(duration("FERRET_WATCH_TEST_REFRESH_DELAY_MS", 0));
         global_inputs(self.watch.as_ref(), self.engine, &self.context);
-        let mut reason = RefreshReason::Backstop;
-        let result = crate::index::global_ignore(&self.context)
-            .map_err(io::Error::other)
-            .and_then(|global| {
-                self.options.global = Some(global);
-                let pin = self.engine.pin();
-                let request = burst.as_ref().map_or_else(
-                    || ferret_crawl::RefreshRequest {
-                        expected_generation: pin.generation(),
-                        scopes: vec![],
-                        rename_hints: vec![],
-                        reason: RefreshReason::Backstop,
-                    },
-                    |b| b.request(pin.catalog()),
-                );
-                reason = request.reason;
-                self.engine
-                    .refresh(request, &self.options)
-                    .map_err(io::Error::other)
-            });
-        // Past the watch cap a poll rewalks a whole root, which can outlast
-        // the poll interval and would then run back to back (D116). A long
-        // refresh spaces the next poll by four times its duration, so polling
-        // holds the writer at most a fifth of the time. Only a refresh that
-        // walked the polled roots, a poll's or a full one, spaces them: a slow
-        // scoped burst elsewhere must not starve them.
+        let (result, reason) = self.run_refresh(burst.as_ref());
         let elapsed = started.elapsed();
-        let spacing = elapsed.saturating_mul(4);
-        if (polled || reason != RefreshReason::Burst) && spacing > self.polling {
-            self.poll_due = self.poll_due.max(Instant::now() + spacing);
-        }
+        self.space_polls(elapsed, polled, reason);
         if elapsed >= Duration::from_secs(1) {
             release_freed_memory();
         }
@@ -562,7 +534,73 @@ impl<'h> Background<'h> {
                 ferret_crawl::RefreshOutcome::RetryFromCurrent(_)
             )
         });
-        match &result {
+        self.settle(&result, burst.as_ref(), reason, retry_current, deferred);
+        if let Some(burst) = burst
+            && let Some(watch) = self.watch
+        {
+            if deferred.is_some() {
+                watch.defer(burst);
+                // Its retry is still that poll, for the refresh log.
+                self.poll_issued |= polled;
+            } else {
+                watch.finish(burst, result.is_ok() && !retry_current);
+            }
+        }
+    }
+
+    /// Refreshes for `burst`, or the whole catalog, under the current global
+    /// ignore rules. Returns the result and the reason the refresh ran for.
+    fn run_refresh(
+        &mut self,
+        burst: Option<&ferret_crawl::watch::Burst>,
+    ) -> (io::Result<ferret_crawl::RefreshReport>, RefreshReason) {
+        let mut reason = RefreshReason::Backstop;
+        let result = crate::index::global_ignore(&self.context)
+            .map_err(io::Error::other)
+            .and_then(|global| {
+                self.options.global = Some(global);
+                let pin = self.engine.pin();
+                let request = burst.map_or_else(
+                    || ferret_crawl::RefreshRequest {
+                        expected_generation: pin.generation(),
+                        scopes: vec![],
+                        rename_hints: vec![],
+                        reason: RefreshReason::Backstop,
+                    },
+                    |b| b.request(pin.catalog()),
+                );
+                reason = request.reason;
+                self.engine
+                    .refresh(request, &self.options)
+                    .map_err(io::Error::other)
+            });
+        (result, reason)
+    }
+
+    /// Past the watch cap a poll rewalks a whole root, which can outlast the
+    /// poll interval and would then run back to back (D116). A long refresh
+    /// spaces the next poll by four times its duration, so polling holds the
+    /// writer at most a fifth of the time. Only a refresh that walked the
+    /// polled roots, a poll's or a full one, spaces them: a slow scoped burst
+    /// elsewhere must not starve them.
+    fn space_polls(&mut self, elapsed: Duration, polled: bool, reason: RefreshReason) {
+        let spacing = elapsed.saturating_mul(4);
+        if (polled || reason != RefreshReason::Burst) && spacing > self.polling {
+            self.poll_due = self.poll_due.max(Instant::now() + spacing);
+        }
+    }
+
+    /// Records a refresh's outcome in the writer status and schedules what
+    /// follows: a retry, or, after a success, the watches and content.
+    fn settle(
+        &mut self,
+        result: &io::Result<ferret_crawl::RefreshReport>,
+        burst: Option<&ferret_crawl::watch::Burst>,
+        reason: RefreshReason,
+        retry_current: bool,
+        deferred: Option<ferret_catalog::bulk::Blocked>,
+    ) {
+        match result {
             Ok(_) if retry_current => {
                 // A budget checkpoint may keep sequence unchanged. It did not
                 // observe the queued work; resolve the complete marker again.
@@ -580,15 +618,13 @@ impl<'h> Background<'h> {
             }
             Ok(report) => {
                 global_inputs(self.watch.as_ref(), self.engine, &self.context);
-                let complete = burst
-                    .as_ref()
-                    .is_none_or(|b| b.reason() != RefreshReason::Burst)
+                let complete = burst.is_none_or(|b| b.reason() != RefreshReason::Burst)
                     && report.report.coverage_faults.is_empty();
                 successful(self.host, &report.report, complete);
                 lock(&self.host.writer_status).last_reason = Some(reason);
                 if let Some(w) = self.watch {
                     w.adopt_aliases(&report.view);
-                    if burst.as_ref().is_none_or(|b| b.reconcile_watches()) {
+                    if burst.is_none_or(|b| b.reconcile_watches()) {
                         w.reconcile(&report.view);
                     }
                 }
@@ -599,17 +635,6 @@ impl<'h> Background<'h> {
             Err(error) => {
                 lock(&self.host.writer_status).error = Some(error.to_string());
                 self.retry_due = Some(self.scheduler.now() + Duration::from_secs(1));
-            }
-        }
-        if let Some(burst) = burst
-            && let Some(watch) = self.watch
-        {
-            if deferred.is_some() {
-                watch.defer(burst);
-                // Its retry is still that poll, for the refresh log.
-                self.poll_issued |= polled;
-            } else {
-                watch.finish(burst, result.is_ok() && !retry_current);
             }
         }
     }
