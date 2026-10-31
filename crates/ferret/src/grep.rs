@@ -309,7 +309,6 @@ impl<'a> Execution<'a> {
     fn search<W: Write>(self, inputs: Vec<Input>, writer: W) -> Result<Exit, Exit> {
         let Self {
             plan,
-            live,
             runtime,
             start,
             ..
@@ -350,57 +349,12 @@ impl<'a> Execution<'a> {
         };
         // rg diagnoses failed explicit operands before searching, even when an
         // earlier operand supplies a quiet match.
-        let mut resolved = Vec::new();
-        for input in inputs {
-            if let Input::Failed(path, error) = input {
-                host.error(&path, &error)
-                    .map_err(|error| runtime.output_failure(&error))?;
-            } else {
-                resolved.push(input);
-            }
-        }
-        let inputs = resolved;
+        let inputs = host.report_failed(inputs, runtime)?;
         // D99: with no path operand, a walk whose filters selected no file is
         // diagnosed at exit.
         let mut searched = false;
-        let mut inputs = inputs.into_iter().peekable();
-        'inputs: while inputs.peek().is_some() {
-            let mut segment = Vec::new();
-            while inputs.peek().is_some_and(|input| {
-                !matches!(input, Input::Stream(_))
-                    && (segment.is_empty()
-                        || !buffered_path_output(plan, runtime.tty) && covered_inputs(live))
-            }) {
-                if let Some(input) = inputs.next() {
-                    segment.push(input);
-                }
-            }
-            if !segment.is_empty() {
-                self.segment(&mut host, segment, &prepared, &mut searched)?;
-                if plan.quiet && host.matched {
-                    if !plan.json {
-                        return Ok(Exit::Ok);
-                    }
-                    break 'inputs;
-                }
-                if buffered_path_output(plan, runtime.tty)
-                    && let Err(error) = host.writer.flush()
-                {
-                    return Err(runtime.output_failure(&error));
-                }
-            }
-            if let Some(Input::Stream(path)) =
-                inputs.next_if(|input| matches!(input, Input::Stream(_)))
-            {
-                searched = true;
-                self.stream(&mut host, &path)?;
-                if plan.quiet && host.matched {
-                    if !plan.json {
-                        return Ok(Exit::Ok);
-                    }
-                    break 'inputs;
-                }
-            }
+        if self.search_inputs(&mut host, inputs, &prepared, &mut searched)? && !plan.json {
+            return Ok(Exit::Ok);
         }
         if let Some(operands) = operands.filter(|_| !searched && !stopped()) {
             searched = self.selects_a_file(operands);
@@ -413,21 +367,59 @@ impl<'a> Execution<'a> {
         host.writer
             .flush()
             .map_err(|error| runtime.output_failure(&error))?;
-        Ok(if plan.quiet && host.matched {
-            Exit::Ok
-        } else if plan.paths.is_empty() && !searched {
-            let _ = (runtime.stderr)(
-                "grep: no files were searched; a glob, type, depth, hidden or ignore filter probably \
-             excluded every file under the current directory",
-            );
-            Exit::Usage
-        } else if host.errors {
-            Exit::Usage
-        } else if host.matched {
-            Exit::Ok
-        } else {
-            Exit::NoMatch
-        })
+        Ok(host.exit(searched, runtime))
+    }
+
+    /// Searches `inputs` in order, each run of walkable operands as one
+    /// segment and each stream alone. Returns whether a quiet search
+    /// stopped at its first match.
+    fn search_inputs<W: Write>(
+        &self,
+        host: &mut Host<'_, W>,
+        inputs: Vec<Input>,
+        prepared: &Prepared<'_>,
+        searched: &mut bool,
+    ) -> Result<bool, Exit> {
+        let Self {
+            plan,
+            live,
+            runtime,
+            ..
+        } = *self;
+        let mut inputs = inputs.into_iter().peekable();
+        while inputs.peek().is_some() {
+            let mut segment = Vec::new();
+            while inputs.peek().is_some_and(|input| {
+                !matches!(input, Input::Stream(_))
+                    && (segment.is_empty()
+                        || !buffered_path_output(plan, runtime.tty) && covered_inputs(live))
+            }) {
+                if let Some(input) = inputs.next() {
+                    segment.push(input);
+                }
+            }
+            if !segment.is_empty() {
+                self.segment(host, segment, prepared, searched)?;
+                if plan.quiet && host.matched {
+                    return Ok(true);
+                }
+                if buffered_path_output(plan, runtime.tty)
+                    && let Err(error) = host.writer.flush()
+                {
+                    return Err(runtime.output_failure(&error));
+                }
+            }
+            if let Some(Input::Stream(path)) =
+                inputs.next_if(|input| matches!(input, Input::Stream(_)))
+            {
+                *searched = true;
+                self.stream(host, &path)?;
+                if plan.quiet && host.matched {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// The catalog's part of a search, before any walk: the index's
@@ -911,6 +903,41 @@ struct Host<'a, W> {
     json_stats: json::Stats,
     errors: bool,
     cancelled: Option<&'a AtomicBool>,
+}
+
+impl<W: Write> Host<'_, W> {
+    /// Reports each failed operand, returning the others.
+    fn report_failed(&mut self, inputs: Vec<Input>, runtime: &Runtime) -> Result<Vec<Input>, Exit> {
+        let mut resolved = Vec::new();
+        for input in inputs {
+            if let Input::Failed(path, error) = input {
+                self.error(&path, &error)
+                    .map_err(|error| runtime.output_failure(&error))?;
+            } else {
+                resolved.push(input);
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// The search's exit status, once its output is flushed.
+    fn exit(&self, searched: bool, runtime: &Runtime) -> Exit {
+        if self.plan.quiet && self.matched {
+            Exit::Ok
+        } else if self.plan.paths.is_empty() && !searched {
+            let _ = (runtime.stderr)(
+                "grep: no files were searched; a glob, type, depth, hidden or ignore filter probably \
+         excluded every file under the current directory",
+            );
+            Exit::Usage
+        } else if self.errors {
+            Exit::Usage
+        } else if self.matched {
+            Exit::Ok
+        } else {
+            Exit::NoMatch
+        }
+    }
 }
 
 /// Live policy loading warns on stderr from search workers, which no group
