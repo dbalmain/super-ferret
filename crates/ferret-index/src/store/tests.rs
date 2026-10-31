@@ -1209,8 +1209,9 @@ fn error_after_successful_reconcile_cleans_unpublished_outputs() {
 }
 
 /// A merge writes its term output here and its trigram output on a second
-/// thread. A failure confined to either side fails the merge, leaves the
-/// published view as it was and removes every unpublished file.
+/// thread. A failure confined to either side's output, while the other side
+/// is writing too, fails the merge, leaves the published view as it was and
+/// removes every unpublished file.
 #[test]
 fn a_merge_failing_on_one_side_publishes_nothing() {
     for fail_trigrams in [false, true] {
@@ -1220,8 +1221,13 @@ fn a_merge_failing_on_one_side_publishes_nothing() {
         let catalog = Catalog::new(40, &[]);
         let before = writer.view().manifest().clone();
         let caller = std::thread::current().id();
+        let injected = AtomicBool::new(false);
+        // Input charges come before the worker starts; only an output
+        // transfer is failed.
         let pace = |_| {
-            if (std::thread::current().id() != caller) == fail_trigrams {
+            let trigram_side = std::thread::current().id() != caller;
+            if trigram_side == fail_trigrams && !input_trace::charging() {
+                injected.store(true, Ordering::Relaxed);
                 Err(io::Error::other("injected one-sided failure"))
             } else {
                 Ok(())
@@ -1232,6 +1238,10 @@ fn a_merge_failing_on_one_side_publishes_nothing() {
             ..Budget::unbounded()
         };
         assert!(writer.merge_all(&catalog.view(), &budget).is_err());
+        assert!(
+            injected.load(Ordering::Relaxed),
+            "no output transfer failed"
+        );
         assert_eq!(writer.view().manifest().segments, before.segments);
         assert_eq!(dir.files(), named(&writer.view()));
     }
