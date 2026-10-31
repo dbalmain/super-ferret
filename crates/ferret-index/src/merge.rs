@@ -32,7 +32,7 @@ use std::ops::Range;
 
 use crate::live::DocSet;
 use crate::manifest::SegmentEntry;
-use crate::segment::{Hit, ReadAt, ReadError, Segment, Sizes, TermEntry, Terms, Writer};
+use crate::segment::{Hit, Info, ReadAt, ReadError, Segment, Sizes, TermEntry, Terms, Writer};
 use crate::store::{Error, Point, hit};
 
 /// Segments merged at once, and per tier before the next tier up.
@@ -106,6 +106,16 @@ pub fn stream<R: ReadAt>(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Sizes, Error> {
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();
+    // An input whose whole range is live keeps every document, so its lists
+    // skip the filter: a first build's merges purge nothing.
+    let whole: Vec<bool> = inputs
+        .iter()
+        .map(|input| {
+            let Info { first, last, .. } = input.info();
+            u64::from(live.count(first, last.saturating_add(1)))
+                == u64::from(last) - u64::from(first) + 1
+        })
+        .collect();
     // Each input's current term and entry, `None` once it is exhausted. The
     // buffers are reused, so stepping a cursor allocates nothing.
     let mut terms: Vec<Vec<u8>> = vec![Vec::new(); inputs.len()];
@@ -137,7 +147,11 @@ pub fn stream<R: ReadAt>(
                 Hit::Single(doc) => list.push(doc),
                 Hit::Postings(postings) => postings.decode(&mut list),
             }
-            docs.extend(list.drain(..).filter(|&doc| live.contains(doc)));
+            if whole[j] {
+                docs.append(&mut list);
+            } else {
+                docs.extend(list.drain(..).filter(|&doc| live.contains(doc)));
+            }
             entries[j] = next(&mut cursors[j], &mut terms[j])?;
             tournament.replay(j, |a, b| before(&entries, &terms, a, b));
         }
