@@ -441,84 +441,11 @@ pub(crate) fn plan(
     if dirs + files + index.ignored >= (NONE - 16) as usize {
         return Err(BuildError::TooLarge);
     }
-    // Each batch's first directory number and its directories, by batch id.
-    let position: HashMap<u32, (usize, usize)> = batches
-        .iter()
-        .zip(&index.dir_base)
-        .map(|(b, &base)| (b.id, (base, b.dirs.len())))
-        .collect();
-    let resolve = |token: DirToken| -> Result<usize, BuildError> {
-        match position.get(&token.batch) {
-            Some(&(base, len)) if (token.index as usize) < len => Ok(base + token.index as usize),
-            _ => Err(BuildError::UnknownToken(token)),
-        }
-    };
-
-    // Each entry's parent, then the entries grouped by parent: count, prefix
-    // sum, scatter. Only each directory's own children are ever sorted.
-    let mut roots = Vec::new();
-    let mut parent_of = vec![NONE; dirs + files + index.ignored];
-    for (i, batch) in batches.iter().enumerate() {
-        for (d, dir) in batch.dirs.iter().enumerate() {
-            let g = index.dir_base[i] + d;
-            match dir.parent {
-                None => roots.push((dir.name.of(&batch.names), g)),
-                Some(parent) => parent_of[g] = resolve(parent)? as u32,
-            }
-        }
-        for (f, file) in batch.files.iter().enumerate() {
-            parent_of[dirs + index.file_base[i] + f] = resolve(file.parent)? as u32;
-        }
-        for (j, ignored) in batch.ignored.iter().enumerate() {
-            parent_of[dirs + files + index.ignored_base[i] + j] = resolve(ignored.parent)? as u32;
-        }
-    }
-    let mut edge_start = vec![0u32; dirs + 1];
-    for &parent in &parent_of {
-        if parent != NONE {
-            edge_start[parent as usize + 1] += 1;
-        }
-    }
-    for d in 0..dirs {
-        edge_start[d + 1] += edge_start[d];
-    }
-    let mut edges = vec![0u32; edge_start[dirs] as usize];
-    let mut cursor = edge_start.clone();
-    for (entry, &parent) in parent_of.iter().enumerate() {
-        if parent != NONE {
-            edges[cursor[parent as usize] as usize] = entry as u32;
-            cursor[parent as usize] += 1;
-        }
-    }
-    drop(cursor);
-    let mut reachable: Vec<u32> = roots.iter().map(|&(_, g)| g as u32).collect();
-    let mut next = 0;
-    while next < reachable.len() {
-        let d = reachable[next] as usize;
-        reachable.extend(
-            edges[edge_start[d] as usize..edge_start[d + 1] as usize]
-                .iter()
-                .copied()
-                .filter(|&e| (e as usize) < dirs),
-        );
-        next += 1;
-    }
-    if reachable.len() != dirs {
-        return Err(BuildError::Unreachable);
-    }
-    let mut visible = vec![false; dirs];
-    for &dir in reachable.iter().rev() {
-        let d = dir as usize;
-        let (b, i) = index.dir(d);
-        visible[d] |= !batches[b].dirs[i].traversed
-            || edges[edge_start[d] as usize..edge_start[d + 1] as usize]
-                .iter()
-                .any(|&e| (dirs..dirs + files).contains(&(e as usize)));
-        if visible[d] && parent_of[d] != NONE {
-            visible[parent_of[d] as usize] = true;
-        }
-    }
-    drop((parent_of, reachable));
+    let tokens = Tokens::new(batches, &index);
+    let (mut roots, parent_of) = parents(batches, &index, &tokens)?;
+    let (edge_start, edges) = group_by_parent(&parent_of, dirs);
+    let visible = visible_dirs(batches, &index, &roots, &parent_of, &edge_start, &edges)?;
+    drop(parent_of);
 
     roots.sort_by(|a, b| a.0.cmp(b.0));
     if let Some(pair) = roots.windows(2).find(|w| w[0].0 == w[1].0) {
@@ -560,8 +487,148 @@ pub(crate) fn plan(
     }
     drop(roots);
 
-    // Breadth first: sort each directory's children, check them, number the
-    // child directories, and note each file's first name position.
+    let file_pos = number_names(&mut plan, batches, &visible)?;
+
+    for batch in batches.iter_mut() {
+        for (dir, count) in std::mem::take(&mut batch.entry_counts) {
+            plan.entry_count[tokens.resolve(dir)?] = count;
+        }
+    }
+
+    number_files(&mut plan, batches, file_pos)?;
+    assign_docs(&mut plan, batches, known.docs)?;
+    push_links(&mut plan, batches)?;
+    push_work_trees(&mut plan, batches, &tokens)?;
+    Ok(plan)
+}
+
+/// Each batch's first directory number and its directory count, by batch
+/// id: resolves a [`DirToken`] to its global directory number.
+struct Tokens(HashMap<u32, (usize, usize)>);
+
+impl Tokens {
+    fn new(batches: &[Batch], index: &Index) -> Self {
+        Self(
+            batches
+                .iter()
+                .zip(&index.dir_base)
+                .map(|(b, &base)| (b.id, (base, b.dirs.len())))
+                .collect(),
+        )
+    }
+
+    fn resolve(&self, token: DirToken) -> Result<usize, BuildError> {
+        match self.0.get(&token.batch) {
+            Some(&(base, len)) if (token.index as usize) < len => Ok(base + token.index as usize),
+            _ => Err(BuildError::UnknownToken(token)),
+        }
+    }
+}
+
+/// Each root's `(path, directory)`.
+type Roots<'a> = Vec<(&'a [u8], usize)>;
+
+/// The roots, and each entry's parent directory, NONE for a root.
+fn parents<'a>(
+    batches: &'a [Batch],
+    index: &Index,
+    tokens: &Tokens,
+) -> Result<(Roots<'a>, Vec<u32>), BuildError> {
+    let mut roots = Vec::new();
+    let mut parent_of = vec![NONE; index.dirs + index.files + index.ignored];
+    let (dirs, files) = (index.dirs, index.files);
+    for (i, batch) in batches.iter().enumerate() {
+        for (d, dir) in batch.dirs.iter().enumerate() {
+            let g = index.dir_base[i] + d;
+            match dir.parent {
+                None => roots.push((dir.name.of(&batch.names), g)),
+                Some(parent) => parent_of[g] = tokens.resolve(parent)? as u32,
+            }
+        }
+        for (f, file) in batch.files.iter().enumerate() {
+            parent_of[dirs + index.file_base[i] + f] = tokens.resolve(file.parent)? as u32;
+        }
+        for (j, ignored) in batch.ignored.iter().enumerate() {
+            parent_of[dirs + files + index.ignored_base[i] + j] =
+                tokens.resolve(ignored.parent)? as u32;
+        }
+    }
+    Ok((roots, parent_of))
+}
+
+/// The entries grouped by parent, as `(edge_start, edges)`: count, prefix
+/// sum, scatter. Only each directory's own children are ever sorted.
+fn group_by_parent(parent_of: &[u32], dirs: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut edge_start = vec![0u32; dirs + 1];
+    for &parent in parent_of {
+        if parent != NONE {
+            edge_start[parent as usize + 1] += 1;
+        }
+    }
+    for d in 0..dirs {
+        edge_start[d + 1] += edge_start[d];
+    }
+    let mut edges = vec![0u32; edge_start[dirs] as usize];
+    let mut cursor = edge_start.clone();
+    for (entry, &parent) in parent_of.iter().enumerate() {
+        if parent != NONE {
+            edges[cursor[parent as usize] as usize] = entry as u32;
+            cursor[parent as usize] += 1;
+        }
+    }
+    (edge_start, edges)
+}
+
+/// Whether each directory stays visible: it was not traversed, or it holds
+/// a file, or a visible directory. Fails unless every directory is
+/// reachable from a root.
+fn visible_dirs(
+    batches: &[Batch],
+    index: &Index,
+    roots: &[(&[u8], usize)],
+    parent_of: &[u32],
+    edge_start: &[u32],
+    edges: &[u32],
+) -> Result<Vec<bool>, BuildError> {
+    let (dirs, files) = (index.dirs, index.files);
+    let mut reachable: Vec<u32> = roots.iter().map(|&(_, g)| g as u32).collect();
+    let mut next = 0;
+    while next < reachable.len() {
+        let d = reachable[next] as usize;
+        reachable.extend(
+            edges[edge_start[d] as usize..edge_start[d + 1] as usize]
+                .iter()
+                .copied()
+                .filter(|&e| (e as usize) < dirs),
+        );
+        next += 1;
+    }
+    if reachable.len() != dirs {
+        return Err(BuildError::Unreachable);
+    }
+    let mut visible = vec![false; dirs];
+    for &dir in reachable.iter().rev() {
+        let d = dir as usize;
+        let (b, i) = index.dir(d);
+        visible[d] |= !batches[b].dirs[i].traversed
+            || edges[edge_start[d] as usize..edge_start[d + 1] as usize]
+                .iter()
+                .any(|&e| (dirs..dirs + files).contains(&(e as usize)));
+        if visible[d] && parent_of[d] != NONE {
+            visible[parent_of[d] as usize] = true;
+        }
+    }
+    Ok(visible)
+}
+
+/// Breadth first: sorts each directory's children, checks them, numbers the
+/// child directories, and returns each file's first name position.
+fn number_names(
+    plan: &mut Plan,
+    batches: &[Batch],
+    visible: &[bool],
+) -> Result<Vec<u32>, BuildError> {
+    let (dirs, files) = (plan.index.dirs, plan.index.files);
     let mut file_pos = vec![NONE; files];
     let mut name_id = 0usize;
     let mut offsets = BlockSizer::default();
@@ -618,18 +685,12 @@ pub(crate) fn plan(
         next += 1;
     }
     plan.offset_blocks = offsets.finish();
+    Ok(file_pos)
+}
 
-    for batch in batches.iter_mut() {
-        for (dir, count) in std::mem::take(&mut batch.entry_counts) {
-            plan.entry_count[resolve(dir)?] = count;
-        }
-    }
-
-    number_files(&mut plan, batches, file_pos)?;
-    assign_docs(&mut plan, batches, known.docs)?;
-
-    // Link targets in inode order, then work-tree paths sorted by directory,
-    // so the strings do not depend on which batch reported what.
+/// Special files and link targets in inode order, so the strings do not
+/// depend on which batch reported what.
+fn push_links(plan: &mut Plan, batches: &[Batch]) -> Result<(), BuildError> {
     for k in 0..plan.winner.len() {
         let (b, f) = plan.index.file(plan.winner[k] as usize);
         let kind = crate::Kind::from_mode(batches[b].file_stats[f].mode);
@@ -648,10 +709,16 @@ pub(crate) fn plan(
             plan.links.push(((plan.order.len() + k) as u32, offset));
         }
     }
+    Ok(())
+}
+
+/// Work-tree paths sorted by directory, so the strings do not depend on
+/// which batch reported what.
+fn push_work_trees(plan: &mut Plan, batches: &[Batch], tokens: &Tokens) -> Result<(), BuildError> {
     let mut work_trees = Vec::new();
     for batch in batches {
         for wt in &batch.work_trees {
-            let dir = plan.dir_id[resolve(wt.dir)?];
+            let dir = plan.dir_id[tokens.resolve(wt.dir)?];
             work_trees.push((dir, wt.common_dir.of(&batch.strings), wt));
         }
     }
@@ -667,7 +734,7 @@ pub(crate) fn plan(
         plan.work_trees
             .push((dir, offset, wt.common_id, wt.kind as u8));
     }
-    Ok(plan)
+    Ok(())
 }
 
 /// One inode row per `(dev, ino)` among files, numbered by first name (D31 C).
