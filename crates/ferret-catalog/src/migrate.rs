@@ -7,9 +7,18 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 
-use crate::format::{self, COLUMNS, Column, Descriptor, Head, SECTIONS, Section, u32_at, u64_at};
+use crate::format::{
+    self, COLUMNS, Column, Descriptor, Head, Layout, SECTIONS, Section, u32_at, u64_at,
+};
 use crate::packed;
 use crate::{DecodeError, Generation, Hash};
+
+/// The v3 head's end: the fixed fields, 23 section ranges and 17 column
+/// descriptors.
+const OLD_END: usize = 680;
+
+/// Each v3 section's `(start, end)` in the old file.
+type OldSections = [(usize, usize); 23];
 
 pub(crate) fn write(
     bytes: &[u8],
@@ -17,6 +26,20 @@ pub(crate) fn write(
     generation: Generation,
     policy: Hash,
 ) -> Result<(), crate::CommitError> {
+    let (head, old) = convert_head(bytes, generation)?;
+    let (layout, len) = copy(bytes, out, &head, &old, policy)?;
+    // Validate legacy columns before interpreting any document id.
+    format::seal(out).map_err(crate::CommitError::Write)?;
+    let converted = check_converted(out, len, &layout)?;
+    write_references(out, &layout, &converted)?;
+    format::seal(out).map_err(crate::CommitError::Write)
+}
+
+/// The v4 head for a v3 file, and where each old section lies in it.
+fn convert_head(
+    bytes: &[u8],
+    generation: Generation,
+) -> Result<(Head, OldSections), crate::CommitError> {
     let fail = || crate::CommitError::Encode(DecodeError::Layout);
     if bytes.len() < 12 || bytes[..8] != format::MAGIC {
         return Err(crate::CommitError::Encode(DecodeError::NotACatalog));
@@ -26,7 +49,6 @@ pub(crate) fn write(
             bytes, 8,
         ))));
     }
-    const OLD_END: usize = 680;
     if bytes.len() < OLD_END || u32_at(bytes, 20) != 23 {
         return Err(fail());
     }
@@ -86,6 +108,18 @@ pub(crate) fn write(
     }
     head.lens[Section::DocRefs as usize] = u64::from(head.docs) * 4;
     head.lens[Section::Policy as usize] = 16;
+    Ok((head, old))
+}
+
+/// Writes `head`, the old sections in place, an all-none retention column
+/// and `policy`. Returns the new layout and file length.
+fn copy(
+    bytes: &[u8],
+    out: &File,
+    head: &Head,
+    old: &OldSections,
+    policy: Hash,
+) -> Result<(Layout, u64), crate::CommitError> {
     let (encoded, len) = head.encode();
     let layout = format::decode_table(&encoded, len).map_err(crate::CommitError::Encode)?;
     let write = || -> io::Result<()> {
@@ -95,7 +129,7 @@ pub(crate) fn write(
             out.write_all_at(&bytes[start..end], layout.sections[i].0 as u64)?;
         }
         let mut retained = format::ColumnWriter::start(out, &layout, Column::RetainedAt, &[])?;
-        for _ in 0..dirs {
+        for _ in 0..head.dirs {
             retained.nullable(None)?;
         }
         retained.finish()?;
@@ -103,8 +137,12 @@ pub(crate) fn write(
         Ok(())
     };
     write().map_err(crate::CommitError::Write)?;
-    // Validate legacy columns before interpreting any document id.
-    format::seal(out).map_err(crate::CommitError::Write)?;
+    Ok((layout, len))
+}
+
+/// Reads the sealed file back and checks every section but the document
+/// references, which are not yet written.
+fn check_converted(out: &File, len: u64, layout: &Layout) -> Result<Vec<u8>, crate::CommitError> {
     let mut converted = vec![0; len as usize];
     out.read_exact_at(&mut converted, 0)
         .map_err(crate::CommitError::Write)?;
@@ -117,10 +155,19 @@ pub(crate) fn write(
         })
         .map_err(crate::CommitError::Encode)?;
     }
+    Ok(converted)
+}
+
+/// Counts each document's references in the converted file and writes them.
+fn write_references(
+    out: &File,
+    layout: &Layout,
+    converted: &[u8],
+) -> Result<(), crate::CommitError> {
     let refs = format::document_references(
-        &layout,
-        layout.section(&converted, Section::Docs),
-        layout.section(&converted, Section::Doc),
+        layout,
+        layout.section(converted, Section::Docs),
+        layout.section(converted, Section::Doc),
     )
     .map_err(crate::CommitError::Encode)?;
     let mut references = format::At::new(out, layout.range(Section::DocRefs).0 as u64);
@@ -128,5 +175,5 @@ pub(crate) fn write(
         format::put_u32(&mut references, count).map_err(crate::CommitError::Write)?;
     }
     references.finish().map_err(crate::CommitError::Write)?;
-    format::seal(out).map_err(crate::CommitError::Write)
+    Ok(())
 }
