@@ -55,32 +55,10 @@ pub(crate) fn check<'a>(
     if checksum(get(section)) != l.checksums[section as usize] {
         return Err(DecodeError::Corrupt(section.label()));
     }
-    let terminated = |heap: &[u8]| heap.last().is_none_or(|&b| b == 0);
-    let strings_len = l.len(Section::Strings);
-    for column in COLUMNS {
-        let coding = column.coding();
-        if column.section() == section && coding.is_blocked() {
-            let desc = l.columns[column as usize].desc;
-            let nullable = coding == Coding::NullableBlocked;
-            if !l
-                .blocked(column, get(section))
-                .check(desc.width, desc.base, nullable)
-            {
-                return Err(DecodeError::Corrupt(section.label()));
-            }
-        }
-    }
+    check_blocked(section, l, get(section))?;
     match section {
-        Section::NameHeap => {
-            if !terminated(get(Section::NameHeap)) {
-                return Err(DecodeError::Corrupt("name heap"));
-            }
-        }
-        Section::Strings => {
-            if !terminated(get(Section::Strings)) {
-                return Err(DecodeError::Corrupt("strings"));
-            }
-        }
+        Section::NameHeap => check_terminated(get(section), "name heap")?,
+        Section::Strings => check_terminated(get(section), "strings")?,
         Section::Names => {
             let dir_children = check_names(l, get(Section::Names), get(Section::NameHeap))?;
             // A racing loader may have set it first; its count is the same.
@@ -95,113 +73,15 @@ pub(crate) fn check<'a>(
         Section::Dev => check_dictionary(l, Column::Dev, get(Section::Dev))?,
         Section::Mode => check_dictionary(l, Column::Mode, get(Section::Mode))?,
         Section::Owner => check_dictionary(l, Column::Owner, get(Section::Owner))?,
-        Section::Roots => {
-            let roots = get(Section::Roots);
-            let dir_names = l.view(Column::DirName, get(Section::DirNames));
-            let unnamed = dir_names.nullables(l.dirs).filter(Option::is_none).count();
-            let mut last = None;
-            for pair in roots.chunks_exact(PAIR_ROW) {
-                let (dir, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
-                let ok = (dir as usize) < l.dirs
-                    && dir_names.nullable(dir as usize).is_none()
-                    && last.is_none_or(|last| dir > last)
-                    && offset < strings_len;
-                if !ok {
-                    return Err(DecodeError::Corrupt("roots"));
-                }
-                last = Some(dir);
-            }
-            if roots.len() / PAIR_ROW != unnamed {
-                return Err(DecodeError::Corrupt("roots"));
-            }
-        }
-        Section::Specials => {
-            let mut last = None;
-            for pair in get(Section::Specials).chunks_exact(PAIR_ROW) {
-                let (ino, kind) = (u32_at(pair, 0), u32_at(pair, 4));
-                if !(l.dirs..l.inodes).contains(&(ino as usize))
-                    || last.is_some_and(|last| ino <= last)
-                    || !(3..=6).contains(&kind)
-                {
-                    return Err(DecodeError::Corrupt("specials"));
-                }
-                last = Some(ino);
-            }
-        }
-        Section::Links => {
-            let specials = get(Section::Specials);
-            let mut at = 0;
-            let mut last = None;
-            for pair in get(Section::Links).chunks_exact(PAIR_ROW) {
-                let (ino, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
-                while at < specials.len() && u32_at(specials, at) < ino {
-                    at += PAIR_ROW;
-                }
-                let ok = (at == specials.len() || u32_at(specials, at) != ino)
-                    && (l.dirs..l.inodes).contains(&(ino as usize))
-                    && last.is_none_or(|last| ino > last)
-                    && offset < strings_len;
-                if !ok {
-                    return Err(DecodeError::Corrupt("links"));
-                }
-                last = Some(ino);
-            }
-        }
-        Section::WorkTrees => {
-            let mut last = None;
-            for row in get(Section::WorkTrees).chunks_exact(WORK_TREE_ROW) {
-                let (dir, offset) = (u32_at(row, 0), u32_at(row, 4) as usize);
-                let ok = (dir as usize) < l.dirs
-                    && last.is_none_or(|last| dir > last)
-                    && offset < strings_len
-                    && crate::WorkTreeKind::from_byte(row[24]).is_some();
-                if !ok {
-                    return Err(DecodeError::Corrupt("work trees"));
-                }
-                last = Some(dir);
-            }
-        }
-        Section::Docs => {
-            // Each id as the reader decodes it: sorted, and assigned.
-            let ids = l.view(Column::DocId, get(Section::Docs));
-            let mut last = None;
-            for (row, id) in ids.values(l.docs).enumerate() {
-                let id = id.wrapping_add(row as u64);
-                if id >= u64::from(l.next_doc) || last.is_some_and(|last| id <= last) {
-                    return Err(DecodeError::Corrupt("docs"));
-                }
-                last = Some(id);
-            }
-        }
-        Section::DocRefs => {
-            let counts = document_references(l, get(Section::Docs), get(Section::Doc))?;
-            for (row, count) in counts.into_iter().enumerate() {
-                if count == 0 || count != u32_at(get(section), row * 4) {
-                    return Err(DecodeError::Corrupt("document references"));
-                }
-            }
-        }
-        Section::RetainedAt => {
-            let retained = l.blocked(Column::RetainedAt, get(section));
-            if (0..l.dirs).any(|row| {
-                retained
-                    .nullable(row)
-                    .is_some_and(|n| n > l.generation.sequence)
-            }) {
-                return Err(DecodeError::Corrupt("retained at"));
-            }
-        }
+        Section::Roots => check_roots(l, get(Section::Roots), get(Section::DirNames))?,
+        Section::Specials => check_specials(l, get(Section::Specials))?,
+        Section::Links => check_links(l, get(Section::Links), get(Section::Specials))?,
+        Section::WorkTrees => check_work_trees(l, get(Section::WorkTrees))?,
+        Section::Docs => check_docs(l, get(Section::Docs))?,
+        Section::DocRefs => check_doc_refs(l, get(section), get(Section::Docs), get(Section::Doc))?,
+        Section::RetainedAt => check_retained_at(l, get(section))?,
         Section::Policy => {}
-        Section::Revealed => {
-            let mut last = None;
-            for row in get(section).chunks_exact(4) {
-                let id = u32_at(row, 0);
-                if id as usize >= l.names || last.is_some_and(|last| id <= last) {
-                    return Err(DecodeError::Corrupt("revealed"));
-                }
-                last = Some(id);
-            }
-        }
+        Section::Revealed => check_revealed(l, get(section))?,
         Section::Entries
         | Section::Traversed
         | Section::Ino
@@ -213,6 +93,169 @@ pub(crate) fn check<'a>(
         | Section::Nlink
         | Section::Doc
         | Section::States => {}
+    }
+    Ok(())
+}
+
+/// Every blocked column stored in `section` decodes within its width.
+fn check_blocked(section: Section, l: &Layout, bytes: &[u8]) -> Result<(), DecodeError> {
+    for column in COLUMNS {
+        let coding = column.coding();
+        if column.section() == section && coding.is_blocked() {
+            let desc = l.columns[column as usize].desc;
+            let nullable = coding == Coding::NullableBlocked;
+            if !l
+                .blocked(column, bytes)
+                .check(desc.width, desc.base, nullable)
+            {
+                return Err(DecodeError::Corrupt(section.label()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A string heap ends in the terminator of its last string.
+fn check_terminated(heap: &[u8], label: &'static str) -> Result<(), DecodeError> {
+    if heap.last().is_none_or(|&b| b == 0) {
+        Ok(())
+    } else {
+        Err(DecodeError::Corrupt(label))
+    }
+}
+
+/// One root per unnamed directory, ascending, each naming a string.
+fn check_roots(l: &Layout, roots: &[u8], dir_names: &[u8]) -> Result<(), DecodeError> {
+    let strings_len = l.len(Section::Strings);
+    let dir_names = l.view(Column::DirName, dir_names);
+    let unnamed = dir_names.nullables(l.dirs).filter(Option::is_none).count();
+    let mut last = None;
+    for pair in roots.chunks_exact(PAIR_ROW) {
+        let (dir, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
+        let ok = (dir as usize) < l.dirs
+            && dir_names.nullable(dir as usize).is_none()
+            && last.is_none_or(|last| dir > last)
+            && offset < strings_len;
+        if !ok {
+            return Err(DecodeError::Corrupt("roots"));
+        }
+        last = Some(dir);
+    }
+    if roots.len() / PAIR_ROW != unnamed {
+        return Err(DecodeError::Corrupt("roots"));
+    }
+    Ok(())
+}
+
+/// Non-directory inodes with a special kind, ascending.
+fn check_specials(l: &Layout, specials: &[u8]) -> Result<(), DecodeError> {
+    let mut last = None;
+    for pair in specials.chunks_exact(PAIR_ROW) {
+        let (ino, kind) = (u32_at(pair, 0), u32_at(pair, 4));
+        if !(l.dirs..l.inodes).contains(&(ino as usize))
+            || last.is_some_and(|last| ino <= last)
+            || !(3..=6).contains(&kind)
+        {
+            return Err(DecodeError::Corrupt("specials"));
+        }
+        last = Some(ino);
+    }
+    Ok(())
+}
+
+/// Symlink targets for non-directory, non-special inodes, ascending.
+fn check_links(l: &Layout, links: &[u8], specials: &[u8]) -> Result<(), DecodeError> {
+    let strings_len = l.len(Section::Strings);
+    let mut at = 0;
+    let mut last = None;
+    for pair in links.chunks_exact(PAIR_ROW) {
+        let (ino, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
+        while at < specials.len() && u32_at(specials, at) < ino {
+            at += PAIR_ROW;
+        }
+        let ok = (at == specials.len() || u32_at(specials, at) != ino)
+            && (l.dirs..l.inodes).contains(&(ino as usize))
+            && last.is_none_or(|last| ino > last)
+            && offset < strings_len;
+        if !ok {
+            return Err(DecodeError::Corrupt("links"));
+        }
+        last = Some(ino);
+    }
+    Ok(())
+}
+
+/// Work trees by directory, ascending, each with a known kind.
+fn check_work_trees(l: &Layout, work_trees: &[u8]) -> Result<(), DecodeError> {
+    let strings_len = l.len(Section::Strings);
+    let mut last = None;
+    for row in work_trees.chunks_exact(WORK_TREE_ROW) {
+        let (dir, offset) = (u32_at(row, 0), u32_at(row, 4) as usize);
+        let ok = (dir as usize) < l.dirs
+            && last.is_none_or(|last| dir > last)
+            && offset < strings_len
+            && crate::WorkTreeKind::from_byte(row[24]).is_some();
+        if !ok {
+            return Err(DecodeError::Corrupt("work trees"));
+        }
+        last = Some(dir);
+    }
+    Ok(())
+}
+
+/// Document ids are sorted and assigned.
+fn check_docs(l: &Layout, docs: &[u8]) -> Result<(), DecodeError> {
+    // Each id as the reader decodes it: sorted, and assigned.
+    let ids = l.view(Column::DocId, docs);
+    let mut last = None;
+    for (row, id) in ids.values(l.docs).enumerate() {
+        let id = id.wrapping_add(row as u64);
+        if id >= u64::from(l.next_doc) || last.is_some_and(|last| id <= last) {
+            return Err(DecodeError::Corrupt("docs"));
+        }
+        last = Some(id);
+    }
+    Ok(())
+}
+
+/// Each stored reference count matches the inode bindings, and none is zero.
+fn check_doc_refs(
+    l: &Layout,
+    refs: &[u8],
+    docs: &[u8],
+    bindings: &[u8],
+) -> Result<(), DecodeError> {
+    let counts = document_references(l, docs, bindings)?;
+    for (row, count) in counts.into_iter().enumerate() {
+        if count == 0 || count != u32_at(refs, row * 4) {
+            return Err(DecodeError::Corrupt("document references"));
+        }
+    }
+    Ok(())
+}
+
+/// No directory was retained after this generation.
+fn check_retained_at(l: &Layout, retained_at: &[u8]) -> Result<(), DecodeError> {
+    let retained = l.blocked(Column::RetainedAt, retained_at);
+    if (0..l.dirs).any(|row| {
+        retained
+            .nullable(row)
+            .is_some_and(|n| n > l.generation.sequence)
+    }) {
+        return Err(DecodeError::Corrupt("retained at"));
+    }
+    Ok(())
+}
+
+/// Revealed name ids are in range and ascending.
+fn check_revealed(l: &Layout, revealed: &[u8]) -> Result<(), DecodeError> {
+    let mut last = None;
+    for row in revealed.chunks_exact(4) {
+        let id = u32_at(row, 0);
+        if id as usize >= l.names || last.is_some_and(|last| id <= last) {
+            return Err(DecodeError::Corrupt("revealed"));
+        }
+        last = Some(id);
     }
     Ok(())
 }
