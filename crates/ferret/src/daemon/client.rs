@@ -282,14 +282,18 @@ fn connect_owner(
         .ok()
         .flatten()
         .map(|generation| crate::find_json::hex(&generation.incarnation));
-    let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
-    let context = endpoint::context()?;
+    let handshake = Handshake {
+        endpoint,
+        context: endpoint::context()?,
+        incarnation,
+        until: Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000),
+        can_spawn,
+        writer,
+    };
     let mut draining_socket = None;
-    while Instant::now() < until {
+    while Instant::now() < handshake.until {
         if let Some(identity) = draining_socket {
-            if fs::symlink_metadata(endpoint.socket())
-                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
-            {
+            if socket_identity(endpoint) == Some(identity) {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
@@ -297,102 +301,12 @@ fn connect_owner(
             // seen, so a writer with nobody listening runs in-process.
             *observed_owner = false;
         }
-        let connected = fs::symlink_metadata(endpoint.socket()).and_then(|metadata| {
-            if !metadata.file_type().is_socket()
-                || metadata.uid() != endpoint::uid()?
-                || metadata.mode() & 0o7777 != 0o600
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "unusable daemon socket",
-                ));
-            }
-            let identity = (metadata.dev(), metadata.ino());
-            UnixStream::connect(endpoint.socket()).map(|stream| (stream, identity))
-        });
-        match connected {
+        match open_socket(endpoint) {
             Ok((stream, identity)) => {
                 *observed_owner = true;
-                stream.set_read_timeout(Some(
-                    until
-                        .saturating_duration_since(Instant::now())
-                        .max(Duration::from_millis(1)),
-                ))?;
-                let mut reader = BufReader::new(stream);
-                let mut line = Vec::new();
-                // A close before any hello is an owner that is exiting,
-                // draining or full. A writer waits for its socket to go, as
-                // for a build-mismatch drain: the daemon releases its catalog
-                // lock before removing the socket (D110). Queries answer
-                // in-process at once instead.
-                let mut hello = match event(&mut reader, &mut line) {
-                    Err(error)
-                        if writer
-                            && matches!(
-                                error.kind(),
-                                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                            ) =>
-                    {
-                        draining_socket = Some(identity);
-                        continue;
-                    }
-                    hello => hello?,
-                };
-                // Writer commands wait out loading on this connection, within
-                // the startup deadline: answering in-process would race the
-                // daemon's writer ownership.
-                while writer && field_text(&hello, "state") == Some("loading") {
-                    hello = event(&mut reader, &mut line)?;
-                }
-                if field_text(&hello, "event") != Some("hello")
-                    || field_number(&hello, "major") != Some(MAJOR)
-                    || field_text(&hello, "index") != Some(&endpoint.identity)
-                    || field_text(&hello, "context") != Some(&context)
-                {
-                    return Err(io::Error::other("incompatible daemon context or protocol"));
-                }
-                if field_text(&hello, "build") != Some(BUILD)
-                    || field_number(&hello, "format") != Some(FORMAT)
-                    || !supports_queries(&hello)
-                    || writer && !has_capability(&hello, "writer")
-                {
-                    if !can_spawn {
-                        return Err(io::Error::other(
-                            "incompatible writer owner; use ferret status --json",
-                        ));
-                    }
-                    reader.get_mut().write_all(b"{\"op\":\"drain\"}\n")?;
-                    // Wait for the owning lock and socket to be released.
-                    // Active queries finish; the same deadline bounds
-                    // fallback.
-                    draining_socket = fs::symlink_metadata(endpoint.socket())
-                        .ok()
-                        .map(|metadata| (metadata.dev(), metadata.ino()));
-                    continue;
-                }
-                match field_text(&hello, "state") {
-                    Some("loading") => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "daemon is still loading; using the in-process engine",
-                        ));
-                    }
-                    Some("ready") => {
-                        if let Some(incarnation) = &incarnation
-                            && hello
-                                .field("generation")
-                                .and_then(|generation| field_text(generation, "incarnation"))
-                                != Some(incarnation.as_str())
-                        {
-                            return Err(io::Error::other("incompatible catalog incarnation"));
-                        }
-                        reader.get_ref().set_read_timeout(None)?;
-                        return Ok(Connected {
-                            reader,
-                            raw_output: has_capability(&hello, "raw-output-v1"),
-                        });
-                    }
-                    _ => return Err(io::Error::other("daemon could not open the catalog")),
+                match handshake.greet(stream, identity)? {
+                    Greeting::Draining(identity) => draining_socket = identity,
+                    Greeting::Ready(connected) => return Ok(connected),
                 }
             }
             Err(error) if !can_spawn || *observed_owner && writer => return Err(error),
@@ -409,6 +323,129 @@ fn connect_owner(
         io::ErrorKind::TimedOut,
         "daemon startup deadline",
     ))
+}
+
+/// The device and inode of the daemon's socket, if it has one.
+fn socket_identity(endpoint: &Endpoint) -> Option<(u64, u64)> {
+    fs::symlink_metadata(endpoint.socket())
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+/// Connects to the daemon's socket, if it is one only this user can use,
+/// with the socket's identity.
+fn open_socket(endpoint: &Endpoint) -> io::Result<(UnixStream, (u64, u64))> {
+    let metadata = fs::symlink_metadata(endpoint.socket())?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != endpoint::uid()?
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unusable daemon socket",
+        ));
+    }
+    let identity = (metadata.dev(), metadata.ino());
+    UnixStream::connect(endpoint.socket()).map(|stream| (stream, identity))
+}
+
+/// What a client checks an owner's greeting against, until its deadline.
+struct Handshake<'a> {
+    endpoint: &'a Endpoint,
+    context: String,
+    /// The published catalog's incarnation, in hex.
+    incarnation: Option<String>,
+    until: Instant,
+    can_spawn: bool,
+    writer: bool,
+}
+
+/// What an owner's greeting leaves the client to do.
+enum Greeting {
+    /// Wait for the leaving owner's socket, with this identity, to go.
+    Draining(Option<(u64, u64)>),
+    Ready(Connected),
+}
+
+impl Handshake<'_> {
+    /// Reads the owner's greeting on `stream`, the socket `identity`, and
+    /// asks an owner that cannot answer to drain.
+    fn greet(&self, stream: UnixStream, identity: (u64, u64)) -> io::Result<Greeting> {
+        let writer = self.writer;
+        stream.set_read_timeout(Some(
+            self.until
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1)),
+        ))?;
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        // A close before any hello is an owner that is exiting, draining or
+        // full. A writer waits for its socket to go, as for a build-mismatch
+        // drain: the daemon releases its catalog lock before removing the
+        // socket (D110). Queries answer in-process at once instead.
+        let mut hello = match event(&mut reader, &mut line) {
+            Err(error)
+                if writer
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                return Ok(Greeting::Draining(Some(identity)));
+            }
+            hello => hello?,
+        };
+        // Writer commands wait out loading on this connection, within the
+        // startup deadline: answering in-process would race the daemon's
+        // writer ownership.
+        while writer && field_text(&hello, "state") == Some("loading") {
+            hello = event(&mut reader, &mut line)?;
+        }
+        if field_text(&hello, "event") != Some("hello")
+            || field_number(&hello, "major") != Some(MAJOR)
+            || field_text(&hello, "index") != Some(&self.endpoint.identity)
+            || field_text(&hello, "context") != Some(&self.context)
+        {
+            return Err(io::Error::other("incompatible daemon context or protocol"));
+        }
+        if field_text(&hello, "build") != Some(BUILD)
+            || field_number(&hello, "format") != Some(FORMAT)
+            || !supports_queries(&hello)
+            || writer && !has_capability(&hello, "writer")
+        {
+            if !self.can_spawn {
+                return Err(io::Error::other(
+                    "incompatible writer owner; use ferret status --json",
+                ));
+            }
+            reader.get_mut().write_all(b"{\"op\":\"drain\"}\n")?;
+            // Wait for the owning lock and socket to be released. Active
+            // queries finish; the same deadline bounds fallback.
+            return Ok(Greeting::Draining(socket_identity(self.endpoint)));
+        }
+        match field_text(&hello, "state") {
+            Some("loading") => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "daemon is still loading; using the in-process engine",
+            )),
+            Some("ready") => {
+                if let Some(incarnation) = &self.incarnation
+                    && hello
+                        .field("generation")
+                        .and_then(|generation| field_text(generation, "incarnation"))
+                        != Some(incarnation.as_str())
+                {
+                    return Err(io::Error::other("incompatible catalog incarnation"));
+                }
+                reader.get_ref().set_read_timeout(None)?;
+                Ok(Greeting::Ready(Connected {
+                    reader,
+                    raw_output: has_capability(&hello, "raw-output-v1"),
+                }))
+            }
+            _ => Err(io::Error::other("daemon could not open the catalog")),
+        }
+    }
 }
 fn has_capability(hello: &Value, capability: &str) -> bool {
     matches!(hello.field("capabilities"), Some(Value::Arr(values)) if values.iter().any(|v| v.text() == Some(capability)))
