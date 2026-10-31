@@ -4,7 +4,6 @@
 use super::job::{Cache, Job, Observed, Worker};
 use super::*;
 use ferret_query::GroupSchedule;
-use std::io::BufWriter;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -48,6 +47,10 @@ struct Relay<'a> {
     stopped: &'a dyn Fn() -> bool,
     started: bool,
     sender: Option<SyncSender<Message>>,
+    /// Written bytes not yet sent, up to a [`CHUNK`]; allocated by the
+    /// first write, since most groups never stream, and sent as the chunk
+    /// itself.
+    pending: Vec<u8>,
 }
 impl Relay<'_> {
     fn send(&mut self, message: Message) -> io::Result<()> {
@@ -79,17 +82,32 @@ impl Relay<'_> {
         }
     }
 }
-impl Write for Relay<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+impl Relay<'_> {
+    fn send_pending(&mut self) -> io::Result<()> {
         if (self.stopped)() {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
-        let count = bytes.len().min(CHUNK);
-        self.send(Message::Chunk(bytes[..count].to_vec()))?;
+        let chunk = std::mem::take(&mut self.pending);
+        self.send(Message::Chunk(chunk))
+    }
+}
+impl Write for Relay<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.pending.len() == CHUNK {
+            self.send_pending()?;
+        }
+        if self.pending.capacity() == 0 {
+            self.pending.reserve_exact(CHUNK);
+        }
+        let count = bytes.len().min(CHUNK - self.pending.len());
+        self.pending.extend_from_slice(&bytes[..count]);
         Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        match self.pending.is_empty() {
+            true => Ok(()),
+            false => self.send_pending(),
+        }
     }
 }
 
@@ -281,18 +299,19 @@ impl<'s> Search<'s> {
         let Some(_descriptors) = self.descriptors.acquire(stopped) else {
             return Handoff::Complete(job.finished(), Observed::Skipped);
         };
-        let relay = Relay {
+        let mut relay = Relay {
             path: job.path(),
             handoff,
             concurrent,
             stopped,
             started: false,
             sender: None,
+            pending: Vec::new(),
         };
-        let mut stream = BufWriter::with_capacity(CHUNK, relay);
-        let result = prepare(&job, &mut stream);
-        // Never retry pending writes implicitly after a destination fault.
-        let (mut relay, _) = stream.into_parts();
+        let result = prepare(&job, &mut relay);
+        // Never retry pending writes implicitly after a destination fault:
+        // what `prepare` did not flush is dropped.
+        relay.pending = Vec::new();
         let result = match result {
             Ok(Observed::Streamed(result, error, capture)) => relay
                 .send(Message::Finish(result, error, capture))
