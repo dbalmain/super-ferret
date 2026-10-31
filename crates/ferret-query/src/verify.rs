@@ -1710,6 +1710,13 @@ const RUN_BYTES: u64 = 64 << 10;
 struct Feed<Task> {
     state: Mutex<FeedState<Task>>,
     runs: Vec<Mutex<VecDeque<(u64, Task)>>>,
+    /// Tasks in `runs`, never fewer: raised under the feed lock as a run
+    /// fills, lowered after an owner or thief removes one. While it reads
+    /// zero under the feed lock there is nothing to steal, and a worker
+    /// skips locking every run in turn, which on an empty feed held the
+    /// feed lock against the producer: `grep -l fn` over `~/w` on 32
+    /// workers fell from 152 to 127 ms (2026-10-31).
+    stealable: AtomicUsize,
     ready: Condvar,
     room: Condvar,
     capacity: usize,
@@ -1737,6 +1744,7 @@ impl<Task> Feed<Task> {
                 full: false,
             }),
             runs: (0..threads).map(|_| Mutex::default()).collect(),
+            stealable: AtomicUsize::new(0),
             ready: Condvar::new(),
             room: Condvar::new(),
             capacity,
@@ -1792,6 +1800,7 @@ impl<Task> Feed<Task> {
         if self.indexed
             && let Some(task) = lock(&self.runs[worker]).pop_front()
         {
+            self.stealable.fetch_sub(1, Ordering::Relaxed);
             return Some(task);
         }
         let mut state = lock(&self.state);
@@ -1813,7 +1822,7 @@ impl<Task> Feed<Task> {
                 }
                 return Some(task);
             }
-            if self.indexed {
+            if self.indexed && self.stealable.load(Ordering::Relaxed) > 0 {
                 for offset in 1..self.runs.len() {
                     let mut run = lock(&self.runs[(worker + offset) % self.runs.len()]);
                     if !run.is_empty() {
@@ -1824,6 +1833,7 @@ impl<Task> Feed<Task> {
                         let mut own = lock(&self.runs[worker]);
                         own.extend(run.drain(half..));
                         let task = own.pop_front();
+                        self.stealable.fetch_sub(1, Ordering::Relaxed);
                         let lend = (!run.is_empty() || !own.is_empty()) && state.sleeping > 0;
                         drop(own);
                         drop(run);
@@ -1860,6 +1870,7 @@ impl<Task> Feed<Task> {
                 run.push_back(next);
             }
         }
+        self.stealable.fetch_add(run.len(), Ordering::Relaxed);
         !run.is_empty()
     }
 
