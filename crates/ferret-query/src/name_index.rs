@@ -36,6 +36,56 @@ struct Base {
     scope_build_time: std::time::Duration,
 }
 
+impl Base {
+    /// The base of `checkpoint`, with its own interned names when `raw`.
+    fn build(checkpoint: &Catalog, raw: bool) -> Self {
+        let scope_started = std::time::Instant::now();
+        let scopes = scope_counts(checkpoint);
+        let live_scopes = checkpoint
+            .dir_ids()
+            .filter(|&dir| {
+                checkpoint.entry_count(dir).is_none() || checkpoint.retained_at(dir).is_some()
+            })
+            .collect();
+        Base {
+            owned: raw.then(|| Arc::new(checkpoint.build_resident_names())),
+            terms: OnceLock::new(),
+            scopes,
+            live_scopes,
+            scope_build_time: scope_started.elapsed(),
+        }
+    }
+}
+
+/// Each checkpoint directory's subtree name count: its own rows, which the
+/// name table groups by parent, plus its children's, summed from the
+/// highest directory id down.
+fn scope_counts(checkpoint: &Catalog) -> Vec<u32> {
+    let mut scopes = vec![0u32; checkpoint.base_dir_count() as usize];
+    let mut current = None;
+    let mut count = 0u32;
+    for parent in checkpoint.name_reader().parents() {
+        if current == Some(parent) {
+            count += 1;
+        } else {
+            if let Some(previous) = current {
+                scopes[previous.0 as usize] = count;
+            }
+            current = Some(parent);
+            count = 1;
+        }
+    }
+    if let Some(parent) = current {
+        scopes[parent.0 as usize] = count;
+    }
+    for dir in (0..checkpoint.base_dir_count()).rev().map(InoId) {
+        if let Some(edge) = checkpoint.dir_name(dir) {
+            scopes[checkpoint.name(edge).parent.0 as usize] += scopes[dir.0 as usize];
+        }
+    }
+    scopes
+}
+
 struct TermIndex {
     terms: PackedStrings,
     keys: PackedNameLists,
@@ -91,46 +141,7 @@ impl NameIndex {
                     && old.base.owned.is_some() == raw
             })
             .map_or_else(
-                || {
-                    let scope_started = std::time::Instant::now();
-                    let mut scopes = vec![0u32; checkpoint.base_dir_count() as usize];
-                    let mut current = None;
-                    let mut count = 0u32;
-                    for parent in checkpoint.name_reader().parents() {
-                        if current == Some(parent) {
-                            count += 1;
-                        } else {
-                            if let Some(previous) = current {
-                                scopes[previous.0 as usize] = count;
-                            }
-                            current = Some(parent);
-                            count = 1;
-                        }
-                    }
-                    if let Some(parent) = current {
-                        scopes[parent.0 as usize] = count;
-                    }
-                    for dir in (0..checkpoint.base_dir_count()).rev().map(InoId) {
-                        if let Some(edge) = checkpoint.dir_name(dir) {
-                            scopes[checkpoint.name(edge).parent.0 as usize] +=
-                                scopes[dir.0 as usize];
-                        }
-                    }
-                    let live_scopes = checkpoint
-                        .dir_ids()
-                        .filter(|&dir| {
-                            checkpoint.entry_count(dir).is_none()
-                                || checkpoint.retained_at(dir).is_some()
-                        })
-                        .collect();
-                    Arc::new(Base {
-                        owned: raw.then(|| Arc::new(checkpoint.build_resident_names())),
-                        terms: OnceLock::new(),
-                        scopes,
-                        live_scopes,
-                        scope_build_time: scope_started.elapsed(),
-                    })
-                },
+                || Arc::new(Base::build(&checkpoint, raw)),
                 |old| old.base.clone(),
             );
         let owned = base.owned.clone();
@@ -146,8 +157,17 @@ impl NameIndex {
             counters: previous
                 .map_or_else(|| Arc::new(PlanCounters::default()), |p| p.counters.clone()),
         };
+        out.count_suppressed(catalog, &checkpoint, names);
+        out.count_delta(catalog, &checkpoint);
+        out.propagate_scope_changes(catalog, &checkpoint);
+        out.live_scopes = out.has_live_scopes(catalog);
+        out
+    }
+
+    /// Uncounts each checkpoint name the view suppressed.
+    fn count_suppressed(&mut self, catalog: &Catalog, checkpoint: &Catalog, names: &ResidentNames) {
         for id in catalog.suppressed_base_names() {
-            *out.counts.entry(names.key(id)).or_default() -= 1;
+            *self.counts.entry(names.key(id)).or_default() -= 1;
             let edge = checkpoint.name(id);
             // A deleted directory's rows are counted where the checkpoint had
             // them (see `propagate_scope_changes`); only a live directory
@@ -159,10 +179,14 @@ impl NameIndex {
                     .dir_name(child)
                     .is_none_or(|id| catalog.name(id).parent != edge.parent)
             {
-                out.mark_unknown(&checkpoint, edge.parent);
+                self.mark_unknown(checkpoint, edge.parent);
             }
-            *out.scope_changes.entry(edge.parent).or_default() -= 1;
+            *self.scope_changes.entry(edge.parent).or_default() -= 1;
         }
+    }
+
+    /// Indexes and counts each name the view added.
+    fn count_delta(&mut self, catalog: &Catalog, checkpoint: &Catalog) {
         for &(_, row) in catalog.delta_names().1 {
             let id = NameId(row);
             let edge = catalog.name(id);
@@ -175,15 +199,17 @@ impl NameIndex {
                         .dir_name(child)
                         .is_none_or(|id| checkpoint.name(id).parent != edge.parent);
                 if moved {
-                    out.mark_unknown(catalog, edge.parent);
+                    self.mark_unknown(catalog, edge.parent);
                 }
             }
-            out.delta.entry(edge.bytes.to_vec()).or_default().push(id);
-            *out.scope_changes.entry(edge.parent).or_default() += 1;
+            self.delta.entry(edge.bytes.to_vec()).or_default().push(id);
+            *self.scope_changes.entry(edge.parent).or_default() += 1;
         }
-        out.propagate_scope_changes(catalog, &checkpoint);
-        out.live_scopes = out
-            .base
+    }
+
+    /// Whether any live directory has an unknown or retained listing.
+    fn has_live_scopes(&self, catalog: &Catalog) -> bool {
+        self.base
             .live_scopes
             .iter()
             .copied()
@@ -191,8 +217,7 @@ impl NameIndex {
             .any(|dir| {
                 catalog.is_live_inode(dir)
                     && (catalog.entry_count(dir).is_none() || catalog.retained_at(dir).is_some())
-            });
-        out
+            })
     }
 
     fn mark_unknown(&mut self, catalog: &Catalog, mut dir: InoId) {
