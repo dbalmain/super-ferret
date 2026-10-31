@@ -481,21 +481,7 @@ impl<'a> Final<'a> {
             .collect();
         roots.sort_unstable_by_key(|&i| dirs[i].observation.name);
         let observed_roots: Vec<_> = roots.iter().map(|&i| dirs[i].observation.name).collect();
-        if observed_roots
-            != refreshed
-                .iter()
-                .filter(|p| {
-                    !self.old.roots().any(|(id, path)| {
-                        path == p.as_os_str().as_bytes()
-                            && protection.directories.contains(&id.0)
-                            && !observed_roots.contains(&path)
-                    })
-                })
-                .map(|p| p.as_os_str().as_bytes())
-                .collect::<Vec<_>>()
-        {
-            return Err(invalid("recrawl root observations"));
-        }
+        self.check_roots(&observed_roots, refreshed, protection)?;
         let mut queue: VecDeque<_> = roots.into();
         let mut visited = 0;
         while let Some(i) = queue.pop_front() {
@@ -532,29 +518,7 @@ impl<'a> Final<'a> {
                 .previous_directory()
                 .filter(|&id| !self.inodes.contains(id.0));
             let continuing = hinted
-                .or_else(|| {
-                    if let Some(parent) = parent_id {
-                        self.old
-                            .is_live_inode(InoId(parent))
-                            .then(|| self.old.lookup(InoId(parent), d.name))
-                            .flatten()
-                            .map(|id| self.old.name(id).child)
-                            .filter(|&id| {
-                                self.old.is_live_inode(id)
-                                    && self.old.is_directory(id)
-                                    && self.old.identity(id) == (d.stat.dev, d.stat.ino)
-                            })
-                            .or_else(|| {
-                                root.and_then(|r| {
-                                    self.session
-                                        .directory_identity(InoId(r), (d.stat.dev, d.stat.ino))
-                                })
-                            })
-                    } else {
-                        root.map(InoId)
-                            .filter(|&id| self.old.identity(id) == (d.stat.dev, d.stat.ino))
-                    }
-                })
+                .or_else(|| self.continuing_directory(&d, parent_id, root))
                 .filter(|id| !self.inodes.contains(id.0));
             let id = match continuing {
                 Some(id) => id.0,
@@ -563,32 +527,101 @@ impl<'a> Final<'a> {
             dirs[i].id = Some(id);
             dirs[i].root = parent.map_or(id, |p| dirs[p].root);
             self.observe_inode(id, Kind::Dir, *d.stat, Content::Unindexed)?;
-            if let Some(parent) = parent_id {
-                let same_edge = hinted
-                    .and_then(|_| self.old.dir_name(InoId(id)))
-                    .filter(|&name| {
-                        let edge = self.old.name(name);
-                        edge.parent.0 == parent && edge.bytes == d.name
-                    });
-                if let Some(name) = same_edge {
-                    self.keep(name, d.revealed)?;
-                } else {
-                    self.edge(parent, id, d.name, d.revealed)?;
-                }
-            } else if continuing.is_none() {
-                push(
-                    &self.budget,
-                    &mut self.changes.records,
-                    Record::RootPut {
-                        id,
-                        path: d.name.to_vec(),
-                    },
-                )?;
-            }
+            self.name_directory(&d, id, parent_id, hinted.is_some(), continuing.is_some())?;
         }
         // A disconnected/cyclic token graph cannot reach publication.
         if visited != dirs.len() {
             return Err(invalid("unreachable directory observation"));
+        }
+        Ok(())
+    }
+
+    /// Fails unless the observed roots are the refreshed roots, less the
+    /// protected ones the crawl did not observe.
+    fn check_roots(
+        &self,
+        observed_roots: &[&[u8]],
+        refreshed: &[PathBuf],
+        protection: &crate::coverage::Protection,
+    ) -> Result<(), Error> {
+        if observed_roots
+            != refreshed
+                .iter()
+                .filter(|p| {
+                    !self.old.roots().any(|(id, path)| {
+                        path == p.as_os_str().as_bytes()
+                            && protection.directories.contains(&id.0)
+                            && !observed_roots.contains(&path)
+                    })
+                })
+                .map(|p| p.as_os_str().as_bytes())
+                .collect::<Vec<_>>()
+        {
+            return Err(invalid("recrawl root observations"));
+        }
+        Ok(())
+    }
+
+    /// The old directory `d` continues, when its token gives no hint: the
+    /// same identity under the same name in its parent, or anywhere under
+    /// its root; for a root, the root itself.
+    fn continuing_directory(
+        &self,
+        d: &DirectoryObservation<'_>,
+        parent_id: Option<u32>,
+        root: Option<u32>,
+    ) -> Option<InoId> {
+        let identity = (d.stat.dev, d.stat.ino);
+        let Some(parent) = parent_id else {
+            return root
+                .map(InoId)
+                .filter(|&id| self.old.identity(id) == identity);
+        };
+        self.old
+            .is_live_inode(InoId(parent))
+            .then(|| self.old.lookup(InoId(parent), d.name))
+            .flatten()
+            .map(|id| self.old.name(id).child)
+            .filter(|&id| {
+                self.old.is_live_inode(id)
+                    && self.old.is_directory(id)
+                    && self.old.identity(id) == identity
+            })
+            .or_else(|| root.and_then(|r| self.session.directory_identity(InoId(r), identity)))
+    }
+
+    /// Names directory `id` in its parent, keeping a hinted directory's
+    /// unchanged name, or puts it as a new root.
+    fn name_directory(
+        &mut self,
+        d: &DirectoryObservation<'_>,
+        id: u32,
+        parent_id: Option<u32>,
+        hinted: bool,
+        continuing: bool,
+    ) -> Result<(), Error> {
+        if let Some(parent) = parent_id {
+            let same_edge = hinted
+                .then(|| self.old.dir_name(InoId(id)))
+                .flatten()
+                .filter(|&name| {
+                    let edge = self.old.name(name);
+                    edge.parent.0 == parent && edge.bytes == d.name
+                });
+            if let Some(name) = same_edge {
+                self.keep(name, d.revealed)?;
+            } else {
+                self.edge(parent, id, d.name, d.revealed)?;
+            }
+        } else if !continuing {
+            push(
+                &self.budget,
+                &mut self.changes.records,
+                Record::RootPut {
+                    id,
+                    path: d.name.to_vec(),
+                },
+            )?;
         }
         Ok(())
     }
