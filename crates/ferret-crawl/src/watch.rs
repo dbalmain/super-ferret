@@ -122,6 +122,39 @@ struct Hint {
     from: bool,
     to: bool,
 }
+impl Hint {
+    /// A hint for a first event on one name of `directories`.
+    fn new(directories: Vec<Arc<Directory>>, flags: ReadFlags, cookie: u32) -> Self {
+        Self {
+            directories,
+            subtree: flags
+                .intersects(ReadFlags::ISDIR | ReadFlags::MOVE_SELF | ReadFlags::DELETE_SELF),
+            cookie,
+            ambiguous_cookie: false,
+            from: flags.contains(ReadFlags::MOVED_FROM),
+            to: flags.contains(ReadFlags::MOVED_TO),
+        }
+    }
+
+    /// Adds a later event on the same name.
+    fn merge(&mut self, flags: ReadFlags, cookie: u32) {
+        // Multiple moves involving one endpoint are ambiguous. Observation
+        // is still required, but it must not manufacture a cookie pair.
+        if cookie != 0 && flags.intersects(ReadFlags::MOVED_FROM | ReadFlags::MOVED_TO) {
+            if self.cookie != 0 && self.cookie != cookie {
+                self.cookie = 0;
+                self.ambiguous_cookie = true;
+            } else if !self.ambiguous_cookie {
+                self.cookie = cookie;
+            }
+        }
+        self.subtree |=
+            flags.intersects(ReadFlags::ISDIR | ReadFlags::MOVE_SELF | ReadFlags::DELETE_SELF);
+        self.from |= flags.contains(ReadFlags::MOVED_FROM);
+        self.to |= flags.contains(ReadFlags::MOVED_TO);
+    }
+}
+
 /// Failures kept by key for one root, directories and policy inputs together.
 /// A scoped refresh that later installs one of these clears it; past the
 /// bound, and for a loss with no key, only the next complete observation does.
@@ -493,34 +526,10 @@ impl Watch {
             return;
         }
         if flags.contains(ReadFlags::IGNORED) {
-            if state.removed.remove(&wd) {
-                return;
-            }
-            state.descriptors.remove(&wd);
-            state.identities.retain(|_, value| *value != wd);
-            if let Some(inputs) = state.policies.remove(&wd) {
-                state
-                    .gaps
-                    .extend(inputs.into_iter().map(|i| i.root.to_path_buf()));
-            }
-            loss(&mut state, RefreshReason::Overflow);
+            ignored(&mut state, wd);
             return;
         }
-        let policy_roots = state
-            .policies
-            .get(&wd)
-            .map(|inputs| {
-                inputs
-                    .iter()
-                    .filter(|i| name.is_empty() || i.name.as_bytes() == name)
-                    .map(|i| i.root.to_path_buf())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if !policy_roots.is_empty() {
-            state.scoped_roots.extend(policy_roots);
-            state.first.get_or_insert_with(Instant::now);
-        }
+        scope_policy_roots(&mut state, wd, name);
         if !state.descriptors.contains_key(&wd) && state.policies.contains_key(&wd) {
             return;
         }
@@ -540,20 +549,7 @@ impl Watch {
         state.last = Some(now);
         let key = (wd, name.to_vec());
         if let Some(hint) = state.pending.get_mut(&key) {
-            // Multiple moves involving one endpoint are ambiguous. Observation
-            // is still required, but it must not manufacture a cookie pair.
-            if cookie != 0 && flags.intersects(ReadFlags::MOVED_FROM | ReadFlags::MOVED_TO) {
-                if hint.cookie != 0 && hint.cookie != cookie {
-                    hint.cookie = 0;
-                    hint.ambiguous_cookie = true;
-                } else if !hint.ambiguous_cookie {
-                    hint.cookie = cookie;
-                }
-            }
-            hint.subtree |=
-                flags.intersects(ReadFlags::ISDIR | ReadFlags::MOVE_SELF | ReadFlags::DELETE_SELF);
-            hint.from |= flags.contains(ReadFlags::MOVED_FROM);
-            hint.to |= flags.contains(ReadFlags::MOVED_TO);
+            hint.merge(flags, cookie);
             return;
         }
         let charge = std::mem::size_of::<Hint>()
@@ -567,18 +563,9 @@ impl Watch {
             return;
         }
         state.bytes += charge;
-        state.pending.insert(
-            key,
-            Hint {
-                directories,
-                subtree: flags
-                    .intersects(ReadFlags::ISDIR | ReadFlags::MOVE_SELF | ReadFlags::DELETE_SELF),
-                cookie,
-                ambiguous_cookie: false,
-                from: flags.contains(ReadFlags::MOVED_FROM),
-                to: flags.contains(ReadFlags::MOVED_TO),
-            },
-        );
+        state
+            .pending
+            .insert(key, Hint::new(directories, flags, cookie));
     }
     /// Debug-build injection at the exact kernel intake seam. Release hosts
     /// expose no event injection. This exercises loss and cookie ambiguity
@@ -908,6 +895,41 @@ impl Watch {
         }
     }
 }
+/// Forgets watch `wd`, which the kernel removed. One this process removed
+/// was expected; any other loses events, and its policy roots become gaps.
+fn ignored(s: &mut State, wd: i32) {
+    if s.removed.remove(&wd) {
+        return;
+    }
+    s.descriptors.remove(&wd);
+    s.identities.retain(|_, value| *value != wd);
+    if let Some(inputs) = s.policies.remove(&wd) {
+        s.gaps
+            .extend(inputs.into_iter().map(|i| i.root.to_path_buf()));
+    }
+    loss(s, RefreshReason::Overflow);
+}
+
+/// Scopes the roots whose policy inputs under watch `wd` an event on `name`
+/// (or on the directory itself) touched.
+fn scope_policy_roots(s: &mut State, wd: i32, name: &[u8]) {
+    let policy_roots = s
+        .policies
+        .get(&wd)
+        .map(|inputs| {
+            inputs
+                .iter()
+                .filter(|i| name.is_empty() || i.name.as_bytes() == name)
+                .map(|i| i.root.to_path_buf())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !policy_roots.is_empty() {
+        s.scoped_roots.extend(policy_roots);
+        s.first.get_or_insert_with(Instant::now);
+    }
+}
+
 /// The `(dev, ino)` of `fd`'s parent, if it can be read.
 fn parent_identity(fd: BorrowedFd<'_>) -> Option<(u64, u64)> {
     openat(
