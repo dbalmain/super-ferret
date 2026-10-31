@@ -1,10 +1,9 @@
 mod capture;
 use super::job::{Cache, Cached, Job, JobPath, Worker, observe};
-use super::render::{Cancellable, OutputCapture, Record, write_parts};
+use super::render::{Cancellable, OutputCapture, Record};
 use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
 use std::cell::Cell;
-use std::io::IoSlice;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -532,7 +531,7 @@ fn late_spill_failure_remains_a_capture_fault() {
 // Three quarter-limit records stay in memory; three half-limit records
 // cross the real streaming transition and never create a rendered spill.
 #[test]
-fn vectored_plain_records_replay_exactly_before_and_after_streaming() {
+fn plain_records_replay_exactly_before_and_after_streaming() {
     for (size, streams) in [
         (0, false),
         (11, false),
@@ -547,16 +546,9 @@ fn vectored_plain_records_replay_exactly_before_and_after_streaming() {
                 inner: &mut output,
                 stopped: &|| false,
             };
-            write_parts(
-                &mut writer,
-                &mut [
-                    IoSlice::new(b"path"),
-                    IoSlice::new(b":"),
-                    IoSlice::new(&bytes),
-                    IoSlice::new(b"\n"),
-                ],
-            )
-            .unwrap();
+            writer
+                .write_all(&[b"path:".as_slice(), &bytes, b"\n"].concat())
+                .unwrap();
         }
         output.flush().unwrap();
         assert_eq!(output.streamed, streams, "{size}-byte records");
@@ -564,54 +556,6 @@ fn vectored_plain_records_replay_exactly_before_and_after_streaming() {
         output.buffer.write_to(output.target).unwrap();
         assert!(replay == [b"path:".as_slice(), &bytes, b"\n"].concat().repeat(3));
     }
-}
-
-#[test]
-fn vectored_records_handle_partial_interrupted_zero_and_cancelled_writes() {
-    struct Short {
-        bytes: Vec<u8>,
-        interrupt: bool,
-        limit: usize,
-    }
-    impl Write for Short {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if std::mem::take(&mut self.interrupt) {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            let count = bytes.len().min(self.limit);
-            self.bytes.extend_from_slice(&bytes[..count]);
-            Ok(count)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut short = Short {
-        bytes: Vec::new(),
-        interrupt: true,
-        limit: 2,
-    };
-    write_parts(
-        &mut short,
-        &mut [
-            IoSlice::new(b""),
-            IoSlice::new(b"abc"),
-            IoSlice::new(b"def"),
-            IoSlice::new(b"\n"),
-        ],
-    )
-    .unwrap();
-    assert_eq!(short.bytes, b"abcdef\n");
-    short.limit = 0;
-    let error = write_parts(&mut short, &mut [IoSlice::new(b"x")]).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-    let mut writer = Cancellable {
-        inner: &mut short,
-        stopped: &|| true,
-    };
-    let error = write_parts(&mut writer, &mut [IoSlice::new(b"x")]).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
-    assert_eq!(short.bytes, b"abcdef\n");
 }
 
 fn plan(args: &[&str]) -> Plan {

@@ -2,7 +2,6 @@
 //! bounded capture that streams once it outgrows the shared budget.
 
 use super::*;
-use std::io::IoSlice;
 use std::sync::Arc;
 
 pub(in super::super) struct Render<'a> {
@@ -71,6 +70,8 @@ pub(super) struct Cursor {
     line: Option<u64>,
     printed: bool,
     gap: bool,
+    /// A plain line, assembled so that it reaches the output in one write.
+    scratch: Vec<u8>,
 }
 
 /// Rendered captures never spill. Above the threshold they claim the single
@@ -193,26 +194,27 @@ impl Render<'_> {
         } else {
             b":"
         };
-        if !self.plan.presentation.color.enabled() && !self.plan.line_number {
+        if !self.plan.presentation.color.enabled() {
             let prefix = self
                 .prefix
                 .filter(|_| self.plan.presentation.heading != Some(true));
-            let separator = prefix.map_or(b"".as_slice(), |_| {
-                if self.plan.presentation.null {
+            let scratch = &mut cursor.scratch;
+            scratch.clear();
+            if let Some(prefix) = prefix {
+                scratch.extend_from_slice(prefix);
+                scratch.extend_from_slice(if self.plan.presentation.null {
                     b"\0"
                 } else {
                     delimiter
-                }
-            });
-            return write_parts(
-                &mut output,
-                &mut [
-                    IoSlice::new(prefix.unwrap_or_default()),
-                    IoSlice::new(separator),
-                    IoSlice::new(omitted.as_deref().unwrap_or(line.bytes)),
-                    IoSlice::new(b"\n"),
-                ],
-            );
+                });
+            }
+            if self.plan.line_number {
+                scratch.extend_from_slice(presentation::decimal(line.number, &mut [0; 20]));
+                scratch.extend_from_slice(delimiter);
+            }
+            scratch.extend_from_slice(omitted.as_deref().unwrap_or(line.bytes));
+            scratch.push(b'\n');
+            return output.write_all(scratch);
         }
         if self.plan.presentation.heading != Some(true)
             && let Some(prefix) = self.prefix
@@ -309,54 +311,9 @@ impl<W: Write + ?Sized> Write for Cancellable<'_, W> {
         }
         self.inner.write(&bytes[..bytes.len().min(CHUNK)])
     }
-    fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
-        if (self.stopped)() {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "grep cancelled",
-            ));
-        }
-        // Cap both bytes and stack space. Partial vector writes preserve the
-        // same between-chunk cancellation bound as ordinary writes.
-        let mut parts = [IoSlice::new(&[]); 4];
-        let mut left = CHUNK;
-        let mut used = 0;
-        for part in bytes
-            .iter()
-            .filter(|part| !part.is_empty())
-            .take(parts.len())
-        {
-            let count = part.len().min(left);
-            parts[used] = IoSlice::new(&part[..count]);
-            used += 1;
-            left -= count;
-            if left == 0 {
-                break;
-            }
-        }
-        self.inner.write_vectored(&parts[..used])
-    }
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
-}
-
-pub(super) fn write_parts(mut output: impl Write, mut parts: &mut [IoSlice<'_>]) -> io::Result<()> {
-    IoSlice::advance_slices(&mut parts, 0);
-    while !parts.is_empty() {
-        match output.write_vectored(parts) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                ));
-            }
-            Ok(written) => IoSlice::advance_slices(&mut parts, written),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 pub(in super::super) fn emit(
