@@ -1018,6 +1018,57 @@ impl Layout {
 /// the file's first [`TABLE_END`] bytes, or all of it if shorter; `file_len`
 /// is the whole file's length, which the sections must tile exactly.
 pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeError> {
+    let generation = decode_header(head)?;
+    let (sections, checksums) = decode_sections(head, file_len)?;
+    let counts = Counts {
+        dirs: u32_at(head, 24),
+        inodes: u32_at(head, 28),
+        names: u32_at(head, 32),
+        docs: u32_at(head, 36),
+    };
+    if counts.inodes > NONE - 16 || counts.names == NONE || counts.dirs > counts.inodes {
+        return Err(DecodeError::Corrupt("counts"));
+    }
+    let len = |s: Section| (sections[s as usize].1 - sections[s as usize].0) as u64;
+    check_lengths(&counts, len)?;
+    let (columns, hashes) = place_columns(head, &counts, len)?;
+    Ok(Layout {
+        generation,
+        checksums,
+        sniffer: u32_at(head, 12),
+        next_doc: u32_at(head, 16),
+        sections,
+        columns,
+        dirs: counts.dirs as usize,
+        inodes: counts.inodes as usize,
+        names: counts.names as usize,
+        docs: counts.docs as usize,
+        hashes,
+    })
+}
+
+/// The row counts a catalog's header declares.
+struct Counts {
+    dirs: u32,
+    inodes: u32,
+    names: u32,
+    docs: u32,
+}
+
+impl Counts {
+    fn rows(&self, rows: Rows) -> u32 {
+        match rows {
+            Rows::Names => self.names,
+            Rows::Dirs => self.dirs,
+            Rows::Inodes => self.inodes,
+            Rows::Docs => self.docs,
+        }
+    }
+}
+
+/// Validates the header's magic, version, checksum and checkpoint, and
+/// returns its generation.
+fn decode_header(head: &[u8]) -> Result<Generation, DecodeError> {
     if head.len() < 12 || head[..8] != MAGIC {
         return Err(DecodeError::NotACatalog);
     }
@@ -1047,6 +1098,15 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     {
         return Err(DecodeError::Corrupt("checkpoint header"));
     }
+    Ok(generation)
+}
+
+/// Each section's byte range in the file, and each section's checksum.
+type SectionTable = ([(usize, usize); SECTIONS.len()], [[u8; 16]; SECTIONS.len()]);
+
+/// The section table: each section's byte range, tiling the file from the
+/// table's end, and its checksum.
+fn decode_sections(head: &[u8], file_len: u64) -> Result<SectionTable, DecodeError> {
     let mut sections = [(0, 0); SECTIONS.len()];
     let mut checksums = [[0; 16]; SECTIONS.len()];
     let mut expect = TABLE_END as u64;
@@ -1067,13 +1127,11 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     if expect != file_len {
         return Err(DecodeError::Layout);
     }
+    Ok((sections, checksums))
+}
 
-    let (dirs, inodes, names) = (u32_at(head, 24), u32_at(head, 28), u32_at(head, 32));
-    let docs = u32_at(head, 36);
-    if inodes > NONE - 16 || names == NONE || dirs > inodes {
-        return Err(DecodeError::Corrupt("counts"));
-    }
-    let len = |s: Section| (sections[s as usize].1 - sections[s as usize].0) as u64;
+/// Checks the lengths of the sections with fixed rows against the counts.
+fn check_lengths(counts: &Counts, len: impl Fn(Section) -> u64) -> Result<(), DecodeError> {
     for (section, row) in [
         (Section::Roots, PAIR_ROW),
         (Section::Links, PAIR_ROW),
@@ -1085,23 +1143,31 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
             return Err(DecodeError::Corrupt(section.label()));
         }
     }
-    let bits = u64::from(dirs).div_ceil(8);
+    let bits = u64::from(counts.dirs).div_ceil(8);
     if len(Section::Traversed) != bits && len(Section::Traversed) != bits * 2 {
         return Err(DecodeError::Corrupt("traversed"));
     }
-    if len(Section::States) != u64::from(inodes).div_ceil(4) {
+    if len(Section::States) != u64::from(counts.inodes).div_ceil(4) {
         return Err(DecodeError::Corrupt("states"));
     }
-    if (len(Section::NameHeap) == 0) != (names == 0) {
+    if (len(Section::NameHeap) == 0) != (counts.names == 0) {
         return Err(DecodeError::Corrupt("name heap"));
     }
 
-    if len(Section::DocRefs) != u64::from(docs) * 4 || len(Section::Policy) != 16 {
+    if len(Section::DocRefs) != u64::from(counts.docs) * 4 || len(Section::Policy) != 16 {
         return Err(DecodeError::Corrupt("writer sections"));
     }
+    Ok(())
+}
 
-    // Each column starts after the columns before it in its section, and a
-    // column section holds exactly its columns.
+/// Places each column after the columns before it in its section, and
+/// checks that a column section holds exactly its columns. Returns the
+/// columns and where the docs section's hashes start.
+fn place_columns(
+    head: &[u8],
+    counts: &Counts,
+    len: impl Fn(Section) -> u64,
+) -> Result<([Placed; COLUMNS.len()], usize), DecodeError> {
     let mut columns = [Placed::default(); COLUMNS.len()];
     let mut used = [0u64; SECTIONS.len()];
     for (i, column) in COLUMNS.into_iter().enumerate() {
@@ -1117,12 +1183,7 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
         {
             return Err(DecodeError::Corrupt(section.label()));
         }
-        let count = match column.rows() {
-            Rows::Names => names,
-            Rows::Dirs => dirs,
-            Rows::Inodes => inodes,
-            Rows::Docs => docs,
-        };
+        let count = counts.rows(column.rows());
         columns[i] = Placed {
             desc,
             start: used[section as usize] as usize,
@@ -1132,27 +1193,14 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     }
     // The docs section's hashes follow its id column.
     let hashes = used[Section::Docs as usize];
-    used[Section::Docs as usize] = hashes.saturating_add(u64::from(docs) * HASH_ROW as u64);
+    used[Section::Docs as usize] = hashes.saturating_add(u64::from(counts.docs) * HASH_ROW as u64);
     for column in COLUMNS {
         let section = column.section();
         if used[section as usize] != len(section) {
             return Err(DecodeError::Corrupt(section.label()));
         }
     }
-
-    Ok(Layout {
-        generation,
-        checksums,
-        sniffer: u32_at(head, 12),
-        next_doc: u32_at(head, 16),
-        sections,
-        columns,
-        dirs: dirs as usize,
-        inodes: inodes as usize,
-        names: names as usize,
-        docs: docs as usize,
-        hashes: hashes as usize,
-    })
+    Ok((columns, hashes as usize))
 }
 
 /// Validates a whole file held in memory: the table, then every section.
