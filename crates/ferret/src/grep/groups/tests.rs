@@ -1,6 +1,6 @@
 mod capture;
 use super::job::{Cache, Cached, Job, JobPath, Worker, observe};
-use super::render::{Cancellable, OutputCapture, Record};
+use super::render::{Cancellable, OutputCapture, Record, Recording};
 use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
 use std::cell::Cell;
@@ -1354,4 +1354,45 @@ fn cached_records_stream_when_an_escaped_alias_amplifies_output() {
             .count(),
         4000 * 500
     );
+}
+
+// Lines are assembled into one write only up to a chunk; a longer one is
+// written in pieces, and must read the same.
+#[test]
+fn a_line_past_one_chunk_renders_as_a_short_one_does() {
+    let mut text = vec![b'x'; 3 * CHUNK];
+    text.extend_from_slice(b"red");
+    let input = [text.as_slice(), b"\n"].concat();
+    for (args, expected) in [
+        (
+            &["-n", "red"][..],
+            [b"f:1:".as_slice(), &text, b"\n"].concat(),
+        ),
+        (&["red"][..], [b"f:".as_slice(), &text, b"\n"].concat()),
+    ] {
+        let plan = plan(args);
+        let render = Render {
+            plan: &plan,
+            prefix: Some(b"f"),
+            stopped: &|| false,
+            capture: None,
+        };
+        let mut replay = Vec::new();
+        {
+            let mut output = OutputCapture::new(&mut replay);
+            render
+                .scan(
+                    &mut &input[..],
+                    input.len() as u64,
+                    &mut Vec::new(),
+                    &mut output,
+                    &mut Recording::new(false),
+                )
+                .unwrap();
+            if !output.streamed {
+                output.buffer.write_to(output.target).unwrap();
+            }
+        }
+        assert!(replay == expected, "{args:?}");
+    }
 }

@@ -70,7 +70,8 @@ pub(super) struct Cursor {
     line: Option<u64>,
     printed: bool,
     gap: bool,
-    /// A plain line, assembled so that it reaches the output in one write.
+    /// A plain or JSON line, assembled so that it reaches the output in one
+    /// write.
     scratch: Vec<u8>,
 }
 
@@ -157,12 +158,15 @@ impl Render<'_> {
             if self.plan.quiet {
                 return Ok(());
             }
-            return super::json::line(
-                &mut output,
-                self.prefix.unwrap_or(b"<stdin>"),
-                self.plan.line_number,
-                line,
-            );
+            let path = self.prefix.unwrap_or(b"<stdin>");
+            // As below: a long line is not copied whole before it is written.
+            if line.bytes.len() > CHUNK {
+                return super::json::line(&mut output, path, self.plan.line_number, line);
+            }
+            let scratch = &mut cursor.scratch;
+            scratch.clear();
+            super::json::line(scratch, path, self.plan.line_number, line)?;
+            return output.write_all(scratch);
         }
         let gap = cursor.line.is_some_and(|number| {
             line.source_lines.map_or(line.number, |(start, _)| start) > number.saturating_add(1)
@@ -212,7 +216,16 @@ impl Render<'_> {
                 scratch.extend_from_slice(presentation::decimal(line.number, &mut [0; 20]));
                 scratch.extend_from_slice(delimiter);
             }
-            scratch.extend_from_slice(omitted.as_deref().unwrap_or(line.bytes));
+            let text = omitted.as_deref().unwrap_or(line.bytes);
+            // A line past one write's chunk keeps its own bounded writes:
+            // copying it whole would allocate and copy before cancellation
+            // or the capture budget could act.
+            if text.len() > CHUNK {
+                output.write_all(scratch)?;
+                output.write_all(text)?;
+                return output.write_all(b"\n");
+            }
+            scratch.extend_from_slice(text);
             scratch.push(b'\n');
             return output.write_all(scratch);
         }
