@@ -96,6 +96,9 @@ const SHARDS: usize = 64;
 /// workers rarely share a lock. Holds only inodes read this run that have
 /// more than one link.
 pub(crate) struct Cache {
+    /// A poisoned shard means a worker panicked while holding it; the panic
+    /// ends the walk anyway, and the map itself is never left half-written,
+    /// so [`lock`] may recover it.
     shards: Vec<Mutex<HashMap<(u64, u64), Slot>>>,
     /// Deferred aliases not yet recorded, across the run's workers, and
     /// the most there have been at once.
