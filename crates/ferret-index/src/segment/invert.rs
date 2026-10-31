@@ -15,7 +15,7 @@ const PER_TERM: usize = 64;
 /// the bound the caller set.
 #[derive(Debug)]
 pub struct Inverter {
-    terms: HashMap<Box<[u8]>, Vec<u32>>,
+    terms: HashMap<Box<[u8]>, Docs>,
     memory: usize,
     bound: usize,
     last: Option<u32>,
@@ -42,20 +42,15 @@ impl Inverter {
             return Err(WriteError::DocOrder);
         }
         self.last = Some(doc);
-        let docs = match self.terms.get_mut(term) {
-            Some(docs) => docs,
-            None => {
-                self.memory += term.len() + PER_TERM;
-                self.payload_capacity += term.len();
-                self.terms.entry(term.into()).or_default()
-            }
+        let Some(docs) = self.terms.get_mut(term) else {
+            self.memory += term.len() + PER_TERM;
+            self.payload_capacity += term.len();
+            self.terms.insert(term.into(), Docs::One(doc));
+            return Ok(());
         };
-        if docs.last() != Some(&doc) {
-            let capacity = docs.capacity();
-            docs.push(doc);
-            self.memory += (docs.capacity() - capacity) * size_of::<u32>();
-            self.payload_capacity += (docs.capacity() - capacity) * size_of::<u32>();
-        }
+        let grown = docs.push(doc) * size_of::<u32>();
+        self.memory += grown;
+        self.payload_capacity += grown;
         Ok(())
     }
 
@@ -76,12 +71,12 @@ impl Inverter {
             return 0;
         }
         let buckets = (self.terms.capacity() + 1).next_power_of_two();
-        buckets * (size_of::<(Box<[u8]>, Vec<u32>)>() + 1) + 16
+        buckets * (size_of::<(Box<[u8]>, Docs)>() + 1) + 16
     }
 
     /// Capacity charge including the vector of entries needed at drain.
     pub fn flush_bytes(&self) -> usize {
-        self.allocated_bytes() + self.terms.len() * size_of::<(Box<[u8]>, Vec<u32>)>()
+        self.allocated_bytes() + self.terms.len() * size_of::<(Box<[u8]>, Docs)>()
     }
 
     /// Whether the estimate has reached the bound.
@@ -145,16 +140,56 @@ impl Inverter {
         let payload = self.payload_capacity;
         let mut terms: Vec<_> = self.terms.drain().collect();
         let allocated =
-            payload + self.table_bytes() + terms.capacity() * size_of::<(Box<[u8]>, Vec<u32>)>();
+            payload + self.table_bytes() + terms.capacity() * size_of::<(Box<[u8]>, Docs)>();
         self.memory = 0;
         self.payload_capacity = 0;
         self.last = None;
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (term, docs) in &terms {
+            let docs = docs.as_slice();
             let bytes = writer.push(term, docs)?;
             on_entry(term, docs, bytes);
             observe(allocated + writer.allocated_bytes());
         }
         Ok(writer)
+    }
+}
+
+/// A term's documents. Most terms in a segment occur in one document, so
+/// that one lives in the table slot and only a second document allocates.
+#[derive(Debug)]
+enum Docs {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl Docs {
+    /// Appends `doc` unless it is already last, returning how many `u32`s of
+    /// capacity were allocated.
+    fn push(&mut self, doc: u32) -> usize {
+        match self {
+            Self::One(first) if *first == doc => 0,
+            Self::One(first) => {
+                // Four, as `Vec`'s first growth of a `u32` list would give.
+                let mut docs = Vec::with_capacity(4);
+                docs.extend([*first, doc]);
+                let capacity = docs.capacity();
+                *self = Self::Many(docs);
+                capacity
+            }
+            Self::Many(docs) if docs.last() == Some(&doc) => 0,
+            Self::Many(docs) => {
+                let capacity = docs.capacity();
+                docs.push(doc);
+                docs.capacity() - capacity
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::One(doc) => std::slice::from_ref(doc),
+            Self::Many(docs) => docs,
+        }
     }
 }
