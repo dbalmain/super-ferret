@@ -228,10 +228,22 @@ pub struct Segment<R> {
     blocks: usize,
 }
 
-impl<R: ReadAt> Segment<R> {
-    /// Reads and checks the head, the block index and the chunk sums.
-    pub fn open(source: R) -> Result<Self, ReadError> {
-        let size = source.size()?;
+/// Each section's `(offset, length, checksum)`, in [`Section`] order.
+type Table = [(u64, u64, [u8; 16]); ALL];
+
+/// A segment head whose fields and digest have been checked.
+struct Head {
+    /// The head's bytes, ending in its digest.
+    bytes: Vec<u8>,
+    dictionary: u32,
+    sections: &'static [Section],
+    info: Info,
+}
+
+impl Head {
+    /// Reads the head of a segment of `size` bytes and checks its magic,
+    /// version, codecs, digest and fixed fields.
+    fn read(source: &impl ReadAt, size: u64) -> Result<Self, ReadError> {
         let mut head = vec![0; size.min(HEAD_MAX as u64) as usize];
         source.read_exact_at(&mut head, 0)?;
         if head.len() < 12 || head[..8] != MAGIC {
@@ -273,13 +285,24 @@ impl<R: ReadAt> Segment<R> {
         {
             return Err(ReadError::Head);
         }
+        Ok(Self {
+            bytes: head,
+            dictionary,
+            sections,
+            info,
+        })
+    }
 
+    /// The section table, checked to tile the `size`-byte file after the
+    /// head.
+    fn table(&self, size: u64) -> Result<Table, ReadError> {
+        let head = &self.bytes;
         let mut table = [(0u64, 0u64, [0u8; 16]); ALL];
-        let mut expect = head_len as u64;
-        for (i, &section) in sections.iter().enumerate() {
+        let mut expect = head.len() as u64;
+        for (i, &section) in self.sections.iter().enumerate() {
             let slot = &mut table[section as usize];
             let at = FIELDS + i * TABLE_ENTRY;
-            let (offset, len) = (u64_at(&head, at), u64_at(&head, at + 8));
+            let (offset, len) = (u64_at(head, at), u64_at(head, at + 8));
             let end = offset.checked_add(len).ok_or(ReadError::Layout)?;
             if offset != expect || end > size {
                 return Err(ReadError::Layout);
@@ -292,17 +315,36 @@ impl<R: ReadAt> Segment<R> {
         if expect != size {
             return Err(ReadError::Layout);
         }
-        let read_whole = |section: Section| -> Result<Vec<u8>, ReadError> {
-            let (offset, len, sum) = table[section as usize];
-            let mut bytes = vec![0; usize::try_from(len).map_err(|_| ReadError::Layout)?];
-            source.read_exact_at(&mut bytes, offset)?;
-            if checksum(&bytes) != sum {
-                return Err(ReadError::Corrupt(section));
-            }
-            Ok(bytes)
-        };
-        let index = read_whole(Section::Index)?;
-        let sums = read_whole(Section::Sums)?;
+        Ok(table)
+    }
+
+    /// The head's own BLAKE3-128.
+    fn digest(&self) -> [u8; 16] {
+        let mut digest = [0; 16];
+        digest.copy_from_slice(&self.bytes[self.bytes.len() - 16..]);
+        digest
+    }
+}
+
+/// `section` read whole and checked against its sum in `table`.
+fn read_whole(source: &impl ReadAt, table: &Table, section: Section) -> Result<Vec<u8>, ReadError> {
+    let (offset, len, sum) = table[section as usize];
+    let mut bytes = vec![0; usize::try_from(len).map_err(|_| ReadError::Layout)?];
+    source.read_exact_at(&mut bytes, offset)?;
+    if checksum(&bytes) != sum {
+        return Err(ReadError::Corrupt(section));
+    }
+    Ok(bytes)
+}
+
+impl<R: ReadAt> Segment<R> {
+    /// Reads and checks the head, the block index and the chunk sums.
+    pub fn open(source: R) -> Result<Self, ReadError> {
+        let size = source.size()?;
+        let head = Head::read(&source, size)?;
+        let table = head.table(size)?;
+        let index = read_whole(&source, &table, Section::Index)?;
+        let sums = read_whole(&source, &table, Section::Sums)?;
         let (blocks_len, postings_len) = (table[0].1, table[1].1);
         let fingerprint_len = table[Section::Fingerprints as usize].1;
         // The table checksums of blocks, postings and fingerprints are each
@@ -316,24 +358,26 @@ impl<R: ReadAt> Segment<R> {
         {
             return Err(ReadError::Corrupt(Section::Sums));
         }
-        let fingerprints = if dictionary == DICTIONARY_CODEC {
+        let fingerprints = if head.dictionary == DICTIONARY_CODEC {
             FingerprintIndex::default()
         } else {
-            FingerprintIndex::parse(&read_whole(Section::FingerprintIndex)?, fingerprint_len)
-                .ok_or(ReadError::Corrupt(Section::FingerprintIndex))?
+            FingerprintIndex::parse(
+                &read_whole(&source, &table, Section::FingerprintIndex)?,
+                fingerprint_len,
+            )
+            .ok_or(ReadError::Corrupt(Section::FingerprintIndex))?
         };
 
+        let info = head.info;
         let samples = parse_index(&index, info.terms, blocks_len, postings_len)
             .ok_or(ReadError::Corrupt(Section::Index))?;
-        let mut digest = [0; 16];
-        digest.copy_from_slice(&head[head_len - 16..]);
         Ok(Self {
             source,
             info,
-            codec: dictionary,
+            codec: head.dictionary,
             fingerprints_at: (table[4].0, fingerprint_len),
             fingerprints,
-            digest,
+            digest: head.digest(),
             blocks_at: (table[0].0, blocks_len),
             postings_at: (table[1].0, postings_len),
             lengths: table.map(|(_, len, _)| len),
