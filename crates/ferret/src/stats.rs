@@ -249,12 +249,16 @@ fn extension(name: &[u8]) -> Vec<u8> {
 }
 
 fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
+    report_entries(catalog, census, out);
+    report_sections(catalog, out);
+    report_content(census, out);
+    report_distributions(census, out);
+    report_extensions(census, out);
+}
+
+/// Names, inodes and documents, by kind.
+fn report_entries(catalog: &Catalog, census: &Census, out: &mut String) {
     let names = u64::from(catalog.name_count());
-    let total: u64 = catalog.section_sizes().map(|(_, len)| len).sum();
-    let per_name = |n: u64| match names {
-        0 => 0.0,
-        _ => n as f64 / names as f64,
-    };
     let [
         dir_names,
         file_names,
@@ -297,7 +301,16 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
         next - live
     );
     let _ = writeln!(out, "sniffer   version {}", catalog.sniffer_version());
+}
 
+/// Each section's bytes, per name, and its packed columns.
+fn report_sections(catalog: &Catalog, out: &mut String) {
+    let names = u64::from(catalog.name_count());
+    let total: u64 = catalog.section_sizes().map(|(_, len)| len).sum();
+    let per_name = |n: u64| match names {
+        0 => 0.0,
+        _ => n as f64 / names as f64,
+    };
     let _ = writeln!(
         out,
         "\nsections  {} in all, {:.1} B per name (the {} B head of the file aside)",
@@ -323,7 +336,10 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
         }
         out.push('\n');
     }
+}
 
+/// File inodes by content state, hard links and duplicate documents.
+fn report_content(census: &Census, out: &mut String) {
     let _ = writeln!(out, "\ncontent (file inodes)");
     for (label, state) in [
         ("hashed", ContentState::Hashed),
@@ -354,7 +370,10 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
             census.dangling
         );
     }
+}
 
+/// Depth, name length and file size histograms.
+fn report_distributions(census: &mut Census, out: &mut String) {
     let _ = writeln!(
         out,
         "\ndepth below the root: {}",
@@ -369,7 +388,10 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
     histogram(out, &census.name_len, false);
     let _ = writeln!(out, "\nfile size");
     histogram(out, &census.file_size, true);
+}
 
+/// The most common extensions.
+fn report_extensions(census: &Census, out: &mut String) {
     let mut extensions: Vec<_> = census.extensions.iter().collect();
     extensions.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
     let _ = writeln!(
