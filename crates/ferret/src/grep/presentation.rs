@@ -52,11 +52,27 @@ pub(super) fn number(
     if presentation.color.enabled() {
         writer.write_all(NUMBER)?;
     }
-    write!(writer, "{number}")?;
+    writer.write_all(decimal(number, &mut [0; 20]))?;
     if presentation.color.enabled() {
         writer.write_all(RESET)?;
     }
     Ok(())
+}
+
+/// `number` in decimal, in the tail of `buffer`. Line numbers are printed
+/// once per output line, where `write!` was a visible share of a dense
+/// `-n` run.
+pub(super) fn decimal(number: u64, buffer: &mut [u8; 20]) -> &[u8] {
+    let mut at = buffer.len();
+    let mut rest = number;
+    loop {
+        at -= 1;
+        buffer[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            return &buffer[at..];
+        }
+    }
 }
 
 pub(super) fn text(plan: &Plan, writer: &mut impl Write, line: Line<'_>) -> io::Result<()> {

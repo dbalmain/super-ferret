@@ -615,3 +615,14 @@ fn json_retry_discards_events_offsets_binary_state_and_counts_together() {
         }
     }
 }
+
+#[test]
+fn decimal_matches_display_at_every_width() {
+    for number in [0, 1, 9, 10, 99, 100, 12_345, u64::from(u32::MAX), u64::MAX] {
+        let mut buffer = [0; 20];
+        assert_eq!(
+            presentation::decimal(number, &mut buffer),
+            number.to_string().as_bytes()
+        );
+    }
+}
