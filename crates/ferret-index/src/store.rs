@@ -295,16 +295,17 @@ impl View {
     }
 
     /// Headroom for the next policy-selected merge, absent when no merge is
-    /// due. Memory includes growable decoded lists and spilling scratch;
-    /// the term and trigram outputs merge at once, and their two lists each
-    /// reach 8 bytes a document. Disk includes output plus postings scratch
-    /// while the committed inputs still exist.
+    /// due. Memory includes growable decoded lists and spilling scratch.
+    /// The term and trigram outputs merge at once, and each stream holds
+    /// three document lists (decoded, live, and the writer's relative ids)
+    /// whose capacity can reach 8 bytes a document. Disk includes output
+    /// plus postings scratch while the committed inputs still exist.
     pub fn merge_resources(&self, live: &DocSet) -> Option<(u64, u64)> {
         let entries = self.merge_selection(live)?;
         let bytes = entries.iter().map(SegmentEntry::total_bytes).sum::<u64>();
         let docs = entries.iter().map(|s| u64::from(s.docs)).sum::<u64>();
         Some((
-            docs.saturating_mul(24)
+            docs.saturating_mul(2 * 3 * 8)
                 .saturating_add(64 << 20)
                 .saturating_add(bytes / 8),
             bytes.saturating_mul(3).saturating_add(16 << 20),
