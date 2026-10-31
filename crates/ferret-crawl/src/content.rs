@@ -972,41 +972,15 @@ fn hold_directory(
     catalog: &Catalog,
     dir: InoId,
 ) -> Result<Option<OwnedFd>, ContentFault> {
-    let directory = |stat: &rustix::fs::Stat, identity: (u64, u64)| {
-        FileType::from_raw_mode(stat.st_mode) == FileType::Directory
-            && (stat.st_dev, stat.st_ino) == identity
-    };
-    let root_path = |root: InoId| {
-        catalog
-            .roots()
-            .find(|&(id, _)| id == root)
-            .map(|(_, path)| std::ffi::OsStr::from_bytes(path))
-            .ok_or(ContentFault::Changed)
-    };
     // A held `dir`'s chain is the held walk through it: the same checks,
     // from what each level kept rather than from the catalog, which is the
     // one view this reader's documents, and so its held ids, come from. Most
     // files a reader opens sit in the directory its last one did.
-    if let Some(at) = held.fds.iter().position(|level| level.id == dir) {
-        let root = &held.fds[0];
-        // The root's own path may pass through symlinks: the user's.
-        let stat =
-            rustix::fs::stat(root_path(root.id)?).map_err(|e| ContentFault::Stat(e.into()))?;
-        if directory(&stat, root.identity) {
-            for pair in held.fds[..=at].windows(2) {
-                let stat = statat(
-                    &pair[0].fd,
-                    std::ffi::OsStr::from_bytes(&pair[1].name),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .map_err(|e| ContentFault::Stat(e.into()))?;
-                if !directory(&stat, pair[1].identity) {
-                    return Err(ContentFault::Changed);
-                }
-            }
-            held.truncate(at + 1);
-            return Ok(None);
-        }
+    if let Some(at) = held.fds.iter().position(|level| level.id == dir)
+        && held.recheck(at, root_path(catalog, held.fds[0].id)?)?
+    {
+        held.truncate(at + 1);
+        return Ok(None);
     }
     let names = catalog.name_reader();
     // `dir` and its ancestors below the root, nearest first.
@@ -1018,74 +992,136 @@ fn hold_directory(
         at = parent;
     }
     let root = at;
-    let path = root_path(root)?;
-    // How much of the held chain is `dir`'s and still at its path.
-    let mut kept = 0;
-    if held.fds.first().is_some_and(|level| level.id == root) {
+    let path = root_path(catalog, root)?;
+    let kept = held.kept(catalog, root, path, &chain)?;
+    held.truncate(kept);
+    held.open_chain(catalog, root, path, &chain)
+}
+
+/// The path of root `root`.
+fn root_path(catalog: &Catalog, root: InoId) -> Result<&std::ffi::OsStr, ContentFault> {
+    catalog
+        .roots()
+        .find(|&(id, _)| id == root)
+        .map(|(_, path)| std::ffi::OsStr::from_bytes(path))
+        .ok_or(ContentFault::Changed)
+}
+
+/// Whether `stat` is of a directory with `identity`.
+fn is_directory(stat: &rustix::fs::Stat, identity: (u64, u64)) -> bool {
+    FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+        && (stat.st_dev, stat.st_ino) == identity
+}
+
+/// Stats `name` in `parent`, not following a symlink.
+fn stat_child(parent: &OwnedFd, name: &[u8]) -> Result<rustix::fs::Stat, ContentFault> {
+    statat(
+        parent,
+        std::ffi::OsStr::from_bytes(name),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|e| ContentFault::Stat(e.into()))
+}
+
+impl Held {
+    /// Checks the held chain through level `at` again, from its root at
+    /// `path`. False when the root is no longer the held directory there.
+    fn recheck(&self, at: usize, path: &std::ffi::OsStr) -> Result<bool, ContentFault> {
+        // The root's own path may pass through symlinks: the user's.
         let stat = rustix::fs::stat(path).map_err(|e| ContentFault::Stat(e.into()))?;
-        if directory(&stat, catalog.identity(root)) {
-            kept = 1;
-            for (&(id, bytes), pair) in chain.iter().rev().zip(held.fds.windows(2)) {
-                if id != pair[1].id {
-                    break;
-                }
-                let stat = statat(
-                    &pair[0].fd,
-                    std::ffi::OsStr::from_bytes(bytes),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .map_err(|e| ContentFault::Stat(e.into()))?;
-                if !directory(&stat, catalog.identity(id)) {
-                    return Err(ContentFault::Changed);
-                }
-                kept += 1;
+        if !is_directory(&stat, self.fds[0].identity) {
+            return Ok(false);
+        }
+        for pair in self.fds[..=at].windows(2) {
+            if !is_directory(&stat_child(&pair[0].fd, &pair[1].name)?, pair[1].identity) {
+                return Err(ContentFault::Changed);
             }
         }
+        Ok(true)
     }
-    held.truncate(kept);
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    // Past the budget, the walk goes on through this one descriptor.
-    let mut unheld = None;
-    if held.fds.is_empty() {
-        // The root's own path is the user's; symlinks above it are theirs
-        // to keep. Everything below it must not follow one.
-        let fd = open(path, flags, Mode::empty()).map_err(|e| ContentFault::Open(e.into()))?;
-        check_directory(&fd, catalog, root)?;
-        match held.budget.take() {
-            true => held.fds.push(Level {
-                id: root,
-                fd,
-                name: Box::default(),
-                identity: catalog.identity(root),
-            }),
-            false => unheld = Some(fd),
+
+    /// How much of the held chain is `chain`'s, under `root` at `path`, and
+    /// still at its path.
+    fn kept(
+        &self,
+        catalog: &Catalog,
+        root: InoId,
+        path: &std::ffi::OsStr,
+        chain: &[(InoId, &[u8])],
+    ) -> Result<usize, ContentFault> {
+        if self.fds.first().is_none_or(|level| level.id != root) {
+            return Ok(0);
         }
-    }
-    let done = held.fds.len().saturating_sub(1);
-    for &(id, bytes) in chain.iter().rev().skip(done) {
-        let parent = match (&unheld, held.fds.last()) {
-            (Some(fd), _) | (None, Some(Level { fd, .. })) => fd,
-            (None, None) => return Err(ContentFault::Changed),
-        };
-        let fd = openat(
-            parent,
-            std::ffi::OsStr::from_bytes(bytes),
-            flags | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|e| ContentFault::Open(e.into()))?;
-        check_directory(&fd, catalog, id)?;
-        match unheld.is_none() && held.budget.take() {
-            true => held.fds.push(Level {
-                id,
-                fd,
-                name: bytes.into(),
-                identity: catalog.identity(id),
-            }),
-            false => unheld = Some(fd),
+        let stat = rustix::fs::stat(path).map_err(|e| ContentFault::Stat(e.into()))?;
+        if !is_directory(&stat, catalog.identity(root)) {
+            return Ok(0);
         }
+        let mut kept = 1;
+        for (&(id, bytes), pair) in chain.iter().rev().zip(self.fds.windows(2)) {
+            if id != pair[1].id {
+                break;
+            }
+            if !is_directory(&stat_child(&pair[0].fd, bytes)?, catalog.identity(id)) {
+                return Err(ContentFault::Changed);
+            }
+            kept += 1;
+        }
+        Ok(kept)
     }
-    Ok(unheld)
+
+    /// Opens the rest of `chain` below what is held, holding each level
+    /// while the budget allows. Past it, the walk goes on through one
+    /// descriptor, which is returned.
+    fn open_chain(
+        &mut self,
+        catalog: &Catalog,
+        root: InoId,
+        path: &std::ffi::OsStr,
+        chain: &[(InoId, &[u8])],
+    ) -> Result<Option<OwnedFd>, ContentFault> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut unheld = None;
+        if self.fds.is_empty() {
+            // The root's own path is the user's; symlinks above it are
+            // theirs to keep. Everything below it must not follow one.
+            let fd = open(path, flags, Mode::empty()).map_err(|e| ContentFault::Open(e.into()))?;
+            check_directory(&fd, catalog, root)?;
+            match self.budget.take() {
+                true => self.fds.push(Level {
+                    id: root,
+                    fd,
+                    name: Box::default(),
+                    identity: catalog.identity(root),
+                }),
+                false => unheld = Some(fd),
+            }
+        }
+        let done = self.fds.len().saturating_sub(1);
+        for &(id, bytes) in chain.iter().rev().skip(done) {
+            let parent = match (&unheld, self.fds.last()) {
+                (Some(fd), _) | (None, Some(Level { fd, .. })) => fd,
+                (None, None) => return Err(ContentFault::Changed),
+            };
+            let fd = openat(
+                parent,
+                std::ffi::OsStr::from_bytes(bytes),
+                flags | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|e| ContentFault::Open(e.into()))?;
+            check_directory(&fd, catalog, id)?;
+            match unheld.is_none() && self.budget.take() {
+                true => self.fds.push(Level {
+                    id,
+                    fd,
+                    name: bytes.into(),
+                    identity: catalog.identity(id),
+                }),
+                false => unheld = Some(fd),
+            }
+        }
+        Ok(unheld)
+    }
 }
 
 fn check_directory(fd: &OwnedFd, catalog: &Catalog, id: InoId) -> Result<(), ContentFault> {
