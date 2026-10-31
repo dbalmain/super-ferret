@@ -404,6 +404,13 @@ impl Batch {
     ) {
         assert!(self.full, "checkpoint pruning requires full observations");
         self.seal();
+        self.retain_dirs(mapping);
+        self.retain_files(mapping, &keep_edge);
+        self.retain_edges(mapping, &keep_edge);
+    }
+
+    /// Keeps the mapped directories and their stats, remapping parents.
+    fn retain_dirs(&mut self, mapping: &std::collections::BTreeMap<DirToken, DirToken>) {
         let id = self.id;
         let mut read = 0;
         let mut write = 0;
@@ -424,6 +431,16 @@ impl Batch {
             true
         });
         self.dir_stats.truncate(write);
+    }
+
+    /// Keeps the files under mapped directories whose edges `keep_edge`
+    /// accepts, with their stats, contents, targets and retained and
+    /// revealed marks renumbered to their new rows.
+    fn retain_files(
+        &mut self,
+        mapping: &std::collections::BTreeMap<DirToken, DirToken>,
+        keep_edge: &impl Fn(DirToken, &[u8]) -> bool,
+    ) {
         let retained = std::mem::take(&mut self.retained_files);
         let revealed = std::mem::take(&mut self.revealed_files);
         let mut revealed = revealed.into_iter().peekable();
@@ -473,6 +490,15 @@ impl Batch {
         self.file_stats.truncate(write);
         self.contents.truncate(write);
         self.targets.truncate(target_write);
+    }
+
+    /// Keeps the ignored edges, work trees and entry counts under mapped
+    /// directories, remapped.
+    fn retain_edges(
+        &mut self,
+        mapping: &std::collections::BTreeMap<DirToken, DirToken>,
+        keep_edge: &impl Fn(DirToken, &[u8]) -> bool,
+    ) {
         self.ignored.retain_mut(|edge| {
             let Some(&parent) = mapping.get(&edge.parent) else {
                 return false;
