@@ -7547,7 +7547,8 @@ fixed and tested.
 ## D135 — How often a held directory is checked again
 
 **Question:** Should a grep worker check its held directories again for every
-file it opens through them, or at most once every 100 µs?
+file it opens through them, level by level, or more cheaply: one path lookup of
+the deepest level per file, or at most once every 100 µs?
 
 Today each catalogued file a worker opens re-checks its whole held chain:
 a `stat` of the root's path, then a no-follow `fstatat` per level, each
@@ -7579,8 +7580,24 @@ when a daemon caps its search threads.
 | A. Keep: every file re-checks the chain | 6.6 stat calls per file; a third of the 4-thread search time. | The guarantee as written: each directory read through was at its path at a moment between the file's own walk starting and its open. |
 | B. Re-check at most once per 100 µs per reader | An `Instant` per reader and a clock read per file. The guarantee loosens to: at its path within 100 µs before the open. `a_held_directory_is_checked_again_for_each_path` must wait out the window or inject a clock. | About a third off the 4-thread search (A to B above). A directory moved mid-query still fails, within 100 µs. |
 | C. Check a held directory only when opened | Nothing to maintain. A directory moved mid-query keeps serving the old path's files until the reader is dropped, which is the end of the query. | The same speed as B. |
+| D. Per file, one no-follow stat of the deepest held level's full path, checked against its identity | One path lookup per file instead of one stat per level. Intermediate levels are checked only by resolving through them, so a symlink put in an ancestor's place is followed where A refuses it; the file read is still the one at its displayed path. | About 20% off the 4-thread search, most of B's gain. Every file is still checked after the previous one's open, which keeps the duplicate cache's replay exact. |
 
-**Recommendation:** B. It keeps the property that matters, that a rename
+Measured again at 0153f70 (4 search threads, median of 15, two runs each,
+ms; both prototypes uncommitted):
+
+| Re-check a held chain               | `-l fn`    | `-c e`     |
+| ----------------------------------- | ---------- | ---------- |
+| A. Every level, every file (today)  | 125, 123   | 161, 164   |
+| B. At most once per 100 µs          | 100, 86    | 128, 127   |
+| D. One path stat per file           | 97, 96     | 133, 133   |
+
+**Recommendation:** D (revised 2026-10-31, after Astra's note below). It keeps
+a check per file, so nothing that relies on the check following the previous
+file's open changes, and takes most of B's gain. The fact that would change it:
+needing to refuse a symlink swapped into an ancestor mid-query (then A), or the
+last 10% at 4 threads mattering more than the cache's exactness (then B).
+
+Earlier recommendation: B. It keeps the property that matters, that a rename
 or replacement during a query is noticed and the file read through it fails,
 and bounds the staleness to 100 µs, well under the time a rename takes to
 reach a user's attention. Its measured speed is C's. The fact that would
