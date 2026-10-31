@@ -160,30 +160,7 @@ fn test_accept_errno(name: &str) -> Option<i32> {
     })
 }
 fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
-    let mut index = std::env::var_os("FERRET_INDEX")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::xdg::Dirs::from_env().ok().map(|dirs| dirs.data));
-    // Zero: stay up and keep the index fresh between bursts of use (D116).
-    let mut idle = duration("FERRET_DAEMON_IDLE_MS", 0);
-    let mut args = args;
-    while let Some(arg) = args.next() {
-        match arg.to_str() {
-            Some("--index") => index = args.next().map(PathBuf::from),
-            Some("--idle-ms") => {
-                idle = Duration::from_millis(
-                    args.next()
-                        .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
-                        .ok_or_else(|| io::Error::other("--idle-ms needs milliseconds"))?,
-                )
-            }
-            _ => {
-                return Err(io::Error::other(
-                    "usage: ferretd [--index DIR] [--idle-ms N]",
-                ));
-            }
-        }
-    }
+    let (index, idle) = arguments(args)?;
     let index = index.ok_or_else(|| io::Error::other("no index directory"))?;
     // The endpoint is named after the directory's identity, so a daemon
     // started before the first index creates it, as the writer would.
@@ -191,26 +168,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let index = fs::canonicalize(index)?;
     let endpoint = Endpoint::open(&index)?;
     let endpoint_lock = endpoint.private_file("lock")?;
-    let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
-    loop {
-        match endpoint_lock.try_lock() {
-            Ok(()) => break,
-            Err(fs::TryLockError::WouldBlock) => {
-                if owner_responds(&endpoint.socket()) {
-                    return Ok(());
-                }
-                // A draining owner may have unlinked just before releasing
-                // its lock. Retry acquisition so that starter can become the
-                // new winner instead of waiting for a departed host to bind.
-                if Instant::now() >= until {
-                    return Err(io::Error::other("singleton winner did not bind"));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(fs::TryLockError::Error(error)) => return Err(error),
-        }
-    }
-    if UnixStream::connect(endpoint.socket()).is_ok() {
+    if !win_singleton(&endpoint, &endpoint_lock)? {
         return Ok(());
     }
     match endpoint.remove_socket() {
@@ -224,36 +182,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let cleanup = SocketCleanup(&endpoint, own_socket.dev(), own_socket.ino());
     fs::set_permissions(endpoint.socket(), fs::Permissions::from_mode(0o600))?;
     let (server_send, server_receive) = mpsc::channel();
-    let accept_send = server_send.clone();
-    let accept_lock = endpoint_lock.try_clone()?;
-    std::thread::spawn(move || {
-        let _lock = &accept_lock;
-        // One line per streak. A persistent EMFILE would otherwise fill stderr.
-        let mut reported = false;
-        loop {
-            let accepted = match next_accepted(&listener) {
-                Err(error) if transient_accept(&error) => {
-                    if !reported {
-                        crate::cli::warn(&format!("accept: {error}; continuing"));
-                        reported = true;
-                    }
-                    // EMFILE and ENFILE leave the connection queued. Retrying
-                    // immediately pegs a core until a descriptor frees.
-                    if matches!(error.raw_os_error(), Some(ENFILE | EMFILE)) {
-                        std::thread::sleep(ACCEPT_BACKOFF);
-                    }
-                    continue;
-                }
-                other => {
-                    reported = false;
-                    other
-                }
-            };
-            if accept_send.send(ServerEvent::Accepted(accepted)).is_err() {
-                break;
-            }
-        }
-    });
+    spawn_accept(listener, server_send.clone(), endpoint_lock.try_clone()?);
     let (writer_send, writer_receive) = writer::Queue::new(32);
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
@@ -284,68 +213,9 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         permits: Permits::new(ferret_crawl::default_workers()),
     });
     let writer = writer::start(host.clone(), writer_receive)?;
-    let mut idle_since = Instant::now();
     // Every exit, including a fatal accept and a dead accept thread, joins
     // the writer before the socket is removed (D110).
-    let mut exit_error = None;
-    loop {
-        let draining = lock(&host.lifecycle).draining;
-        let clients = host.clients.load(Ordering::Acquire);
-        // A dead writer's pending count can be stale, so a failed service
-        // waits only for connections, which its drain has already woken.
-        let fatal = *lock(&host.fatal);
-        if let Some(service) = fatal
-            && clients == 0
-        {
-            exit_error = Some(io::Error::other(service));
-            break;
-        }
-        let busy = writer::busy(&host);
-        if clients != 0 {
-            idle_since = Instant::now();
-        }
-        if (draining && clients == 0 && !busy)
-            || (!idle.is_zero() && clients == 0 && !busy && idle_since.elapsed() >= idle)
-        {
-            break;
-        }
-        // Once work blocks an expired deadline, its completion notification
-        // supplies the next wakeup; a zero timeout would spin.
-        let event = if idle.is_zero() || clients != 0 || (busy && idle_since.elapsed() >= idle) {
-            match server_receive.recv() {
-                Ok(event) => event,
-                Err(mpsc::RecvError) => {
-                    exit_error = Some(io::Error::other("accept loop stopped"));
-                    break;
-                }
-            }
-        } else {
-            match server_receive.recv_timeout(idle.saturating_sub(idle_since.elapsed())) {
-                Ok(event) => event,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    exit_error = Some(io::Error::other("accept loop stopped"));
-                    break;
-                }
-            }
-        };
-        match event {
-            ServerEvent::Wake => {}
-            ServerEvent::Accepted(Ok(stream)) if !draining && clients < CLIENTS => {
-                host.clients.fetch_add(1, Ordering::AcqRel);
-                let host = host.clone();
-                std::thread::spawn(move || {
-                    let _client = ClientCount(&host);
-                    let _ = connection(stream, &host);
-                });
-            }
-            ServerEvent::Accepted(Ok(_)) => {}
-            ServerEvent::Accepted(Err(error)) => {
-                exit_error = Some(error);
-                break;
-            }
-        }
-    }
+    let exit_error = serve(&host, &server_receive, idle);
     host.stop.store(true, Ordering::Release);
     host.writer_send.wake();
     let _ = writer.join();
@@ -371,6 +241,158 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     }
     removed?;
     Ok(())
+}
+/// The index directory and idle timeout, from the environment and then
+/// `--index` and `--idle-ms`.
+fn arguments(args: impl Iterator<Item = OsString>) -> io::Result<(Option<PathBuf>, Duration)> {
+    let mut index = std::env::var_os("FERRET_INDEX")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::xdg::Dirs::from_env().ok().map(|dirs| dirs.data));
+    // Zero: stay up and keep the index fresh between bursts of use (D116).
+    let mut idle = duration("FERRET_DAEMON_IDLE_MS", 0);
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--index") => index = args.next().map(PathBuf::from),
+            Some("--idle-ms") => {
+                idle = Duration::from_millis(
+                    args.next()
+                        .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
+                        .ok_or_else(|| io::Error::other("--idle-ms needs milliseconds"))?,
+                )
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "usage: ferretd [--index DIR] [--idle-ms N]",
+                ));
+            }
+        }
+    }
+    Ok((index, idle))
+}
+/// Takes the endpoint's lifetime lock, or finds the host that holds it.
+/// `false` when another host already answers on the socket.
+fn win_singleton(endpoint: &Endpoint, endpoint_lock: &fs::File) -> io::Result<bool> {
+    let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
+    loop {
+        match endpoint_lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                if owner_responds(&endpoint.socket()) {
+                    return Ok(false);
+                }
+                // A draining owner may have unlinked just before releasing
+                // its lock. Retry acquisition so that starter can become the
+                // new winner instead of waiting for a departed host to bind.
+                if Instant::now() >= until {
+                    return Err(io::Error::other("singleton winner did not bind"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Ok(UnixStream::connect(endpoint.socket()).is_err())
+}
+/// Accepts connections for the life of the process, holding a clone of
+/// the endpoint lock, and forwards each to the server loop.
+fn spawn_accept(
+    listener: UnixListener,
+    accept_send: mpsc::Sender<ServerEvent>,
+    accept_lock: fs::File,
+) {
+    std::thread::spawn(move || {
+        let _lock = &accept_lock;
+        // One line per streak. A persistent EMFILE would otherwise fill stderr.
+        let mut reported = false;
+        loop {
+            let accepted = match next_accepted(&listener) {
+                Err(error) if transient_accept(&error) => {
+                    if !reported {
+                        crate::cli::warn(&format!("accept: {error}; continuing"));
+                        reported = true;
+                    }
+                    // EMFILE and ENFILE leave the connection queued. Retrying
+                    // immediately pegs a core until a descriptor frees.
+                    if matches!(error.raw_os_error(), Some(ENFILE | EMFILE)) {
+                        std::thread::sleep(ACCEPT_BACKOFF);
+                    }
+                    continue;
+                }
+                other => {
+                    reported = false;
+                    other
+                }
+            };
+            if accept_send.send(ServerEvent::Accepted(accepted)).is_err() {
+                break;
+            }
+        }
+    });
+}
+/// Hands accepted connections to client threads until the host drains,
+/// idles out or fails, returning the failure.
+fn serve(
+    host: &Arc<Host>,
+    server_receive: &mpsc::Receiver<ServerEvent>,
+    idle: Duration,
+) -> Option<io::Error> {
+    let mut idle_since = Instant::now();
+    loop {
+        let draining = lock(&host.lifecycle).draining;
+        let clients = host.clients.load(Ordering::Acquire);
+        // A dead writer's pending count can be stale, so a failed service
+        // waits only for connections, which its drain has already woken.
+        let fatal = *lock(&host.fatal);
+        if let Some(service) = fatal
+            && clients == 0
+        {
+            return Some(io::Error::other(service));
+        }
+        let busy = writer::busy(host);
+        if clients != 0 {
+            idle_since = Instant::now();
+        }
+        if (draining && clients == 0 && !busy)
+            || (!idle.is_zero() && clients == 0 && !busy && idle_since.elapsed() >= idle)
+        {
+            return None;
+        }
+        // Once work blocks an expired deadline, its completion notification
+        // supplies the next wakeup; a zero timeout would spin.
+        let event = if idle.is_zero() || clients != 0 || (busy && idle_since.elapsed() >= idle) {
+            match server_receive.recv() {
+                Ok(event) => event,
+                Err(mpsc::RecvError) => {
+                    return Some(io::Error::other("accept loop stopped"));
+                }
+            }
+        } else {
+            match server_receive.recv_timeout(idle.saturating_sub(idle_since.elapsed())) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Some(io::Error::other("accept loop stopped"));
+                }
+            }
+        };
+        match event {
+            ServerEvent::Wake => {}
+            ServerEvent::Accepted(Ok(stream)) if !draining && clients < CLIENTS => {
+                host.clients.fetch_add(1, Ordering::AcqRel);
+                let host = host.clone();
+                std::thread::spawn(move || {
+                    let _client = ClientCount(&host);
+                    let _ = connection(stream, &host);
+                });
+            }
+            ServerEvent::Accepted(Ok(_)) => {}
+            ServerEvent::Accepted(Err(error)) => {
+                return Some(error);
+            }
+        }
+    }
 }
 fn owner_responds(socket: &Path) -> bool {
     let Ok(mut stream) = UnixStream::connect(socket) else {
