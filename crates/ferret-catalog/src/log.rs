@@ -711,32 +711,7 @@ impl Writer {
             }
             return Ok(expected);
         }
-        let mut next = self.manifest.clone();
-        next.generation.sequence = expected
-            .sequence
-            .checked_add(1)
-            .filter(|&n| n != u64::MAX)
-            .ok_or(Error::Invalid(DecodeError::Corrupt("sequence exhausted")))?;
-        next.sniffer = sniffer;
-        next.counters = changes.counters;
-        next.counts = changes.counts;
-        Manifest::decode(&next.encode()).map_err(Error::Invalid)?;
-        if next
-            .counters
-            .iter()
-            .zip(self.manifest.counters)
-            .any(|(a, b)| *a < b)
-        {
-            return Err(Error::Invalid(DecodeError::Corrupt(
-                "allocation counters decreased",
-            )));
-        }
-        let length = checked_size(changes, next.generation.sequence).map_err(Error::Invalid)?;
-        next.log_end = self
-            .manifest
-            .log_end
-            .checked_add(length)
-            .ok_or(Error::Invalid(DecodeError::Corrupt("log exhausted")))?;
+        let (next, length) = self.next_manifest(expected, changes, sniffer)?;
         let current = self
             .current
             .advance_with_sniffer(expected, changes, sniffer)
@@ -770,6 +745,44 @@ impl Writer {
         self.budget = budget;
         self.poisoned = false;
         Ok(self.manifest.generation)
+    }
+
+    /// The manifest that appending `changes` after `expected` publishes,
+    /// checked to round-trip and never to lower an allocation counter, and the
+    /// length of the log transaction it appends.
+    fn next_manifest(
+        &self,
+        expected: Generation,
+        changes: &ChangeSet,
+        sniffer: u32,
+    ) -> Result<(Manifest, u64), Error> {
+        let mut next = self.manifest.clone();
+        next.generation.sequence = expected
+            .sequence
+            .checked_add(1)
+            .filter(|&n| n != u64::MAX)
+            .ok_or(Error::Invalid(DecodeError::Corrupt("sequence exhausted")))?;
+        next.sniffer = sniffer;
+        next.counters = changes.counters;
+        next.counts = changes.counts;
+        Manifest::decode(&next.encode()).map_err(Error::Invalid)?;
+        if next
+            .counters
+            .iter()
+            .zip(self.manifest.counters)
+            .any(|(a, b)| *a < b)
+        {
+            return Err(Error::Invalid(DecodeError::Corrupt(
+                "allocation counters decreased",
+            )));
+        }
+        let length = checked_size(changes, next.generation.sequence).map_err(Error::Invalid)?;
+        next.log_end = self
+            .manifest
+            .log_end
+            .checked_add(length)
+            .ok_or(Error::Invalid(DecodeError::Corrupt("log exhausted")))?;
+        Ok((next, length))
     }
 }
 
