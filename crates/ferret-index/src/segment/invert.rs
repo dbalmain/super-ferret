@@ -159,7 +159,13 @@ impl Inverter {
         self.memory = 0;
         self.payload_capacity = 0;
         self.last = None;
-        terms.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+        // Most terms differ in their first eight bytes, which compare as one
+        // integer; only a tie compares the rest.
+        terms.sort_unstable_by(|a, b| {
+            a.0.prefix()
+                .cmp(&b.0.prefix())
+                .then_with(|| a.0.as_slice().cmp(b.0.as_slice()))
+        });
         for (term, docs) in &terms {
             let (term, docs) = (term.as_slice(), docs.as_slice());
             let bytes = writer.push(term, docs)?;
@@ -254,6 +260,19 @@ impl Key {
             Bytes::Inline(len, bytes) => &bytes[..usize::from(*len)],
             Bytes::Heap(bytes) => bytes,
         }
+    }
+
+    /// The first eight bytes, zero-padded, as a big-endian integer: ordered
+    /// as the bytes are, up to ties.
+    fn prefix(&self) -> u64 {
+        let mut prefix = [0; 8];
+        match &self.bytes {
+            // Past its length an inline key is zeros.
+            Bytes::Inline(_, bytes) => prefix.copy_from_slice(&bytes[..8]),
+            // A boxed key is longer than an inline one can be.
+            Bytes::Heap(bytes) => prefix.copy_from_slice(&bytes[..8]),
+        }
+        u64::from_be_bytes(prefix)
     }
 
     /// Bytes allocated off the table for this key.

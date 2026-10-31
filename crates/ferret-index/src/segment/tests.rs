@@ -309,6 +309,39 @@ fn inverter_matches_a_brute_force_inversion() {
     check(&bytes, 40, 139, &expected, &mut rng);
 }
 
+/// The drain orders terms by their bytes where an eight-byte prefix ties or
+/// misleads: a term that is another's prefix, zero bytes against the
+/// padding, and boxed keys beside inline ones sharing their first eight.
+#[test]
+fn inverter_drains_in_byte_order_past_the_prefix() {
+    let long = |tail: &[u8]| [b"abcdefgh".as_slice(), &[b'-'; 16], tail].concat();
+    let mut terms: Vec<Vec<u8>> = vec![
+        b"ab".to_vec(),
+        b"ab\0".to_vec(),
+        b"ab\0c".to_vec(),
+        b"abc".to_vec(),
+        b"\0".to_vec(),
+        b"\xff".to_vec(),
+        b"abcdefgh".to_vec(),
+        b"abcdefgh\0".to_vec(),
+        b"abcdefghz".to_vec(),
+        long(b"a"),
+        long(b""),
+        long(b"\xff"),
+        b"abcdefgg\xff".to_vec(),
+    ];
+    let mut inverter = Inverter::new(usize::MAX);
+    for term in &terms {
+        inverter.add(1, term).unwrap();
+    }
+    let mut drained = Vec::new();
+    inverter
+        .drain_into_with(1, 1, |term, _, _| drained.push(term.to_vec()))
+        .unwrap();
+    terms.sort();
+    assert_eq!(drained, terms);
+}
+
 #[test]
 fn inverter_reports_full_at_its_bound_and_refuses_falling_documents() {
     let mut inverter = Inverter::new(200);
