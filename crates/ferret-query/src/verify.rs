@@ -1702,6 +1702,10 @@ const FEED_PER_THREAD: usize = 4;
 /// belong to a worker's run. A larger file travels alone.
 const RUN_TASKS: usize = 16;
 const RUN_BYTES: u64 = 64 << 10;
+/// An indexed producer pushes up to [`RUN_TASKS`] paths under one feed
+/// lock, but holds the first no longer than this: a sparse walk would
+/// otherwise keep idle workers waiting for a run to fill.
+const BATCH_WAIT: Duration = Duration::from_micros(100);
 
 /// Tasks produced on a separate thread. Indexed paths are taken in runs for
 /// checked-directory reuse; their pending tails remain accessible even while
@@ -1752,12 +1756,17 @@ impl<Task> Feed<Task> {
         }
     }
 
-    /// Runs `next` without holding a feed or run lock.
+    /// Runs `next` without holding a feed or run lock. An indexed producer
+    /// gathers a batch (see [`BATCH_WAIT`]) and pushes it under one lock:
+    /// pushing each path alone contended with every returning worker, and
+    /// `grep -l fn` over `~/w` on 16 workers fell from 114 to 83 ms. A
+    /// batch may carry the feed past its capacity by less than a run.
     fn produce(
         &self,
         next: &mut impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
         stopped: &dyn Fn() -> bool,
     ) {
+        let mut batch = Vec::new();
         loop {
             {
                 let mut state = lock(&self.state);
@@ -1770,23 +1779,42 @@ impl<Task> Feed<Task> {
                     return;
                 }
             }
-            if stopped() {
-                return;
+            let batch_len = if self.indexed { RUN_TASKS } else { 1 };
+            let mut ended = false;
+            let mut first = None;
+            while batch.len() < batch_len
+                && first.is_none_or(|first: Instant| first.elapsed() < BATCH_WAIT)
+            {
+                if stopped() {
+                    return;
+                }
+                match next(stopped) {
+                    Some(task) => {
+                        batch.push(task);
+                        first.get_or_insert_with(Instant::now);
+                    }
+                    None => {
+                        ended = true;
+                        break;
+                    }
+                }
             }
-            let Some(task) = next(stopped) else { return };
             let mut state = lock(&self.state);
             if state.closed {
                 return;
             }
-            state.tasks.push_back(task);
+            state.tasks.extend(batch.drain(..));
             let wake = if self.indexed {
-                state.sleeping > 0 && state.tasks.len().is_multiple_of(RUN_TASKS)
+                state.sleeping > 0
             } else {
                 state.sleeping >= state.tasks.len()
             };
             drop(state);
             if wake {
                 self.ready.notify_one();
+            }
+            if ended {
+                return;
             }
         }
     }
