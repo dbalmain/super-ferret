@@ -676,147 +676,153 @@ impl LiveWalk {
                 }
                 continue;
             }
-            let Some(level) = self.levels.last_mut() else {
+            if self.levels.is_empty() {
                 let path = self.paths.next()?;
                 let known = self.known.next().flatten();
-                let follow = self.options.follow != Follow::Physical;
-                self.entry = Entry::new(path, 0, FileKind::File);
-                self.entry.cwd = self.options.cwd.clone();
-                self.entry.cwd_handle = self.options.cwd_handle.clone();
-                self.entry.inherit_cwd = self.options.inherit_cwd;
-                self.entry.removed_children = self.removed_children.clone();
-                if self.options.retain_parent
-                    && (self.catalog.is_none() || self.options.live_checks)
-                {
-                    match parent_handle(&self.entry) {
-                        Ok(handle) => {
-                            self.entry.state.directory = Some(DirectoryHandle::uncharged(handle))
-                        }
-                        Err(error) => return Some(Err(self.entry.error(error))),
-                    }
-                }
-                if let Some(catalog) = &self.catalog {
-                    if self.options.delete {
-                        self.entry.state.id = None;
-                        self.entry.state.parent =
-                            std::path::absolute(self.entry.lookup_path().as_ref())
-                                .ok()
-                                .as_deref()
-                                .and_then(Path::parent)
-                                .and_then(|parent| resolve(catalog, parent, true).ok().flatten())
-                                .and_then(|(target, remainder)| match target {
-                                    Target::Inode(id) if !remainder => Some(id),
-                                    _ => None,
-                                });
-                    }
-                    let follow = follow || self.entry.path.ends_with(b"/");
-                    let resolved = match known.filter(|_| !follow).map_or_else(
-                        || resolve(catalog, self.entry.lookup_path().as_ref(), follow),
-                        |target| Ok(Some((target, false))),
-                    ) {
-                        Ok(Some(resolved)) => resolved,
-                        Ok(None) => {
-                            return Some(Err(self.entry.error(io::Error::other(OutsideCatalog))));
-                        }
-                        Err(error) => return Some(Err(self.entry.error(error))),
-                    };
-                    if !resolved.1
-                        && let Target::Inode(id) = resolved.0
-                    {
-                        self.entry.state.target = Some(resolved.0);
-                        self.entry.state.catalog = Some(catalog.clone());
-                        self.entry.state.kind = Some(catalog_kind(catalog.kind(id)));
-                        self.entry.state.follow = follow;
-                        // A physical resolution followed no final symlink.
-                        self.entry.state.followed_symlink = follow
-                            && resolve(catalog, self.entry.lookup_path().as_ref(), false)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|(target, _)| target != resolved.0);
-                        if let Err(error) = self.entry.follow_catalog() {
-                            return Some(Err(self.entry.error(error)));
-                        }
-                        if self.options.live_checks
-                            && let Err(error) = self.entry.metadata()
-                        {
-                            return Some(Err(self.entry.error(error)));
-                        }
-                        if self.options.xdev {
-                            self.root_dev = catalog.identity(id).0;
-                        }
-                        return Some(Ok(Loaded::Entry));
-                    }
-                }
-                if self.options.retain_parent && self.entry.state.directory.is_none() {
-                    match parent_handle(&self.entry) {
-                        Ok(handle) => {
-                            self.entry.state.directory = Some(DirectoryHandle::uncharged(handle))
-                        }
-                        Err(error) => return Some(Err(self.entry.error(error))),
-                    }
-                }
-                let follow = follow || self.entry.path.ends_with(b"/");
-                let stat = match self
-                    .entry
-                    .with_observed_at(|dir, path| metadata_at(dir, path, follow))
-                {
-                    Ok(stat) => stat,
-                    Err(error) => return Some(Err(self.entry.error(error))),
-                };
-                self.root_dev = stat.dev();
-                self.entry.state.kind = Some(stat.kind());
-                self.entry.state.follow = follow;
-                self.entry.state.metadata = OnceCell::from(Ok(stat));
-                return Some(Ok(Loaded::Entry));
-            };
-            let index = level.next;
-            level.next += 1;
-            let child = self.children[index];
-            let entry = &mut self.entry;
-            entry.path.truncate(level.path_len);
-            if level.separator {
-                entry.path.push(b'/');
+                return Some(self.load_operand(path, known));
             }
-            entry
-                .path
-                .extend_from_slice(&self.names[child.name.0..child.name.1]);
-            entry.state.follow = self.options.follow == Follow::All;
-            entry.state.followed_symlink = false;
-            entry.state.directory = level.handle.clone();
-            entry.state.listed = level.identity;
-            entry.state.hidden = level.hidden.clone();
-            entry.state.depth = level.own.depth + 1;
-            entry.state.kind = child.kind;
-            entry.check_directory = false;
-            entry.state.metadata = OnceCell::new();
-            entry.state.target = child.target;
-            entry.state.parent = child.parent;
-            entry.state.id = child.id;
-            // Deletion accounting is walk-wide and stays in the reusable entry;
-            // re-cloning its shared counter here contends across workers.
-            if child.target.is_some() {
-                if entry.state.catalog.is_none() {
-                    entry.state.catalog = self.catalog.clone();
-                }
-            } else {
-                entry.state.catalog = None;
-            }
-            if let Err(error) = entry.follow_catalog() {
-                return Some(Err(entry.error(error)));
-            }
-            if child.kind == Some(FileKind::Directory)
-                && (child.target.is_none() || self.options.live_checks)
-                && !self.options.lazy_directories
-            {
-                match level.first.take() {
-                    Some(stat) if index == level.start => {
-                        entry.state.metadata = OnceCell::from(stat)
-                    }
-                    _ => entry.check_directory = true,
-                }
-            }
-            return Some(Ok(Loaded::Entry));
+            return Some(self.load_child());
         }
+    }
+
+    /// Loads start operand `path` into the lent entry: through the catalog
+    /// when it resolves there, else by a live stat. `known` is the catalog
+    /// target the caller already resolved, if any.
+    fn load_operand(&mut self, path: PathBuf, known: Option<Target>) -> Result<Loaded, WalkError> {
+        let follow = self.options.follow != Follow::Physical;
+        self.entry = Entry::new(path, 0, FileKind::File);
+        self.entry.cwd = self.options.cwd.clone();
+        self.entry.cwd_handle = self.options.cwd_handle.clone();
+        self.entry.inherit_cwd = self.options.inherit_cwd;
+        self.entry.removed_children = self.removed_children.clone();
+        if self.options.retain_parent && (self.catalog.is_none() || self.options.live_checks) {
+            match parent_handle(&self.entry) {
+                Ok(handle) => self.entry.state.directory = Some(DirectoryHandle::uncharged(handle)),
+                Err(error) => return Err(self.entry.error(error)),
+            }
+        }
+        if let Some(catalog) = &self.catalog {
+            if self.options.delete {
+                self.entry.state.id = None;
+                self.entry.state.parent = std::path::absolute(self.entry.lookup_path().as_ref())
+                    .ok()
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .and_then(|parent| resolve(catalog, parent, true).ok().flatten())
+                    .and_then(|(target, remainder)| match target {
+                        Target::Inode(id) if !remainder => Some(id),
+                        _ => None,
+                    });
+            }
+            let follow = follow || self.entry.path.ends_with(b"/");
+            let resolved = match known.filter(|_| !follow).map_or_else(
+                || resolve(catalog, self.entry.lookup_path().as_ref(), follow),
+                |target| Ok(Some((target, false))),
+            ) {
+                Ok(Some(resolved)) => resolved,
+                Ok(None) => {
+                    return Err(self.entry.error(io::Error::other(OutsideCatalog)));
+                }
+                Err(error) => return Err(self.entry.error(error)),
+            };
+            if !resolved.1
+                && let Target::Inode(id) = resolved.0
+            {
+                self.entry.state.target = Some(resolved.0);
+                self.entry.state.catalog = Some(catalog.clone());
+                self.entry.state.kind = Some(catalog_kind(catalog.kind(id)));
+                self.entry.state.follow = follow;
+                // A physical resolution followed no final symlink.
+                self.entry.state.followed_symlink = follow
+                    && resolve(catalog, self.entry.lookup_path().as_ref(), false)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|(target, _)| target != resolved.0);
+                if let Err(error) = self.entry.follow_catalog() {
+                    return Err(self.entry.error(error));
+                }
+                if self.options.live_checks
+                    && let Err(error) = self.entry.metadata()
+                {
+                    return Err(self.entry.error(error));
+                }
+                if self.options.xdev {
+                    self.root_dev = catalog.identity(id).0;
+                }
+                return Ok(Loaded::Entry);
+            }
+        }
+        if self.options.retain_parent && self.entry.state.directory.is_none() {
+            match parent_handle(&self.entry) {
+                Ok(handle) => self.entry.state.directory = Some(DirectoryHandle::uncharged(handle)),
+                Err(error) => return Err(self.entry.error(error)),
+            }
+        }
+        let follow = follow || self.entry.path.ends_with(b"/");
+        let stat = match self
+            .entry
+            .with_observed_at(|dir, path| metadata_at(dir, path, follow))
+        {
+            Ok(stat) => stat,
+            Err(error) => return Err(self.entry.error(error)),
+        };
+        self.root_dev = stat.dev();
+        self.entry.state.kind = Some(stat.kind());
+        self.entry.state.follow = follow;
+        self.entry.state.metadata = OnceCell::from(Ok(stat));
+        Ok(Loaded::Entry)
+    }
+
+    /// Loads the innermost level's next child into the lent entry.
+    fn load_child(&mut self) -> Result<Loaded, WalkError> {
+        let Some(level) = self.levels.last_mut() else {
+            unreachable!("load_child with no open level")
+        };
+        let index = level.next;
+        level.next += 1;
+        let child = self.children[index];
+        let entry = &mut self.entry;
+        entry.path.truncate(level.path_len);
+        if level.separator {
+            entry.path.push(b'/');
+        }
+        entry
+            .path
+            .extend_from_slice(&self.names[child.name.0..child.name.1]);
+        entry.state.follow = self.options.follow == Follow::All;
+        entry.state.followed_symlink = false;
+        entry.state.directory = level.handle.clone();
+        entry.state.listed = level.identity;
+        entry.state.hidden = level.hidden.clone();
+        entry.state.depth = level.own.depth + 1;
+        entry.state.kind = child.kind;
+        entry.check_directory = false;
+        entry.state.metadata = OnceCell::new();
+        entry.state.target = child.target;
+        entry.state.parent = child.parent;
+        entry.state.id = child.id;
+        // Deletion accounting is walk-wide and stays in the reusable entry;
+        // re-cloning its shared counter here contends across workers.
+        if child.target.is_some() {
+            if entry.state.catalog.is_none() {
+                entry.state.catalog = self.catalog.clone();
+            }
+        } else {
+            entry.state.catalog = None;
+        }
+        if let Err(error) = entry.follow_catalog() {
+            return Err(entry.error(error));
+        }
+        if child.kind == Some(FileKind::Directory)
+            && (child.target.is_none() || self.options.live_checks)
+            && !self.options.lazy_directories
+        {
+            match level.first.take() {
+                Some(stat) if index == level.start => entry.state.metadata = OnceCell::from(stat),
+                _ => entry.check_directory = true,
+            }
+        }
+        Ok(Loaded::Entry)
     }
 
     /// Applies visit-time checks to the lent entry. `Ok(true)` yields it;
