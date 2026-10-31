@@ -3,7 +3,7 @@
 
 use super::super::holders::Holders;
 use super::super::visibility::{Visibility, Visit};
-use super::job::Job;
+use super::job::{Job, JobPath};
 use super::*;
 use std::sync::Mutex;
 
@@ -118,7 +118,7 @@ impl Filter<'_> {
                 {
                     return Some((
                         catalog.size(inode),
-                        Job::Unindexed(entry.path().to_owned(), name),
+                        Job::Unindexed(JobPath::new(entry.path()), name),
                     ));
                 }
                 return None;
@@ -128,20 +128,20 @@ impl Filter<'_> {
                 .is_some_and(|candidates| !candidates.contains(doc.0, stopped))
             {
                 if self.emit_absent {
-                    return Some((0, Job::Absent(entry.path().to_owned())));
+                    return Some((0, Job::Absent(JobPath::new(entry.path()))));
                 }
                 return None;
             }
             return Some((
                 catalog.size(inode),
-                Job::Checked(entry.path().to_owned(), name, doc.0),
+                Job::Checked(JobPath::new(entry.path()), name, doc.0),
             ));
         }
         if self.traversal.follow {
             return Some((
                 0,
                 Job::Listed(
-                    entry.path().to_owned(),
+                    JobPath::new(entry.path()),
                     self.cwd.join(entry.path()),
                     engine::reader::Parent::Followed,
                     true,
@@ -168,7 +168,7 @@ impl Filter<'_> {
         Some((
             0,
             Job::Listed(
-                entry.path().to_owned(),
+                JobPath::new(entry.path()),
                 self.cwd.join(entry.path()),
                 parent,
                 uncovered,

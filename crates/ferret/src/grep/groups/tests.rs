@@ -1,5 +1,5 @@
 mod capture;
-use super::job::{Cache, Cached, Job, Worker, observe};
+use super::job::{Cache, Cached, Job, JobPath, Worker, observe};
 use super::render::{Cancellable, OutputCapture, Record, write_parts};
 use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
@@ -7,6 +7,30 @@ use std::cell::Cell;
 use std::io::IoSlice;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+
+impl From<&str> for JobPath {
+    fn from(path: &str) -> Self {
+        Self::new(Path::new(path))
+    }
+}
+impl From<String> for JobPath {
+    fn from(path: String) -> Self {
+        Self::new(Path::new(&path))
+    }
+}
+
+/// A job's path reads back as given, inline or not, at either side of the
+/// inline capacity.
+#[test]
+fn a_job_path_reads_back_as_given() {
+    use std::os::unix::ffi::OsStringExt;
+    for len in [0, 1, 117, 118, 119, 255, 256, 4000] {
+        let path = PathBuf::from(OsString::from_vec(
+            (0..len).map(|i| b'a' + (i % 26) as u8).collect(),
+        ));
+        assert_eq!(JobPath::new(&path).as_path(), path, "{len}");
+    }
+}
 
 fn host<W: Write>(plan: &Plan, writer: W) -> Host<'_, W> {
     Host {
@@ -1344,7 +1368,7 @@ fn cached_records_stream_when_an_escaped_alias_amplifies_output() {
     let mut output = Vec::new();
     let second = worker
         .prepare(
-            &Job::Checked(path, NameId(1), 0),
+            &Job::Checked(JobPath::new(&path), NameId(1), 0),
             true,
             &cache,
             true,

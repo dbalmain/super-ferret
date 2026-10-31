@@ -6,6 +6,8 @@ use super::render::{Capture, Cursor, OutputCapture, Record, Render, record_size}
 use super::*;
 use ferret_query::ReadVersion;
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 
 pub(in super::super) struct Group {
@@ -131,6 +133,47 @@ pub(in super::super) fn observe_streaming(
     })
 }
 
+/// A job's display path, kept inline when it is short. The producer makes
+/// one for every file it lists, and most are never read: a heap path each,
+/// allocated there and freed on another thread, was a seventh of its time.
+pub(in super::super) enum JobPath {
+    Inline(u8, [u8; INLINE_PATH]),
+    Heap(PathBuf),
+}
+
+/// Holds most paths below a search root; 99% of ~/w's are 126 bytes or less.
+const INLINE_PATH: usize = 118;
+
+impl JobPath {
+    pub(super) fn new(path: &Path) -> Self {
+        let bytes = path.as_os_str().as_bytes();
+        let Ok(len) = u8::try_from(bytes.len()).map_err(drop).and_then(|len| {
+            match usize::from(len) <= INLINE_PATH {
+                true => Ok(len),
+                false => Err(()),
+            }
+        }) else {
+            return Self::Heap(path.to_owned());
+        };
+        let mut inline = [0; INLINE_PATH];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        Self::Inline(len, inline)
+    }
+
+    pub(super) fn as_path(&self) -> &Path {
+        match self {
+            Self::Inline(len, bytes) => Path::new(OsStr::from_bytes(&bytes[..usize::from(*len)])),
+            Self::Heap(path) => path,
+        }
+    }
+}
+
+impl From<PathBuf> for JobPath {
+    fn from(path: PathBuf) -> Self {
+        Self::Heap(path)
+    }
+}
+
 pub(in super::super) enum Job {
     /// An explicit file: display spelling and absolute lookup path.
     Direct(PathBuf, PathBuf),
@@ -138,24 +181,23 @@ pub(in super::super) enum Job {
     /// beneath, never through a symlink; then whether to probe binary as rg
     /// does, and whether to read it once without the changed-during-read
     /// check, as an uncovered scan does (D123).
-    Listed(PathBuf, PathBuf, engine::reader::Parent, bool, bool),
-    Checked(PathBuf, NameId, u32),
+    Listed(JobPath, PathBuf, engine::reader::Parent, bool, bool),
+    Checked(JobPath, NameId, u32),
     /// A catalogued file omitted from content indexing: oversized, or binary
     /// under -a. Read through the checked catalog walk, uncached.
-    Unindexed(PathBuf, NameId),
+    Unindexed(JobPath, NameId),
     Failed(PathBuf, String),
     // Catalog posting absence only: explicit/live inputs always read bytes.
-    Absent(PathBuf),
+    Absent(JobPath),
 }
 impl Job {
     pub(super) fn path(&self) -> &Path {
         match self {
-            Self::Direct(p, _)
-            | Self::Listed(p, _, _, _, _)
+            Self::Direct(p, _) | Self::Failed(p, _) => p,
+            Self::Listed(p, _, _, _, _)
             | Self::Checked(p, _, _)
             | Self::Unindexed(p, _)
-            | Self::Failed(p, _)
-            | Self::Absent(p) => p,
+            | Self::Absent(p) => p.as_path(),
         }
     }
 
@@ -164,7 +206,7 @@ impl Job {
     /// would otherwise keep its directory's descriptor open.
     pub(super) fn finished(self) -> Self {
         match self {
-            Self::Listed(path, actual, _, _, _) => Self::Direct(path, actual),
+            Self::Listed(path, actual, _, _, _) => Self::Direct(path.as_path().to_owned(), actual),
             job => job,
         }
     }

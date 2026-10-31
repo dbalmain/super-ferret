@@ -17,6 +17,9 @@ pub(super) enum Message {
     Finish(InputResult, Option<String>, Option<capture::Held>),
 }
 
+// Complete is the variant almost every file takes, so boxing it, as the lint
+// suggests, would put back an allocation per file.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Handoff {
     Complete(Job, Observed),
     Stream(PathBuf, Receiver<Message>),
