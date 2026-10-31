@@ -359,6 +359,7 @@ fn a_writer_panic_names_its_message_in_the_stopped_cause() {
 #[test]
 fn a_burst_of_wakeups_queues_one_and_leaves_room_for_commands() {
     let (queue, receive) = super::Queue::new(2);
+    let now = Some(Duration::ZERO);
     for _ in 0..100 {
         queue.wake();
     }
@@ -367,16 +368,48 @@ fn a_burst_of_wakeups_queues_one_and_leaves_room_for_commands() {
         .send
         .try_send(Message::Intake)
         .unwrap_or_else(|_| panic!("the burst filled the queue"));
-    let first = receive
-        .try_recv()
-        .map_err(|_| mpsc::RecvTimeoutError::Timeout);
-    assert!(matches!(first, Ok(Message::Intake)));
-    queue.received(&first);
-    assert!(matches!(receive.try_recv(), Ok(Message::Intake)));
-    assert!(receive.try_recv().is_err());
+    assert!(matches!(queue.receive(&receive, now), Ok(Message::Intake)));
+    assert!(matches!(queue.receive(&receive, now), Ok(Message::Intake)));
+    assert!(queue.receive(&receive, now).is_err());
     // Taken, a wakeup queues again.
     queue.wake();
     queue.wake();
-    assert!(matches!(receive.try_recv(), Ok(Message::Intake)));
-    assert!(receive.try_recv().is_err());
+    assert!(matches!(queue.receive(&receive, now), Ok(Message::Intake)));
+    assert!(queue.receive(&receive, now).is_err());
+}
+
+// A wakeup that finds the queue full of commands is not lost: once the
+// writer has taken them, it receives the wakeup instead of blocking. A
+// draining writer blocks with no deadline, so a lost stop wakeup hung
+// teardown (Astra, 2026-10-31).
+#[test]
+fn a_wakeup_that_finds_the_queue_full_arrives_after_it() {
+    let (queue, receive) = super::Queue::new(1);
+    let now = Some(Duration::ZERO);
+    let (reply, _replies) = mpsc::sync_channel(1);
+    let filler = Command {
+        request: Request {
+            id: "status".into(),
+            op: Op::Status,
+            grep: None,
+            args: Vec::new(),
+            cwd: None,
+            limit: None,
+            capabilities: vec![],
+            child_stdin: None,
+            start_unix_ns: None,
+        },
+        reply,
+    };
+    assert!(queue.command(filler).is_ok());
+    queue.wake();
+    assert!(matches!(
+        queue.receive(&receive, now),
+        Ok(Message::Command(_))
+    ));
+    assert!(matches!(queue.receive(&receive, now), Ok(Message::Intake)));
+    assert!(queue.receive(&receive, now).is_err());
+    // A later wakeup queues as usual.
+    queue.wake();
+    assert!(matches!(queue.receive(&receive, now), Ok(Message::Intake)));
 }

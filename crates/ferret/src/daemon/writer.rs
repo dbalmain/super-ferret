@@ -65,7 +65,9 @@ pub(super) enum Message {
 /// filled the queue and turned the next command away as `WriterUnavailable`.
 pub(super) struct Queue {
     send: mpsc::SyncSender<Message>,
-    /// Whether an `Intake` is queued and not yet received.
+    /// Whether a wakeup is pending: an `Intake` queued and not yet received,
+    /// or one that found the queue full and is delivered by
+    /// [`Queue::receive`] once the queue empties.
     woken: AtomicBool,
 }
 
@@ -79,11 +81,12 @@ impl Queue {
         (queue, receive)
     }
 
-    /// Wakes the writer, unless a wakeup is already queued.
+    /// Wakes the writer, unless a wakeup is already pending. A full queue
+    /// leaves it pending: the writer has messages to take first, and asks
+    /// for the wakeup before it next blocks.
     pub fn wake(&self) {
-        if !self.woken.swap(true, Ordering::AcqRel) && self.send.try_send(Message::Intake).is_err()
-        {
-            self.woken.store(false, Ordering::Release);
+        if !self.woken.swap(true, Ordering::AcqRel) {
+            let _ = self.send.try_send(Message::Intake);
         }
     }
 
@@ -95,12 +98,34 @@ impl Queue {
             .map_err(|_| ())
     }
 
-    /// Marks a queued wakeup taken: an event after this wakes the writer
+    /// The writer's next message, waiting at most `timeout`, or for ever
+    /// when it is `None`. A pending wakeup that found the queue full is
+    /// delivered as an `Intake` once the queue is empty, before blocking.
+    /// Taking a wakeup clears it, so an event after this wakes the writer
     /// again.
-    fn received(&self, message: &Result<Message, mpsc::RecvTimeoutError>) {
+    fn receive(
+        &self,
+        receive: &mpsc::Receiver<Message>,
+        timeout: Option<Duration>,
+    ) -> Result<Message, mpsc::RecvTimeoutError> {
+        let message = match receive.try_recv() {
+            Ok(message) => Ok(message),
+            Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
+            Err(mpsc::TryRecvError::Empty) if self.woken.swap(false, Ordering::AcqRel) => {
+                return Ok(Message::Intake);
+            }
+            Err(mpsc::TryRecvError::Empty) => match timeout {
+                Some(timeout) => receive.recv_timeout(timeout),
+                None => receive
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            },
+        };
         if let Ok(Message::Intake) = message {
-            self.woken.store(false, Ordering::Release);
+            // Acquires a coalesced waker's event as the swap above does.
+            self.woken.swap(false, Ordering::AcqRel);
         }
+        message
     }
 }
 #[derive(Default)]
@@ -406,14 +431,10 @@ fn serve(
         // Drain forbids background work, so its deadlines never advance and
         // an expired one would spin until stop. Only a command or the stop
         // intake can change anything.
-        let message = if draining {
-            receive
-                .recv()
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-        } else {
-            receive.recv_timeout(deadline.saturating_duration_since(now))
-        };
-        host.writer_send.received(&message);
+        let message = host.writer_send.receive(
+            &receive,
+            (!draining).then(|| deadline.saturating_duration_since(now)),
+        );
         match message {
             Ok(Message::Command(command)) => {
                 let mut command_options = options.clone();
