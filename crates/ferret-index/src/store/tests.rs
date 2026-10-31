@@ -1734,6 +1734,95 @@ fn several_readers_follow_exactly_as_one_does() {
     }
 }
 
+/// A pass that may write many segments writes each full buffer's files on
+/// a second thread while it reads on. It must write the files that one pass
+/// per segment writes, on one reader or several.
+#[test]
+fn a_pass_of_many_segments_writes_what_a_pass_per_segment_does() {
+    let corpus = Corpus::new(1231, 80);
+    let mut catalog = Catalog::new(80, &[3, 40, 41, 79]);
+    catalog.unreadable = [0, 7, 50].into();
+    let one = Budget {
+        buffer: 0,
+        ..Budget::unbounded()
+    };
+    let many = Budget {
+        segments: usize::MAX,
+        ..one
+    };
+    for readers in [1, 4] {
+        let name = |budget: &str| format!("many-segments-{budget}-{readers}");
+        let (one_passes, one_files) =
+            follow_with_readers(&name("one"), readers, &catalog, &corpus, &one);
+        let (passes, files) = follow_with_readers(&name("many"), readers, &catalog, &corpus, &many);
+        assert!(one_passes.len() > 10, "a segment per pass");
+        assert_eq!(passes.len(), 1, "one pass");
+        assert_eq!(files, one_files, "{readers} readers");
+    }
+}
+
+/// Each segment a many-segment pass completes is published as it lands, so
+/// a pass that fails later keeps them, publishes no document past them, and
+/// leaves no unnamed file.
+#[test]
+fn a_failed_pass_of_many_segments_keeps_what_it_published() {
+    let dir = Dir::new("many-segments-failed");
+    let corpus = Corpus::new(1237, 80);
+    let mut catalog = Catalog::new(80, &[]);
+    catalog.unreadable = (0..80).filter(|d| d % 9 == 4).collect();
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let transfers = AtomicU64::new(0);
+    let pace = |_| {
+        if transfers.fetch_add(1, Ordering::Relaxed) == 40 {
+            Err(io::Error::other("injected late write failure"))
+        } else {
+            Ok(())
+        }
+    };
+    let budget = Budget {
+        buffer: 0,
+        segments: usize::MAX,
+        pace: &pace,
+        ..Budget::unbounded()
+    };
+    let read = |doc: u32, bytes: &mut Vec<u8>| {
+        if catalog.unreadable.contains(&doc) {
+            return Err(Fault::Unreadable);
+        }
+        bytes.extend_from_slice(&corpus.text(doc));
+        Ok(())
+    };
+    assert!(
+        writer
+            .follow(&catalog.view(), &budget, &mut { read })
+            .is_err()
+    );
+    let view = writer.view();
+    let frontier = view.manifest().frontier;
+    assert!(
+        view.manifest().segments.len() > 1 && frontier < 80,
+        "published some segments, not all"
+    );
+    assert!(
+        view.manifest().segments.iter().all(|s| s.last < frontier),
+        "no segment past the frontier"
+    );
+    assert!(
+        view.manifest().unreadable.iter().all(|&d| d < frontier),
+        "no unreadable document past the frontier"
+    );
+    assert_eq!(dir.files(), named(&view));
+    // A failed write poisons the writer; a reopened one resumes from the
+    // published frontier.
+    drop(writer);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    assert_eq!(writer.view().manifest().frontier, frontier);
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    assert_eq!(answers(&writer.view(), &catalog), catalog.truth(&corpus));
+    let unreadable: Vec<u32> = catalog.unreadable.iter().copied().collect();
+    assert_eq!(writer.view().manifest().unreadable, unreadable);
+}
+
 #[test]
 fn a_pass_that_is_always_out_of_time_still_advances() {
     // The daemon's pause includes a deadline a slow document can outlast.

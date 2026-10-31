@@ -685,7 +685,11 @@ fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
     let documents = ferret_crawl::Documents::new(catalog)
         .map_err(|e| e.to_string())?
         .holding_directories();
-    let budget = Budget::unbounded();
+    // Each full buffer's files are written while the next is read.
+    let budget = Budget {
+        segments: usize::MAX,
+        ..Budget::unbounded()
+    };
     while crate::engine::follow_reading(
         &mut writer,
         &view,

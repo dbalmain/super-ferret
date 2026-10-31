@@ -86,6 +86,7 @@ pub(super) fn turn(
     let budget = ferret_index::Budget {
         bytes: 256 << 10,
         buffer: 1 << 20,
+        segments: 1,
         pace: &pace,
         cancelled: &cancelled,
     };
@@ -189,6 +190,7 @@ fn merge(
     let budget = ferret_index::Budget {
         bytes: u64::MAX,
         buffer: 1 << 20,
+        segments: 1,
         pace: &pace,
         cancelled: &interrupted,
     };
@@ -264,6 +266,7 @@ pub(super) fn follow_explicit(host: &Host, engine: &Engine) -> Result<(), String
         let budget = ferret_index::Budget {
             bytes: u64::MAX,
             buffer: ferret_index::BUFFER,
+            segments: 1,
             pace: &pace,
             cancelled: &cancelled,
         };
