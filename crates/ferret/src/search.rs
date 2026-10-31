@@ -294,7 +294,12 @@ fn search(
     let session = engine.pin();
     let catalog = session.catalog();
     outcome.size = Some((catalog.name_count(), catalog.inode_count()));
-    let (result, failed) = print_rows(&session, query, &options, started, outcome);
+    // Held until the run is reported: dropping it retries any bytes a
+    // failed write left buffered, which must follow the diagnostic.
+    let stdout = io::stdout();
+    let tty = stdout.is_terminal();
+    let mut out = BufWriter::with_capacity(64 << 10, stdout.lock());
+    let (result, failed) = print_rows(&mut out, tty, &session, query, &options, started, outcome);
     outcome.bytes_read = catalog.bytes_read();
     match result {
         Ok(stats) => outcome.stats = Some(stats),
@@ -346,9 +351,12 @@ fn open_engine(context: &Context, query: &Query, outcome: &mut Outcome) -> Resul
     Ok(engine)
 }
 
-/// Runs `query` over `session`, writing each row to stdout, and returns the
-/// run's result and the first write error, which stops it.
+/// Runs `query` over `session`, writing each row to `out`, flushed per row
+/// when it is a `tty`, and returns the run's result and the first write
+/// error, which stops it.
 fn print_rows(
+    out: &mut impl Write,
+    tty: bool,
     session: &QuerySession,
     query: &Query,
     options: &Options,
@@ -356,9 +364,6 @@ fn print_rows(
     outcome: &mut Outcome,
 ) -> (Result<Stats, RunError>, Option<io::Error>) {
     let catalog = session.catalog();
-    let stdout = io::stdout();
-    let tty = stdout.is_terminal();
-    let mut out = BufWriter::with_capacity(64 << 10, stdout.lock());
     let mut line = Vec::new();
     let mut failed: Option<io::Error> = None;
     let result = session.search_content(
