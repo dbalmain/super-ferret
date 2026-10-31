@@ -18,7 +18,7 @@ use ferret_query::{
 };
 
 use crate::cli::{Context, Exit, error};
-use crate::engine::Engine;
+use crate::engine::{Engine, QuerySession};
 use crate::json::Object;
 use crate::protocol::Value;
 
@@ -287,38 +287,75 @@ fn search(
     started: Instant,
     outcome: &mut Outcome,
 ) -> Exit {
-    let Options {
-        json,
-        limit,
-        scan_uncovered,
-    } = options;
+    let engine = match open_engine(context, query, outcome) {
+        Ok(engine) => engine,
+        Err(exit) => return exit,
+    };
+    let session = engine.pin();
+    let catalog = session.catalog();
+    outcome.size = Some((catalog.name_count(), catalog.inode_count()));
+    let (result, failed) = print_rows(&session, query, &options, started, outcome);
+    outcome.bytes_read = catalog.bytes_read();
+    match result {
+        Ok(stats) => outcome.stats = Some(stats),
+        Err(e) => return run_failed(context, &session, query, e, outcome),
+    }
+    match failed {
+        // The reader went away; what it read was delivered.
+        Some(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+        Some(e) => return fail(outcome, "write", &format!("writing results: {e}")),
+        None => {}
+    }
+    if outcome.rows > 0 {
+        Exit::Ok
+    } else {
+        Exit::NoMatch
+    }
+}
+
+/// Reports `message` and records `kind` as the run's error.
+fn fail(outcome: &mut Outcome, kind: &'static str, message: &str) -> Exit {
+    error(message);
+    outcome.error = Some(kind);
+    Exit::Error
+}
+
+/// The engine over `context`'s index, with its content index open when
+/// `query` reads content.
+fn open_engine(context: &Context, query: &Query, outcome: &mut Outcome) -> Result<Engine, Exit> {
     let engine = match Engine::open(&context.index) {
         Ok(Some(engine)) => engine,
         Ok(None) => {
-            error(&format!(
+            let message = format!(
                 "no index in {}: run `ferret index DIR` first",
                 context.index.display()
-            ));
-            outcome.error = Some("no index");
-            return Exit::Error;
+            );
+            return Err(fail(outcome, "no index", &message));
         }
         Err(e) => {
-            error(&crate::index::open_failed(context, &e));
-            outcome.error = Some("open");
-            return Exit::Error;
+            let message = crate::index::open_failed(context, &e);
+            return Err(fail(outcome, "open", &message));
         }
     };
     if query.has_content()
         && let Err(e) = engine.open_content(&context.index)
     {
-        error(&format!("{}: content index: {e}", context.index.display()));
-        outcome.error = Some("content index");
-        return Exit::Error;
+        let message = format!("{}: content index: {e}", context.index.display());
+        return Err(fail(outcome, "content index", &message));
     }
-    let session = engine.pin();
-    let catalog = session.catalog();
-    outcome.size = Some((catalog.name_count(), catalog.inode_count()));
+    Ok(engine)
+}
 
+/// Runs `query` over `session`, writing each row to stdout, and returns the
+/// run's result and the first write error, which stops it.
+fn print_rows(
+    session: &QuerySession,
+    query: &Query,
+    options: &Options,
+    started: Instant,
+    outcome: &mut Outcome,
+) -> (Result<Stats, RunError>, Option<io::Error>) {
+    let catalog = session.catalog();
     let stdout = io::stdout();
     let tty = stdout.is_terminal();
     let mut out = BufWriter::with_capacity(64 << 10, stdout.lock());
@@ -326,11 +363,11 @@ fn search(
     let mut failed: Option<io::Error> = None;
     let result = session.search_content(
         query,
-        (!scan_uncovered).then_some(UNCOVERED_BOUND),
+        (!options.scan_uncovered).then_some(UNCOVERED_BOUND),
         None,
         |row| {
             line.clear();
-            if json {
+            if options.json {
                 json_row(&mut line, catalog, row);
             } else {
                 line.extend_from_slice(row.path);
@@ -346,7 +383,7 @@ fn search(
                 failed = Some(e);
                 return ControlFlow::Break(());
             }
-            match limit {
+            match options.limit {
                 Some(limit) if outcome.rows >= limit => ControlFlow::Break(()),
                 _ => ControlFlow::Continue(()),
             }
@@ -355,40 +392,32 @@ fn search(
     if failed.is_none() {
         failed = out.flush().err();
     }
-    outcome.bytes_read = catalog.bytes_read();
-    match result {
-        Ok(stats) => outcome.stats = Some(stats),
-        Err(scan_error @ RunError::ScanRequired { .. }) => {
+    (result, failed)
+}
+
+/// Reports a run that `query` could not finish.
+fn run_failed(
+    context: &Context,
+    session: &QuerySession,
+    query: &Query,
+    e: RunError,
+    outcome: &mut Outcome,
+) -> Exit {
+    match e {
+        scan_error @ RunError::ScanRequired { .. } => {
             outcome.refused = session.explain_content(query).ok();
-            error(&scan_error.to_string());
-            outcome.error = Some("scan required");
-            return Exit::Error;
+            fail(outcome, "scan required", &scan_error.to_string())
         }
-        Err(RunError::IndexIncomplete { uncovered, live }) => {
-            error(&incomplete_message(uncovered, live));
-            outcome.error = Some("index incomplete");
-            return Exit::Error;
-        }
-        Err(e) => {
-            error(&format!("{}: {e}", context.index.display()));
-            outcome.error = Some("read");
-            return Exit::Error;
-        }
-    }
-    match failed {
-        // The reader went away; what it read was delivered.
-        Some(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-        Some(e) => {
-            error(&format!("writing results: {e}"));
-            outcome.error = Some("write");
-            return Exit::Error;
-        }
-        None => {}
-    }
-    if outcome.rows > 0 {
-        Exit::Ok
-    } else {
-        Exit::NoMatch
+        RunError::IndexIncomplete { uncovered, live } => fail(
+            outcome,
+            "index incomplete",
+            &incomplete_message(uncovered, live),
+        ),
+        e => fail(
+            outcome,
+            "read",
+            &format!("{}: {e}", context.index.display()),
+        ),
     }
 }
 
