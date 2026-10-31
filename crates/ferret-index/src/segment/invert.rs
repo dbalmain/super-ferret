@@ -4,6 +4,8 @@
 //! is no sort of postings, only of terms, once, when the segment is written.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher, RandomState};
+use std::sync::LazyLock;
 
 use super::{WriteError, Writer};
 
@@ -15,7 +17,7 @@ const PER_TERM: usize = 64;
 /// the bound the caller set.
 #[derive(Debug)]
 pub struct Inverter {
-    terms: HashMap<Key, Docs>,
+    terms: HashMap<Key, Docs, BuildHasherDefault<Passed>>,
     memory: usize,
     bound: usize,
     last: Option<u32>,
@@ -27,7 +29,7 @@ impl Inverter {
     /// estimated memory reaches `bound` bytes.
     pub fn new(bound: usize) -> Self {
         Self {
-            terms: HashMap::new(),
+            terms: HashMap::default(),
             memory: 0,
             bound,
             last: None,
@@ -38,12 +40,25 @@ impl Inverter {
     /// Records that `doc` holds `term`. `doc` must not be below any document
     /// added before; repeats of a `(doc, term)` pair are free.
     pub fn add(&mut self, doc: u32, term: &[u8]) -> Result<(), WriteError> {
+        self.add_hashed(doc, term_hash(term), term)
+    }
+
+    /// [`Inverter::add`] with `term`'s [`term_hash`], computed by the caller,
+    /// so that a reader thread can take the hashing off the writer's.
+    pub(crate) fn add_hashed(
+        &mut self,
+        doc: u32,
+        hash: u64,
+        term: &[u8],
+    ) -> Result<(), WriteError> {
+        debug_assert_eq!(hash, term_hash(term));
         if self.last.is_some_and(|last| doc < last) {
             return Err(WriteError::DocOrder);
         }
         self.last = Some(doc);
-        let Some(docs) = self.terms.get_mut(term) else {
-            let key = Key::new(term);
+        let probe: &dyn Lookup = &(hash, term);
+        let Some(docs) = self.terms.get_mut(probe) else {
+            let key = Key::new(hash, term);
             self.memory += term.len() + PER_TERM;
             self.payload_capacity += key.heap_bytes();
             self.terms.insert(key, Docs::One(doc));
@@ -194,10 +209,25 @@ impl Docs {
     }
 }
 
-/// A term's bytes as a table key. Most terms are short, so they live in the
-/// slot itself and only a long term allocates.
+/// The hash an [`Inverter`]'s table files `term` under. The seed is random
+/// per process, as std's maps' are, and shared by every thread.
+pub(crate) fn term_hash(term: &[u8]) -> u64 {
+    static SEED: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+    SEED.hash_one(term)
+}
+
+/// A term as a table key: its bytes and its [`term_hash`], which the table
+/// uses as given rather than hashing the bytes again.
 #[derive(Debug)]
-enum Key {
+struct Key {
+    hash: u64,
+    bytes: Bytes,
+}
+
+/// Most terms are short, so they live in the slot itself and only a long
+/// term allocates.
+#[derive(Debug)]
+enum Bytes {
     Inline(u8, [u8; INLINE]),
     Heap(Box<[u8]>),
 }
@@ -207,50 +237,110 @@ enum Key {
 const INLINE: usize = 22;
 
 impl Key {
-    fn new(term: &[u8]) -> Self {
-        match u8::try_from(term.len()) {
+    fn new(hash: u64, term: &[u8]) -> Self {
+        let bytes = match u8::try_from(term.len()) {
             Ok(len) if usize::from(len) <= INLINE => {
                 let mut bytes = [0; INLINE];
                 bytes[..term.len()].copy_from_slice(term);
-                Self::Inline(len, bytes)
+                Bytes::Inline(len, bytes)
             }
-            _ => Self::Heap(term.into()),
-        }
+            _ => Bytes::Heap(term.into()),
+        };
+        Self { hash, bytes }
     }
 
     fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Inline(len, bytes) => &bytes[..usize::from(*len)],
-            Self::Heap(bytes) => bytes,
+        match &self.bytes {
+            Bytes::Inline(len, bytes) => &bytes[..usize::from(*len)],
+            Bytes::Heap(bytes) => bytes,
         }
     }
 
     /// Bytes allocated off the table for this key.
     fn heap_bytes(&self) -> usize {
-        match self {
-            Self::Inline(..) => 0,
-            Self::Heap(bytes) => bytes.len(),
+        match &self.bytes {
+            Bytes::Inline(..) => 0,
+            Bytes::Heap(bytes) => bytes.len(),
         }
     }
 }
 
-// `Borrow<[u8]>` requires the key to hash and compare as its bytes do.
-impl std::hash::Hash for Key {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_slice().hash(state);
+/// What the table compares: a stored [`Key`], or a `(hash, term)` probe,
+/// which looks a term up without building a key. Both hash as their stored
+/// hash and compare as their bytes, as `Borrow` requires.
+trait Lookup {
+    fn hash(&self) -> u64;
+    fn bytes(&self) -> &[u8];
+}
+
+impl Lookup for Key {
+    fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Lookup for (u64, &[u8]) {
+    fn hash(&self) -> u64 {
+        self.0
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.1
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn Lookup + 'a> for Key {
+    fn borrow(&self) -> &(dyn Lookup + 'a) {
+        self
+    }
+}
+
+impl Hash for dyn Lookup + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(Lookup::hash(self));
+    }
+}
+
+impl PartialEq for dyn Lookup + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        Lookup::hash(self) == Lookup::hash(other) && self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for dyn Lookup + '_ {}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
     }
 }
 
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
+        self.hash == other.hash && self.as_slice() == other.as_slice()
     }
 }
 
 impl Eq for Key {}
 
-impl std::borrow::Borrow<[u8]> for Key {
-    fn borrow(&self) -> &[u8] {
-        self.as_slice()
+/// Hands the table a [`term_hash`] unchanged: it is already SipHash.
+#[derive(Default)]
+struct Passed(u64);
+
+impl Hasher for Passed {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("an inverter key hashes as its stored u64");
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }

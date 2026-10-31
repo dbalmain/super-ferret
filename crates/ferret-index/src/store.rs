@@ -715,8 +715,8 @@ impl IndexWriter {
                             oversized = true;
                         }
                     }
-                    for term in extracted.terms() {
-                        inverter.add(doc, term)?;
+                    for (hash, term) in extracted.terms() {
+                        inverter.add_hashed(doc, hash, term)?;
                     }
                     followed.docs += 1;
                     followed.bytes += extracted.len;

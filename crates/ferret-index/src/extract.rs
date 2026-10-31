@@ -8,7 +8,7 @@ use std::sync::{Condvar, Mutex, mpsc};
 
 use ferret_text::{Scratch, cap, tokenize_terms};
 
-use crate::segment::KeySet;
+use crate::segment::{KeySet, term_hash};
 use crate::store::{Fault, Reader};
 
 /// Documents a reader thread may run ahead of the writer, per reader. The
@@ -31,17 +31,22 @@ pub(crate) struct Extracted {
     pub keys: Vec<u32>,
     text: Vec<u8>,
     ends: Vec<usize>,
+    hashes: Vec<u64>,
 }
 
 impl Extracted {
-    /// The document's distinct terms, capped as the term index stores them.
-    pub fn terms(&self) -> impl Iterator<Item = &[u8]> {
+    /// The document's distinct terms, capped as the term index stores them,
+    /// each with its [`term_hash`].
+    pub fn terms(&self) -> impl Iterator<Item = (u64, &[u8])> {
         let mut start = 0;
-        self.ends.iter().map(move |&end| {
-            let term = &self.text[start..end];
-            start = end;
-            term
-        })
+        self.ends
+            .iter()
+            .zip(&self.hashes)
+            .map(move |(&end, &hash)| {
+                let term = &self.text[start..end];
+                start = end;
+                (hash, term)
+            })
     }
 }
 
@@ -76,6 +81,7 @@ impl Extractor {
         self.keys.distinct(&self.bytes, &mut out.keys);
         out.text.clear();
         out.ends.clear();
+        out.hashes.clear();
         if self.last.len() > REMEMBERED {
             self.last.clear();
         }
@@ -96,6 +102,7 @@ impl Extractor {
             if fresh {
                 out.text.extend_from_slice(term);
                 out.ends.push(out.text.len());
+                out.hashes.push(term_hash(term));
             }
         });
         Ok(())
