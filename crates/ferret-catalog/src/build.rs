@@ -288,9 +288,40 @@ impl Plan {
                 .map(|&d| self.children(d).len())
                 .sum::<usize>(),
         );
-        let mut ranges = [Range::default(); COLUMNS.len()];
-        let mut sets: [HashSet<u64>; COLUMNS.len()] = Default::default();
-        let mut blocks: [BlockSizer; COLUMNS.len()] = Default::default();
+        let mut sizing = Sizing::default();
+        self.size_inodes(batches, &mut sizing);
+        self.size_dirs(batches, &mut sizing);
+        self.size_names(batches, &mut sizing, names);
+        for (row, &(_, id)) in self.docs.iter().enumerate() {
+            sizing.ranges[Column::DocId as usize].add(u64::from(id) - row as u64);
+        }
+        let (columns, dicts) = sizing.descriptors(self.offset_blocks);
+        let lens = self.section_lens(dirs, inodes);
+        let head = Head {
+            generation: crate::Generation {
+                incarnation: [1; 16],
+                checkpoint: 0,
+                sequence: 0,
+            },
+            sniffer: self.sniffer,
+            next_doc: self.next_doc,
+            dirs: dirs as u32,
+            inodes: inodes as u32,
+            names: names as u32,
+            docs: self.docs.len() as u32,
+            columns,
+            lens,
+        };
+        (head, dicts)
+    }
+
+    /// Sizes the stat and doc columns in one pass over the inode rows.
+    fn size_inodes(&self, batches: &[Batch], sizing: &mut Sizing) {
+        let Sizing {
+            ranges,
+            sets,
+            blocks,
+        } = sizing;
         // Neighbouring rows nearly always share a dictionary value; skipping
         // the repeat saves a hash per row.
         let mut last = [None; COLUMNS.len()];
@@ -311,7 +342,11 @@ impl Plan {
             }
             push_known(&mut blocks[Column::Doc as usize], doc);
         }
-        // In the order the directory columns are written: by InoId.
+    }
+
+    /// Sizes the directory columns, in the order they are written: by InoId.
+    fn size_dirs(&self, batches: &[Batch], sizing: &mut Sizing) {
+        let blocks = &mut sizing.blocks;
         for &dir in &self.order {
             let dir = dir as usize;
             push_known(&mut blocks[Column::Entries as usize], self.entry_count[dir]);
@@ -321,9 +356,14 @@ impl Plan {
                 None => blocks[Column::RetainedAt as usize].push_null(),
             }
         }
-        // Ids are sized by what they index: the counts and the heap.
-        ranges[Column::DirName as usize] = Range((names > 0).then(|| (0, names as u64 - 1)));
-        let [parent, child] = blocks
+    }
+
+    /// Sizes the name columns. Ids are sized by what they index: the counts
+    /// and the heap.
+    fn size_names(&self, batches: &[Batch], sizing: &mut Sizing, names: usize) {
+        sizing.ranges[Column::DirName as usize] = Range((names > 0).then(|| (0, names as u64 - 1)));
+        let [parent, child] = sizing
+            .blocks
             .get_disjoint_mut([Column::NameParent as usize, Column::NameChild as usize])
             .unwrap_or_else(|_| unreachable!("two columns"));
         for (id, &dir) in self.order.iter().enumerate() {
@@ -332,31 +372,11 @@ impl Plan {
                 child.push(u64::from(self.child(batches, entry)));
             }
         }
-        for (row, &(_, id)) in self.docs.iter().enumerate() {
-            ranges[Column::DocId as usize].add(u64::from(id) - row as u64);
-        }
+    }
 
-        let mut dicts: [Vec<u64>; COLUMNS.len()] = Default::default();
-        let columns = COLUMNS.map(|column| {
-            let c = column as usize;
-            match column.coding() {
-                Coding::Sequence => Descriptor::frame(ranges[c]),
-                Coding::Nullable => Descriptor::nullable(ranges[c]),
-                Coding::Blocked if column == Column::NameOffset => {
-                    Descriptor::blocked(self.offset_blocks)
-                }
-                Coding::Blocked | Coding::NullableBlocked => {
-                    Descriptor::blocked(std::mem::take(&mut blocks[c]).finish())
-                }
-                Coding::Dictionary => {
-                    let mut dict: Vec<u64> = std::mem::take(&mut sets[c]).into_iter().collect();
-                    dict.sort_unstable();
-                    let len = dict.len() as u32;
-                    dicts[c] = dict;
-                    Descriptor::dictionary(len)
-                }
-            }
-        });
+    /// Each section's length in bytes, for `dirs` directories and `inodes`
+    /// inodes.
+    fn section_lens(&self, dirs: usize, inodes: usize) -> [u64; SECTIONS.len()] {
         let mut lens = [0; SECTIONS.len()];
         for (section, len) in [
             (Section::NameHeap, self.heap_len),
@@ -374,22 +394,49 @@ impl Plan {
         ] {
             lens[section as usize] = len as u64;
         }
-        let head = Head {
-            generation: crate::Generation {
-                incarnation: [1; 16],
-                checkpoint: 0,
-                sequence: 0,
-            },
-            sniffer: self.sniffer,
-            next_doc: self.next_doc,
-            dirs: dirs as u32,
-            inodes: inodes as u32,
-            names: names as u32,
-            docs: self.docs.len() as u32,
-            columns,
-            lens,
-        };
-        (head, dicts)
+        lens
+    }
+}
+
+/// What [`Plan::head`] gathers to size each column, by its coding: a range,
+/// the distinct values, or the blocks.
+#[derive(Default)]
+struct Sizing {
+    ranges: [Range; COLUMNS.len()],
+    sets: [HashSet<u64>; COLUMNS.len()],
+    blocks: [BlockSizer; COLUMNS.len()],
+}
+
+impl Sizing {
+    /// Each column's descriptor, and each dictionary column's sorted values.
+    /// The name offsets' blocks were sized as the heap was laid out.
+    fn descriptors(
+        mut self,
+        offset_blocks: (u64, u32),
+    ) -> ([Descriptor; COLUMNS.len()], [Vec<u64>; COLUMNS.len()]) {
+        let mut dicts: [Vec<u64>; COLUMNS.len()] = Default::default();
+        let columns = COLUMNS.map(|column| {
+            let c = column as usize;
+            match column.coding() {
+                Coding::Sequence => Descriptor::frame(self.ranges[c]),
+                Coding::Nullable => Descriptor::nullable(self.ranges[c]),
+                Coding::Blocked if column == Column::NameOffset => {
+                    Descriptor::blocked(offset_blocks)
+                }
+                Coding::Blocked | Coding::NullableBlocked => {
+                    Descriptor::blocked(std::mem::take(&mut self.blocks[c]).finish())
+                }
+                Coding::Dictionary => {
+                    let mut dict: Vec<u64> =
+                        std::mem::take(&mut self.sets[c]).into_iter().collect();
+                    dict.sort_unstable();
+                    let len = dict.len() as u32;
+                    dicts[c] = dict;
+                    Descriptor::dictionary(len)
+                }
+            }
+        });
+        (columns, dicts)
     }
 }
 
