@@ -944,152 +944,198 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
     }
     #[cfg(debug_assertions)]
     if request.op == Op::Status {
-        let status = lock(&host.writer_status);
-        if let Some(watch) = &status.watch {
-            if request
-                .capabilities
-                .iter()
-                .any(|c| c == "test-watch-overflow")
-            {
-                watch.inject_overflow();
-            }
-            for (capability, panic) in [
-                ("test-watch-intake-panic", true),
-                ("test-watch-intake-read-error", false),
-            ] {
-                if request.capabilities.iter().any(|c| c == capability) {
-                    watch.inject_intake_fault(panic);
-                }
-            }
-            if request.capabilities.iter().any(|c| c == "test-watch-move")
-                && request.args.len() == 4
-            {
-                use std::os::unix::ffi::OsStrExt;
-                let path = Path::new(std::ffi::OsStr::from_bytes(&request.args[0]));
-                let cookie = std::str::from_utf8(&request.args[2])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                watch.inject_move(path, &request.args[1], cookie, request.args[3] == b"from");
-            }
-        }
+        inject_watch_faults(host, request);
     }
-    // Freshness preparation can itself panic before batch emits begin. Turn
-    // that failure into an ordinary null-generation runtime-error block.
-    let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(host)))
-        .unwrap_or_else(|_| Err(io::Error::other("engine selection panicked")));
-    let session = match selected {
-        Ok(session) => session,
-        Err(error) => {
-            emit_to(destination, &request.id, "begin", |o| {
-                o.null("generation");
-            })?;
-            return emit_to(destination, &request.id, "end", |o| {
-                o.int("exit", runtime_status(request))
-                    .bool("cancelled", false)
-                    .str("error", "RuntimeError")
-                    .str("message", &error.to_string());
-            });
-        }
+    let Some(session) = select(host, request, destination)? else {
+        return Ok(());
     };
     match request.op {
         Op::Index | Op::RootsRemove => {
             unreachable!("writer requests routed before query selection")
         }
-        Op::Search => {
-            // Dropped when this arm returns. `search_request` joins its
-            // verification workers before then, including cancellation, client
-            // disconnect and a broken socket write.
-            let grant = host.permits.take(session.search_threads());
-            let result = crate::batch::search_request(
-                request,
-                Some(session),
-                None,
-                destination,
-                Some(grant.workers()),
-            );
-            drop(grant);
-            result
+        Op::Search => serve_search(host, request, session, destination),
+        Op::Grep => serve_grep(host, request, session, destination),
+        Op::Find => serve_find(host, request, session, destination),
+        Op::Status | Op::Reload => serve_report(host, request, &session, destination),
+    }
+}
+
+/// Applies a debug build's `test-watch-*` capabilities to the live watch.
+#[cfg(debug_assertions)]
+fn inject_watch_faults(host: &Host, request: &Request) {
+    let status = lock(&host.writer_status);
+    if let Some(watch) = &status.watch {
+        if request
+            .capabilities
+            .iter()
+            .any(|c| c == "test-watch-overflow")
+        {
+            watch.inject_overflow();
         }
-        Op::Grep => {
-            // The client's thread count is only an upper bound. The resident
-            // search-thread cap still applies, then the shared pool. `serve`
-            // sizes every pool from the grant and joins those workers before
-            // `grep_request` returns, including a broken stdout pipe.
-            let asked = request
-                .grep
-                .as_ref()
-                .map_or(1, |options| options.threads.min(session.search_threads()));
-            let grant = host.permits.take(asked);
-            let result = crate::batch::grep_request(
-                request,
-                Some(session),
-                destination,
-                host.query_limit,
-                Some(grant.workers()),
-            );
-            drop(grant);
-            result
+        for (capability, panic) in [
+            ("test-watch-intake-panic", true),
+            ("test-watch-intake-read-error", false),
+        ] {
+            if request.capabilities.iter().any(|c| c == capability) {
+                watch.inject_intake_fault(panic);
+            }
         }
-        Op::Find => {
-            // Clear all action grants. Even a direct socket caller cannot ask
-            // the daemon to execute, prompt, delete or open an output file.
-            // Find has no job-count flag; the ask is the in-process default.
-            // `find_request` joins the walk before it returns. A transport
-            // error counts as cancellation and stops that walk first.
-            let mut request = request.clone();
-            request
-                .capabilities
-                .retain(|capability| capability == "test-find-panic");
-            let grant = host.permits.take(ferret_crawl::default_workers());
-            let result = crate::batch::find_request(
-                &request,
-                Path::new("/"),
-                Some(session),
-                true,
-                destination,
-                grant.workers(),
-            );
-            drop(grant);
-            result
-        }
-        Op::Status | Op::Reload => {
-            let report = if request.op == Op::Status {
-                stats_report(host, request, &session)
-            } else {
-                None
-            };
-            emit_to(
-                destination,
-                &request.id,
-                if request.op == Op::Status {
-                    "status"
-                } else {
-                    "reload"
-                },
-                |o| {
-                    generation(o, Some(session.generation()));
-                    o.int("engine_opens", Engine::open_count())
-                        .int("bytes", session.resident_bytes());
-                    writer::fields(host, o);
-                    let (held, running) = host.permits.snapshot();
-                    o.int("worker_budget", host.permits.budget as u64)
-                        .int("worker_permits", held as u64)
-                        .integers("worker_grants", running.into_iter().map(|n| n as u64));
-                    crate::status::resources(o);
-                    crate::status::catalog_fields(o, &session);
-                    let engine = lock(&host.engine);
-                    if let Loaded::Ready(engine) = &*engine {
-                        o.integers("pinned_internal_epochs", engine.pinned_epochs());
-                    }
-                    if request.args == [b"--stats".to_vec()] {
-                        crate::stats::json_fields(o, &session);
-                    }
-                    if let Some(report) = &report {
-                        o.str("report", report);
-                    }
-                },
-            )
+        if request.capabilities.iter().any(|c| c == "test-watch-move") && request.args.len() == 4 {
+            use std::os::unix::ffi::OsStrExt;
+            let path = Path::new(std::ffi::OsStr::from_bytes(&request.args[0]));
+            let cookie = std::str::from_utf8(&request.args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            watch.inject_move(path, &request.args[1], cookie, request.args[3] == b"from");
         }
     }
+}
+
+/// Pins the engine for one query; `None` once a selection failure has been
+/// answered with a null-generation runtime-error block.
+fn select(
+    host: &Host,
+    request: &Request,
+    destination: &Destination,
+) -> io::Result<Option<QuerySession>> {
+    // Freshness preparation can itself panic before batch emits begin. Turn
+    // that failure into an ordinary null-generation runtime-error block.
+    let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(host)))
+        .unwrap_or_else(|_| Err(io::Error::other("engine selection panicked")));
+    match selected {
+        Ok(session) => Ok(Some(session)),
+        Err(error) => {
+            emit_to(destination, &request.id, "begin", |o| {
+                o.null("generation");
+            })?;
+            emit_to(destination, &request.id, "end", |o| {
+                o.int("exit", runtime_status(request))
+                    .bool("cancelled", false)
+                    .str("error", "RuntimeError")
+                    .str("message", &error.to_string());
+            })?;
+            Ok(None)
+        }
+    }
+}
+
+fn serve_search(
+    host: &Host,
+    request: &Request,
+    session: QuerySession,
+    destination: &Destination,
+) -> io::Result<()> {
+    // Dropped when this arm returns. `search_request` joins its
+    // verification workers before then, including cancellation, client
+    // disconnect and a broken socket write.
+    let grant = host.permits.take(session.search_threads());
+    let result = crate::batch::search_request(
+        request,
+        Some(session),
+        None,
+        destination,
+        Some(grant.workers()),
+    );
+    drop(grant);
+    result
+}
+
+fn serve_grep(
+    host: &Host,
+    request: &Request,
+    session: QuerySession,
+    destination: &Destination,
+) -> io::Result<()> {
+    // The client's thread count is only an upper bound. The resident
+    // search-thread cap still applies, then the shared pool. `serve`
+    // sizes every pool from the grant and joins those workers before
+    // `grep_request` returns, including a broken stdout pipe.
+    let asked = request
+        .grep
+        .as_ref()
+        .map_or(1, |options| options.threads.min(session.search_threads()));
+    let grant = host.permits.take(asked);
+    let result = crate::batch::grep_request(
+        request,
+        Some(session),
+        destination,
+        host.query_limit,
+        Some(grant.workers()),
+    );
+    drop(grant);
+    result
+}
+
+fn serve_find(
+    host: &Host,
+    request: &Request,
+    session: QuerySession,
+    destination: &Destination,
+) -> io::Result<()> {
+    // Clear all action grants. Even a direct socket caller cannot ask
+    // the daemon to execute, prompt, delete or open an output file.
+    // Find has no job-count flag; the ask is the in-process default.
+    // `find_request` joins the walk before it returns. A transport
+    // error counts as cancellation and stops that walk first.
+    let mut request = request.clone();
+    request
+        .capabilities
+        .retain(|capability| capability == "test-find-panic");
+    let grant = host.permits.take(ferret_crawl::default_workers());
+    let result = crate::batch::find_request(
+        &request,
+        Path::new("/"),
+        Some(session),
+        true,
+        destination,
+        grant.workers(),
+    );
+    drop(grant);
+    result
+}
+
+/// Answers `status` and `reload` with the engine, writer and worker fields.
+fn serve_report(
+    host: &Host,
+    request: &Request,
+    session: &QuerySession,
+    destination: &Destination,
+) -> io::Result<()> {
+    let report = if request.op == Op::Status {
+        stats_report(host, request, session)
+    } else {
+        None
+    };
+    emit_to(
+        destination,
+        &request.id,
+        if request.op == Op::Status {
+            "status"
+        } else {
+            "reload"
+        },
+        |o| {
+            generation(o, Some(session.generation()));
+            o.int("engine_opens", Engine::open_count())
+                .int("bytes", session.resident_bytes());
+            writer::fields(host, o);
+            let (held, running) = host.permits.snapshot();
+            o.int("worker_budget", host.permits.budget as u64)
+                .int("worker_permits", held as u64)
+                .integers("worker_grants", running.into_iter().map(|n| n as u64));
+            crate::status::resources(o);
+            crate::status::catalog_fields(o, session);
+            let engine = lock(&host.engine);
+            if let Loaded::Ready(engine) = &*engine {
+                o.integers("pinned_internal_epochs", engine.pinned_epochs());
+            }
+            if request.args == [b"--stats".to_vec()] {
+                crate::stats::json_fields(o, session);
+            }
+            if let Some(report) = &report {
+                o.str("report", report);
+            }
+        },
+    )
 }
