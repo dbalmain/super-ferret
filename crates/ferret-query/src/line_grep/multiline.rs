@@ -137,6 +137,75 @@ pub(super) fn scan_progress(
     }
     let bytes = buffer.strip_prefix(b"\xef\xbb\xbf").unwrap_or(buffer);
     result.bytes_searched = bytes.len() as u64;
+    let lines = split_lines(bytes, stopped)?;
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let whole = !plan.grep.excludes_lf();
+    let regex = plan.grep.regex();
+    let Selection {
+        spans,
+        groups,
+        searched_end,
+    } = select(plan, regex, bytes, &lines, stopped)?;
+    let selected = !groups.is_empty();
+    if plan.output == Output::WithoutMatch {
+        result.matched = !selected;
+        return Ok(());
+    }
+    result.matched = selected;
+    if (plan.quiet && !plan.json) || plan.output == Output::Names {
+        return Ok(());
+    }
+    if !selected {
+        return Ok(());
+    }
+    result.count =
+        if !plan.invert && (whole || plan.only_matching || plan.output == Output::CountMatches) {
+            spans.len() as u64
+        } else {
+            groups
+                .iter()
+                .map(|group| (group.end - group.start) as u64)
+                .sum()
+        };
+    if plan.output != Output::Lines {
+        return Ok(());
+    }
+
+    let windows = windows(plan, &groups, lines.len(), stopped)?;
+    let mut render = Render {
+        plan,
+        regex,
+        bytes,
+        lines: &lines,
+        spans: &spans,
+        groups: &groups,
+        searched_end,
+        // JSON events and replacement cover a whole selected group; plain
+        // and `-o` output render one source line at a time.
+        split: whole && !plan.invert,
+        stopped,
+        highlights: Vec::new(),
+        local: Vec::new(),
+    };
+    let (mut group_at, mut span_at) = (0, 0);
+    for window in windows {
+        let mut index = window.start;
+        while index < window.end {
+            cancelled(stopped)?;
+            while group_at < groups.len() && groups[group_at].end <= index {
+                group_at += 1;
+            }
+            index = render.line(index, group_at, &mut span_at, &mut emit)?;
+        }
+    }
+    Ok(())
+}
+
+/// Each line's byte range, its LF included.
+fn split_lines(bytes: &[u8], stopped: &dyn Fn() -> bool) -> io::Result<Vec<Range<usize>>> {
     let mut lines = Vec::new();
     let mut start = 0;
     for (chunk_number, chunk) in bytes.chunks(crate::scan::BUFFER).enumerate() {
@@ -151,22 +220,35 @@ pub(super) fn scan_progress(
     if start < bytes.len() {
         push(&mut lines, start..bytes.len())?;
     }
-    if lines.is_empty() {
-        return Ok(());
-    }
+    Ok(lines)
+}
 
-    let whole = !plan.grep.excludes_lf();
-    let regex = plan.grep.regex();
-    // One pass over the original input (D81 C): assertions see the whole
-    // input and every match is taken whole. A line group holds every match
-    // that starts on its lines, so a group can extend downward; `-m N` stops at
-    // the first match that would start group N + 1. Nothing is clipped or
-    // re-matched: counts, rendering, `-o`, `-r` and JSON all use these spans.
-    // Inversion needs only the matched lines, so it keeps no spans.
+/// The matches a whole-input scan takes, and the line groups it selects.
+struct Selection {
+    /// Every match, whole; empty under inversion.
+    spans: Vec<Range<usize>>,
+    /// Selected line groups, ascending and disjoint.
+    groups: Vec<Range<usize>>,
+    /// Lines from here on are past the `-m` limit: context, never searched.
+    searched_end: usize,
+}
+
+/// One pass over the original input (D81 C): assertions see the whole input
+/// and every match is taken whole. A line group holds every match that
+/// starts on its lines, so a group can extend downward; `-m N` stops at the
+/// first match that would start group N + 1. Nothing is clipped or
+/// re-matched: counts, rendering, `-o`, `-r` and JSON all use these spans.
+/// Inversion needs only the matched lines, so it keeps no spans.
+fn select(
+    plan: &Plan,
+    regex: &ferret_verify::Regex,
+    bytes: &[u8],
+    lines: &[Range<usize>],
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<Selection> {
     let mut spans: Vec<Range<usize>> = Vec::new();
     let mut groups: Vec<Range<usize>> = Vec::new();
     let (mut taken, mut group_end) = (0, 0);
-    // Lines from here on are past the `-m` limit: context, never searched.
     let mut searched_end = lines.len();
     for span in regex.spans(bytes) {
         cancelled(stopped)?;
@@ -175,8 +257,8 @@ pub(super) fn scan_progress(
             // so it draws no before-context either (D98).
             break;
         }
-        let first = line_at(&lines, span.start);
-        let last = line_at(&lines, span.end.saturating_sub(1).max(span.start));
+        let first = line_at(lines, span.start);
+        let last = line_at(lines, span.end.saturating_sub(1).max(span.start));
         if first >= group_end {
             if !plan.invert && plan.max_count.is_some_and(|limit| taken >= limit) {
                 break;
@@ -209,260 +291,331 @@ pub(super) fn scan_progress(
         }
         groups = selected;
     }
-    let selected = !groups.is_empty();
-    if plan.output == Output::WithoutMatch {
-        result.matched = !selected;
-        return Ok(());
-    }
-    result.matched = selected;
-    if (plan.quiet && !plan.json) || plan.output == Output::Names {
-        return Ok(());
-    }
-    if !selected {
-        return Ok(());
-    }
-    result.count =
-        if !plan.invert && (whole || plan.only_matching || plan.output == Output::CountMatches) {
-            spans.len() as u64
-        } else {
-            groups
-                .iter()
-                .map(|group| (group.end - group.start) as u64)
-                .sum()
-        };
-    if plan.output != Output::Lines {
-        return Ok(());
-    }
+    Ok(Selection {
+        spans,
+        groups,
+        searched_end,
+    })
+}
 
+/// The selected groups widened by their context, merged where they meet.
+fn windows(
+    plan: &Plan,
+    groups: &[Range<usize>],
+    lines: usize,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<Vec<Range<usize>>> {
     let mut windows = Vec::new();
-    for group in &groups {
+    for group in groups {
         cancelled(stopped)?;
         let before = usize::try_from(plan.before).unwrap_or(usize::MAX);
         let after = usize::try_from(plan.after).unwrap_or(usize::MAX);
         add_group(
             &mut windows,
-            group.start.saturating_sub(before)..group.end.saturating_add(after).min(lines.len()),
+            group.start.saturating_sub(before)..group.end.saturating_add(after).min(lines),
         )?;
     }
-    // JSON events and replacement cover a whole selected group; plain and
-    // `-o` output render one source line at a time.
-    let split = whole && !plan.invert;
-    let (mut group_at, mut span_at) = (0, 0);
-    let mut highlights: Vec<Range<usize>> = Vec::new();
-    let mut local = Vec::new();
-    for window in windows {
-        let mut index = window.start;
-        while index < window.end {
-            cancelled(stopped)?;
-            while group_at < groups.len() && groups[group_at].end <= index {
-                group_at += 1;
-            }
-            let selected = groups
-                .get(group_at)
-                .is_some_and(|group| group.contains(&index));
-            let kind = if selected {
-                LineKind::Match
-            } else {
-                LineKind::Context
-            };
-            let range = lines[index].clone();
-            let content_end = if bytes[range.end - 1] == b'\n' {
-                range.end - 1
-            } else {
-                range.end
-            };
-            let last = if split && selected {
-                groups[group_at].end
-            } else {
-                index + 1
-            };
-            let end = lines[last - 1].end;
-            while span_at < spans.len()
-                && (spans[span_at].end < range.start
-                    || (!spans[span_at].is_empty() && spans[span_at].end == range.start))
-            {
+    Ok(windows)
+}
+
+/// Renders the windows' lines from the scan's spans, reusing its highlight
+/// buffers across lines.
+struct Render<'a> {
+    plan: &'a Plan,
+    regex: &'a ferret_verify::Regex,
+    bytes: &'a [u8],
+    lines: &'a [Range<usize>],
+    spans: &'a [Range<usize>],
+    groups: &'a [Range<usize>],
+    searched_end: usize,
+    split: bool,
+    stopped: &'a dyn Fn() -> bool,
+    highlights: Vec<Range<usize>>,
+    local: Vec<Range<usize>>,
+}
+
+/// The source line being rendered.
+struct At {
+    index: usize,
+    range: Range<usize>,
+    content_end: usize,
+    /// One past the last line the record covers.
+    last: usize,
+    /// The end of the record's bytes.
+    end: usize,
+    kind: LineKind,
+    selected: bool,
+    /// An inverted context line before the limit: a matching one. Its
+    /// captures and highlights come from the complete line, including its
+    /// LF.
+    inverted_context: bool,
+    /// The first span that may touch the line.
+    span_at: usize,
+}
+
+impl Render<'_> {
+    /// Emits line `index`'s records; returns the next line to render.
+    fn line(
+        &mut self,
+        index: usize,
+        group_at: usize,
+        span_at: &mut usize,
+        emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+    ) -> Result<usize, ScanError> {
+        let (bytes, spans) = (self.bytes, self.spans);
+        let selected = self
+            .groups
+            .get(group_at)
+            .is_some_and(|group| group.contains(&index));
+        let kind = if selected {
+            LineKind::Match
+        } else {
+            LineKind::Context
+        };
+        let range = self.lines[index].clone();
+        let content_end = if bytes[range.end - 1] == b'\n' {
+            range.end - 1
+        } else {
+            range.end
+        };
+        let last = if self.split && selected {
+            self.groups[group_at].end
+        } else {
+            index + 1
+        };
+        let end = self.lines[last - 1].end;
+        while *span_at < spans.len()
+            && (spans[*span_at].end < range.start
+                || (!spans[*span_at].is_empty() && spans[*span_at].end == range.start))
+        {
+            cancelled(self.stopped)?;
+            *span_at += 1;
+        }
+        let at = At {
+            index,
+            range,
+            content_end,
+            last,
+            end,
+            kind,
+            selected,
+            inverted_context: self.plan.invert && !selected && index < self.searched_end,
+            span_at: *span_at,
+        };
+        if self.plan.json {
+            self.json(&at, emit)?;
+            return Ok(at.last);
+        }
+        if self.plan.replacement.is_some() {
+            self.replace(&at, emit).map_err(ScanError::Output)?;
+            return Ok(at.last);
+        }
+        if self.plan.only_matching && at.selected && !self.plan.invert {
+            self.fragments(&at, emit)?;
+        } else {
+            self.plain(&at, emit)?;
+        }
+        Ok(at.index + 1)
+    }
+
+    /// Spans from `from` that start before `to`; an unterminated last line
+    /// also owns the empty span at its end.
+    fn upto(&self, from: usize, to: usize) -> usize {
+        let (bytes, spans) = (self.bytes, self.spans);
+        let mut at = from;
+        while at < spans.len()
+            && (spans[at].start < to
+                || (to == bytes.len() && !bytes.ends_with(b"\n") && spans[at].start == to))
+        {
+            at += 1;
+        }
+        at
+    }
+
+    fn json(
+        &mut self,
+        at: &At,
+        emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+    ) -> Result<(), ScanError> {
+        let (bytes, stopped) = (self.bytes, self.stopped);
+        let region = at.range.start..at.end;
+        self.highlights.clear();
+        if at.inverted_context {
+            for span in self.regex.spans(&bytes[region.clone()]) {
                 cancelled(stopped)?;
-                span_at += 1;
+                if span.start < region.len() {
+                    push(&mut self.highlights, span)?;
+                }
             }
-            // Spans that start before `to`; an unterminated last line also
-            // owns the empty span at its end.
-            let upto = |to: usize| {
-                let mut at = span_at;
-                while at < spans.len()
-                    && (spans[at].start < to
-                        || (to == bytes.len() && !bytes.ends_with(b"\n") && spans[at].start == to))
-                {
-                    at += 1;
+        } else {
+            for span in &self.spans[at.span_at..self.upto(at.span_at, at.end)] {
+                cancelled(stopped)?;
+                if span.start >= region.start && span.end <= region.end {
+                    push(
+                        &mut self.highlights,
+                        span.start - region.start..span.end - region.start,
+                    )?;
                 }
-                at
-            };
-            // Inverted context lines before the limit are the matching ones.
-            // Their captures and highlights come from the complete line,
-            // including its LF.
-            let inverted_context = plan.invert && !selected && index < searched_end;
-            if plan.json {
-                let region = range.start..end;
-                highlights.clear();
-                if inverted_context {
-                    for span in regex.spans(&bytes[region.clone()]) {
-                        cancelled(stopped)?;
-                        if span.start < region.len() {
-                            push(&mut highlights, span)?;
-                        }
-                    }
-                } else {
-                    for span in &spans[span_at..upto(end)] {
-                        cancelled(stopped)?;
-                        if span.start >= region.start && span.end <= region.end {
-                            push(
-                                &mut highlights,
-                                span.start - region.start..span.end - region.start,
-                            )?;
-                        }
-                    }
-                }
-                emit(Line {
-                    offset: region.start as u64,
-                    source_lines: Some((index as u64 + 1, last as u64)),
-                    terminated: bytes[region.end - 1] == b'\n',
-                    number: index as u64 + 1,
-                    bytes: &bytes[region],
-                    kind,
-                    fragment: false,
-                    highlights: Some(&highlights),
-                })
-                .map_err(ScanError::Output)?;
-                index = last;
-                continue;
             }
-            if plan.replacement.is_some() {
-                let line = Line {
-                    offset: range.start as u64,
-                    number: index as u64 + 1,
-                    source_lines: Some((index as u64 + 1, last as u64)),
-                    terminated: bytes[end - 1] == b'\n',
-                    bytes: &bytes[range.start..content_end],
-                    kind,
-                    fragment: false,
-                    highlights: Some(&[]),
-                };
-                if inverted_context {
-                    let source = &bytes[range.clone()];
-                    replacement::region(
-                        plan,
-                        replacement::Region {
-                            source,
-                            range: 0..line.bytes.len(),
-                        },
-                        regex.spans(source),
-                        line,
-                        stopped,
-                        &mut emit,
-                    )
-                } else {
-                    let range_end = if !split && bytes[end - 1] == b'\n' {
-                        end - 1
-                    } else {
-                        end
-                    };
-                    replacement::region(
-                        plan,
-                        replacement::Region {
-                            source: bytes,
-                            range: range.start..range_end,
-                        },
-                        spans[span_at..upto(end)].iter().cloned(),
-                        line,
-                        stopped,
-                        &mut emit,
-                    )
-                }
-                .map_err(ScanError::Output)?;
-                index = last;
-                continue;
-            }
-            let relevant = &spans[span_at..upto(range.end)];
-            if plan.only_matching && selected && !plan.invert {
-                let mut printed = false;
-                for span in relevant {
-                    cancelled(stopped)?;
-                    let from = span.start.max(range.start);
-                    let to = span.end.min(content_end);
-                    // D79 D: `-o` never prints an empty record.
-                    if from >= to {
-                        continue;
-                    }
-                    printed = true;
-                    emit(Line {
-                        offset: range.start as u64,
-                        source_lines: None,
-                        terminated: true,
-                        number: index as u64 + 1,
-                        bytes: &bytes[from..to],
-                        kind,
-                        fragment: true,
-                        highlights: None,
-                    })
-                    .map_err(ScanError::Output)?;
-                }
-                if !printed {
-                    // An empty fragment prints nothing; it keeps this selected
-                    // line in the context window.
-                    emit(Line {
-                        offset: range.start as u64,
-                        source_lines: None,
-                        terminated: true,
-                        number: index as u64 + 1,
-                        bytes: &[],
-                        kind,
-                        fragment: true,
-                        highlights: None,
-                    })
-                    .map_err(ScanError::Output)?;
-                }
+        }
+        emit(Line {
+            offset: region.start as u64,
+            source_lines: Some((at.index as u64 + 1, at.last as u64)),
+            terminated: bytes[region.end - 1] == b'\n',
+            number: at.index as u64 + 1,
+            bytes: &bytes[region],
+            kind: at.kind,
+            fragment: false,
+            highlights: Some(&self.highlights),
+        })
+        .map_err(ScanError::Output)
+    }
+
+    fn replace(
+        &self,
+        at: &At,
+        emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let (plan, bytes, end) = (self.plan, self.bytes, at.end);
+        let line = Line {
+            offset: at.range.start as u64,
+            number: at.index as u64 + 1,
+            source_lines: Some((at.index as u64 + 1, at.last as u64)),
+            terminated: bytes[end - 1] == b'\n',
+            bytes: &bytes[at.range.start..at.content_end],
+            kind: at.kind,
+            fragment: false,
+            highlights: Some(&[]),
+        };
+        if at.inverted_context {
+            let source = &bytes[at.range.clone()];
+            replacement::region(
+                plan,
+                replacement::Region {
+                    source,
+                    range: 0..line.bytes.len(),
+                },
+                self.regex.spans(source),
+                line,
+                self.stopped,
+                emit,
+            )
+        } else {
+            let range_end = if !self.split && bytes[end - 1] == b'\n' {
+                end - 1
             } else {
-                let relevant = if inverted_context {
-                    local.clear();
-                    for span in regex.spans(&bytes[range.clone()]) {
-                        cancelled(stopped)?;
-                        push(&mut local, span.start + range.start..span.end + range.start)?;
-                    }
-                    local.as_slice()
-                } else {
-                    relevant
-                };
-                highlights.clear();
-                for span in relevant {
-                    cancelled(stopped)?;
-                    let from = span.start.max(range.start);
-                    let to = span.end.min(content_end);
-                    if from < to {
-                        let highlight = from - range.start..to - range.start;
-                        if let Some(last) = highlights.last_mut()
-                            && last.end == highlight.start
-                        {
-                            last.end = highlight.end;
-                        } else {
-                            push(&mut highlights, highlight)?;
-                        }
-                    }
-                }
-                emit(Line {
-                    offset: range.start as u64,
-                    source_lines: None,
-                    terminated: content_end < range.end,
-                    number: index as u64 + 1,
-                    bytes: &bytes[range.start..content_end],
-                    kind,
-                    fragment: false,
-                    highlights: Some(&highlights),
-                })
-                .map_err(ScanError::Output)?;
-            }
-            index += 1;
+                end
+            };
+            replacement::region(
+                plan,
+                replacement::Region {
+                    source: bytes,
+                    range: at.range.start..range_end,
+                },
+                self.spans[at.span_at..self.upto(at.span_at, end)]
+                    .iter()
+                    .cloned(),
+                line,
+                self.stopped,
+                emit,
+            )
         }
     }
-    Ok(())
+
+    /// `-o`: each match's part of a selected line.
+    fn fragments(
+        &self,
+        at: &At,
+        emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+    ) -> Result<(), ScanError> {
+        let bytes = self.bytes;
+        let mut printed = false;
+        for span in &self.spans[at.span_at..self.upto(at.span_at, at.range.end)] {
+            cancelled(self.stopped)?;
+            let from = span.start.max(at.range.start);
+            let to = span.end.min(at.content_end);
+            // D79 D: `-o` never prints an empty record.
+            if from >= to {
+                continue;
+            }
+            printed = true;
+            emit(Line {
+                offset: at.range.start as u64,
+                source_lines: None,
+                terminated: true,
+                number: at.index as u64 + 1,
+                bytes: &bytes[from..to],
+                kind: at.kind,
+                fragment: true,
+                highlights: None,
+            })
+            .map_err(ScanError::Output)?;
+        }
+        if !printed {
+            // An empty fragment prints nothing; it keeps this selected line
+            // in the context window.
+            emit(Line {
+                offset: at.range.start as u64,
+                source_lines: None,
+                terminated: true,
+                number: at.index as u64 + 1,
+                bytes: &[],
+                kind: at.kind,
+                fragment: true,
+                highlights: None,
+            })
+            .map_err(ScanError::Output)?;
+        }
+        Ok(())
+    }
+
+    fn plain(
+        &mut self,
+        at: &At,
+        emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+    ) -> Result<(), ScanError> {
+        let (bytes, stopped, range) = (self.bytes, self.stopped, &at.range);
+        let relevant = if at.inverted_context {
+            self.local.clear();
+            for span in self.regex.spans(&bytes[range.clone()]) {
+                cancelled(stopped)?;
+                push(
+                    &mut self.local,
+                    span.start + range.start..span.end + range.start,
+                )?;
+            }
+            self.local.as_slice()
+        } else {
+            &self.spans[at.span_at..self.upto(at.span_at, range.end)]
+        };
+        self.highlights.clear();
+        for span in relevant {
+            cancelled(stopped)?;
+            let from = span.start.max(range.start);
+            let to = span.end.min(at.content_end);
+            if from < to {
+                let highlight = from - range.start..to - range.start;
+                if let Some(last) = self.highlights.last_mut()
+                    && last.end == highlight.start
+                {
+                    last.end = highlight.end;
+                } else {
+                    push(&mut self.highlights, highlight)?;
+                }
+            }
+        }
+        emit(Line {
+            offset: range.start as u64,
+            source_lines: None,
+            terminated: at.content_end < range.end,
+            number: at.index as u64 + 1,
+            bytes: &bytes[range.start..at.content_end],
+            kind: at.kind,
+            fragment: false,
+            highlights: Some(&self.highlights),
+        })
+        .map_err(ScanError::Output)
+    }
 }
 
 #[cfg(test)]
