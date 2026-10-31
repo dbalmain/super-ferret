@@ -2007,10 +2007,13 @@ impl<G> Held<G> {
         [crossed, full]
     }
 
-    /// The held batch, if any, leaving the slot empty.
+    /// The held batch, if any, leaving the slot empty and sized for a full
+    /// batch, so that holding the next one does not regrow it a push at a
+    /// time.
     fn take(&mut self) -> Option<Vec<G>> {
         self.bytes = 0;
-        (!self.groups.is_empty()).then(|| std::mem::take(&mut self.groups))
+        (!self.groups.is_empty())
+            .then(|| std::mem::replace(&mut self.groups, Vec::with_capacity(HANDOFF_GROUPS)))
     }
 }
 
