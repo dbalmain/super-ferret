@@ -28,11 +28,11 @@ pub(super) fn record_size(bytes: &[u8], highlights: Option<&[std::ops::Range<usi
     bytes.len() + std::mem::size_of::<Record>() + highlights.map_or(0, std::mem::size_of_val)
 }
 
-pub(super) struct Capture {
+pub(super) struct Recording {
     pub(super) records: Option<Vec<Record>>,
     bytes: usize,
 }
-impl Capture {
+impl Recording {
     pub(super) fn new(enabled: bool) -> Self {
         Self {
             records: enabled.then(Vec::new),
@@ -265,7 +265,7 @@ impl Render<'_> {
         size: u64,
         buffer: &mut Vec<u8>,
         output: &mut OutputCapture<'_>,
-        capture: &mut Capture,
+        recording: &mut Recording,
     ) -> Result<InputResult, (InputResult, ScanError)> {
         #[cfg(test)]
         super::seam::BEFORE_SCAN.with_borrow_mut(|hook| {
@@ -280,7 +280,7 @@ impl Render<'_> {
         let mut cursor = Cursor::default();
         let result =
             line_grep::scan_lines_progress(self.plan, input, size, buffer, self.stopped, |line| {
-                capture.push(line);
+                recording.push(line);
                 self.line(output, line, &mut cursor)
             });
         let partial = match &result {

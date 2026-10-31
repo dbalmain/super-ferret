@@ -2,7 +2,7 @@
 //! or replayed from the bounded duplicate cache.
 
 use super::read::{read_catalogued, read_file, read_file_policy};
-use super::render::{Capture, Cursor, OutputCapture, Record, Render, record_size};
+use super::render::{Cursor, OutputCapture, Record, Recording, Render, record_size};
 use super::*;
 use ferret_query::ReadVersion;
 use std::collections::HashMap;
@@ -49,20 +49,20 @@ pub(in super::super) fn observe_streaming(
 ) -> io::Result<Observed> {
     let mut output = OutputCapture::new(target).pooled(render);
     let mut result = InputResult::default();
-    let mut capture = Capture::new(cache);
+    let mut recording = Recording::new(cache);
     let mut output_failure = None;
     let mut changed_after_publication = false;
     let outcome = ferret_query::retry_read(
         || {
             output.reset();
             result = InputResult::default();
-            capture = Capture::new(cache);
+            recording = Recording::new(cache);
             let mut each = |input: &mut dyn Read, size| match render.scan(
                 input,
                 size,
                 buffer,
                 &mut output,
-                &mut capture,
+                &mut recording,
             ) {
                 Ok(scanned) => {
                     result = scanned;
@@ -125,7 +125,7 @@ pub(in super::super) fn observe_streaming(
             output: output.buffer,
             _capture: output.held,
             version,
-            records: capture.records,
+            records: recording.records,
         }),
         ReadOutcome::Failed(error) => Observed::Failed(error),
         ReadOutcome::RetryChanged => Observed::Failed(ReadFault::Unstable),
