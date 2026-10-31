@@ -28,7 +28,7 @@ pub(in super::super) enum Observed {
 
 /// Test scans still use the production threshold, with a discard destination.
 #[cfg(test)]
-pub(in super::super) fn observe(
+pub(super) fn observe(
     render: &Render<'_>,
     buffer: &mut Vec<u8>,
     read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
