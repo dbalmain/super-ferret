@@ -7544,3 +7544,46 @@ fixed and tested.
 **Still through /proc:** `-printf %F` (statfs, per printed entry) and the
 `-newer` family's reference operands (once per operand).
 
+## D135 — How often a held directory is checked again
+
+**Question:** Should a grep worker check its held directories again for every
+file it opens through them, or at most once every 100 µs?
+
+Today each catalogued file a worker opens re-checks its whole held chain:
+a `stat` of the root's path, then a no-follow `fstatat` per level, each
+against the catalog's `(dev, ino)` (`ferret-crawl/src/content.rs`,
+`hold_directory`). That is what makes a directory renamed or replaced
+mid-query fail the next path through it, as a fresh walk from the root
+would. It is also the largest kernel cost in a search. Under `strace`, a
+`-l fn` over `~/w` makes about 480k `newfstatat` calls, 6.6 per file
+searched. The daemon then spends 376 ms of kernel time per query against
+232 ms in user space, at 4 search threads.
+
+Measured through the daemon on `~/w` at 4 search threads (median of 15,
+two runs each, ms). The windowed and once-per-query rows are uncommitted
+prototypes:
+
+| Re-check a held chain            | `-l fn`    | `-c e`     |
+| -------------------------------- | ---------- | ---------- |
+| A. For every file (today)        | 143, 137   | 181, 178   |
+| B. At most once per 100 µs       | 88, 93     | 136, 140   |
+| B. At most once per 1 ms         | 96, 98     | 132, 143   |
+| C. Never (checked only on open)  | 97, 94     | 142, 136   |
+
+At 16 threads the search is producer-bound and none of the three differ
+(`-l fn` 64–67 ms). So this matters on machines with 8 cores or fewer, or
+when a daemon caps its search threads.
+
+| Option | Costs | Buys |
+| ------ | ----- | ---- |
+| A. Keep: every file re-checks the chain | 6.6 stat calls per file; a third of the 4-thread search time. | The guarantee as written: each directory read through was at its path at a moment between the file's own walk starting and its open. |
+| B. Re-check at most once per 100 µs per reader | An `Instant` per reader and a clock read per file. The guarantee loosens to: at its path within 100 µs before the open. `a_held_directory_is_checked_again_for_each_path` must wait out the window or inject a clock. | About a third off the 4-thread search (A to B above). A directory moved mid-query still fails, within 100 µs. |
+| C. Check a held directory only when opened | Nothing to maintain. A directory moved mid-query keeps serving the old path's files until the reader is dropped, which is the end of the query. | The same speed as B. |
+
+**Recommendation:** B. It keeps the property that matters, that a rename
+or replacement during a query is noticed and the file read through it fails,
+and bounds the staleness to 100 µs, well under the time a rename takes to
+reach a user's attention. Its measured speed is C's. The fact that would
+change it: a consumer that needs the check to fall strictly after the
+previous file's open. Nothing in the code relies on that today beyond the
+test above, which models a rename between two reads.
