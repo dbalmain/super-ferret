@@ -398,6 +398,20 @@ impl LiveWalk {
         self.list_directory(before_directory, cancelled)
     }
 
+    /// Opens the lent entry's directory to list it. On failure a depth-first
+    /// walk still visits the entry after its (unlisted) children.
+    fn open_listing(&mut self) -> Result<Arc<File>, WalkError> {
+        match open_directory(&self.entry) {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if self.options.depth_first {
+                    self.slot = Slot::After;
+                }
+                Err(self.entry.error(error))
+            }
+        }
+    }
+
     /// Lists catalogued directory `dir` from its stored entries, checking
     /// each name live where the walk's actions can remove one.
     fn list_catalogued(
@@ -406,22 +420,14 @@ impl LiveWalk {
         before_directory: &mut dyn FnMut() -> io::Result<()>,
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<(), WalkError> {
+        let handle = if self.options.live_checks {
+            Some(self.open_listing()?)
+        } else {
+            None
+        };
         let entry = &mut self.entry;
         let Some(catalog) = &self.catalog else {
             unreachable!("descend found the catalog")
-        };
-        let handle = if self.options.live_checks {
-            match open_directory(entry) {
-                Ok(handle) => Some(handle),
-                Err(error) => {
-                    if self.options.depth_first {
-                        self.slot = Slot::After;
-                    }
-                    return Err(entry.error(error));
-                }
-            }
-        } else {
-            None
         };
         let start = self.children.len();
         let names_start = self.children.names_len();
@@ -458,22 +464,7 @@ impl LiveWalk {
             // catalog's stored listing has no way to know that already
             // happened - GNU's live readdir simply never lists it.
             if self.options.live_checks {
-                let own_len = entry.path.len();
-                if !entry.path.ends_with(b"/") {
-                    entry.path.push(b'/');
-                }
-                entry.path.extend_from_slice(child.bytes);
-                let missing = match &handle {
-                    Some(directory) => statat(
-                        directory,
-                        OsStr::from_bytes(child.bytes),
-                        AtFlags::SYMLINK_NOFOLLOW,
-                    )
-                    .is_err_and(|error| error == rustix::io::Errno::NOENT),
-                    None => fs::symlink_metadata(entry.lookup_path().as_ref())
-                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
-                };
-                entry.path.truncate(own_len);
+                let missing = missing_now(entry, handle.as_ref(), child.bytes);
                 let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| lock(removed).entries.contains(&id)));
                 if missing && (child.kind != Kind::Dir || removed_here) {
                     continue;
@@ -557,16 +548,8 @@ impl LiveWalk {
         before_directory: &mut dyn FnMut() -> io::Result<()>,
         cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<(), WalkError> {
+        let handle = self.open_listing()?;
         let entry = &mut self.entry;
-        let handle = match open_directory(entry) {
-            Ok(handle) => handle,
-            Err(error) => {
-                if self.options.depth_first {
-                    self.slot = Slot::After;
-                }
-                return Err(entry.error(error));
-            }
-        };
         let path_len = entry.path.len();
         let separator = !entry.path.ends_with(b"/");
         let follow = self.options.follow == Follow::All;
@@ -645,27 +628,12 @@ impl LiveWalk {
             });
         }
         let own = Saved::take(entry);
-        // A pure, action-free walk never needs this directory open past its
-        // own listing - no -delete/-execdir will ask a child for its
-        // parent's fd. Dropping it here, rather than carrying it for the
-        // whole subtree the way an effectful walk must, bounds live fd use
-        // by width instead of depth (#10): a 100-level chain under a tight
-        // RLIMIT_NOFILE no longer exhausts descriptors one per ancestor.
-        let (handle, identity) = if !self.options.retain_parent {
-            drop(handle);
-            (None, None)
-        } else if !self.options.bounded_parents {
-            (Some(DirectoryHandle::uncharged(handle)), None)
-        } else if let Some(charge) = Charge::take() {
-            (Some(DirectoryHandle::charged(handle, charge)), None)
-        } else {
-            match handle.metadata() {
-                Ok(stat) => (None, Some((stat.dev(), stat.ino()))),
-                Err(error) => {
-                    self.children.truncate(start, names_start);
-                    own.restore(entry);
-                    return Err(entry.error(error));
-                }
+        let (handle, identity) = match retain_listed(&self.options, handle) {
+            Ok(kept) => kept,
+            Err(error) => {
+                self.children.truncate(start, names_start);
+                own.restore(entry);
+                return Err(entry.error(error));
             }
         };
         self.levels.push(Level {
@@ -1058,6 +1026,55 @@ fn parent_handle(entry: &Entry) -> io::Result<Arc<File>> {
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?)))
+}
+
+/// Whether `name`, a catalogued child of the entry's directory, is gone:
+/// looked up through `handle` when the listing opened one, else by path.
+fn missing_now(entry: &mut Entry, handle: Option<&Arc<File>>, name: &[u8]) -> bool {
+    let own_len = entry.path.len();
+    if !entry.path.ends_with(b"/") {
+        entry.path.push(b'/');
+    }
+    entry.path.extend_from_slice(name);
+    let missing = match handle {
+        Some(directory) => statat(
+            directory,
+            OsStr::from_bytes(name),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .is_err_and(|error| error == rustix::io::Errno::NOENT),
+        None => fs::symlink_metadata(entry.lookup_path().as_ref())
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+    };
+    entry.path.truncate(own_len);
+    missing
+}
+
+/// A listed directory's kept handle, or the `(dev, ino)` to reopen it by.
+type Retained = (Option<DirectoryHandle>, Option<(u64, u64)>);
+
+/// What a listed directory's level keeps of its `handle`: the handle while
+/// the walk retains parents and, when they are bounded, a charge is free;
+/// else its identity, to reopen it by; else nothing.
+///
+/// A pure, action-free walk never needs this directory open past its own
+/// listing - no -delete/-execdir will ask a child for its parent's fd.
+/// Dropping it here, rather than carrying it for the whole subtree the way
+/// an effectful walk must, bounds live fd use by width instead of depth
+/// (#10): a 100-level chain under a tight RLIMIT_NOFILE no longer exhausts
+/// descriptors one per ancestor.
+fn retain_listed(options: &Options, handle: Arc<File>) -> io::Result<Retained> {
+    Ok(if !options.retain_parent {
+        drop(handle);
+        (None, None)
+    } else if !options.bounded_parents {
+        (Some(DirectoryHandle::uncharged(handle)), None)
+    } else if let Some(charge) = Charge::take() {
+        (Some(DirectoryHandle::charged(handle, charge)), None)
+    } else {
+        let stat = handle.metadata()?;
+        (None, Some((stat.dev(), stat.ino())))
+    })
 }
 
 fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
