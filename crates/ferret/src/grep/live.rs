@@ -445,6 +445,61 @@ fn global() -> Result<Arc<str>, String> {
     Ok(text.into())
 }
 
+/// The override `selection` from `cwd` gives `entry`, or `None` when it
+/// does not select the entry at all.
+fn select(
+    selection: &GrepSelection,
+    cwd: &Path,
+    entry: &Entry,
+    directory: bool,
+    ignore_rule: Option<bool>,
+) -> Option<Option<bool>> {
+    let relative = super::visibility::relative_to(entry.path(), cwd)
+        .as_os_str()
+        .as_bytes();
+    let whitelist = ignore_rule == Some(true);
+    selection
+        .selects(
+            entry.path().as_os_str().as_bytes(),
+            relative,
+            entry.depth(),
+            directory,
+            whitelist,
+        )
+        .then(|| selection.override_for(relative, directory))
+}
+
+/// The decision for an entry no policy root covers.
+fn decide_uncovered(item: PolicyEntry) -> Decision {
+    match item {
+        PolicyEntry::Dir => Decision::Descend,
+        PolicyEntry::File { size } if size <= Config::default().size_cap => Decision::Index,
+        _ => Decision::Catalog(ferret_policy::Reason::TooLarge),
+    }
+}
+
+/// The state a directory enters under `decision`, with its parent's root
+/// and rules, or `None` when the walk does not enter it.
+fn descend(
+    decision: Decision,
+    covered: Option<(&PathBuf, &DirRules)>,
+    name: &std::ffi::OsStr,
+) -> Option<State> {
+    Some(match (decision, covered) {
+        (Decision::Descend, Some((root, rules))) => State::Entering {
+            root: root.clone(),
+            parent: rules.clone(),
+            rules: Arc::default(),
+        },
+        (Decision::Traverse, Some((root, rules))) => State::Rules {
+            root: root.clone(),
+            rules: rules.traverse(name),
+        },
+        (Decision::Descend, None) => State::Bypass,
+        _ => return None,
+    })
+}
+
 #[derive(Clone)]
 enum State {
     Rules {
@@ -653,72 +708,24 @@ impl Policy {
             FileKind::Symlink => PolicyEntry::Symlink,
             _ => PolicyEntry::Other,
         };
-        let local_rule = rules.and_then(|rules| rules.ignore_match(name, directory));
-        // Rg applies the global git excludes only inside a work tree.
-        let in_work_tree = rules.is_some_and(DirRules::in_work_tree);
-        let ignore_rule = local_rule.or_else(|| {
-            let (_, cwd) = selection.filter(|_| in_work_tree)?;
-            let absolute = cwd.join(entry.path());
-            self.anchors.git_global.decision(
-                absolute
-                    .strip_prefix(cwd)
-                    .ok()
-                    .map(|path| path.as_os_str().as_bytes()),
-                entry.name(),
-                directory,
-            )
-        });
-        let override_rule = if let Some((selection, cwd)) = selection {
-            let relative = super::visibility::relative_to(entry.path(), cwd)
-                .as_os_str()
-                .as_bytes();
-            let whitelist = ignore_rule == Some(true);
-            if !selection.selects(
-                entry.path().as_os_str().as_bytes(),
-                relative,
-                entry.depth(),
-                directory,
-                whitelist,
-            ) {
-                return Ok(false);
-            }
-            selection.override_for(relative, directory)
-        } else {
-            None
+        let ignore_rule = self.ignore_rule(rules, entry, directory, selection.map(|(_, cwd)| cwd));
+        let override_rule = match selection {
+            Some((selection, cwd)) => match select(selection, cwd, entry, directory, ignore_rule) {
+                Some(rule) => rule,
+                None => return Ok(false),
+            },
+            None => None,
         };
-        let decision = if override_rule == Some(true) {
-            if directory {
-                Decision::Descend
-            } else {
-                Decision::Index
-            }
-        } else if selection.is_some() && ignore_rule == Some(false) {
-            Decision::Skip
-        } else {
-            match rules {
-                Some(rules) => rules.decide_child(name, item),
-                None => match item {
-                    PolicyEntry::Dir => Decision::Descend,
-                    PolicyEntry::File { size } if size <= Config::default().size_cap => {
-                        Decision::Index
-                    }
-                    _ => Decision::Catalog(ferret_policy::Reason::TooLarge),
-                },
-            }
+        let decision = match (override_rule, ignore_rule, rules) {
+            (Some(true), ..) if directory => Decision::Descend,
+            (Some(true), ..) => Decision::Index,
+            (_, Some(false), _) if selection.is_some() => Decision::Skip,
+            (.., Some(rules)) => rules.decide_child(name, item),
+            (.., None) => decide_uncovered(item),
         };
         if let Some(path) = path {
-            let next = match (decision, root.zip(rules)) {
-                (Decision::Descend, Some((root, rules))) => State::Entering {
-                    root: root.clone(),
-                    parent: rules.clone(),
-                    rules: Arc::default(),
-                },
-                (Decision::Traverse, Some((root, rules))) => State::Rules {
-                    root: root.clone(),
-                    rules: rules.traverse(name),
-                },
-                (Decision::Descend, None) => State::Bypass,
-                _ => return Ok(false),
+            let Some(next) = descend(decision, root.zip(rules), name) else {
+                return Ok(false);
             };
             self.stack.push((path, next));
             Ok(true)
@@ -730,6 +737,33 @@ impl Policy {
                 || (self.anchors.fallback
                     && matches!(decision, Decision::Catalog(ferret_policy::Reason::TooLarge))))
         }
+    }
+
+    /// The ignore-file rule for `entry`: its directory's, else, under a
+    /// selection from `cwd` inside a work tree, the global git excludes'.
+    fn ignore_rule(
+        &self,
+        rules: Option<&DirRules>,
+        entry: &Entry,
+        directory: bool,
+        cwd: Option<&Path>,
+    ) -> Option<bool> {
+        let name = std::ffi::OsStr::from_bytes(entry.name());
+        let local_rule = rules.and_then(|rules| rules.ignore_match(name, directory));
+        // Rg applies the global git excludes only inside a work tree.
+        let in_work_tree = rules.is_some_and(DirRules::in_work_tree);
+        local_rule.or_else(|| {
+            let cwd = cwd.filter(|_| in_work_tree)?;
+            let absolute = cwd.join(entry.path());
+            self.anchors.git_global.decision(
+                absolute
+                    .strip_prefix(cwd)
+                    .ok()
+                    .map(|path| path.as_os_str().as_bytes()),
+                entry.name(),
+                directory,
+            )
+        })
     }
 }
 
