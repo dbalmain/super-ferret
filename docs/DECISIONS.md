@@ -7651,6 +7651,10 @@ mean of four, same corpus and setup (prototype saved as `d136b.patch`):
 | Drains and files while reading (prototype)  | 2.94 s | 458 MB  |
 
 B now buys 23% for 122 MB (36% more peak), where it bought 11% for 130 MB.
+Moving only the trigram drain to the second thread, with a second trigram
+buffer but not a second term buffer, measured 3.60 s for 40 MB more: less
+time per megabyte than B, so it is not offered. The term drain is the longer
+of the two.
 
 | Option | Costs | Buys |
 | ------ | ----- | ---- |
