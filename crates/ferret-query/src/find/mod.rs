@@ -17,6 +17,10 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
+/// Paths for a known-entry catalog walk, each with its catalog target, or
+/// `None` for a start.
+type KnownEntries = (Vec<std::path::PathBuf>, Vec<Option<ferret_catalog::Target>>);
+
 pub use output::{OutputBuffer, spill_path};
 pub use parse::{ParseError, Plan};
 pub use walk::{
@@ -469,30 +473,43 @@ impl Plan {
         catalog: ferret_catalog::Catalog,
         index: &crate::NameIndex,
     ) -> LiveWalk {
-        use ferret_catalog::{Handle, Target};
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        let fallback = || self.parallel_catalog_source(catalog.clone());
+        let Some((paths, known)) = self
+            .indexed_pattern(index)
+            .filter(|_| !self.touches_nested_root(&catalog))
+            .and_then(|pattern| self.indexed_entries(&catalog, index, pattern))
+        else {
+            return self.parallel_catalog_source(catalog);
+        };
+        let mut options = self.options.clone();
+        options.max_depth = Some(0);
+        CatalogSource::known(catalog, paths, known, options).walk
+    }
+
+    /// The name pattern of a `-name P -print` find that postings can answer.
+    fn indexed_pattern(&self, index: &crate::NameIndex) -> Option<&glob::Pattern> {
         let Expression::And(left, right) = &self.expression else {
-            return fallback();
+            return None;
         };
         let (Expression::Name(pattern), Expression::Print(_)) = (&**left, &**right) else {
-            return fallback();
+            return None;
         };
-        if self.no_ignore
-            || !index.can_accelerate_find()
-            || self.options.max_depth.is_some()
-            || self.options.min_depth != 0
-            || self.options.depth_first
-            || self.options.xdev
-            || self.options.follow != Follow::Physical
-            || self.unsupported.is_some()
-        {
-            return fallback();
-        }
-        // Nested configured roots are separate catalog graph roots but the
-        // find walker attaches them at physical boundaries. Keep that walker
-        // for a start that holds a nested root or lies inside one; nesting
-        // elsewhere does not touch this find.
+        let plain = !self.no_ignore
+            && index.can_accelerate_find()
+            && self.options.max_depth.is_none()
+            && self.options.min_depth == 0
+            && !self.options.depth_first
+            && !self.options.xdev
+            && self.options.follow == Follow::Physical
+            && self.unsupported.is_none();
+        plain.then_some(pattern)
+    }
+
+    /// Nested configured roots are separate catalog graph roots but the find
+    /// walker attaches them at physical boundaries. Keep that walker for a
+    /// start that holds a nested root or lies inside one; nesting elsewhere
+    /// does not touch this find.
+    fn touches_nested_root(&self, catalog: &ferret_catalog::Catalog) -> bool {
+        use std::os::unix::ffi::OsStrExt;
         let roots: Vec<_> = catalog
             .roots()
             .map(|(_, path)| Path::new(std::ffi::OsStr::from_bytes(path)))
@@ -505,44 +522,51 @@ impl Plan {
                     .any(|other| other != *path && path.starts_with(other))
             })
             .collect();
-        if self.paths.iter().any(|start| {
+        self.paths.iter().any(|start| {
             let logical = self.options.logical_path(start);
             nested
                 .iter()
                 .any(|root| root.starts_with(&logical) || logical.starts_with(root))
-        }) {
-            return fallback();
-        }
+        })
+    }
+
+    /// Each start and the entries below it whose names match `pattern`, read
+    /// from the name postings, with each entry's catalog target. `None` when
+    /// a start is not a catalogued directory or postings are not the plan.
+    fn indexed_entries(
+        &self,
+        catalog: &ferret_catalog::Catalog,
+        index: &crate::NameIndex,
+        pattern: &glob::Pattern,
+    ) -> Option<KnownEntries> {
+        use ferret_catalog::{Handle, Target};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let mut paths = Vec::new();
         let mut known = Vec::new();
         for start in &self.paths {
             let logical = self.options.logical_path(start);
-            let Some(resolved) = catalog.resolve(logical.as_os_str().as_bytes()) else {
-                return fallback();
-            };
+            let resolved = catalog.resolve(logical.as_os_str().as_bytes())?;
             let Target::Inode(dir) = resolved.target else {
-                return fallback();
+                return None;
             };
             if !resolved.remainder.is_empty() || !catalog.is_directory(dir) {
-                return fallback();
+                return None;
             }
-            let Ok(selection) = index.select(
-                &catalog,
-                Some(Handle {
-                    generation: catalog.generation(),
-                    id: dir,
-                }),
-                &[],
-                |name| pattern.matches(name),
-            ) else {
-                return fallback();
-            };
+            let selection = index
+                .select(
+                    catalog,
+                    Some(Handle {
+                        generation: catalog.generation(),
+                        id: dir,
+                    }),
+                    &[],
+                    |name| pattern.matches(name),
+                )
+                .ok()?;
             if selection.estimate.plan != crate::NamePlan::Postings {
-                return fallback();
+                return None;
             }
-            let Ok(rows) = selection.rows(&catalog) else {
-                return fallback();
-            };
+            let rows = selection.rows(catalog).ok()?;
             // Include the starting entry even when its own basename matches.
             paths.push(start.clone());
             known.push(None);
@@ -556,19 +580,14 @@ impl Plan {
                 }
                 full.clear();
                 catalog.path(row, &mut full);
-                let Some(suffix) = full
+                let suffix = full
                     .strip_prefix(prefix.as_slice())
-                    .and_then(|suffix| suffix.strip_prefix(b"/"))
-                else {
-                    return fallback();
-                };
+                    .and_then(|suffix| suffix.strip_prefix(b"/"))?;
                 paths.push(start.join(OsString::from_vec(suffix.to_vec())));
                 known.push(Some(target));
             }
         }
-        let mut options = self.options.clone();
-        options.max_depth = Some(0);
-        CatalogSource::known(catalog, paths, known, options).walk
+        Some((paths, known))
     }
 
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
