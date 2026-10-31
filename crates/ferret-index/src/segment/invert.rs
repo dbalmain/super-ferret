@@ -291,11 +291,41 @@ impl Docs {
     }
 }
 
-/// The hash an [`Inverter`]'s table files `term` under. The seed is random
-/// per process, as std's maps' are, and shared by every thread.
+/// The hash an [`Inverter`]'s table files `term` under: each eight bytes
+/// folded into the state by a 128-bit multiply, as hashbrown's default
+/// hasher does, under two keys random per process, as std's maps' are, and
+/// shared by every thread. SipHash cost a reader 7% of its time on terms
+/// of a few bytes.
 pub(crate) fn term_hash(term: &[u8]) -> u64 {
-    static SEED: LazyLock<RandomState> = LazyLock::new(RandomState::new);
-    SEED.hash_one(term)
+    static KEYS: LazyLock<[u64; 2]> = LazyLock::new(|| {
+        let random = RandomState::new();
+        [random.hash_one(0u8), random.hash_one(1u8)]
+    });
+    let [a, b] = *KEYS;
+    let mut state = a ^ term.len() as u64;
+    let mut words = term.chunks_exact(8);
+    for word in words.by_ref() {
+        let word = u64::from_le_bytes([
+            word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
+        ]);
+        state = fold(word ^ a, state ^ b);
+    }
+    let tail = words.remainder();
+    if !tail.is_empty() {
+        // Built a byte at a time: copying a short slice is a call to memcpy.
+        let word = tail
+            .iter()
+            .rev()
+            .fold(0, |word, &byte| word << 8 | u64::from(byte));
+        state = fold(word ^ a, state ^ b);
+    }
+    fold(state, b)
+}
+
+/// The high and low halves of a 128-bit product, folded together.
+fn fold(x: u64, y: u64) -> u64 {
+    let product = u128::from(x) * u128::from(y);
+    (product >> 64) as u64 ^ product as u64
 }
 
 /// A table keyed by terms, each with its [`term_hash`], which the table uses

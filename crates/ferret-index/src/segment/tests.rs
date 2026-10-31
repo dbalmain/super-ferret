@@ -572,3 +572,25 @@ fn mutation_fuzz_long() {
         .unwrap_or(20_000);
     mutation_fuzz(iterations);
 }
+
+/// Every one- and two-byte term hashes apart, spread over the low bits a
+/// table indexes by and the high seven it tags slots with: a hash that
+/// dropped a short term's tail, or mixed weakly, would still invert
+/// correctly, only slowly.
+#[test]
+fn term_hashes_spread_over_short_terms() {
+    let terms = (0..=255u8)
+        .map(|a| vec![a])
+        .chain((0..=u16::MAX).map(|ab| ab.to_le_bytes().to_vec()));
+    let hashes: Vec<u64> = terms.map(|term| super::term_hash(&term)).collect();
+    let distinct = |bits: fn(u64) -> u64| {
+        let mut values: Vec<u64> = hashes.iter().map(|&hash| bits(hash)).collect();
+        values.sort_unstable();
+        values.dedup();
+        values.len()
+    };
+    assert_eq!(distinct(|hash| hash), hashes.len());
+    // 65,792 random values fill about 41,600 of 65,536 buckets.
+    assert!(distinct(|hash| hash & 0xffff) > 40_000);
+    assert_eq!(distinct(|hash| hash >> 57), 128);
+}
