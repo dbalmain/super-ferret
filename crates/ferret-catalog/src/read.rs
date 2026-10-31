@@ -1898,13 +1898,15 @@ pub struct NameReader<'c> {
 impl<'c> NameReader<'c> {
     /// One name edge, read by itself: for a sparse hit.
     pub fn get(&self, id: NameId) -> Name<'c> {
-        if let Some((ns, base)) = self.overlay {
-            let Some(name) = ns.name(base, id.0) else {
-                panic!("dead name {}", id.0)
-            };
-            return name;
+        // A view shares its checkpoint's columns, so a name the overlay
+        // leaves alone decodes here rather than through a second reader.
+        if let Some((ns, _)) = self.overlay {
+            if let Some(sparse) = ns.sparse_name(id.0) {
+                return sparse.unwrap_or_else(|| panic!("dead name {}", id.0));
+            }
+            assert!((id.0 as usize) < self.count, "dead name {}", id.0);
         }
-        let (parent, bytes) = self.edge(id);
+        let (parent, bytes) = self.base_edge(id);
         Name {
             parent,
             child: InoId(self.children.get(id.0 as usize) as u32),
@@ -1919,6 +1921,11 @@ impl<'c> NameReader<'c> {
             let n = self.get(id);
             return (n.parent, n.bytes);
         }
+        self.base_edge(id)
+    }
+
+    /// A checkpoint name's directory and bytes.
+    fn base_edge(&self, id: NameId) -> (InoId, &'c [u8]) {
         let i = id.0 as usize;
         if let Some(names) = self.resident {
             return (InoId(self.parents.get(i) as u32), names.name(id));

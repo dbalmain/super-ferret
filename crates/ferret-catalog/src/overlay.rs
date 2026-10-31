@@ -1000,6 +1000,11 @@ impl Namespace {
     pub(crate) fn name<'a>(&'a self, base: &'a Catalog, id: u32) -> Option<Name<'a>> {
         name(base, &self.rows, id)
     }
+    /// A name's sparse row, `Some(None)` for a deletion; `None` leaves the
+    /// answer to the checkpoint.
+    pub(crate) fn sparse_name(&self, id: u32) -> Option<Option<Name<'_>>> {
+        sparse_name(&self.rows, id)
+    }
     pub(crate) fn lookup(&self, base: &Catalog, parent: u32, bytes: &[u8]) -> Option<u32> {
         lookup(base, &self.rows, &self.keys, parent, bytes)
     }
@@ -1018,19 +1023,25 @@ impl Namespace {
     }
 }
 fn name<'a>(base: &'a Catalog, rows: &'a Projection, id: u32) -> Option<Name<'a>> {
+    sparse_name(rows, id)
+        .unwrap_or_else(|| (id < base.base_name_count()).then(|| base.name(NameId(id))))
+}
+/// A name's sparse row: `Some(None)` where it was deleted, `None` where the
+/// checkpoint answers.
+fn sparse_name(rows: &Projection, id: u32) -> Option<Option<Name<'_>>> {
     match rows.get(NAME, id) {
         Some(Record::NamePut {
             parent,
             child,
             name,
             ..
-        }) => Some(Name {
+        }) => Some(Some(Name {
             parent: InoId(*parent),
             child: InoId(*child),
             bytes: name,
-        }),
-        Some(Record::NameDelete { .. }) => None,
-        _ => (id < base.base_name_count()).then(|| base.name(NameId(id))),
+        })),
+        Some(Record::NameDelete { .. }) => Some(None),
+        _ => None,
     }
 }
 fn lookup(
