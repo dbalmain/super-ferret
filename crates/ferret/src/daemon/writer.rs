@@ -303,43 +303,13 @@ fn serve(
     // here until the command finishes, which keeps a watch refresh queued.
     let lane = CommandLane::spawn(host, &engine, &scheduler, &watch)?;
     ferret_crawl::lower_index_priority()?;
-    let mut options = IndexOptions {
-        watch: watch.clone(),
-        bulk: Some(scheduler.clone()),
-        ..IndexOptions::default()
-    };
-    let hourly = duration("FERRET_BACKSTOP_MS", 60 * 60 * 1000).max(Duration::from_millis(1));
-    let polling = duration("FERRET_POLL_MS", 5 * 60 * 1000).max(Duration::from_millis(1));
-    let mut full_due = Instant::now() + hourly;
-    let mut poll_due = Instant::now() + polling;
-    // Whether a poll with roots to walk was issued that no refresh has taken
-    // yet.
-    let mut poll_issued = false;
-    let mut refresh_log = RefreshLog::default();
-    let mut retry_due: Option<Duration> = None;
-    let mut initial = watch.is_none();
-    lock(&host.writer_status).fallback_backstop = initial;
-    let mut content_due = Instant::now();
-    let mut content_state = content::State::default();
+    let mut background = Background::new(host, &engine, &scheduler, &watch, context);
     loop {
         if host.stop.load(Ordering::Acquire) {
             break;
         }
         let now = Instant::now();
-        let mut deadline = full_due.min(poll_due);
-        // A catalog retry owns this boundary. An expired content deadline
-        // must not wake repeatedly while that retry is cooling down.
-        if retry_due.is_none() {
-            deadline = deadline.min(content_due);
-        }
-        if let Some(retry) = retry_due {
-            deadline = deadline.min(now + retry.saturating_sub(scheduler.now()));
-        }
-        if retry_due.is_none()
-            && let Some(due) = watch.as_ref().and_then(|w| w.next_due())
-        {
-            deadline = deadline.min(due);
-        }
+        let deadline = background.deadline(now);
         let draining = lock(&host.lifecycle).draining;
         // Drain forbids background work, so its deadlines never advance and
         // an expired one would spin until stop. Only a command or the stop
@@ -350,10 +320,10 @@ fn serve(
         );
         match message {
             Ok(Message::Command(command)) => {
-                if run_command(host, &lane, &options, &scheduler, *command)? {
-                    initial = true;
+                if run_command(host, &lane, &background.options, &scheduler, *command)? {
+                    background.initial = true;
                 }
-                content_due = Instant::now();
+                background.content_due = Instant::now();
                 continue;
             }
             Ok(Message::Intake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -362,18 +332,116 @@ fn serve(
         if lock(&host.lifecycle).draining {
             continue;
         }
-        if Instant::now() >= full_due {
-            if let Some(w) = &watch {
+        background.backstop_if_due();
+        background.poll_if_due();
+        background.turn()?;
+    }
+    drop(background);
+    // The merge worker is joined. This thread still holds the catalog lock
+    // until it returns. A test can hold that window open (D110).
+    #[cfg(debug_assertions)]
+    if host.stop.load(Ordering::Acquire) {
+        let delay = duration("FERRET_DAEMON_TEST_STOP_DELAY_MS", 0);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+    Ok(())
+}
+/// The writer loop's background schedule: the backstop, poll, retry and
+/// content timers, and the refreshes they start.
+struct Background<'h> {
+    host: &'h Arc<Host>,
+    engine: &'h Arc<Engine>,
+    scheduler: &'h Arc<crate::scheduler::Scheduler>,
+    watch: &'h Option<Arc<Watch>>,
+    context: crate::cli::Context,
+    options: IndexOptions,
+    hourly: Duration,
+    polling: Duration,
+    full_due: Instant,
+    poll_due: Instant,
+    /// Whether a poll with roots to walk was issued that no refresh has
+    /// taken yet.
+    poll_issued: bool,
+    refresh_log: RefreshLog,
+    retry_due: Option<Duration>,
+    initial: bool,
+    content_due: Instant,
+    content_state: content::State,
+}
+
+impl<'h> Background<'h> {
+    fn new(
+        host: &'h Arc<Host>,
+        engine: &'h Arc<Engine>,
+        scheduler: &'h Arc<crate::scheduler::Scheduler>,
+        watch: &'h Option<Arc<Watch>>,
+        context: crate::cli::Context,
+    ) -> Self {
+        let hourly = duration("FERRET_BACKSTOP_MS", 60 * 60 * 1000).max(Duration::from_millis(1));
+        let polling = duration("FERRET_POLL_MS", 5 * 60 * 1000).max(Duration::from_millis(1));
+        let initial = watch.is_none();
+        lock(&host.writer_status).fallback_backstop = initial;
+        Self {
+            host,
+            engine,
+            scheduler,
+            watch,
+            context,
+            options: IndexOptions {
+                watch: watch.clone(),
+                bulk: Some(scheduler.clone()),
+                ..IndexOptions::default()
+            },
+            hourly,
+            polling,
+            full_due: Instant::now() + hourly,
+            poll_due: Instant::now() + polling,
+            poll_issued: false,
+            refresh_log: RefreshLog::default(),
+            retry_due: None,
+            initial,
+            content_due: Instant::now(),
+            content_state: content::State::default(),
+        }
+    }
+
+    /// When the loop must next wake without a message.
+    fn deadline(&self, now: Instant) -> Instant {
+        let mut deadline = self.full_due.min(self.poll_due);
+        // A catalog retry owns this boundary. An expired content deadline
+        // must not wake repeatedly while that retry is cooling down.
+        if self.retry_due.is_none() {
+            deadline = deadline.min(self.content_due);
+        }
+        if let Some(retry) = self.retry_due {
+            deadline = deadline.min(now + retry.saturating_sub(self.scheduler.now()));
+        }
+        if self.retry_due.is_none()
+            && let Some(due) = self.watch.as_ref().and_then(|w| w.next_due())
+        {
+            deadline = deadline.min(due);
+        }
+        deadline
+    }
+
+    fn backstop_if_due(&mut self) {
+        if Instant::now() >= self.full_due {
+            if let Some(w) = self.watch {
                 w.backstop(RefreshReason::Backstop);
             } else {
-                initial = true;
-                lock(&host.writer_status).fallback_backstop = true;
+                self.initial = true;
+                lock(&self.host.writer_status).fallback_backstop = true;
             }
-            full_due = Instant::now() + hourly;
+            self.full_due = Instant::now() + self.hourly;
         }
-        if Instant::now() >= poll_due {
-            if let Some(w) = &watch {
-                let pin = engine.pin();
+    }
+
+    fn poll_if_due(&mut self) {
+        if Instant::now() >= self.poll_due {
+            if let Some(w) = self.watch {
+                let pin = self.engine.pin();
                 let scopes = w
                     .polling_roots(pin.catalog())
                     .into_iter()
@@ -381,61 +449,76 @@ fn serve(
                     .collect::<BTreeSet<_>>();
                 // A poll with nothing to walk issues no refresh. Marking it
                 // issued would make the next inotify burst count as a poll.
-                poll_issued |= !scopes.is_empty();
+                self.poll_issued |= !scopes.is_empty();
                 w.scoped_roots(scopes.into_iter().collect());
             } else {
-                initial = true;
-                poll_issued = true;
-                lock(&host.writer_status).fallback_backstop = true;
+                self.initial = true;
+                self.poll_issued = true;
+                lock(&self.host.writer_status).fallback_backstop = true;
             }
-            poll_due = Instant::now() + polling;
+            self.poll_due = Instant::now() + self.polling;
         }
-        if retry_due.is_some_and(|retry| scheduler.now() < retry) {
-            continue;
+    }
+
+    /// One background turn: wait out a retry or a pause, take a content
+    /// turn, or refresh.
+    fn turn(&mut self) -> io::Result<()> {
+        let scheduler = self.scheduler;
+        if self.retry_due.is_some_and(|retry| scheduler.now() < retry) {
+            return Ok(());
         }
         // An expired retry is spent here. Left set, it would keep hiding the
         // watch's next due time from the deadline, and a later `continue`
         // would spin on the past deadline.
-        retry_due = None;
-        options.workers = scheduler.status().workers;
+        self.retry_due = None;
+        self.options.workers = scheduler.status().workers;
         let paused = scheduler.status().paused;
-        let burst = watch
+        let burst = self
+            .watch
             .as_ref()
             .and_then(|w| w.take_admitted(paused.is_none()));
         if paused.is_some() && burst.is_none() {
-            content_due = Instant::now() + Duration::from_secs(1);
-            if initial
-                || watch
+            self.content_due = Instant::now() + Duration::from_secs(1);
+            if self.initial
+                || self
+                    .watch
                     .as_ref()
                     .is_some_and(|w| w.status().backstop.is_some())
             {
-                retry_due = Some(scheduler.now() + Duration::from_secs(1));
+                self.retry_due = Some(scheduler.now() + Duration::from_secs(1));
             }
-            continue;
+            return Ok(());
         }
-        if burst.is_none() && !initial {
-            if Instant::now() >= content_due {
-                content_due =
-                    Instant::now() + content::turn(host, &engine, &scheduler, &mut content_state)?;
+        if burst.is_none() && !self.initial {
+            if Instant::now() >= self.content_due {
+                self.content_due = Instant::now()
+                    + content::turn(self.host, self.engine, scheduler, &mut self.content_state)?;
             }
-            continue;
+            return Ok(());
         }
         if paused.is_none() {
-            lock(&host.writer_status).blocked = None;
+            lock(&self.host.writer_status).blocked = None;
         }
+        self.refresh(burst);
+        Ok(())
+    }
+
+    /// Refreshes for a burst, or the whole catalog, and schedules what
+    /// follows from the outcome.
+    fn refresh(&mut self, burst: Option<ferret_crawl::watch::Burst>) {
         let started = Instant::now();
         // The burst taken above holds any poll issued before it.
-        let polled = std::mem::take(&mut poll_issued);
-        let _operation = Operation::start(host, "refresh");
+        let polled = std::mem::take(&mut self.poll_issued);
+        let _operation = Operation::start(self.host, "refresh");
         #[cfg(debug_assertions)]
         std::thread::sleep(duration("FERRET_WATCH_TEST_REFRESH_DELAY_MS", 0));
-        global_inputs(watch.as_ref(), &engine, &context);
+        global_inputs(self.watch.as_ref(), self.engine, &self.context);
         let mut reason = RefreshReason::Backstop;
-        let result = crate::index::global_ignore(&context)
+        let result = crate::index::global_ignore(&self.context)
             .map_err(io::Error::other)
             .and_then(|global| {
-                options.global = Some(global);
-                let pin = engine.pin();
+                self.options.global = Some(global);
+                let pin = self.engine.pin();
                 let request = burst.as_ref().map_or_else(
                     || ferret_crawl::RefreshRequest {
                         expected_generation: pin.generation(),
@@ -446,7 +529,9 @@ fn serve(
                     |b| b.request(pin.catalog()),
                 );
                 reason = request.reason;
-                engine.refresh(request, &options).map_err(io::Error::other)
+                self.engine
+                    .refresh(request, &self.options)
+                    .map_err(io::Error::other)
             });
         // Past the watch cap a poll rewalks a whole root, which can outlast
         // the poll interval and would then run back to back (D116). A long
@@ -456,13 +541,14 @@ fn serve(
         // scoped burst elsewhere must not starve them.
         let elapsed = started.elapsed();
         let spacing = elapsed.saturating_mul(4);
-        if (polled || reason != RefreshReason::Burst) && spacing > polling {
-            poll_due = poll_due.max(Instant::now() + spacing);
+        if (polled || reason != RefreshReason::Burst) && spacing > self.polling {
+            self.poll_due = self.poll_due.max(Instant::now() + spacing);
         }
         if elapsed >= Duration::from_secs(1) {
             release_freed_memory();
         }
-        refresh_log.record(&context, reason, polled, elapsed, &result);
+        self.refresh_log
+            .record(&self.context, reason, polled, elapsed, &result);
         let deferred = result
             .as_ref()
             .ok()
@@ -480,64 +566,53 @@ fn serve(
             Ok(_) if retry_current => {
                 // A budget checkpoint may keep sequence unchanged. It did not
                 // observe the queued work; resolve the complete marker again.
-                initial = true;
-                lock(&host.writer_status).fallback_backstop = watch.is_none();
-                retry_due = Some(scheduler.now());
+                self.initial = true;
+                lock(&self.host.writer_status).fallback_backstop = self.watch.is_none();
+                self.retry_due = Some(self.scheduler.now());
             }
             Ok(_) if deferred.is_some() => {
-                lock(&host.writer_status).blocked = deferred;
-                if watch.is_none() {
-                    initial = true;
-                    lock(&host.writer_status).fallback_backstop = true;
+                lock(&self.host.writer_status).blocked = deferred;
+                if self.watch.is_none() {
+                    self.initial = true;
+                    lock(&self.host.writer_status).fallback_backstop = true;
                 }
-                retry_due = Some(scheduler.now() + Duration::from_secs(1));
+                self.retry_due = Some(self.scheduler.now() + Duration::from_secs(1));
             }
             Ok(report) => {
-                global_inputs(watch.as_ref(), &engine, &context);
+                global_inputs(self.watch.as_ref(), self.engine, &self.context);
                 let complete = burst
                     .as_ref()
                     .is_none_or(|b| b.reason() != RefreshReason::Burst)
                     && report.report.coverage_faults.is_empty();
-                successful(host, &report.report, complete);
-                lock(&host.writer_status).last_reason = Some(reason);
-                if let Some(w) = &watch {
+                successful(self.host, &report.report, complete);
+                lock(&self.host.writer_status).last_reason = Some(reason);
+                if let Some(w) = self.watch {
                     w.adopt_aliases(&report.view);
                     if burst.as_ref().is_none_or(|b| b.reconcile_watches()) {
                         w.reconcile(&report.view);
                     }
                 }
-                initial = false;
-                retry_due = None;
-                content_due = Instant::now();
+                self.initial = false;
+                self.retry_due = None;
+                self.content_due = Instant::now();
             }
             Err(error) => {
-                lock(&host.writer_status).error = Some(error.to_string());
-                retry_due = Some(scheduler.now() + Duration::from_secs(1));
+                lock(&self.host.writer_status).error = Some(error.to_string());
+                self.retry_due = Some(self.scheduler.now() + Duration::from_secs(1));
             }
         }
         if let Some(burst) = burst
-            && let Some(watch) = &watch
+            && let Some(watch) = self.watch
         {
             if deferred.is_some() {
                 watch.defer(burst);
                 // Its retry is still that poll, for the refresh log.
-                poll_issued |= polled;
+                self.poll_issued |= polled;
             } else {
                 watch.finish(burst, result.is_ok() && !retry_current);
             }
         }
     }
-    drop(content_state);
-    // The merge worker is joined. This thread still holds the catalog lock
-    // until it returns. A test can hold that window open (D110).
-    #[cfg(debug_assertions)]
-    if host.stop.load(Ordering::Acquire) {
-        let delay = duration("FERRET_DAEMON_TEST_STOP_DELAY_MS", 0);
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-    }
-    Ok(())
 }
 /// The inotify watch sized from the process's limits, or `None` when they
 /// cannot be read or the watch cannot start, which leaves the writer polling.
