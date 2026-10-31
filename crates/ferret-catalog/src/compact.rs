@@ -111,123 +111,12 @@ impl Plan {
         view: &Catalog,
         generation: Generation,
     ) -> io::Result<(Head, [Vec<u64>; COLUMNS.len()])> {
-        let mut ranges = [Range::default(); COLUMNS.len()];
-        let mut sets: [HashSet<u64>; COLUMNS.len()] = Default::default();
-        let mut last = [None; COLUMNS.len()];
-        let mut blocks: [BlockSizer; COLUMNS.len()] = Default::default();
-        let mut lens = [0u64; SECTIONS.len()];
-        for &id in &self.order {
-            let inode = view.inode(id);
-            for column in STAT_COLUMNS {
-                let c = column as usize;
-                let value = stat_field(column, &inode.stat);
-                match column.coding() {
-                    Coding::Dictionary => {
-                        if last[c] != Some(value) {
-                            sets[c].insert(value);
-                            last[c] = Some(value);
-                        }
-                    }
-                    _ => blocks[c].push(value),
-                }
-            }
-            match inode.doc {
-                Some(doc) => {
-                    blocks[Column::Doc as usize].push(u64::from(doc.0));
-                    let row = self
-                        .doc_row(doc)
-                        .ok_or_else(|| invalid("compaction missing document"))?;
-                    self.refs[row] = self.refs[row]
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("document refcount overflow"))?;
-                }
-                None => blocks[Column::Doc as usize].push_null(),
-            }
-            match view.kind(id) {
-                Kind::Symlink => {
-                    lens[Section::Links as usize] += 8;
-                    lens[Section::Strings as usize] += view
-                        .link_target(id)
-                        .ok_or_else(|| invalid("missing link target"))?
-                        .len() as u64
-                        + 1;
-                }
-                Kind::Dir | Kind::File => {}
-                _ => lens[Section::Specials as usize] += 8,
-            }
-        }
-        for (&id, &count) in self.docs.iter().zip(&self.refs) {
-            if count == 0 || view.doc_references(id) != Some(count) {
-                return Err(invalid("compaction document refcounts"));
-            }
-        }
-        let mut offset = 0;
-        for (parent, &dir) in self.order[..self.dirs].iter().enumerate() {
-            let c = Column::DirName as usize;
-            if self.dir_names[parent] != NONE {
-                ranges[c].add(u64::from(self.dir_names[parent]));
-            }
-            for (column, value) in [
-                (Column::Entries, view.entry_count(dir).map(u64::from)),
-                (Column::RetainedAt, view.retained_at(dir)),
-            ] {
-                match value {
-                    Some(n) => blocks[column as usize].push(n),
-                    None => blocks[column as usize].push_null(),
-                }
-            }
-            for id in view.children(dir) {
-                let name = view.name(id);
-                if view.is_revealed(id) {
-                    lens[Section::Revealed as usize] += 4;
-                }
-                blocks[Column::NameParent as usize].push(parent as u64);
-                blocks[Column::NameChild as usize].push(u64::from(self.child(name.target())));
-                blocks[Column::NameOffset as usize].push(offset);
-                offset += name.bytes.len() as u64 + 1;
-            }
-        }
-        if offset > u64::from(u32::MAX) {
-            return Err(invalid("compaction name heap limit"));
-        }
-        lens[Section::NameHeap as usize] = offset;
-        for (row, &id) in self.docs.iter().enumerate() {
-            ranges[Column::DocId as usize].add(u64::from(id.0) - row as u64);
-        }
-        for (_, path) in view.roots() {
-            lens[Section::Strings as usize] += path.len() as u64 + 1;
-        }
-        for tree in view.work_trees() {
-            lens[Section::Strings as usize] += tree.common_dir.len() as u64 + 1;
-        }
-        if lens[Section::Strings as usize] > u64::from(u32::MAX) {
-            return Err(invalid("compaction strings limit"));
-        }
-        lens[Section::Roots as usize] = self.roots.len() as u64 * 8;
-        lens[Section::WorkTrees as usize] = self.work_trees.len() as u64 * 32;
-        let independent_suppression = self.order[..self.dirs]
-            .iter()
-            .any(|&dir| view.is_search_suppressed(dir) != view.is_traversed(dir));
-        lens[Section::Traversed as usize] =
-            self.dirs.div_ceil(8) as u64 * if independent_suppression { 2 } else { 1 };
-        lens[Section::States as usize] = self.order.len().div_ceil(4) as u64;
-        lens[Section::Docs as usize] = self.docs.len() as u64 * 16;
-        lens[Section::DocRefs as usize] = self.docs.len() as u64 * 4;
-        lens[Section::Policy as usize] = 16;
-        let mut dicts: [Vec<u64>; COLUMNS.len()] = Default::default();
-        let columns = COLUMNS.map(|column| {
-            let c = column as usize;
-            match column.coding() {
-                Coding::Dictionary => {
-                    dicts[c] = std::mem::take(&mut sets[c]).into_iter().collect();
-                    dicts[c].sort_unstable();
-                    Descriptor::dictionary(dicts[c].len() as u32)
-                }
-                Coding::Nullable => Descriptor::nullable(ranges[c]),
-                Coding::Sequence => Descriptor::frame(ranges[c]),
-                _ => Descriptor::blocked(std::mem::take(&mut blocks[c]).finish()),
-            }
-        });
+        let mut sizes = Sizes::default();
+        self.size_inodes(view, &mut sizes)?;
+        self.size_names(view, &mut sizes)?;
+        self.size_sections(view, &mut sizes)?;
+        let lens = sizes.lens;
+        let (columns, dicts) = sizes.descriptors();
         Ok((
             Head {
                 generation,
@@ -242,6 +131,121 @@ impl Plan {
             },
             dicts,
         ))
+    }
+
+    /// Sizes each inode's stat and document columns and its link or special
+    /// row, counting its document's references as it goes.
+    fn size_inodes(&mut self, view: &Catalog, sizes: &mut Sizes) -> io::Result<()> {
+        for &id in &self.order {
+            let inode = view.inode(id);
+            for column in STAT_COLUMNS {
+                let c = column as usize;
+                let value = stat_field(column, &inode.stat);
+                match column.coding() {
+                    Coding::Dictionary => {
+                        if sizes.last[c] != Some(value) {
+                            sizes.sets[c].insert(value);
+                            sizes.last[c] = Some(value);
+                        }
+                    }
+                    _ => sizes.blocks[c].push(value),
+                }
+            }
+            match inode.doc {
+                Some(doc) => {
+                    sizes.blocks[Column::Doc as usize].push(u64::from(doc.0));
+                    let row = self
+                        .doc_row(doc)
+                        .ok_or_else(|| invalid("compaction missing document"))?;
+                    self.refs[row] = self.refs[row]
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("document refcount overflow"))?;
+                }
+                None => sizes.blocks[Column::Doc as usize].push_null(),
+            }
+            match view.kind(id) {
+                Kind::Symlink => {
+                    sizes.lens[Section::Links as usize] += 8;
+                    sizes.lens[Section::Strings as usize] += view
+                        .link_target(id)
+                        .ok_or_else(|| invalid("missing link target"))?
+                        .len() as u64
+                        + 1;
+                }
+                Kind::Dir | Kind::File => {}
+                _ => sizes.lens[Section::Specials as usize] += 8,
+            }
+        }
+        for (&id, &count) in self.docs.iter().zip(&self.refs) {
+            if count == 0 || view.doc_references(id) != Some(count) {
+                return Err(invalid("compaction document refcounts"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Sizes each directory's columns and the names under it.
+    fn size_names(&self, view: &Catalog, sizes: &mut Sizes) -> io::Result<()> {
+        let mut offset = 0;
+        for (parent, &dir) in self.order[..self.dirs].iter().enumerate() {
+            let c = Column::DirName as usize;
+            if self.dir_names[parent] != NONE {
+                sizes.ranges[c].add(u64::from(self.dir_names[parent]));
+            }
+            for (column, value) in [
+                (Column::Entries, view.entry_count(dir).map(u64::from)),
+                (Column::RetainedAt, view.retained_at(dir)),
+            ] {
+                match value {
+                    Some(n) => sizes.blocks[column as usize].push(n),
+                    None => sizes.blocks[column as usize].push_null(),
+                }
+            }
+            for id in view.children(dir) {
+                let name = view.name(id);
+                if view.is_revealed(id) {
+                    sizes.lens[Section::Revealed as usize] += 4;
+                }
+                sizes.blocks[Column::NameParent as usize].push(parent as u64);
+                sizes.blocks[Column::NameChild as usize].push(u64::from(self.child(name.target())));
+                sizes.blocks[Column::NameOffset as usize].push(offset);
+                offset += name.bytes.len() as u64 + 1;
+            }
+        }
+        if offset > u64::from(u32::MAX) {
+            return Err(invalid("compaction name heap limit"));
+        }
+        sizes.lens[Section::NameHeap as usize] = offset;
+        Ok(())
+    }
+
+    /// Sizes the document ids, the strings and the sections whose rows are
+    /// fixed.
+    fn size_sections(&self, view: &Catalog, sizes: &mut Sizes) -> io::Result<()> {
+        for (row, &id) in self.docs.iter().enumerate() {
+            sizes.ranges[Column::DocId as usize].add(u64::from(id.0) - row as u64);
+        }
+        for (_, path) in view.roots() {
+            sizes.lens[Section::Strings as usize] += path.len() as u64 + 1;
+        }
+        for tree in view.work_trees() {
+            sizes.lens[Section::Strings as usize] += tree.common_dir.len() as u64 + 1;
+        }
+        if sizes.lens[Section::Strings as usize] > u64::from(u32::MAX) {
+            return Err(invalid("compaction strings limit"));
+        }
+        sizes.lens[Section::Roots as usize] = self.roots.len() as u64 * 8;
+        sizes.lens[Section::WorkTrees as usize] = self.work_trees.len() as u64 * 32;
+        let independent_suppression = self.order[..self.dirs]
+            .iter()
+            .any(|&dir| view.is_search_suppressed(dir) != view.is_traversed(dir));
+        sizes.lens[Section::Traversed as usize] =
+            self.dirs.div_ceil(8) as u64 * if independent_suppression { 2 } else { 1 };
+        sizes.lens[Section::States as usize] = self.order.len().div_ceil(4) as u64;
+        sizes.lens[Section::Docs as usize] = self.docs.len() as u64 * 16;
+        sizes.lens[Section::DocRefs as usize] = self.docs.len() as u64 * 4;
+        sizes.lens[Section::Policy as usize] = 16;
+        Ok(())
     }
 }
 
@@ -432,5 +436,38 @@ impl Plan {
         hashes.finish()?;
         refs.finish()?;
         Ok(())
+    }
+}
+
+/// What compaction learns of each column and section while it plans them.
+#[derive(Default)]
+struct Sizes {
+    ranges: [Range; COLUMNS.len()],
+    sets: [HashSet<u64>; COLUMNS.len()],
+    /// Each dictionary column's last value, so a run adds to its set once.
+    last: [Option<u64>; COLUMNS.len()],
+    blocks: [BlockSizer; COLUMNS.len()],
+    lens: [u64; SECTIONS.len()],
+}
+
+impl Sizes {
+    /// Each column's descriptor, and the sorted dictionary of each
+    /// dictionary column.
+    fn descriptors(mut self) -> ([Descriptor; COLUMNS.len()], [Vec<u64>; COLUMNS.len()]) {
+        let mut dicts: [Vec<u64>; COLUMNS.len()] = Default::default();
+        let columns = COLUMNS.map(|column| {
+            let c = column as usize;
+            match column.coding() {
+                Coding::Dictionary => {
+                    dicts[c] = std::mem::take(&mut self.sets[c]).into_iter().collect();
+                    dicts[c].sort_unstable();
+                    Descriptor::dictionary(dicts[c].len() as u32)
+                }
+                Coding::Nullable => Descriptor::nullable(self.ranges[c]),
+                Coding::Sequence => Descriptor::frame(self.ranges[c]),
+                _ => Descriptor::blocked(std::mem::take(&mut self.blocks[c]).finish()),
+            }
+        });
+        (columns, dicts)
     }
 }
