@@ -2,7 +2,6 @@
 //! builds, and after the process's descriptor table has grown; and the
 //! [`Shortfall`] a run reports when the system refuses some.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{Scope, ScopedJoinHandle};
 
@@ -36,6 +35,7 @@ pub(crate) fn spawn_named<'scope, R: Send + 'scope>(
 /// tests can refuse one kind of thread at a time.
 #[cfg(debug_assertions)]
 fn refused_for_tests(name: &str) -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     static LIMIT: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
     static STARTED: AtomicUsize = AtomicUsize::new(0);
     let limit = LIMIT.get_or_init(|| {
