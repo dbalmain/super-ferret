@@ -422,107 +422,13 @@ impl EventVisitor for Hasher<'_> {
             return None;
         }
         match event {
-            Event::Decided(decided) => {
-                if let Some(watch) = self.watch {
-                    watch.file(self.root, &decided);
-                }
-                if decided.decision == Decision::Skip {
-                    self.out
-                        .batch
-                        .ignored(decided.parent, decided.name.as_bytes(), decided.kind);
-                    return None;
-                }
-                if matches!(decided.decision, Decision::Descend | Decision::Traverse)
-                    && let Some(watch) = self.watch
-                {
-                    watch.arm_entry(self.root, &decided);
-                }
-                let stat = decided.stat.as_ref().map(observe::from_walk)?;
-                let name = decided.name.as_bytes();
-                let revealed = decided.revealed;
-                match decided.decision {
-                    Decision::Skip => None,
-                    Decision::Descend => {
-                        self.out.counts.dirs += 1;
-                        let token =
-                            self.out
-                                .batch
-                                .revealing(revealed)
-                                .dir(decided.parent, name, stat);
-                        self.promote_changed_parent(token, &stat, decided.path);
-                        Some(token)
-                    }
-                    Decision::Traverse => {
-                        self.out.counts.traversed += 1;
-                        let token = self.out.batch.revealing(revealed).traversed_dir(
-                            decided.parent,
-                            name,
-                            stat,
-                        );
-                        self.promote_changed_parent(token, &stat, decided.path);
-                        Some(token)
-                    }
-                    Decision::Catalog(Reason::Symlink) => {
-                        let target = decided.stat.and_then(|s| s.link_target)?;
-                        self.out.counts.symlinks += 1;
-                        self.out.batch.revealing(revealed).symlink(
-                            decided.parent,
-                            name,
-                            stat,
-                            target.as_bytes(),
-                        );
-                        None
-                    }
-                    Decision::Catalog(Reason::TooLarge) => {
-                        self.out.counts.files += 1;
-                        self.out.batch.revealing(revealed).file(
-                            decided.parent,
-                            name,
-                            stat,
-                            Content::Unindexed,
-                        );
-                        None
-                    }
-                    Decision::Catalog(Reason::Special) => {
-                        self.out.counts.specials += 1;
-                        self.out.batch.revealing(revealed).file(
-                            decided.parent,
-                            name,
-                            stat,
-                            Content::Unindexed,
-                        );
-                        None
-                    }
-                    Decision::Index => {
-                        self.out.counts.files += 1;
-                        self.index_file(&decided, stat);
-                        None
-                    }
-                }
-            }
+            Event::Decided(decided) => self.decided(decided),
             Event::Entered {
                 dir,
                 work_tree,
                 entries,
             } => {
-                #[cfg(test)]
-                hook(self.root, Probe::Entered);
-                if let Some(wt) = work_tree {
-                    let kind = match wt.kind {
-                        WorkTreeKind::Main => ferret_catalog::WorkTreeKind::Main,
-                        WorkTreeKind::Linked => ferret_catalog::WorkTreeKind::Linked,
-                        WorkTreeKind::Submodule => ferret_catalog::WorkTreeKind::Submodule,
-                    };
-                    self.out.batch.work_tree(
-                        dir,
-                        kind,
-                        wt.common_dir.as_os_str().as_bytes(),
-                        wt.common_id,
-                    );
-                }
-                if let Some(count) = entries {
-                    self.out.batch.entry_count(dir, count);
-                }
+                self.entered(dir, work_tree, entries);
                 None
             }
             Event::Boundary { .. } => {
@@ -535,42 +441,158 @@ impl EventVisitor for Hasher<'_> {
                 context,
                 error,
             } => {
-                let on_root = matches!(context, FaultContext::Root);
-                if op == IoOp::Lstat && !on_root && error.kind() == io::ErrorKind::NotFound {
-                    self.out.counts.vanished += 1;
-                } else {
-                    self.fault(path, op, context, error);
-                }
+                self.io(path, op, context, error);
                 None
             }
             Event::Pattern(error) => {
-                self.out.counts.pattern_errors += 1;
-                let ferret_policy::PatternError::Line {
-                    file,
-                    pattern,
-                    detail,
-                    ..
-                } = &error;
-                let path_bytes = match file {
-                    ferret_policy::IgnoreFile::Ferret(path)
-                    | ferret_policy::IgnoreFile::Git(path)
-                    | ferret_policy::IgnoreFile::GitExclude(path)
-                    | ferret_policy::IgnoreFile::Dot(path) => path.as_os_str().len(),
-                    ferret_policy::IgnoreFile::Global => 0,
-                };
-                // Lossy path display can expand each invalid byte to three;
-                // fixed overhead also covers the source label and line number.
-                if self.out.reserve(
-                    std::mem::size_of::<String>()
-                        + 64
-                        + path_bytes * 3
-                        + pattern.len()
-                        + detail.len(),
-                ) {
-                    self.out.pattern_errors.push(error.to_string());
-                }
+                self.pattern(error);
                 None
             }
+        }
+    }
+}
+
+impl Hasher<'_> {
+    /// Records one policy decision; a directory to descend returns its token.
+    fn decided(&mut self, decided: Decided<'_, DirToken>) -> Option<DirToken> {
+        if let Some(watch) = self.watch {
+            watch.file(self.root, &decided);
+        }
+        if decided.decision == Decision::Skip {
+            self.out
+                .batch
+                .ignored(decided.parent, decided.name.as_bytes(), decided.kind);
+            return None;
+        }
+        if matches!(decided.decision, Decision::Descend | Decision::Traverse)
+            && let Some(watch) = self.watch
+        {
+            watch.arm_entry(self.root, &decided);
+        }
+        let stat = decided.stat.as_ref().map(observe::from_walk)?;
+        let name = decided.name.as_bytes();
+        let revealed = decided.revealed;
+        match decided.decision {
+            Decision::Skip => None,
+            Decision::Descend => {
+                self.out.counts.dirs += 1;
+                let token = self
+                    .out
+                    .batch
+                    .revealing(revealed)
+                    .dir(decided.parent, name, stat);
+                self.promote_changed_parent(token, &stat, decided.path);
+                Some(token)
+            }
+            Decision::Traverse => {
+                self.out.counts.traversed += 1;
+                let token =
+                    self.out
+                        .batch
+                        .revealing(revealed)
+                        .traversed_dir(decided.parent, name, stat);
+                self.promote_changed_parent(token, &stat, decided.path);
+                Some(token)
+            }
+            Decision::Catalog(Reason::Symlink) => {
+                let target = decided.stat.and_then(|s| s.link_target)?;
+                self.out.counts.symlinks += 1;
+                self.out.batch.revealing(revealed).symlink(
+                    decided.parent,
+                    name,
+                    stat,
+                    target.as_bytes(),
+                );
+                None
+            }
+            Decision::Catalog(Reason::TooLarge) => {
+                self.out.counts.files += 1;
+                self.out.batch.revealing(revealed).file(
+                    decided.parent,
+                    name,
+                    stat,
+                    Content::Unindexed,
+                );
+                None
+            }
+            Decision::Catalog(Reason::Special) => {
+                self.out.counts.specials += 1;
+                self.out.batch.revealing(revealed).file(
+                    decided.parent,
+                    name,
+                    stat,
+                    Content::Unindexed,
+                );
+                None
+            }
+            Decision::Index => {
+                self.out.counts.files += 1;
+                self.index_file(&decided, stat);
+                None
+            }
+        }
+    }
+
+    /// Records an entered directory's work tree and entry count.
+    fn entered(
+        &mut self,
+        dir: DirToken,
+        work_tree: Option<crate::walk::WorkTree<'_>>,
+        entries: Option<u32>,
+    ) {
+        #[cfg(test)]
+        hook(self.root, Probe::Entered);
+        if let Some(wt) = work_tree {
+            let kind = match wt.kind {
+                WorkTreeKind::Main => ferret_catalog::WorkTreeKind::Main,
+                WorkTreeKind::Linked => ferret_catalog::WorkTreeKind::Linked,
+                WorkTreeKind::Submodule => ferret_catalog::WorkTreeKind::Submodule,
+            };
+            self.out.batch.work_tree(
+                dir,
+                kind,
+                wt.common_dir.as_os_str().as_bytes(),
+                wt.common_id,
+            );
+        }
+        if let Some(count) = entries {
+            self.out.batch.entry_count(dir, count);
+        }
+    }
+
+    /// Counts a vanished entry, or records the fault.
+    fn io(&mut self, path: &Path, op: IoOp, context: FaultContext<'_, DirToken>, error: io::Error) {
+        let on_root = matches!(context, FaultContext::Root);
+        if op == IoOp::Lstat && !on_root && error.kind() == io::ErrorKind::NotFound {
+            self.out.counts.vanished += 1;
+        } else {
+            self.fault(path, op, context, error);
+        }
+    }
+
+    /// Counts an ignore-file pattern error and keeps its message while the
+    /// budget allows.
+    fn pattern(&mut self, error: ferret_policy::PatternError) {
+        self.out.counts.pattern_errors += 1;
+        let ferret_policy::PatternError::Line {
+            file,
+            pattern,
+            detail,
+            ..
+        } = &error;
+        let path_bytes = match file {
+            ferret_policy::IgnoreFile::Ferret(path)
+            | ferret_policy::IgnoreFile::Git(path)
+            | ferret_policy::IgnoreFile::GitExclude(path)
+            | ferret_policy::IgnoreFile::Dot(path) => path.as_os_str().len(),
+            ferret_policy::IgnoreFile::Global => 0,
+        };
+        // Lossy path display can expand each invalid byte to three;
+        // fixed overhead also covers the source label and line number.
+        if self.out.reserve(
+            std::mem::size_of::<String>() + 64 + path_bytes * 3 + pattern.len() + detail.len(),
+        ) {
+            self.out.pattern_errors.push(error.to_string());
         }
     }
 }
