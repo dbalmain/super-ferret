@@ -300,6 +300,12 @@ struct Execution<'a> {
 
 impl Execution<'_> {
     fn run<W: Write>(self, inputs: Vec<Input>, writer: W) -> Exit {
+        self.search(inputs, writer).unwrap_or_else(|exit| exit)
+    }
+
+    /// The search. A failure ends it early as `Err`, carrying the exit it
+    /// reported.
+    fn search<W: Write>(self, inputs: Vec<Input>, writer: W) -> Result<Exit, Exit> {
         let Self {
             plan,
             selection,
@@ -316,31 +322,25 @@ impl Execution<'_> {
             .iter()
             .any(|input| matches!(input, Input::Directory(_)));
         let mut candidates = if !plan.invert {
-            match pin
-                .map(|pin| pin.grep_candidates(&plan.grep, &stopped))
+            pin.map(|pin| pin.grep_candidates(&plan.grep, &stopped))
                 .transpose()
-            {
-                Ok(candidates) => candidates,
-                Err(error) => return runtime.failure(&error.to_string()),
-            }
+                .map_err(|error| runtime.failure(&error.to_string()))?
         } else {
             None
         };
-        let names = match pin.map(|pin| pin.doc_names_until(stopped)).transpose() {
-            Ok(names) => names.flatten(),
-            Err(error) => return runtime.failure(&error.to_string()),
-        };
-        let documents = match pin
+        let names = pin
+            .map(|pin| pin.doc_names_until(stopped))
+            .transpose()
+            .map_err(|error| runtime.failure(&error.to_string()))?
+            .flatten();
+        let documents = pin
             .map(|pin| {
                 ferret_crawl::Documents::by_name(pin.catalog()).map(|documents| {
                     documents.with_config(ferret_policy::Config { size_cap: u64::MAX })
                 })
             })
             .transpose()
-        {
-            Ok(documents) => documents,
-            Err(error) => return runtime.failure(&error.to_string()),
-        };
+            .map_err(|error| runtime.failure(&error.to_string()))?;
         // The catalog documents the walks below can reach: candidates are
         // decoded for these alone (S5). Listing a name costs about what
         // decoding a candidate does, so past half the candidates' bound,
@@ -355,21 +355,18 @@ impl Execution<'_> {
             if let Input::Directory(path) = input {
                 if let Some(anchors) = live.filter(|anchors| anchors.walks(path)) {
                     if let Err(error) = anchors.validate(path) {
-                        return runtime.failure(&format!("{}: {error}", path.display()));
+                        return Err(runtime.failure(&format!("{}: {error}", path.display())));
                     }
                 } else if let Some(pin) = pin {
                     let mut source =
-                        match sources::Directory::new(path, Some(pin.catalog()), cwd, false, false)
-                        {
-                            Ok(source) => source,
-                            Err(error) => return runtime.failure(&error.to_string()),
-                        };
+                        sources::Directory::new(path, Some(pin.catalog()), cwd, false, false)
+                            .map_err(|error| runtime.failure(&error.to_string()))?;
                     if let Some(Err(error)) = source.next(true) {
-                        return runtime.failure(&format!(
+                        return Err(runtime.failure(&format!(
                         "{}: {}; refresh the index with ferret index DIR, or use -u to search current files",
                         error.path.display(),
                         error.error
-                    ));
+                    )));
                     }
                     if let Some((docs, budget)) = &mut reachable {
                         match documents_below(
@@ -381,7 +378,7 @@ impl Execution<'_> {
                         ) {
                             Ok(true) => {}
                             Ok(false) => reachable = None,
-                            Err(error) => return runtime.failure(&error.to_string()),
+                            Err(error) => return Err(runtime.failure(&error.to_string())),
                         }
                     }
                 }
@@ -397,7 +394,7 @@ impl Execution<'_> {
         if let (Some(candidates), Some((reachable, _))) = (&mut candidates, reachable)
             && let Err(error) = candidates.probe(reachable, &stopped)
         {
-            return runtime.failure(&error.to_string());
+            return Err(runtime.failure(&error.to_string()));
         }
         // Past one candidate a document, every directory may hold one,
         // unless the globs and types admit files by name.
@@ -407,16 +404,8 @@ impl Execution<'_> {
                     || selection.whitelists_names())
         }) {
             Some((candidates, pin)) => {
-                match holders::Holders::new(
-                    pin.catalog(),
-                    candidates,
-                    selection,
-                    plan.text,
-                    &stopped,
-                ) {
-                    Ok(holders) => holders,
-                    Err(error) => return runtime.failure(&error.to_string()),
-                }
+                holders::Holders::new(pin.catalog(), candidates, selection, plan.text, &stopped)
+                    .map_err(|error| runtime.failure(&error.to_string()))?
             }
             None => None,
         };
@@ -453,9 +442,8 @@ impl Execution<'_> {
         let mut resolved = Vec::new();
         for input in inputs {
             if let Input::Failed(path, error) = input {
-                if let Err(error) = host.error(&path, &error) {
-                    return runtime.output_failure(&error);
-                }
+                host.error(&path, &error)
+                    .map_err(|error| runtime.output_failure(&error))?;
             } else {
                 resolved.push(input);
             }
@@ -515,11 +503,11 @@ impl Execution<'_> {
                             asked: threads,
                             cause,
                         }) {
-                            return runtime.output_failure(&error);
+                            return Err(runtime.output_failure(&error));
                         }
                         Some(1)
                     }
-                    Some(Err(error)) => return runtime.output_failure(&error),
+                    Some(Err(error)) => return Err(runtime.output_failure(&error)),
                 };
                 if let Some(threads) = serial {
                     let result = groups::run(
@@ -532,20 +520,18 @@ impl Execution<'_> {
                         cancelled,
                     );
                     searched |= source.searched();
-                    if let Err(error) = result {
-                        return runtime.output_failure(&error);
-                    }
+                    result.map_err(|error| runtime.output_failure(&error))?;
                 }
                 if plan.quiet && host.matched {
                     if !plan.json {
-                        return Exit::Ok;
+                        return Ok(Exit::Ok);
                     }
                     break 'inputs;
                 }
                 if buffered_path_output(plan, runtime.tty)
                     && let Err(error) = host.writer.flush()
                 {
-                    return runtime.output_failure(&error);
+                    return Err(runtime.output_failure(&error));
                 }
             }
             if let Some(Input::Stream(path)) =
@@ -560,12 +546,10 @@ impl Execution<'_> {
                         Err(error) => host.error(&path, &error),
                     }
                 };
-                if let Err(error) = result {
-                    return runtime.output_failure(&error);
-                }
+                result.map_err(|error| runtime.output_failure(&error))?;
                 if plan.quiet && host.matched {
                     if !plan.json {
-                        return Exit::Ok;
+                        return Ok(Exit::Ok);
                     }
                     break 'inputs;
                 }
@@ -588,12 +572,12 @@ impl Execution<'_> {
         if plan.json
             && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start)
         {
-            return runtime.output_failure(&error);
+            return Err(runtime.output_failure(&error));
         }
-        if let Err(error) = host.writer.flush() {
-            return runtime.output_failure(&error);
-        }
-        if plan.quiet && host.matched {
+        host.writer
+            .flush()
+            .map_err(|error| runtime.output_failure(&error))?;
+        Ok(if plan.quiet && host.matched {
             Exit::Ok
         } else if plan.paths.is_empty() && !searched {
             let _ = (runtime.stderr)(
@@ -607,7 +591,7 @@ impl Execution<'_> {
             Exit::Ok
         } else {
             Exit::NoMatch
-        }
+        })
     }
 }
 
