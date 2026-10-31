@@ -1208,6 +1208,35 @@ fn error_after_successful_reconcile_cleans_unpublished_outputs() {
     assert_eq!(dir.files(), named(&writer.view()));
 }
 
+/// A merge writes its term output here and its trigram output on a second
+/// thread. A failure confined to either side fails the merge, leaves the
+/// published view as it was and removes every unpublished file.
+#[test]
+fn a_merge_failing_on_one_side_publishes_nothing() {
+    for fail_trigrams in [false, true] {
+        let dir = Dir::new(&format!("pair-merge-error-{fail_trigrams}"));
+        let corpus = Corpus::new(1201, 40);
+        let mut writer = four_segments(&dir, &corpus);
+        let catalog = Catalog::new(40, &[]);
+        let before = writer.view().manifest().clone();
+        let caller = std::thread::current().id();
+        let pace = |_| {
+            if (std::thread::current().id() != caller) == fail_trigrams {
+                Err(io::Error::other("injected one-sided failure"))
+            } else {
+                Ok(())
+            }
+        };
+        let budget = Budget {
+            pace: &pace,
+            ..Budget::unbounded()
+        };
+        assert!(writer.merge_all(&catalog.view(), &budget).is_err());
+        assert_eq!(writer.view().manifest().segments, before.segments);
+        assert_eq!(dir.files(), named(&writer.view()));
+    }
+}
+
 /// Review of P7: segments open on the host's thread count, capped by the
 /// segment count, and a refused spawn opens the rest on the calling thread,
 /// in manifest order and with the first error a serial open returns.
