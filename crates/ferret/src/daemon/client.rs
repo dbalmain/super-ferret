@@ -518,190 +518,29 @@ fn query(
         }
         Err(_) => return None,
     };
-    let mut first_row = None;
-    let mut summary = None;
-    let mut rows = 0u64;
-    let mut output_failure = false;
-    let mut first_frame = true;
-    let result = (|| -> io::Result<Exit> {
-        reader.get_mut().write_all(&request)?;
-        let mut line = Vec::new();
-        let mut payload = Vec::new();
-        let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
-        let mut err = io::stderr().lock();
-        loop {
-            line.clear();
-            if crate::batch::read_line_bounded(&mut reader, &mut line)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "daemon closed the connection",
-                ));
-            }
-            let value = protocol::parse_object(&line).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid daemon event")
-            })?;
-            if field_text(&value, "id") != Some(op) {
-                return Err(io::Error::other("wrong daemon query tag"));
-            }
-            if op == "find" && json {
-                write(&mut out, &line, &mut output_failure)?;
-                let event_name = field_text(&value, "event");
-                if (first_frame && matches!(event_name, Some("row" | "stdout")))
-                    || matches!(event_name, Some("diagnostic" | "stderr" | "end"))
-                {
-                    out.flush().inspect_err(|_| output_failure = true)?;
-                }
-                if matches!(event_name, Some("row" | "stdout")) {
-                    first_frame = false;
-                }
-            }
-            match field_text(&value, "event") {
-                Some("begin") => {}
-                Some("log") if matches!(op, "index" | "roots-remove") => {
-                    if let Some(context) = context {
-                        context.log(&bytes(&value, "bytes", "bytes_base64")?);
-                    }
-                }
-                Some("status") if op == "status" => {
-                    if text_report {
-                        let report = field_text(&value, "report")
-                            .ok_or_else(|| io::Error::other("missing stats report"))?;
-                        write(&mut out, report.as_bytes(), &mut output_failure)?;
-                    } else {
-                        write(&mut out, &line, &mut output_failure)?;
-                    }
-                    out.flush().inspect_err(|_| output_failure = true)?;
-                    return Ok(Exit::Ok);
-                }
-                Some("row") if op == "search" => {
-                    rows += 1;
-                    if json {
-                        // The shared encoder prefixes native row fields with
-                        // the fixed id/event envelope. Preserve those fields
-                        // verbatim rather than encoding a second row schema.
-                        let fields = line
-                            .strip_prefix(br#"{"id":"search","event":"row","#)
-                            .ok_or_else(|| io::Error::other("invalid row envelope"))?;
-                        let mut native = Vec::with_capacity(fields.len() + 1);
-                        native.push(b'{');
-                        native.extend_from_slice(fields);
-                        write(&mut out, &native, &mut output_failure)?;
-                    } else {
-                        write(
-                            &mut out,
-                            &bytes(&value, "path", "path_base64")?,
-                            &mut output_failure,
-                        )?;
-                        write(&mut out, b"\n", &mut output_failure)?;
-                    }
-                    first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                    if rows == 1 {
-                        out.flush().inspect_err(|_| output_failure = true)?;
-                    }
-                }
-                Some("stdout" | "stderr")
-                    if matches!(op, "find" | "grep" | "search" | "index" | "roots-remove") =>
-                {
-                    if !json {
-                        read_payload(&mut reader, &value, raw_output, &mut payload)?;
-                        let data = &payload;
-                        if field_text(&value, "event") == Some("stdout") {
-                            // A payload is not a row count: a path may contain
-                            // a newline, and a long path splits across parts.
-                            // `end.rows` is the count. A broken pipe arrives
-                            // before that event, so the first payload still
-                            // counts as a match.
-                            if op == "search" && !data.is_empty() {
-                                if rows == 0 {
-                                    rows = 1;
-                                }
-                                first_row
-                                    .get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                            }
-                            write(&mut out, data, &mut output_failure)?;
-                            if first_frame
-                                || grep_tty
-                                || matches!(value.field("flush"), Some(Value::Bool(true)))
-                            {
-                                out.flush().inspect_err(|_| output_failure = true)?;
-                                if !data.is_empty() {
-                                    first_frame = false;
-                                }
-                            }
-                        } else {
-                            out.flush().inspect_err(|_| output_failure = true)?;
-                            if op == "grep" {
-                                // Local grep diagnostics ignore a closed
-                                // stderr.
-                                let _ = err.write_all(data).and_then(|()| err.flush());
-                            } else {
-                                err.write_all(data)?;
-                                err.flush()?;
-                            }
-                        }
-                    }
-                }
-                Some("diagnostic") if op == "find" => {
-                    if field_text(&value, "code") == Some("warning") {
-                        cli::error(&format!(
-                            "find: {}",
-                            field_text(&value, "message").unwrap_or("find warning")
-                        ));
-                    }
-                    if !json {
-                        out.flush().inspect_err(|_| output_failure = true)?;
-                        match field_text(&value, "code") {
-                            Some("permission") => cli::error(crate::find::PERMISSION_WARNING),
-                            Some("warning") => {}
-                            Some("walk") => {
-                                let path = PathBuf::from(OsString::from_vec(bytes(
-                                    &value,
-                                    "path",
-                                    "path_base64",
-                                )?));
-                                cli::error(&format!(
-                                    "find: {}: {}",
-                                    path.display(),
-                                    field_text(&value, "message").unwrap_or("walk error")
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Some("end") => {
-                    out.flush().inspect_err(|_| output_failure = true)?;
-                    if op == "search"
-                        && let Some(reported) = field_number(&value, "rows")
-                    {
-                        rows = reported;
-                    }
-                    let exit = status(
-                        field_number(&value, "exit")
-                            .ok_or_else(|| io::Error::other("missing native status"))?,
-                    )?;
-                    if (op == "search" || !json)
-                        && let Some(error) = field_text(&value, "error")
-                    {
-                        let message = field_text(&value, "message").unwrap_or(error);
-                        if op == "search"
-                            && matches!(value.field("read_error"), Some(Value::Bool(true)))
-                            && let Some(context) = context
-                        {
-                            cli::error(&format!("{}: {message}", context.index.display()));
-                        } else if matches!(op, "find" | "grep") {
-                            cli::error(&format!("{op}: {message}"));
-                        } else {
-                            cli::error(message);
-                        }
-                    }
-                    summary = Some(value);
-                    return Ok(exit);
-                }
-                _ => return Err(io::Error::other("unexpected daemon event")),
-            }
-        }
-    })();
+    let mut tally = Tally::default();
+    let result = Relay {
+        op,
+        json,
+        text_report,
+        grep_tty,
+        raw_output,
+        context,
+        started,
+        out: BufWriter::with_capacity(64 * 1024, io::stdout().lock()),
+        err: io::stderr().lock(),
+        line: Vec::new(),
+        payload: Vec::new(),
+        first_frame: true,
+        tally: &mut tally,
+    }
+    .run(&mut reader, &request);
+    let Tally {
+        rows,
+        first_row,
+        summary,
+        output_failure,
+    } = tally;
     let exit = match result {
         Ok(exit) => exit,
         Err(error) => {
@@ -729,6 +568,256 @@ fn query(
         context.log(&line);
     }
     Some(exit)
+}
+
+/// What a query's relay records for the search log.
+#[derive(Default)]
+struct Tally {
+    rows: u64,
+    first_row: Option<i128>,
+    /// The `end` event.
+    summary: Option<Value>,
+    output_failure: bool,
+}
+
+/// Relays one query's daemon events to stdout and stderr. Dropping it
+/// flushes stdout.
+struct Relay<'a> {
+    op: &'a str,
+    json: bool,
+    /// Print the status event's `report` text instead of its JSON line.
+    text_report: bool,
+    grep_tty: bool,
+    raw_output: bool,
+    context: Option<&'a Context>,
+    started: Instant,
+    out: BufWriter<io::StdoutLock<'static>>,
+    err: io::StderrLock<'static>,
+    line: Vec<u8>,
+    payload: Vec<u8>,
+    first_frame: bool,
+    tally: &'a mut Tally,
+}
+
+impl Relay<'_> {
+    fn run(mut self, reader: &mut BufReader<UnixStream>, request: &[u8]) -> io::Result<Exit> {
+        reader.get_mut().write_all(request)?;
+        loop {
+            self.line.clear();
+            if crate::batch::read_line_bounded(reader, &mut self.line)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "daemon closed the connection",
+                ));
+            }
+            let value = protocol::parse_object(&self.line).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid daemon event")
+            })?;
+            if field_text(&value, "id") != Some(self.op) {
+                return Err(io::Error::other("wrong daemon query tag"));
+            }
+            if self.op == "find" && self.json {
+                self.find_frame(&value)?;
+            }
+            if let Some(exit) = self.event(reader, value)? {
+                return Ok(exit);
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let failed = &mut self.tally.output_failure;
+        self.out.flush().inspect_err(|_| *failed = true)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        write(&mut self.out, bytes, &mut self.tally.output_failure)
+    }
+
+    /// `find --json` copies every event line through.
+    fn find_frame(&mut self, value: &Value) -> io::Result<()> {
+        write(&mut self.out, &self.line, &mut self.tally.output_failure)?;
+        let event_name = field_text(value, "event");
+        if (self.first_frame && matches!(event_name, Some("row" | "stdout")))
+            || matches!(event_name, Some("diagnostic" | "stderr" | "end"))
+        {
+            self.flush()?;
+        }
+        if matches!(event_name, Some("row" | "stdout")) {
+            self.first_frame = false;
+        }
+        Ok(())
+    }
+
+    /// Handles one event; `Some` when it ends the query.
+    fn event(
+        &mut self,
+        reader: &mut BufReader<UnixStream>,
+        value: Value,
+    ) -> io::Result<Option<Exit>> {
+        let op = self.op;
+        match field_text(&value, "event") {
+            Some("begin") => {}
+            Some("log") if matches!(op, "index" | "roots-remove") => {
+                if let Some(context) = self.context {
+                    context.log(&bytes(&value, "bytes", "bytes_base64")?);
+                }
+            }
+            Some("status") if op == "status" => {
+                if self.text_report {
+                    let report = field_text(&value, "report")
+                        .ok_or_else(|| io::Error::other("missing stats report"))?;
+                    self.write(report.as_bytes())?;
+                } else {
+                    write(&mut self.out, &self.line, &mut self.tally.output_failure)?;
+                }
+                self.flush()?;
+                return Ok(Some(Exit::Ok));
+            }
+            Some("row") if op == "search" => self.row(&value)?,
+            Some("stdout" | "stderr")
+                if matches!(op, "find" | "grep" | "search" | "index" | "roots-remove") =>
+            {
+                if !self.json {
+                    self.part(reader, &value)?;
+                }
+            }
+            Some("diagnostic") if op == "find" => self.find_diagnostic(&value)?,
+            Some("end") => return self.end(value).map(Some),
+            _ => return Err(io::Error::other("unexpected daemon event")),
+        }
+        Ok(None)
+    }
+
+    fn row(&mut self, value: &Value) -> io::Result<()> {
+        self.tally.rows += 1;
+        if self.json {
+            // The shared encoder prefixes native row fields with the fixed
+            // id/event envelope. Preserve those fields verbatim rather than
+            // encoding a second row schema.
+            let fields = self
+                .line
+                .strip_prefix(br#"{"id":"search","event":"row","#)
+                .ok_or_else(|| io::Error::other("invalid row envelope"))?;
+            let mut native = Vec::with_capacity(fields.len() + 1);
+            native.push(b'{');
+            native.extend_from_slice(fields);
+            self.write(&native)?;
+        } else {
+            self.write(&bytes(value, "path", "path_base64")?)?;
+            self.write(b"\n")?;
+        }
+        let started = self.started;
+        self.tally
+            .first_row
+            .get_or_insert_with(|| started.elapsed().as_micros() as i128);
+        if self.tally.rows == 1 {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// A `stdout` or `stderr` payload.
+    fn part(&mut self, reader: &mut BufReader<UnixStream>, value: &Value) -> io::Result<()> {
+        read_payload(reader, value, self.raw_output, &mut self.payload)?;
+        if field_text(value, "event") == Some("stdout") {
+            let empty = self.payload.is_empty();
+            // A payload is not a row count: a path may contain a newline,
+            // and a long path splits across parts. `end.rows` is the count.
+            // A broken pipe arrives before that event, so the first payload
+            // still counts as a match.
+            if self.op == "search" && !empty {
+                if self.tally.rows == 0 {
+                    self.tally.rows = 1;
+                }
+                let started = self.started;
+                self.tally
+                    .first_row
+                    .get_or_insert_with(|| started.elapsed().as_micros() as i128);
+            }
+            write(&mut self.out, &self.payload, &mut self.tally.output_failure)?;
+            if self.first_frame
+                || self.grep_tty
+                || matches!(value.field("flush"), Some(Value::Bool(true)))
+            {
+                self.flush()?;
+                if !empty {
+                    self.first_frame = false;
+                }
+            }
+        } else {
+            self.flush()?;
+            if self.op == "grep" {
+                // Local grep diagnostics ignore a closed stderr.
+                let _ = self
+                    .err
+                    .write_all(&self.payload)
+                    .and_then(|()| self.err.flush());
+            } else {
+                self.err.write_all(&self.payload)?;
+                self.err.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn find_diagnostic(&mut self, value: &Value) -> io::Result<()> {
+        if field_text(value, "code") == Some("warning") {
+            cli::error(&format!(
+                "find: {}",
+                field_text(value, "message").unwrap_or("find warning")
+            ));
+        }
+        if !self.json {
+            self.flush()?;
+            match field_text(value, "code") {
+                Some("permission") => cli::error(crate::find::PERMISSION_WARNING),
+                Some("warning") => {}
+                Some("walk") => {
+                    let path =
+                        PathBuf::from(OsString::from_vec(bytes(value, "path", "path_base64")?));
+                    cli::error(&format!(
+                        "find: {}: {}",
+                        path.display(),
+                        field_text(value, "message").unwrap_or("walk error")
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn end(&mut self, value: Value) -> io::Result<Exit> {
+        let op = self.op;
+        self.flush()?;
+        if op == "search"
+            && let Some(reported) = field_number(&value, "rows")
+        {
+            self.tally.rows = reported;
+        }
+        let exit = status(
+            field_number(&value, "exit")
+                .ok_or_else(|| io::Error::other("missing native status"))?,
+        )?;
+        if (op == "search" || !self.json)
+            && let Some(error) = field_text(&value, "error")
+        {
+            let message = field_text(&value, "message").unwrap_or(error);
+            if op == "search"
+                && matches!(value.field("read_error"), Some(Value::Bool(true)))
+                && let Some(context) = self.context
+            {
+                cli::error(&format!("{}: {message}", context.index.display()));
+            } else if matches!(op, "find" | "grep") {
+                cli::error(&format!("{op}: {message}"));
+            } else {
+                cli::error(message);
+            }
+        }
+        self.tally.summary = Some(value);
+        Ok(exit)
+    }
 }
 
 /// The request line for `op`, or `None` when the protocol would reject it
