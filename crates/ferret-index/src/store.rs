@@ -702,7 +702,13 @@ impl IndexWriter {
             let trigrams = &mut trigrams;
             let order = live.range(manifest.frontier, live.bound());
             crate::extract::in_order(order, readers, |doc, extracted| -> Result<bool, Error> {
-                let full = docs != 0 && PairBuffer::full(&inverter, trigrams, budget.buffer);
+                // A document whose trigrams the buffer has no room left for
+                // fills it as surely as the bound does.
+                let overflows = extracted
+                    .as_ref()
+                    .is_ok_and(|e| !PairBuffer::fits(trigrams.len(), e.keys.len()));
+                let full = docs != 0
+                    && (overflows || PairBuffer::full(&inverter, trigrams, budget.buffer));
                 let hand_off = full
                     && followed.bytes < budget.bytes
                     && published + usize::from(writing.is_some()) + 1 < budget.segments;

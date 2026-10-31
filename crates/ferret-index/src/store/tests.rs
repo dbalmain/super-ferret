@@ -1086,6 +1086,61 @@ fn revision_five_charge_and_exact_admission_make_progress() {
     assert_eq!(next.remaining, 0);
 }
 
+/// A pass of many segments hands off when the next document's trigrams
+/// overflow the buffer, as it does when the bound is reached, rather than
+/// ending there: the overflow, not the bound, is what usually fills it.
+#[test]
+fn a_pass_of_many_segments_hands_off_a_trigram_overflow() {
+    let dir = Dir::new("many-segments-overflow");
+    let catalog = Catalog::new(3, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let random = |mut seed: u64| -> Vec<u8> {
+        (0..(2 << 20))
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 32) as u8
+            })
+            .collect()
+    };
+    let (first, second) = (random(0x4b17_9a2d_03e5_c681), random(0x9e37_79b9_7f4a_7c15));
+    let (a, b) = (
+        writer.trigrams.distinct_count(&first),
+        writer.trigrams.distinct_count(&second),
+    );
+    assert!(
+        PairBuffer::fits(0, a) && !PairBuffer::fits(a, b),
+        "{a} + {b}"
+    );
+    let budget = Budget {
+        segments: usize::MAX,
+        ..Budget::unbounded()
+    };
+    let followed = writer
+        .follow(&catalog.view(), &budget, &mut |doc, out| {
+            out.extend_from_slice(match doc {
+                0 => &first[..],
+                1 => &second[..],
+                _ => b"abc",
+            });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        (followed.stopped, followed.docs, followed.remaining),
+        (Stopped::Covered, 3, 0)
+    );
+    let ranges: Vec<_> = writer
+        .view()
+        .manifest()
+        .segments
+        .iter()
+        .map(|s| (s.first, s.last))
+        .collect();
+    assert_eq!(ranges, [(0, 0), (1, 2)]);
+}
+
 #[test]
 fn trigram_sources_estimate_read_and_share_coverage() {
     use crate::candidate::{Atom, Pinned, Source};
