@@ -8,14 +8,14 @@ use std::collections::HashMap;
 use super::{WriteError, Writer};
 
 /// Estimated bytes per distinct term beyond its own bytes and postings: the
-/// boxed key and list headers and the map's slot.
+/// key, a long key's box, the list header and the map's slot.
 const PER_TERM: usize = 64;
 
 /// Accumulates one segment's postings in memory, and says when they reach
 /// the bound the caller set.
 #[derive(Debug)]
 pub struct Inverter {
-    terms: HashMap<Box<[u8]>, Docs>,
+    terms: HashMap<Key, Docs>,
     memory: usize,
     bound: usize,
     last: Option<u32>,
@@ -43,9 +43,10 @@ impl Inverter {
         }
         self.last = Some(doc);
         let Some(docs) = self.terms.get_mut(term) else {
+            let key = Key::new(term);
             self.memory += term.len() + PER_TERM;
-            self.payload_capacity += term.len();
-            self.terms.insert(term.into(), Docs::One(doc));
+            self.payload_capacity += key.heap_bytes();
+            self.terms.insert(key, Docs::One(doc));
             return Ok(());
         };
         let grown = docs.push(doc) * size_of::<u32>();
@@ -71,12 +72,12 @@ impl Inverter {
             return 0;
         }
         let buckets = (self.terms.capacity() + 1).next_power_of_two();
-        buckets * (size_of::<(Box<[u8]>, Docs)>() + 1) + 16
+        buckets * (size_of::<(Key, Docs)>() + 1) + 16
     }
 
     /// Capacity charge including the vector of entries needed at drain.
     pub fn flush_bytes(&self) -> usize {
-        self.allocated_bytes() + self.terms.len() * size_of::<(Box<[u8]>, Docs)>()
+        self.allocated_bytes() + self.terms.len() * size_of::<(Key, Docs)>()
     }
 
     /// Whether the estimate has reached the bound.
@@ -139,14 +140,13 @@ impl Inverter {
     ) -> Result<Writer, WriteError> {
         let payload = self.payload_capacity;
         let mut terms: Vec<_> = self.terms.drain().collect();
-        let allocated =
-            payload + self.table_bytes() + terms.capacity() * size_of::<(Box<[u8]>, Docs)>();
+        let allocated = payload + self.table_bytes() + terms.capacity() * size_of::<(Key, Docs)>();
         self.memory = 0;
         self.payload_capacity = 0;
         self.last = None;
-        terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        terms.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
         for (term, docs) in &terms {
-            let docs = docs.as_slice();
+            let (term, docs) = (term.as_slice(), docs.as_slice());
             let bytes = writer.push(term, docs)?;
             on_entry(term, docs, bytes);
             observe(allocated + writer.allocated_bytes());
@@ -191,5 +191,66 @@ impl Docs {
             Self::One(doc) => std::slice::from_ref(doc),
             Self::Many(docs) => docs,
         }
+    }
+}
+
+/// A term's bytes as a table key. Most terms are short, so they live in the
+/// slot itself and only a long term allocates.
+#[derive(Debug)]
+enum Key {
+    Inline(u8, [u8; INLINE]),
+    Heap(Box<[u8]>),
+}
+
+/// Longest term kept in the slot; with the length byte the key is no larger
+/// than the boxed form's 16 bytes plus its tag.
+const INLINE: usize = 22;
+
+impl Key {
+    fn new(term: &[u8]) -> Self {
+        match u8::try_from(term.len()) {
+            Ok(len) if usize::from(len) <= INLINE => {
+                let mut bytes = [0; INLINE];
+                bytes[..term.len()].copy_from_slice(term);
+                Self::Inline(len, bytes)
+            }
+            _ => Self::Heap(term.into()),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline(len, bytes) => &bytes[..usize::from(*len)],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+
+    /// Bytes allocated off the table for this key.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Inline(..) => 0,
+            Self::Heap(bytes) => bytes.len(),
+        }
+    }
+}
+
+// `Borrow<[u8]>` requires the key to hash and compare as its bytes do.
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Key {}
+
+impl std::borrow::Borrow<[u8]> for Key {
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
     }
 }
