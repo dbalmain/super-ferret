@@ -783,93 +783,18 @@ fn run_explicit(
     request: &Request,
     options: &mut IndexOptions,
 ) -> CommandReply {
-    // The first argv item is the originating client's rules. Paths are
-    // absolute bytes, checked again by the real producer.
-    let global = request
-        .args
-        .first()
-        .map(|s| String::from_utf8_lossy(s).into_owned());
-    let paths: Vec<_> = request
-        .args
-        .iter()
-        .skip(1)
-        .map(|s| PathBuf::from(OsStr::from_bytes(s)))
-        .collect();
-    let result = if global.is_none() {
-        Err(ferret_crawl::IndexError::BadRoot(PathBuf::new()))
-    } else {
-        options.global = global;
-        let (change, refresh) = match request.op {
-            Op::Index => (
-                RootChange {
-                    add: &paths,
-                    remove: &[],
-                },
-                if paths.is_empty() {
-                    Refresh::All
-                } else {
-                    Refresh::Only(&paths)
-                },
-            ),
-            _ => (
-                RootChange {
-                    add: &[],
-                    remove: &paths,
-                },
-                Refresh::Only(&[]),
-            ),
-        };
-        engine
-            .index_change(change, refresh, options)
-            .map_err(|error| match error {
-                ferret_crawl::IndexError::DeferredBulk(ferret_catalog::bulk::Blocked::Memory) => {
-                    let status = scheduler.status();
-                    ferret_crawl::IndexError::DeferredMemory {
-                        required: status.required_memory,
-                        available: status.sample.memory.unwrap_or(0),
-                    }
-                }
-                other => other,
-            })
-    };
+    let result = change_roots(engine, scheduler, request, options);
     let mut arm_fallback = false;
-    if let Ok(report) = &result {
-        global_inputs(watch, engine, context);
-        successful(host, report, false);
-        if let Some(w) = watch {
-            w.adopt_aliases(engine.pin().catalog());
-            w.reconcile(engine.pin().catalog());
-        }
-    } else if let Err(error) = &result {
-        let deferred = match error {
-            ferret_crawl::IndexError::DeferredBulk(reason) => Some(*reason),
-            ferret_crawl::IndexError::DeferredMemory { .. } => {
-                Some(ferret_catalog::bulk::Blocked::Memory)
-            }
-            _ => None,
-        };
-        if let Some(reason) = deferred {
-            lock(&host.writer_status).blocked = Some(reason);
+    match &result {
+        Ok(report) => {
+            global_inputs(watch, engine, context);
+            successful(host, report, false);
             if let Some(w) = watch {
-                w.backstop(RefreshReason::Backstop);
-            } else {
-                arm_fallback = true;
-                lock(&host.writer_status).fallback_backstop = true;
+                w.adopt_aliases(engine.pin().catalog());
+                w.reconcile(engine.pin().catalog());
             }
         }
-        if let Some(w) = watch {
-            w.abort_policy_roots();
-        }
-        lock(&host.writer_status).error = Some(error.to_string());
-        if matches!(
-            error,
-            ferret_crawl::IndexError::Update(_)
-                | ferret_crawl::IndexError::Commit(_)
-                | ferret_crawl::IndexError::Undurable { .. }
-        ) && let Some(w) = watch
-        {
-            w.backstop(RefreshReason::Backstop);
-        }
+        Err(error) => arm_fallback = explicit_failed(host, watch, error),
     }
     let content = if result.is_ok() {
         content::follow_explicit(host, engine)
@@ -882,6 +807,107 @@ fn run_explicit(
         arm_fallback,
     }
 }
+
+/// Adds (`Op::Index`) or removes the roots `request` names and refreshes
+/// them, or every root when an index request names none. A bulk pass
+/// deferred for memory reports the scheduler's figures.
+fn change_roots(
+    engine: &Engine,
+    scheduler: &crate::scheduler::Scheduler,
+    request: &Request,
+    options: &mut IndexOptions,
+) -> Result<ferret_crawl::Report, ferret_crawl::IndexError> {
+    // The first argv item is the originating client's rules. Paths are
+    // absolute bytes, checked again by the real producer.
+    let global = request
+        .args
+        .first()
+        .map(|s| String::from_utf8_lossy(s).into_owned());
+    let paths: Vec<_> = request
+        .args
+        .iter()
+        .skip(1)
+        .map(|s| PathBuf::from(OsStr::from_bytes(s)))
+        .collect();
+    if global.is_none() {
+        return Err(ferret_crawl::IndexError::BadRoot(PathBuf::new()));
+    }
+    options.global = global;
+    let (change, refresh) = match request.op {
+        Op::Index => (
+            RootChange {
+                add: &paths,
+                remove: &[],
+            },
+            if paths.is_empty() {
+                Refresh::All
+            } else {
+                Refresh::Only(&paths)
+            },
+        ),
+        _ => (
+            RootChange {
+                add: &[],
+                remove: &paths,
+            },
+            Refresh::Only(&[]),
+        ),
+    };
+    engine
+        .index_change(change, refresh, options)
+        .map_err(|error| match error {
+            ferret_crawl::IndexError::DeferredBulk(ferret_catalog::bulk::Blocked::Memory) => {
+                let status = scheduler.status();
+                ferret_crawl::IndexError::DeferredMemory {
+                    required: status.required_memory,
+                    available: status.sample.memory.unwrap_or(0),
+                }
+            }
+            other => other,
+        })
+}
+
+/// Records an explicit command's `error` in the writer status and arms the
+/// watch's backstop for a deferred or failed write. Returns whether a
+/// deferral without a watch needs the fallback backstop.
+fn explicit_failed(
+    host: &Host,
+    watch: Option<&Arc<Watch>>,
+    error: &ferret_crawl::IndexError,
+) -> bool {
+    let mut arm_fallback = false;
+    let deferred = match error {
+        ferret_crawl::IndexError::DeferredBulk(reason) => Some(*reason),
+        ferret_crawl::IndexError::DeferredMemory { .. } => {
+            Some(ferret_catalog::bulk::Blocked::Memory)
+        }
+        _ => None,
+    };
+    if let Some(reason) = deferred {
+        lock(&host.writer_status).blocked = Some(reason);
+        if let Some(w) = watch {
+            w.backstop(RefreshReason::Backstop);
+        } else {
+            arm_fallback = true;
+            lock(&host.writer_status).fallback_backstop = true;
+        }
+    }
+    if let Some(w) = watch {
+        w.abort_policy_roots();
+    }
+    lock(&host.writer_status).error = Some(error.to_string());
+    if matches!(
+        error,
+        ferret_crawl::IndexError::Update(_)
+            | ferret_crawl::IndexError::Commit(_)
+            | ferret_crawl::IndexError::Undurable { .. }
+    ) && let Some(w) = watch
+    {
+        w.backstop(RefreshReason::Backstop);
+    }
+    arm_fallback
+}
+
 /// Roots whose effective catalog still holds a retained directory (D26's
 /// S1+ checked retention), which polling retries until a refresh repairs them.
 /// The catalog is the authority: a report names only the faults in the scopes
