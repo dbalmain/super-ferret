@@ -23,6 +23,22 @@ pub(super) struct Record {
     pub(super) highlights: Option<Vec<std::ops::Range<usize>>>,
 }
 
+impl Record {
+    /// The line this record holds, to render again.
+    pub(super) fn line(&self) -> line_grep::Line<'_> {
+        line_grep::Line {
+            offset: self.offset,
+            source_lines: self.source_lines,
+            terminated: self.terminated,
+            number: self.number,
+            bytes: &self.bytes,
+            kind: self.kind,
+            fragment: self.fragment,
+            highlights: self.highlights.as_deref(),
+        }
+    }
+}
+
 pub(super) fn record_size(bytes: &[u8], highlights: Option<&[std::ops::Range<usize>]>) -> usize {
     bytes.len() + std::mem::size_of::<Record>() + highlights.map_or(0, std::mem::size_of_val)
 }

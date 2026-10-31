@@ -219,6 +219,27 @@ pub(super) struct Cached {
     result: InputResult,
     records: Vec<Record>,
 }
+impl Cached {
+    /// Renders the cached lines of a file unchanged since they were read.
+    fn replay(&self, render: &Render<'_>, target: &mut dyn Write) -> io::Result<Observed> {
+        let mut output = OutputCapture::new(target).pooled(render);
+        let mut cursor = Cursor::default();
+        for record in &self.records {
+            render.line(&mut output, record.line(), &mut cursor)?;
+        }
+        output.flush()?;
+        if output.streamed {
+            return Ok(Observed::Streamed(self.result, None, output.held));
+        }
+        Ok(Observed::Ready(Group {
+            result: self.result,
+            output: output.buffer,
+            _capture: output.held,
+            version: ReadVersion::Catalogued,
+            records: None,
+        }))
+    }
+}
 #[derive(Default)]
 pub(super) struct Cache {
     pub(super) entries: HashMap<u32, Arc<Cached>>,
@@ -367,35 +388,7 @@ fn search_job(
             if let Some(cached) = cached {
                 match read(*name, ReadRequest::Stat) {
                     ReadOutcome::Stable(ReadVersion::Catalogued) => {
-                        let mut output = OutputCapture::new(target).pooled(&render);
-                        let mut cursor = Cursor::default();
-                        for record in &cached.records {
-                            render.line(
-                                &mut output,
-                                line_grep::Line {
-                                    offset: record.offset,
-                                    source_lines: record.source_lines,
-                                    terminated: record.terminated,
-                                    number: record.number,
-                                    bytes: &record.bytes,
-                                    kind: record.kind,
-                                    fragment: record.fragment,
-                                    highlights: record.highlights.as_deref(),
-                                },
-                                &mut cursor,
-                            )?;
-                        }
-                        output.flush()?;
-                        if output.streamed {
-                            return Ok(Observed::Streamed(cached.result, None, output.held));
-                        }
-                        return Ok(Observed::Ready(Group {
-                            result: cached.result,
-                            output: output.buffer,
-                            _capture: output.held,
-                            version: ReadVersion::Catalogued,
-                            records: None,
-                        }));
+                        return cached.replay(&render, target);
                     }
                     ReadOutcome::Failed(error) => return Ok(Observed::Failed(error)),
                     ReadOutcome::Cancelled | ReadOutcome::Vanished => {
