@@ -114,6 +114,7 @@ mod query;
 mod read;
 mod run;
 mod scan;
+mod threads;
 mod verify;
 
 #[cfg(test)]
@@ -129,10 +130,11 @@ pub use plan::{
 pub use query::{GREP_PREFIX, ParseError, Query, Strategy};
 pub use read::{CheckedReader, ReadFault, ReadOperation, ReadOutcome, retry_read};
 pub use run::{Row, RunError, Stats};
-pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers, reserve_descriptor_table};
+pub use threads::{Shortfall, reserve_descriptor_table};
+pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers};
 
 /// Shared bounded scheduling for completed grep file groups.
 pub use verify::{
-    GroupSchedule, Lane, Reservation, Shortfall, completion_groups, completion_groups_with_handoff,
+    GroupSchedule, Lane, Reservation, completion_groups, completion_groups_with_handoff,
     lane_groups,
 };

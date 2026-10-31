@@ -81,7 +81,7 @@ pub struct Schedule<'q> {
     pub on_panic: Option<&'q (dyn Fn() + Sync)>,
     /// Called on the calling thread when the system refuses a worker, with
     /// how many the walk then runs on.
-    pub on_refused: Option<&'q (dyn Fn(crate::verify::Shortfall) + Sync)>,
+    pub on_refused: Option<&'q (dyn Fn(crate::threads::Shortfall) + Sync)>,
 }
 
 /// Lends work only while fewer than this many tasks per worker are queued or
@@ -226,7 +226,7 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
             let handles: Vec<_> = (1..self.schedule.workers)
                 .filter_map(|i| {
                     let mut visitor = visitor(i);
-                    crate::verify::spawn_named(scope, i, "ferret-walk", move || {
+                    crate::threads::spawn_named(scope, i, "ferret-walk", move || {
                         pool.worker(&mut visitor)
                     })
                     .map_err(|error| refused.get_or_insert(error))
@@ -234,7 +234,7 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                 })
                 .collect();
             if let (Some(cause), Some(on_refused)) = (refused, self.schedule.on_refused) {
-                on_refused(crate::verify::Shortfall {
+                on_refused(crate::threads::Shortfall {
                     running: handles.len() + 1,
                     asked: self.schedule.workers,
                     cause,
