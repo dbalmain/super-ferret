@@ -342,6 +342,43 @@ fn inverter_drains_in_byte_order_past_the_prefix() {
     assert_eq!(drained, terms);
 }
 
+/// A drain large enough to sort in parts, with partitions of every size
+/// from empty to most of the terms, comes out in byte order.
+#[test]
+fn inverter_drains_a_large_skewed_drain_in_byte_order() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut random = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut terms = std::collections::BTreeSet::new();
+    while terms.len() < 3 * super::invert::PARTS_FROM {
+        let bits = random();
+        // Mostly one first byte, as natural vocabularies skew.
+        let first = if bits % 3 == 0 {
+            (bits >> 8) as u8
+        } else {
+            b's'
+        };
+        let len = 1 + (bits >> 16) as usize % 30;
+        let term: Vec<u8> = std::iter::once(first)
+            .chain((1..len).map(|_| random() as u8))
+            .collect();
+        terms.insert(term);
+    }
+    let mut inverter = Inverter::new(usize::MAX);
+    for term in &terms {
+        inverter.add(1, term).unwrap();
+    }
+    let mut drained = Vec::new();
+    inverter
+        .drain_into_with(1, 1, |term, _, _| drained.push(term.to_vec()))
+        .unwrap();
+    assert!(drained.iter().eq(terms.iter()));
+}
+
 #[test]
 fn inverter_reports_full_at_its_bound_and_refuses_falling_documents() {
     let mut inverter = Inverter::new(200);

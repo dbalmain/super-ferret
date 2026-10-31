@@ -156,13 +156,7 @@ impl Inverter {
         self.memory = 0;
         self.payload_capacity = 0;
         self.last = None;
-        // Most terms differ in their first eight bytes, which compare as one
-        // integer; only a tie compares the rest.
-        terms.sort_unstable_by(|a, b| {
-            a.0.prefix()
-                .cmp(&b.0.prefix())
-                .then_with(|| a.0.as_slice().cmp(b.0.as_slice()))
-        });
+        sort_terms(&mut terms);
         for (term, docs) in &terms {
             let (term, docs) = (term.as_slice(), docs.as_slice());
             let bytes = writer.push(term, docs)?;
@@ -171,6 +165,72 @@ impl Inverter {
         }
         Ok(writer)
     }
+}
+
+/// Drains of at least this many terms sort in parts on several threads.
+pub(super) const PARTS_FROM: usize = 1 << 14;
+
+/// Most threads one drain sorts on.
+const PARTS: usize = 8;
+
+/// Sorts entries into byte order of their terms. A large drain is first
+/// partitioned in place by its terms' first bytes, then sorted as runs of
+/// whole partitions on threads of their own: a 300k-term drain waited
+/// 70 ms on one thread for the writer to go on.
+fn sort_terms(terms: &mut [(Key, Docs)]) {
+    // Most terms differ in their first eight bytes, which compare as one
+    // integer; only a tie compares the rest.
+    let compare = |a: &(Key, Docs), b: &(Key, Docs)| {
+        a.0.prefix()
+            .cmp(&b.0.prefix())
+            .then_with(|| a.0.as_slice().cmp(b.0.as_slice()))
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(PARTS));
+    if threads == 1 || terms.len() < PARTS_FROM {
+        terms.sort_unstable_by(compare);
+        return;
+    }
+    let first = |entry: &(Key, Docs)| (entry.0.prefix() >> 56) as usize;
+    let mut counts = [0; 256];
+    for entry in terms.iter() {
+        counts[first(entry)] += 1;
+    }
+    let mut next = [0; 256];
+    let mut sum = 0;
+    for (next, count) in next.iter_mut().zip(counts) {
+        (*next, sum) = (sum, sum + count);
+    }
+    let mut ends = [0; 256];
+    for (end, (next, count)) in ends.iter_mut().zip(next.iter().zip(counts)) {
+        *end = next + count;
+    }
+    // Each swap puts one entry in its partition for good.
+    for byte in 0..256 {
+        while next[byte] < ends[byte] {
+            let target = first(&terms[next[byte]]);
+            if target != byte {
+                terms.swap(next[byte], next[target]);
+            }
+            next[target] += 1;
+        }
+    }
+    let share = terms.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut rest = &mut *terms;
+        let mut counts = counts.into_iter();
+        while !rest.is_empty() {
+            let mut part = 0;
+            for count in counts.by_ref() {
+                part += count;
+                if part >= share {
+                    break;
+                }
+            }
+            let (part, tail) = std::mem::take(&mut rest).split_at_mut(part);
+            rest = tail;
+            scope.spawn(move || part.sort_unstable_by(compare));
+        }
+    });
 }
 
 /// A term's documents. Most terms in a segment occur in one document, so
