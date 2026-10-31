@@ -507,7 +507,7 @@ impl<R: ReadAt> Segment<R> {
         let Some((block, place)) = self.locate(term) else {
             return Ok(None);
         };
-        let (mut entries, _) = self.block(block, place)?;
+        let (mut entries, _) = self.block(block, place, None)?;
         while let Some((candidate, entry)) = entries.next_entry()? {
             match candidate.cmp(term) {
                 std::cmp::Ordering::Less => {}
@@ -523,6 +523,7 @@ impl<R: ReadAt> Segment<R> {
         Terms {
             segment: self,
             window: Window::default(),
+            blocks: Window::default(),
             next: self.samples.first().map(|&place| (0, place)),
             entries: None,
         }
@@ -539,6 +540,7 @@ impl<R: ReadAt> Segment<R> {
         Terms {
             segment: self,
             window: Window::default(),
+            blocks: Window::default(),
             next,
             entries: None,
         }
@@ -589,8 +591,14 @@ impl<R: ReadAt> Segment<R> {
     }
 
     /// Decodes block `b`, at `here`, lazily; also returns the next block's
-    /// place, `None` after the last.
-    fn block(&self, b: usize, here: Place) -> Result<(Entries, Option<Place>), ReadError> {
+    /// place, `None` after the last. A stream reads it through `window`,
+    /// which checks each chunk once rather than once for each block in it.
+    fn block(
+        &self,
+        b: usize,
+        here: Place,
+        window: Option<&mut Window>,
+    ) -> Result<(Entries, Option<Place>), ReadError> {
         let next = if b + 1 < self.blocks {
             Some(next_place(&self.index_bytes, here).ok_or(ReadError::Corrupt(Section::Index))?)
         } else {
@@ -598,8 +606,18 @@ impl<R: ReadAt> Segment<R> {
         };
         let end = next.map_or(self.blocks_at.1, |n| n.start);
         let postings_end = next.map_or(self.postings_at.1, |n| n.postings);
-        let (mut bytes, at) = self.read_checked(Section::Blocks, here.start, end)?;
-        bytes.truncate(at + (end - here.start) as usize);
+        let (bytes, at) = match window {
+            Some(window) => (
+                self.read_through(Section::Blocks, here.start, end, window)?
+                    .to_vec(),
+                0,
+            ),
+            None => {
+                let (mut bytes, at) = self.read_checked(Section::Blocks, here.start, end)?;
+                bytes.truncate(at + (end - here.start) as usize);
+                (bytes, at)
+            }
+        };
         let count = if next.is_some() {
             BLOCK
         } else {
@@ -848,6 +866,8 @@ pub struct Terms<'s, R> {
     segment: &'s Segment<R>,
     /// The postings this stream's lists are read through.
     window: Window,
+    /// The dictionary blocks this stream reads through.
+    blocks: Window,
     /// The next block to read and its place; `None` after the last.
     next: Option<(usize, Place)>,
     entries: Option<Entries>,
@@ -862,7 +882,7 @@ impl<R: ReadAt> Terms<'_, R> {
                 let Some((block, place)) = self.next else {
                     return Ok(None);
                 };
-                let (entries, next) = self.segment.block(block, place)?;
+                let (entries, next) = self.segment.block(block, place, Some(&mut self.blocks))?;
                 self.entries = Some(entries);
                 self.next = next.map(|place| (block + 1, place));
                 continue;
