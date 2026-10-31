@@ -10,6 +10,10 @@ use runs::{Row, Runs};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
+/// Child keys `(parent, basename)` mapped to a name id, `None` for a removal.
+type ChildKeys = Runs<(u32, Vec<u8>), Option<u32>>;
+type ChildKey = Row<(u32, Vec<u8>), Option<u32>>;
+
 pub(crate) const LIFE: u64 = 0;
 pub(crate) const NAME: u64 = 1;
 pub(crate) const DIR: u64 = 2;
@@ -127,7 +131,7 @@ pub(crate) struct Overlay {
 }
 pub(crate) struct Namespace {
     pub(crate) rows: Projection,
-    keys: Runs<(u32, Vec<u8>), Option<u32>>,
+    keys: ChildKeys,
     /// Directories with any child key row: every other directory's children
     /// are its checkpoint range, unchanged and still in basename order.
     touched: BTreeSet<u32>,
@@ -770,33 +774,29 @@ impl Overlay {
         self.load(Family::Namespace)?;
         self.base
             .load(&[Section::Names, Section::DirNames, Section::Roots])?;
-        let mut rows = if let Some(parent) = &self.parent {
-            parent.load_namespace()?;
-            parent.namespace().rows.clone()
-        } else {
-            Projection::default()
-        };
-        let mut keys = if let Some(parent) = &self.parent {
-            parent.namespace().keys.clone()
-        } else {
-            Runs::default()
-        };
-        let mut touched = self
-            .parent
-            .as_ref()
-            .map_or_else(BTreeSet::new, |p| p.namespace().touched.clone());
-        let mut references = self
-            .parent
-            .as_ref()
-            .map_or_else(BTreeMap::new, |p| p.namespace().references.clone());
-        let mut counter = self
-            .parent
-            .as_ref()
-            .map_or(self.base.next_name().0, |p| p.manifest.counters[1]);
-        let mut count = self
-            .parent
-            .as_ref()
-            .map_or(self.base.name_count(), |p| p.manifest.counts[1]);
+        let (mut rows, mut keys, mut touched, mut references, mut counter, mut count) =
+            match &self.parent {
+                Some(parent) => {
+                    parent.load_namespace()?;
+                    let ns = parent.namespace();
+                    (
+                        ns.rows.clone(),
+                        ns.keys.clone(),
+                        ns.touched.clone(),
+                        ns.references.clone(),
+                        parent.manifest.counters[1],
+                        parent.manifest.counts[1],
+                    )
+                }
+                None => (
+                    Projection::default(),
+                    Runs::default(),
+                    BTreeSet::new(),
+                    BTreeMap::new(),
+                    self.base.next_name().0,
+                    self.base.name_count(),
+                ),
+            };
         for (seq, next, records) in self.transactions(Family::Namespace) {
             let mut final_rows: BTreeMap<u64, Arc<Record>> = BTreeMap::new();
             for r in records {
@@ -854,51 +854,9 @@ impl Overlay {
             rows.apply(seq, changed.iter().cloned());
             let mut removed = keys.clone();
             removed.insert(key_rows.clone());
-            let mut additions = Vec::new();
-            for r in &changed {
-                if let Record::NamePut {
-                    id,
-                    parent,
-                    child,
-                    name: bytes,
-                    ..
-                } = r.as_ref()
-                {
-                    if !live(&self.base, &rows, *parent)
-                        || kind(&self.base, &rows, *parent) != Some(Kind::Dir)
-                        || (Kind::from_ignored_child(*child).is_none()
-                            && !live(&self.base, &rows, *child))
-                    {
-                        return Err(bad("name references dead/non-directory inode"));
-                    }
-                    // Changed names are checked against the final transaction,
-                    // including removals of overwritten destinations.
-                    if let Some(other) = lookup(&self.base, &rows, &removed, *parent, bytes)
-                        && other != *id
-                    {
-                        return Err(bad("duplicate child key"));
-                    }
-                    if kind(&self.base, &rows, *child) == Some(Kind::Dir)
-                        && (own(&self.base, &rows, *child) != Some(*id)
-                            || root(&self.base, &rows, *child))
-                    {
-                        return Err(bad("directory has multiple incoming edges"));
-                    }
-                    additions.push(Row {
-                        key: (*parent, bytes.clone()),
-                        sequence: seq,
-                        value: Some(*id),
-                    });
-                }
-            }
-            // Detect equal new keys before run coalescing could hide either.
-            additions.sort_by(|a, b| a.key.cmp(&b.key));
-            if additions.windows(2).any(|w| w[0].key == w[1].key) {
-                return Err(bad("duplicate changed child key"));
-            }
             // Coalesce one transaction into one run: removals and additions
             // have the same sequence, so separate runs cannot order them.
-            key_rows.extend(additions);
+            key_rows.extend(added_keys(&self.base, &rows, &removed, &changed, seq)?);
             touched.extend(key_rows.iter().map(|r| r.key.0));
             keys.insert(key_rows);
             validate_graph(&self.base, &rows, &changed, old_dirs)?;
@@ -912,60 +870,31 @@ impl Overlay {
                     affected.insert(*id);
                 }
             }
-            if !affected.is_empty() {
-                let base_refs = if affected.iter().any(|&id| id < self.base.base_inode_count()) {
-                    self.base.name_references()
-                } else {
-                    &[]
-                };
-                for id in affected {
-                    let actual = i64::from(base_refs.get(id as usize).copied().unwrap_or(0))
-                        + references.get(&id).copied().unwrap_or(0);
-                    let declared = match rows.get(LIFE, id) {
-                        Some(Record::LifePut { names, .. }) => Some(i64::from(*names)),
-                        Some(Record::InodeDelete { .. }) => Some(0),
-                        _ => None,
-                    };
-                    if actual < 0
-                        || declared.is_some_and(|n| n != actual)
-                        || (!live(&self.base, &rows, id) && actual != 0)
-                        || (live(&self.base, &rows, id)
-                            && kind(&self.base, &rows, id) != Some(Kind::Dir)
-                            && actual == 0)
-                    {
-                        return Err(bad("namespace inode reference count"));
-                    }
-                    if !live(&self.base, &rows, id) {
-                        let base_children = if id < self.base.base_inode_count() {
-                            self.base
-                                .children(InoId(id))
-                                .filter(|n| rows.get(NAME, n.0).is_none())
-                                .count()
-                        } else {
-                            0
-                        };
-                        let delta_children = keys
-                            .latest_range((id, Vec::new()), (id + 1, Vec::new()))
-                            .into_iter()
-                            .filter(|r| r.value.is_some())
-                            .count();
-                        if base_children + delta_children != 0 {
-                            return Err(bad("deleted directory retains children"));
-                        }
-                    }
-                }
-            }
+            check_references(&self.base, &rows, &keys, &references, affected)?;
             references.retain(|_, delta| *delta != 0);
             counter = next[1];
         }
         if count != self.manifest.counts[1] {
             return Err(bad("live name count"));
         }
+        let namespace = Namespace::new(&self.base, rows, keys, touched, references);
+        let _ = self.namespace.set(Arc::new(namespace));
+        Ok(())
+    }
+}
+impl Namespace {
+    fn new(
+        base: &Catalog,
+        rows: Projection,
+        keys: ChildKeys,
+        touched: BTreeSet<u32>,
+        references: BTreeMap<u32, i64>,
+    ) -> Self {
         let suppressed: Vec<_> = rows
             .records(NAME)
             .filter_map(|r| match r {
                 Record::NamePut { id, .. } | Record::NameDelete { id }
-                    if *id < self.base.base_name_count() =>
+                    if *id < base.base_name_count() =>
                 {
                     Some(*id)
                 }
@@ -983,7 +912,7 @@ impl Overlay {
                 heap.push(0);
             }
         }
-        let _ = self.namespace.set(Arc::new(Namespace {
+        Self {
             rows,
             keys,
             touched,
@@ -992,11 +921,8 @@ impl Overlay {
             heap,
             spans,
             references,
-        }));
-        Ok(())
+        }
     }
-}
-impl Namespace {
     pub(crate) fn name<'a>(&'a self, base: &'a Catalog, id: u32) -> Option<Name<'a>> {
         name(base, &self.rows, id)
     }
@@ -1047,7 +973,7 @@ fn sparse_name(rows: &Projection, id: u32) -> Option<Option<Name<'_>>> {
 fn lookup(
     base: &Catalog,
     rows: &Projection,
-    keys: &Runs<(u32, Vec<u8>), Option<u32>>,
+    keys: &ChildKeys,
     parent: u32,
     bytes: &[u8],
 ) -> Option<u32> {
@@ -1087,6 +1013,109 @@ fn root(base: &Catalog, rows: &Projection, id: u32) -> bool {
         Some(Record::RootDelete { .. }) => false,
         _ => base.roots().any(|(i, _)| i.0 == id),
     }
+}
+/// One transaction's new child keys, checked against the namespace as it
+/// stands after the transaction, with `removed` holding its retired keys.
+fn added_keys(
+    base: &Catalog,
+    rows: &Projection,
+    removed: &ChildKeys,
+    changed: &[Arc<Record>],
+    seq: u64,
+) -> Result<Vec<ChildKey>, OpenError> {
+    let mut additions = Vec::new();
+    for r in changed {
+        if let Record::NamePut {
+            id,
+            parent,
+            child,
+            name: bytes,
+            ..
+        } = r.as_ref()
+        {
+            if !live(base, rows, *parent)
+                || kind(base, rows, *parent) != Some(Kind::Dir)
+                || (Kind::from_ignored_child(*child).is_none() && !live(base, rows, *child))
+            {
+                return Err(bad("name references dead/non-directory inode"));
+            }
+            // Changed names are checked against the final transaction,
+            // including removals of overwritten destinations.
+            if let Some(other) = lookup(base, rows, removed, *parent, bytes)
+                && other != *id
+            {
+                return Err(bad("duplicate child key"));
+            }
+            if kind(base, rows, *child) == Some(Kind::Dir)
+                && (own(base, rows, *child) != Some(*id) || root(base, rows, *child))
+            {
+                return Err(bad("directory has multiple incoming edges"));
+            }
+            additions.push(Row {
+                key: (*parent, bytes.clone()),
+                sequence: seq,
+                value: Some(*id),
+            });
+        }
+    }
+    // Detect equal new keys before run coalescing could hide either.
+    additions.sort_by(|a, b| a.key.cmp(&b.key));
+    if additions.windows(2).any(|w| w[0].key == w[1].key) {
+        return Err(bad("duplicate changed child key"));
+    }
+    Ok(additions)
+}
+/// Checks each affected inode's name count against its life row, and that
+/// a deleted directory keeps no children.
+fn check_references(
+    base: &Catalog,
+    rows: &Projection,
+    keys: &ChildKeys,
+    references: &BTreeMap<u32, i64>,
+    affected: BTreeSet<u32>,
+) -> Result<(), OpenError> {
+    if affected.is_empty() {
+        return Ok(());
+    }
+    let base_refs = if affected.iter().any(|&id| id < base.base_inode_count()) {
+        base.name_references()
+    } else {
+        &[]
+    };
+    for id in affected {
+        let actual = i64::from(base_refs.get(id as usize).copied().unwrap_or(0))
+            + references.get(&id).copied().unwrap_or(0);
+        let declared = match rows.get(LIFE, id) {
+            Some(Record::LifePut { names, .. }) => Some(i64::from(*names)),
+            Some(Record::InodeDelete { .. }) => Some(0),
+            _ => None,
+        };
+        if actual < 0
+            || declared.is_some_and(|n| n != actual)
+            || (!live(base, rows, id) && actual != 0)
+            || (live(base, rows, id) && kind(base, rows, id) != Some(Kind::Dir) && actual == 0)
+        {
+            return Err(bad("namespace inode reference count"));
+        }
+        if !live(base, rows, id) {
+            let base_children = if id < base.base_inode_count() {
+                base.children(InoId(id))
+                    .filter(|n| rows.get(NAME, n.0).is_none())
+                    .count()
+            } else {
+                0
+            };
+            let delta_children = keys
+                .latest_range((id, Vec::new()), (id + 1, Vec::new()))
+                .into_iter()
+                .filter(|r| r.value.is_some())
+                .count();
+            if base_children + delta_children != 0 {
+                return Err(bad("deleted directory retains children"));
+            }
+        }
+    }
+    Ok(())
 }
 fn validate_graph(
     base: &Catalog,
