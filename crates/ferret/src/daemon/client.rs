@@ -486,14 +486,8 @@ fn query(
     now: SystemTime,
     context: Option<&Context>,
 ) -> Option<Exit> {
-    let Options {
-        limit,
-        scan_uncovered,
-        grep,
-        text_report,
-    } = options;
     let started = Instant::now();
-    let grep_tty = grep.as_ref().is_some_and(|options| options.tty);
+    let grep_tty = options.grep.as_ref().is_some_and(|grep| grep.tty);
     if std::env::var_os("FERRET_NO_DAEMON").is_some() {
         return None;
     }
@@ -503,35 +497,10 @@ fn query(
     // Build and validate before connecting: a request the protocol rejects
     // (an argv past its line or element limit) answers in-process, and must
     // neither reach a daemon nor start one.
-    let cwd = std::env::current_dir().ok()?;
-    let mut request = Vec::new();
-    let mut object = Object::new(&mut request);
-    object
-        .str("id", op)
-        .str("op", op)
-        .byte_strings("args", args.iter().map(|s| s.as_bytes()))
-        .opt_int("limit", limit)
-        .int(
-            "start_unix_ns",
-            now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos() as u64,
-        )
-        .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
-    object.byte_strings(
-        "capabilities",
-        scan_uncovered
-            .then_some(b"scan-uncovered".as_slice())
-            .into_iter()
-            .chain(
-                (matches!(op, "find" | "grep" | "search") && !json)
-                    .then_some(b"raw-output-v1".as_slice()),
-            ),
-    );
-    if let Some(grep) = &grep {
-        grep.encode(&mut object);
-    }
-    object.end();
-    protocol::parse_request(&request).ok()?;
-    request.push(b'\n');
+    let request = encode(op, args, json, &options, now)?;
+    let Options {
+        limit, text_report, ..
+    } = options;
     let Connected {
         mut reader,
         raw_output,
@@ -735,32 +704,9 @@ fn query(
     })();
     let exit = match result {
         Ok(exit) => exit,
-        Err(error) if output_failure => {
-            cancel(reader.get_mut());
-            if (op == "grep" || op == "find" && !json) && error.kind() == io::ErrorKind::BrokenPipe
-            {
-                Exit::Ok
-            } else if op == "search" && error.kind() == io::ErrorKind::BrokenPipe {
-                if rows > 0 { Exit::Ok } else { Exit::NoMatch }
-            } else {
-                cli::error(&format!("{op}: writing stdout: {error}"));
-                if op == "grep" {
-                    Exit::Usage
-                } else if op == "find" {
-                    Exit::NoMatch
-                } else {
-                    Exit::Error
-                }
-            }
-        }
         Err(error) => {
             cancel(reader.get_mut());
-            cli::error(&format!("daemon transport failure: {error}"));
-            if op == "grep" {
-                Exit::Usage
-            } else {
-                Exit::Error
-            }
+            failure_exit(op, json, rows, output_failure, &error)
         }
     };
     if let Some(context) = context.filter(|_| op == "search") {
@@ -783,6 +729,76 @@ fn query(
         context.log(&line);
     }
     Some(exit)
+}
+
+/// The request line for `op`, or `None` when the protocol would reject it
+/// or the cwd or clock cannot be read.
+fn encode(
+    op: &str,
+    args: &[OsString],
+    json: bool,
+    options: &Options,
+    now: SystemTime,
+) -> Option<Vec<u8>> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut request = Vec::new();
+    let mut object = Object::new(&mut request);
+    object
+        .str("id", op)
+        .str("op", op)
+        .byte_strings("args", args.iter().map(|s| s.as_bytes()))
+        .opt_int("limit", options.limit)
+        .int(
+            "start_unix_ns",
+            now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos() as u64,
+        )
+        .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
+    object.byte_strings(
+        "capabilities",
+        options
+            .scan_uncovered
+            .then_some(b"scan-uncovered".as_slice())
+            .into_iter()
+            .chain(
+                (matches!(op, "find" | "grep" | "search") && !json)
+                    .then_some(b"raw-output-v1".as_slice()),
+            ),
+    );
+    if let Some(grep) = &options.grep {
+        grep.encode(&mut object);
+    }
+    object.end();
+    protocol::parse_request(&request).ok()?;
+    request.push(b'\n');
+    Some(request)
+}
+
+/// The exit for a query that failed after connecting, having reported it:
+/// a closed stdout ends quietly where the local command would.
+fn failure_exit(op: &str, json: bool, rows: u64, output_failure: bool, error: &io::Error) -> Exit {
+    if output_failure {
+        if (op == "grep" || op == "find" && !json) && error.kind() == io::ErrorKind::BrokenPipe {
+            Exit::Ok
+        } else if op == "search" && error.kind() == io::ErrorKind::BrokenPipe {
+            if rows > 0 { Exit::Ok } else { Exit::NoMatch }
+        } else {
+            cli::error(&format!("{op}: writing stdout: {error}"));
+            if op == "grep" {
+                Exit::Usage
+            } else if op == "find" {
+                Exit::NoMatch
+            } else {
+                Exit::Error
+            }
+        }
+    } else {
+        cli::error(&format!("daemon transport failure: {error}"));
+        if op == "grep" {
+            Exit::Usage
+        } else {
+            Exit::Error
+        }
+    }
 }
 
 fn write(writer: &mut impl Write, bytes: &[u8], failed: &mut bool) -> io::Result<()> {
