@@ -7587,3 +7587,12 @@ reach a user's attention. Its measured speed is C's. The fact that would
 change it: a consumer that needs the check to fall strictly after the
 previous file's open. Nothing in the code relies on that today beyond the
 test above, which models a rename between two reads.
+
+Astra (round p9) names what B relaxes beyond the test: everything read
+through a held directory within the window after it is renamed. That
+includes the duplicate cache, which replays a hard-linked file's matches
+after a `Stat` of its name. If `dir` is renamed and its old path replaced
+inside the window, `dir/b` is stat'd or read through the detached
+directory and reported under the old path. Option A notices; B and C
+report what the directory held when last checked, for up to 100 µs (B)
+or the rest of the query (C).
