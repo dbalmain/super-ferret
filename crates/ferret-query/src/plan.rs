@@ -144,6 +144,20 @@ pub struct ContentReport {
 }
 
 impl ContentReport {
+    /// Takes in what verification counted.
+    fn count(&mut self, tally: crate::verify::Tally) {
+        self.verified = tally.verified;
+        self.changed = tally.changed;
+        self.verification_time = tally.time;
+        self.regex_time = tally.regex;
+        self.matching = tally.matching;
+        self.snapshot_maybe = tally.maybe_docs;
+        self.snapshot_possible = tally.possible_docs;
+        self.threads = tally.threads;
+    }
+}
+
+impl ContentReport {
     /// One line for the query log's plan.
     pub fn describe(&self) -> String {
         let atoms: Vec<String> = self
@@ -525,17 +539,7 @@ impl Query {
         if content.bound.is_some_and(|bound| uncovered > bound) {
             return Err(RunError::IndexIncomplete { uncovered, live });
         }
-        let atoms = self
-            .atoms
-            .iter()
-            .map(|text| {
-                if stopped() {
-                    return Err(ferret_index::ReadError::Cancelled);
-                }
-                text.estimate_until(pinned, &stopped)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(RunError::Index)?;
+        let atoms = self.estimate_atoms(pinned, &stopped)?;
 
         let plan = self.plan_from_estimates(catalog, index, pinned, &atoms, &stopped)?;
         let bounds = plan.root;
@@ -553,20 +557,7 @@ impl Query {
             Side::Names
         };
 
-        let mut grep_plans = plan.greps.iter();
-        let read_atoms = self
-            .atoms
-            .iter()
-            .map(|atom| {
-                let grep_plan = if matches!(atom, crate::ContentAtom::Grep(_)) {
-                    grep_plans.next()
-                } else {
-                    None
-                };
-                atom.read_until(pinned, &stopped, grep_plan)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(RunError::Index)?;
+        let read_atoms = self.read_atoms(pinned, &stopped, &plan.greps)?;
         catalog.load(&[Section::Doc])?;
         let (ids, docs) = match driver {
             Some(tree) => {
@@ -624,16 +615,51 @@ impl Query {
             width,
         };
         let (mut stats, tally) = self.verify_rows(catalog, &probed, readers, cancelled, emit)?;
-        report.verified = tally.verified;
-        report.changed = tally.changed;
-        report.verification_time = tally.time;
-        report.regex_time = tally.regex;
-        report.matching = tally.matching;
-        report.snapshot_maybe = tally.maybe_docs;
-        report.snapshot_possible = tally.possible_docs;
-        report.threads = tally.threads;
+        report.count(tally);
         stats.content = Some(report);
         Ok(stats)
+    }
+
+    /// Each content atom's estimate: documents, certainty and the cost of
+    /// reading its postings.
+    fn estimate_atoms(
+        &self,
+        pinned: &Pinned<'_>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Vec<(u64, Certainty, u64)>, RunError> {
+        self.atoms
+            .iter()
+            .map(|text| {
+                if stopped() {
+                    return Err(ferret_index::ReadError::Cancelled);
+                }
+                text.estimate_until(pinned, stopped)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RunError::Index)
+    }
+
+    /// Reads each content atom's postings, each grep atom as `greps` planned
+    /// it.
+    fn read_atoms(
+        &self,
+        pinned: &Pinned<'_>,
+        stopped: &dyn Fn() -> bool,
+        greps: &[crate::GrepReport],
+    ) -> Result<Vec<ReadAtom>, RunError> {
+        let mut grep_plans = greps.iter();
+        self.atoms
+            .iter()
+            .map(|atom| {
+                let grep_plan = if matches!(atom, crate::ContentAtom::Grep(_)) {
+                    grep_plans.next()
+                } else {
+                    None
+                };
+                atom.read_until(pinned, stopped, grep_plan)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RunError::Index)
     }
 
     /// The content side's driving tree: the cheapest content conjunct that
