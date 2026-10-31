@@ -10,8 +10,11 @@ use super::{WriteError, Writer};
 /// cleared through the keys found, so a document costs its own length.
 #[derive(Debug)]
 pub struct KeySet {
-    seen: Vec<u64>,
+    /// A bit per 24-bit key, sized so that indexing by a key needs no check.
+    seen: Box<[u64; WORDS]>,
 }
+
+const WORDS: usize = (1 << 24) / 64;
 
 impl Default for KeySet {
     fn default() -> Self {
@@ -21,18 +24,27 @@ impl Default for KeySet {
 
 impl KeySet {
     pub fn new() -> Self {
-        Self {
-            seen: vec![0; (1 << 24) / 64],
-        }
+        // Built on the heap: two megabytes would not fit a test thread's
+        // stack on the way.
+        let Ok(seen) = vec![0; WORDS].into_boxed_slice().try_into() else {
+            unreachable!("a slice of WORDS words");
+        };
+        Self { seen }
     }
 
     /// Replaces `out` with the distinct folded keys of `bytes`, each as its
     /// big-endian number, in order of first occurrence.
     pub fn distinct(&mut self, bytes: &[u8], out: &mut Vec<u32>) {
         out.clear();
-        for window in bytes.windows(3) {
-            let key = trigram_key([window[0], window[1], window[2]]);
-            let number = u32::from_be_bytes([0, key[0], key[1], key[2]]);
+        let [first, second, rest @ ..] = bytes else {
+            return;
+        };
+        // Each byte is folded once, into a key that rolls along the windows:
+        // the number of `trigram_key` of each.
+        let fold = |byte: u8| u32::from(trigram_key([0, 0, byte])[2]);
+        let mut number = fold(*first) << 8 | fold(*second);
+        for &byte in rest {
+            number = (number << 8 | fold(byte)) & 0xff_ffff;
             let word = &mut self.seen[number as usize / 64];
             let bit = 1u64 << (number % 64);
             if *word & bit == 0 {
@@ -46,7 +58,7 @@ impl KeySet {
     }
 
     fn allocated_bytes(&self) -> usize {
-        self.seen.capacity() * size_of::<u64>()
+        size_of::<[u64; WORDS]>()
     }
 }
 
