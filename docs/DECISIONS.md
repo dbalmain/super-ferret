@@ -7671,3 +7671,16 @@ does not matter (then B).
 Revised: still A, narrowly. A quarter off the build for a third more peak is
 close to even; if the density rule is about the index and not a build's peak,
 take B.
+
+**Re-measured (c6cea11).** Since f29075c the readers run further ahead and
+both drains got faster: the trigram sort takes two passes, not three, and a
+large term drain sorts on up to eight threads. The same prototype on
+c6cea11, mean of three, same corpus and setup:
+
+| Flush                                       | Wall   | Max RSS |
+| ------------------------------------------- | ------ | ------- |
+| Files written while reading (c6cea11)       | 2.64 s | 337 MB  |
+| Drains and files while reading (prototype)  | 2.22 s | 435 MB  |
+
+B now buys 16% (0.42 s) for 98 MB (29% more peak). Recommendation unchanged:
+A, by a wider margin than at f29075c.
