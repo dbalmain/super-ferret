@@ -213,6 +213,129 @@ impl<'c> Part<'c> {
     }
 }
 
+/// How [`ResidentNames::build_with`] divides its rows: into `parts` name
+/// ranges, and into row chunks of `chunk` for the passes that go by row, on up
+/// to `threads` threads.
+struct Split {
+    parts: usize,
+    chunk: usize,
+    threads: usize,
+}
+
+impl Split {
+    /// Pass 1, by row chunk: each row's part, and each chunk's count per part.
+    fn assign(
+        &self,
+        names: NameReader<'_>,
+        splitters: &[u64],
+        total: usize,
+    ) -> (Vec<u8>, Vec<Vec<usize>>) {
+        let (parts, chunk) = (self.parts, self.chunk);
+        let mut part = vec![0u8; total];
+        let counts = fan_out(
+            part.chunks_mut(chunk).enumerate().collect(),
+            self.threads,
+            |(c, out)| {
+                let mut counts = vec![0; parts];
+                let from = NameId((c * chunk) as u32);
+                for ((_, name), slot) in names.runs_from(from).zip(out.iter_mut()) {
+                    let p = splitters.partition_point(|&s| s <= prefix(name.bytes));
+                    *slot = p as u8;
+                    counts[p] += 1;
+                }
+                counts
+            },
+        );
+        (part, counts)
+    }
+
+    /// Pass 2, by row chunk: rows grouped by part, ascending within each.
+    /// Chunk c's rows of part p go after earlier chunks' rows of part p.
+    fn group(&self, part: &[u8], counts: &[Vec<usize>]) -> Vec<u32> {
+        let (parts, chunk) = (self.parts, self.chunk);
+        let mut by_part = vec![0u32; part.len()];
+        let mut slots: Vec<Vec<&mut [u32]>> = (0..counts.len()).map(|_| Vec::new()).collect();
+        let mut rest = &mut by_part[..];
+        for p in 0..parts {
+            for (c, counts) in counts.iter().enumerate() {
+                let (here, tail) = rest.split_at_mut(counts[p]);
+                slots[c].push(here);
+                rest = tail;
+            }
+        }
+        let work = slots.into_iter().enumerate().zip(part.chunks(chunk));
+        fan_out(work.collect(), self.threads, |((c, mut slots), part)| {
+            let mut next = vec![0; parts];
+            for (i, &p) in part.iter().enumerate() {
+                let p = p as usize;
+                slots[p][next[p]] = (c * chunk + i) as u32;
+                next[p] += 1;
+            }
+        });
+        by_part
+    }
+
+    /// Pass 4, by row chunk: each row's global key, read back in row order
+    /// from its part's local keys (now in `by_part`).
+    fn keys(
+        &self,
+        part: &[u8],
+        counts: &[Vec<usize>],
+        sizes: &[usize],
+        by_part: &[u32],
+        firsts: &[u32],
+    ) -> Vec<u32> {
+        let (parts, chunk) = (self.parts, self.chunk);
+        let mut ids = vec![0u32; part.len()];
+        let mut starts = vec![0usize; parts];
+        for p in 1..parts {
+            starts[p] = starts[p - 1] + sizes[p - 1];
+        }
+        let mut work = Vec::new();
+        for ((ids, part), counts) in ids.chunks_mut(chunk).zip(part.chunks(chunk)).zip(counts) {
+            work.push((ids, part, starts.clone()));
+            for p in 0..parts {
+                starts[p] += counts[p];
+            }
+        }
+        fan_out(work, self.threads, |(ids, part, mut next)| {
+            for (id, &p) in ids.iter_mut().zip(part) {
+                let p = p as usize;
+                *id = firsts[p] + by_part[next[p]];
+                next[p] += 1;
+            }
+        });
+        ids
+    }
+}
+
+/// Pass 3, by part: intern, sort and post. A part's postings take the same
+/// span of the row array as its rows, since its keys are contiguous; its local
+/// keys then overwrite its rows.
+fn build_parts<'c>(
+    names: NameReader<'c>,
+    by_part: &mut [u32],
+    sizes: &[usize],
+    threads: usize,
+) -> Vec<Part<'c>> {
+    let mut postings_rows = vec![0u32; by_part.len()];
+    let mut rows_rest = by_part;
+    let mut posts_rest = &mut postings_rows[..];
+    let spans = sizes
+        .iter()
+        .map(|&size| {
+            let (rows, tail) = std::mem::take(&mut rows_rest).split_at_mut(size);
+            rows_rest = tail;
+            let (posts, tail) = std::mem::take(&mut posts_rest).split_at_mut(size);
+            posts_rest = tail;
+            (rows, posts)
+        })
+        .collect();
+    fan_out(spans, threads, |(rows, posts)| {
+        Part::build(names, rows, posts)
+    })
+}
+
 /// The three packings at the end of a build, and what each makes.
 enum Packing {
     Strings,
@@ -261,77 +384,17 @@ impl ResidentNames {
         let parts = threads.clamp(1, u8::MAX as usize);
         let total = rows as usize;
         let splitters = splitters(names, rows, parts);
-        let splitters = &splitters[..];
-        let chunk = total.div_ceil(parts).max(1);
-
-        // Pass 1, by row chunk: each row's part, and each chunk's count per
-        // part.
-        let mut part = vec![0u8; total];
-        let counts: Vec<Vec<usize>> = fan_out(
-            part.chunks_mut(chunk).enumerate().collect(),
+        let split = Split {
+            parts,
+            chunk: total.div_ceil(parts).max(1),
             threads,
-            |(c, out)| {
-                let mut counts = vec![0; parts];
-                let from = NameId((c * chunk) as u32);
-                for ((_, name), slot) in names.runs_from(from).zip(out.iter_mut()) {
-                    let p = splitters.partition_point(|&s| s <= prefix(name.bytes));
-                    *slot = p as u8;
-                    counts[p] += 1;
-                }
-                counts
-            },
-        );
-        let chunks = counts.len();
+        };
+        let (part, counts) = split.assign(names, &splitters, total);
         let sizes: Vec<usize> = (0..parts)
             .map(|p| counts.iter().map(|c| c[p]).sum())
             .collect();
-
-        // Pass 2, by row chunk: rows grouped by part, ascending within each.
-        // Chunk c's rows of part p go after earlier chunks' rows of part p.
-        let mut by_part = vec![0u32; total];
-        {
-            let mut slots: Vec<Vec<&mut [u32]>> = (0..chunks).map(|_| Vec::new()).collect();
-            let mut rest = &mut by_part[..];
-            for p in 0..parts {
-                for (c, counts) in counts.iter().enumerate() {
-                    let (here, tail) = rest.split_at_mut(counts[p]);
-                    slots[c].push(here);
-                    rest = tail;
-                }
-            }
-            let work = slots.into_iter().enumerate().zip(part.chunks(chunk));
-            fan_out(work.collect(), threads, |((c, mut slots), part)| {
-                let mut next = vec![0; parts];
-                for (i, &p) in part.iter().enumerate() {
-                    let p = p as usize;
-                    slots[p][next[p]] = (c * chunk + i) as u32;
-                    next[p] += 1;
-                }
-            });
-        }
-
-        // Pass 3, by part: intern, sort and post. A part's postings take the
-        // same span of the row array as its rows, since its keys are
-        // contiguous; its local keys then overwrite its rows.
-        let mut postings_rows = vec![0u32; total];
-        let built: Vec<Part<'_>> = {
-            let mut rows_rest = &mut by_part[..];
-            let mut posts_rest = &mut postings_rows[..];
-            let spans = sizes
-                .iter()
-                .map(|&size| {
-                    let (rows, tail) = std::mem::take(&mut rows_rest).split_at_mut(size);
-                    rows_rest = tail;
-                    let (posts, tail) = std::mem::take(&mut posts_rest).split_at_mut(size);
-                    posts_rest = tail;
-                    (rows, posts)
-                })
-                .collect();
-            fan_out(spans, threads, |(rows, posts)| {
-                Part::build(names, rows, posts)
-            })
-        };
-        drop(postings_rows);
+        let mut by_part = split.group(&part, &counts);
+        let built = build_parts(names, &mut by_part, &sizes, threads);
         let firsts: Vec<u32> = built
             .iter()
             .scan(0u32, |next, part| {
@@ -340,32 +403,7 @@ impl ResidentNames {
                 Some(first)
             })
             .collect();
-
-        // Pass 4, by row chunk: each row's global key, read back in row order
-        // from its part's local keys (now in `by_part`).
-        let mut ids = vec![0u32; total];
-        {
-            let mut starts = vec![0usize; parts];
-            for p in 1..parts {
-                starts[p] = starts[p - 1] + sizes[p - 1];
-            }
-            let (by_part, firsts) = (&by_part[..], &firsts[..]);
-            let mut work = Vec::new();
-            for ((ids, part), counts) in ids.chunks_mut(chunk).zip(part.chunks(chunk)).zip(&counts)
-            {
-                work.push((ids, part, starts.clone()));
-                for p in 0..parts {
-                    starts[p] += counts[p];
-                }
-            }
-            fan_out(work, threads, |(ids, part, mut next)| {
-                for (id, &p) in ids.iter_mut().zip(part) {
-                    let p = p as usize;
-                    *id = firsts[p] + by_part[next[p]];
-                    next[p] += 1;
-                }
-            });
-        }
+        let ids = split.keys(&part, &counts, &sizes, &by_part, &firsts);
         drop((part, by_part));
 
         // The three packings are independent; run them side by side.
