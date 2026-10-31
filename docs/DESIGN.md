@@ -83,11 +83,13 @@ Workers own checked reads and line rendering. Grep workers send completed
 groups through a bounded completion queue (D92 B); the
 calling host publishes each whole group. One thread keeps walk order. A
 publication mutex excludes live policy warnings from groups; per-file
-diagnostics share the host. Workers batch groups only while the host is busy:
-a group whose capture holds 64 KiB or more goes alone, smaller ones travel
-together up to 64 KiB, and the host takes every held batch before it sleeps,
-so a held group waits only on other output, never on its worker's next file
-or on a worker asleep waiting for the producer. For configured concurrency T,
+diagnostics share the host. Workers batch groups: a group whose capture
+holds 64 KiB or more goes alone, smaller ones travel together up to 64 KiB or
+16 groups. The host takes every held batch whenever its queue is empty, and
+with nothing held sleeps at most 500 µs before looking again. So a held group
+waits on other output or at most 500 µs, never on its worker's next file or on
+a worker asleep waiting for the producer, and no worker wakes the host for a
+partial batch. For configured concurrency T,
 the queue holds at most T handoffs, each worker one group in progress and a
 batch of at most 64 KiB, and the host one handoff. Captures share one allocation
 budget of (2T + 1) × 4 MiB across workers, queued groups and the publisher

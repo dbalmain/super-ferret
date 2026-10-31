@@ -1304,8 +1304,11 @@ struct Pool<T: Placed = Item> {
     seams: seam::Seams,
 }
 
-/// Bytes reserved by workers reading now.
+/// Bytes reserved by workers reading now. Every task's reservation writes
+/// `used`, so the budget keeps cache lines of its own: the pool's stop flag,
+/// which every worker reads between lines, would otherwise miss on each.
 #[derive(Default)]
+#[repr(align(128))]
 struct Budget {
     used: AtomicU64,
     /// Workers sleeping for bytes to be freed.
@@ -1963,6 +1966,10 @@ impl<Task> Drop for CloseOnDrop<'_, Task> {
 const HANDOFF_BYTES: u64 = 64 << 10;
 /// At most this many groups travel in one handoff.
 const HANDOFF_GROUPS: usize = 16;
+/// How long the caller sleeps, with nothing queued or held, before it looks
+/// at every held batch again. Bounds how long a held group waits on an idle
+/// caller; workers never wake it for a partial batch.
+const SWEEP: std::time::Duration = std::time::Duration::from_micros(500);
 
 /// A worker's completed groups not yet handed to the caller: at most
 /// [`HANDOFF_BYTES`] and [`HANDOFF_GROUPS`] of them.
@@ -2038,11 +2045,12 @@ pub enum GroupSchedule {
 /// progress and a held batch of at most [`HANDOFF_BYTES`]; the caller owns one
 /// handoff.
 ///
-/// Workers hold groups only while the caller is busy. Before it sleeps, the
-/// caller takes every held batch; a worker that then completes a group finds
-/// it idle and hands off at once. So a held group waits only while the caller
-/// has other groups to publish, never on its worker's next file, nor on a
-/// worker asleep waiting for the producer.
+/// Workers send only full batches and large groups. The caller takes every
+/// held batch whenever the queue is empty, and with nothing held sleeps at
+/// most [`SWEEP`] before looking again. So a held group waits on other
+/// output or at most [`SWEEP`], never on its worker's next file, nor on a
+/// worker asleep waiting for the producer, and a worker never pays a wakeup
+/// for a partial batch.
 ///
 /// Each task carries the same input-byte reservation as document
 /// verification; callers discard oversized input buffers before returning
@@ -2096,9 +2104,6 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
     let source = Mutex::new(next);
     let feed = Feed::new(threads, indexed);
     let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
-    // Set by the caller before its last look at the slots ahead of sleeping;
-    // cleared by the first worker to hand it work, or by the caller on waking.
-    let idle = AtomicBool::new(false);
     let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Group>>(threads);
     std::thread::scope(|scope| {
         let _stop = StopOnDrop(&pool);
@@ -2110,7 +2115,6 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
         let stopped = move || pool.halted() || cancelled.load(Ordering::Acquire);
         let weight = &weight;
         let held = &held;
-        let idle = &idle;
         let mut refused = None;
         let started = (0..threads)
             .take_while(|&i| {
@@ -2121,7 +2125,6 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
                     let mut state = make();
                     let lane = Lane {
                         slot: &held[i],
-                        idle,
                         sender,
                         pool,
                     };
@@ -2169,7 +2172,7 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
             groups_alone_with_handoff(&mut *lock(source), cancelled, make, work, &mut emit);
             return shortfall;
         }
-        collect(&receiver, held, idle, &stopped, &mut emit);
+        collect(&receiver, held, &stopped, &mut emit);
         // Dropping the receiver unblocks senders before scope join. The stop
         // guard also wakes input-budget waiters.
         drop(receiver);
@@ -2180,11 +2183,9 @@ pub fn completion_groups_with_handoff<Task: Send, State, Group: Send>(
 /// A worker's way to the caller: its slot of held groups, and the bounded
 /// queue of handoffs. Shared by [`completion_groups`] and [`lane_groups`].
 /// Weight bounds allocations, not publication effects: a zero-weight group
-/// may print a count or diagnostic. It needs the same idle wakeup as any other
-/// group, before its worker starts another potentially blocking task.
+/// may print a count or diagnostic, and is held and swept like any other.
 pub struct Lane<'g, Group> {
     slot: &'g Mutex<Held<Group>>,
-    idle: &'g AtomicBool,
     sender: std::sync::mpsc::SyncSender<Vec<Group>>,
     pool: &'g Pool<()>,
 }
@@ -2219,27 +2220,13 @@ impl<'g, Group> Lane<'g, Group> {
         {
             return false;
         }
-        self.idle.store(false, Ordering::SeqCst);
         !stopped() && self.sender.send(vec![group]).is_ok()
     }
 
     /// Holds a completed group of `bytes`, or hands batches over now (see
     /// [`completion_groups`]). Breaks once the caller has gone.
     pub fn hand(&self, group: Group, bytes: u64) -> ControlFlow<()> {
-        let handoffs = {
-            let mut slot = lock(self.slot);
-            let mut handoffs = slot.add(group, bytes);
-            // Read under the slot lock, which orders it after the caller's
-            // last look at this slot. Any send wakes the caller, who looks at
-            // every slot again before sleeping, so only one worker need flush.
-            if handoffs.iter().all(Option::is_none)
-                && self.idle.load(Ordering::SeqCst)
-                && self.idle.swap(false, Ordering::SeqCst)
-            {
-                handoffs[1] = slot.take();
-            }
-            handoffs
-        };
+        let handoffs = lock(self.slot).add(group, bytes);
         // Send outside the slot lock: the caller takes that lock to collect,
         // and a full queue waits on the caller.
         for batch in handoffs.into_iter().flatten() {
@@ -2276,16 +2263,16 @@ impl Drop for Reservation<'_> {
 }
 
 /// Collects handoffs on the caller until every lane has gone, the run stops
-/// or `emit` breaks. Before sleeping, takes every held batch.
+/// or `emit` breaks. Takes every held batch before sleeping, and sleeps at
+/// most [`SWEEP`].
 fn collect<Group>(
     receiver: &std::sync::mpsc::Receiver<Vec<Group>>,
     held: &[Mutex<Held<Group>>],
-    idle: &AtomicBool,
     stopped: &dyn Fn() -> bool,
     emit: &mut impl FnMut(Group) -> ControlFlow<()>,
 ) {
-    // Slots seen empty in a row since `idle` was last set, and the next
-    // slot to look at. Sleeping needs a full clean pass after setting it.
+    // Slots seen empty in a row, and the next slot to look at. Sleeping
+    // needs a full clean pass.
     let mut clean = 0;
     let mut at = 0;
     loop {
@@ -2293,23 +2280,21 @@ fn collect<Group>(
             Ok(batch) => Some(batch),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) if clean < held.len() => {
-                if clean == 0 {
-                    idle.store(true, Ordering::SeqCst);
-                }
                 let batch = lock(&held[at]).take();
                 at = (at + 1) % held.len();
                 clean += 1;
                 batch
             }
-            // Every slot was empty after `idle` was set: a group completed
-            // from here on is sent, which wakes this receive.
-            Err(std::sync::mpsc::TryRecvError::Empty) => match receiver.recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => match receiver.recv_timeout(SWEEP) {
                 Ok(batch) => Some(batch),
-                Err(_) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    clean = 0;
+                    None
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             },
         };
         if let Some(batch) = batch {
-            idle.store(false, Ordering::SeqCst);
             clean = 0;
             if publish(batch, stopped, emit).is_break() {
                 break;
@@ -2335,18 +2320,15 @@ pub fn lane_groups<'g, Group: Send + 'g>(
     let threads = threads.max(1);
     let pool = Pool::<()>::schedule(0, threads);
     let held: Vec<Mutex<Held<Group>>> = (0..threads).map(|_| Mutex::default()).collect();
-    let idle = AtomicBool::new(false);
     let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Group>>(threads);
     std::thread::scope(|scope| {
         let _stop = StopOnDrop(&pool);
         let pool = &pool;
         let held = &held;
-        let idle = &idle;
         let stopped = move || pool.halted() || cancelled.load(Ordering::Acquire);
         let lanes = (0..threads)
             .map(|i| Lane {
                 slot: &held[i],
-                idle,
                 sender: sender.clone(),
                 pool,
             })
@@ -2358,7 +2340,7 @@ pub fn lane_groups<'g, Group: Send + 'g>(
         })
         .map(drop);
         if started.is_ok() {
-            collect(&receiver, held, idle, &stopped, &mut emit);
+            collect(&receiver, held, &stopped, &mut emit);
         }
         drop(receiver);
         started
@@ -3279,8 +3261,9 @@ mod group_tests {
         );
     }
 
-    // A worker that completes a group while the caller is idle must hand it
-    // off before taking its next task, which here is slow.
+    // A group a worker completes while the caller is idle is published while
+    // its worker's next task, which here is slow, is still running: the
+    // caller's sweep collects it.
     #[test]
     fn group_completed_while_the_caller_is_idle_publishes_before_a_slow_task() {
         let published = AtomicBool::new(false);
