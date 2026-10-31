@@ -282,11 +282,12 @@ fn connect_owner(
         .ok()
         .flatten()
         .map(|generation| crate::find_json::hex(&generation.incarnation));
+    let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
     let handshake = Handshake {
         endpoint,
         context: endpoint::context()?,
         incarnation,
-        until: Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000),
+        until,
         can_spawn,
         writer,
     };
