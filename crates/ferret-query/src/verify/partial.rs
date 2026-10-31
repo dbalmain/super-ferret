@@ -68,7 +68,7 @@ fn stream_stopped(chunks: &[&[u8]], before: usize) -> (Settled, super::Tally) {
         UNIX_EPOCH + Duration::from_secs(1),
     )
     .unwrap();
-    assert!(super::streams(&query.atoms));
+    assert!(super::settle::streams(&query.atoms));
     let stop = Cell::new(false);
     let size = chunks.iter().map(|c| c.len() as u64).sum();
     let mut read = |_, request: ReadRequest<'_>| {
@@ -219,7 +219,7 @@ fn a_stream_stopped_after_it_finished_counts_its_work() {
 #[test]
 fn a_whole_read_failing_as_the_run_stops_is_not_a_change() {
     let query = Query::parse("grep:(?s)need.e", UNIX_EPOCH + Duration::from_secs(1)).unwrap();
-    assert!(!super::streams(&query.atoms));
+    assert!(!super::settle::streams(&query.atoms));
     let stop = Cell::new(false);
     let mut read = |_, request: ReadRequest<'_>| {
         let ReadRequest::Bytes(..) = request else {
