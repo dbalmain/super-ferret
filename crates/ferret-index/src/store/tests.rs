@@ -1983,7 +1983,9 @@ fn a_pass_that_is_always_out_of_time_still_advances() {
 #[test]
 fn a_reader_panic_reaches_the_caller() {
     let dir = Dir::new("reader-panic");
-    let catalog = Catalog::new(40, &[]);
+    // More documents than two readers' claim window (128), so reader 1
+    // blocks on claims after the panic unless the panic stops them.
+    let catalog = Catalog::new(256, &[]);
     let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
     // Reader 0 panics on the first document it claims. Reader 1 holds its
     // first document until then, so it cannot drain the whole catalog
