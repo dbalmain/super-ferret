@@ -244,107 +244,127 @@ fn run<T>(
         after_time.set(started.elapsed());
         result
     };
-    let session = WriterSession::open(catalog_dir);
-    match session {
-        Ok(mut session) => {
-            session.set_bulk_control(options.bulk.clone());
-            let previous = session.view();
-            let roots = roots(Some(&previous))?;
-            let mut plan = Plan::new(
-                Some(&previous),
-                &roots,
-                refresh,
-                options.sniffer,
-                fingerprint(options),
-            )?;
-            let Reconciled {
-                batches,
-                mut report,
-                changes,
-            } = match observe_reconcile(&session, &mut plan, options) {
-                Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
-                    // `roots`, not `plan.roots`: D119 may have withdrawn a
-                    // root from the plan, and the rewalk must find and
-                    // report it again.
-                    let report = full_rewalk(&mut session, &roots, options, usage)?;
-                    return Ok((report, after(&session.view())));
-                }
-                result => result?,
-            };
-            let started = Instant::now();
-            let (catalog, changed, faulted, aliases, result) = match changes {
-                Some(changes) => {
-                    let changed = !changes.records.is_empty();
-                    let catalog = session
-                        .commit(&changes, options.sniffer)
-                        .map_err(|e| undurable(update_error(e), &mut report))?;
-                    let (faulted, aliases) =
-                        reporting_ids(&session, previous.generation(), &changes);
-                    let result = after(&catalog);
-                    (catalog, changed, faulted, aliases, result)
-                }
-                None => {
-                    let mut txn = session.into_checkpoint(options.sniffer);
-                    txn.set_policy(fingerprint(options));
-                    for batch in batches {
-                        txn.add(batch);
-                    }
-                    for root in &plan.keep {
-                        txn.keep(root.as_os_str().as_bytes())
-                            .map_err(IndexError::Keep)?;
-                    }
-                    let (catalog, result) = txn
-                        .commit_then(after)
-                        .map_err(|e| undurable(IndexError::Commit(e), &mut report))?;
-                    (catalog, true, None, None, result)
-                }
-            };
-            report.commit_time += started.elapsed().saturating_sub(after_time.get());
-            finish_report(
-                &mut report,
-                &catalog,
-                &plan,
-                changed,
-                faulted.as_deref(),
-                aliases.as_deref(),
-            );
-            Ok((report, result))
-        }
+    match WriterSession::open(catalog_dir) {
+        Ok(session) => run_session(session, roots, refresh, options, after, &after_time),
         Err(ferret_catalog::log::Error::MissingCheckpoint)
         | Err(ferret_catalog::log::Error::Previous(ferret_catalog::OpenError::Decode(
             ferret_catalog::DecodeError::Version(_),
-        ))) => {
-            let mut txn =
-                Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
-            let roots = roots(txn.previous())?;
-            let mut plan = Plan::new(
-                txn.previous(),
-                &roots,
-                refresh,
-                options.sniffer,
-                fingerprint(options),
-            )?;
-            let (observed, mut report) = observe(Source::Checkpoint(&txn), &plan, options)?;
-            let batches = initial(&txn, &mut plan, observed, &mut report)?;
-            let started = Instant::now();
-            txn.set_policy(fingerprint(options));
-            for batch in batches {
-                txn.add(batch);
-            }
-            for root in &plan.keep {
-                txn.keep(root.as_os_str().as_bytes())
-                    .map_err(IndexError::Keep)?;
-            }
-            let (catalog, result) = txn
-                .commit_then(after)
-                .map_err(|e| undurable(IndexError::Commit(e), &mut report))?;
-            report.commit_time += started.elapsed().saturating_sub(after_time.get());
-            finish_report(&mut report, &catalog, &plan, true, None, None);
-            Ok((report, result))
-        }
+        ))) => run_initial(catalog_dir, roots, refresh, options, after, &after_time),
         Err(ferret_catalog::log::Error::Locked) => Err(IndexError::Begin(BeginError::Locked)),
         Err(error) => Err(IndexError::Update(error)),
     }
+}
+
+/// [`run`] over an open writer session: a log transaction when reconciling
+/// produced changes, else a new checkpoint. `after_time` holds how long
+/// `after` took, which the commit time excludes.
+fn run_session<T>(
+    mut session: WriterSession,
+    roots: impl FnOnce(Option<&Catalog>) -> Result<Vec<PathBuf>, IndexError>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+    after: impl FnOnce(&Catalog) -> T,
+    after_time: &std::cell::Cell<Duration>,
+) -> Result<(Report, T), IndexError> {
+    session.set_bulk_control(options.bulk.clone());
+    let previous = session.view();
+    let roots = roots(Some(&previous))?;
+    let mut plan = Plan::new(
+        Some(&previous),
+        &roots,
+        refresh,
+        options.sniffer,
+        fingerprint(options),
+    )?;
+    let Reconciled {
+        batches,
+        mut report,
+        changes,
+    } = match observe_reconcile(&session, &mut plan, options) {
+        Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
+            // `roots`, not `plan.roots`: D119 may have withdrawn a root from
+            // the plan, and the rewalk must find and report it again.
+            let report = full_rewalk(&mut session, &roots, options, usage)?;
+            return Ok((report, after(&session.view())));
+        }
+        result => result?,
+    };
+    let started = Instant::now();
+    let (catalog, changed, faulted, aliases, result) = match changes {
+        Some(changes) => {
+            let changed = !changes.records.is_empty();
+            let catalog = session
+                .commit(&changes, options.sniffer)
+                .map_err(|e| undurable(update_error(e), &mut report))?;
+            let (faulted, aliases) = reporting_ids(&session, previous.generation(), &changes);
+            let result = after(&catalog);
+            (catalog, changed, faulted, aliases, result)
+        }
+        None => {
+            let txn = session.into_checkpoint(options.sniffer);
+            let (catalog, result) = checkpoint(txn, batches, &plan, options, after, &mut report)?;
+            (catalog, true, None, None, result)
+        }
+    };
+    report.commit_time += started.elapsed().saturating_sub(after_time.get());
+    finish_report(
+        &mut report,
+        &catalog,
+        &plan,
+        changed,
+        faulted.as_deref(),
+        aliases.as_deref(),
+    );
+    Ok((report, result))
+}
+
+/// [`run`] where no log can be resumed: a full walk into a new checkpoint.
+fn run_initial<T>(
+    catalog_dir: &Path,
+    roots: impl FnOnce(Option<&Catalog>) -> Result<Vec<PathBuf>, IndexError>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+    after: impl FnOnce(&Catalog) -> T,
+    after_time: &std::cell::Cell<Duration>,
+) -> Result<(Report, T), IndexError> {
+    let txn = Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
+    let roots = roots(txn.previous())?;
+    let mut plan = Plan::new(
+        txn.previous(),
+        &roots,
+        refresh,
+        options.sniffer,
+        fingerprint(options),
+    )?;
+    let (observed, mut report) = observe(Source::Checkpoint(&txn), &plan, options)?;
+    let batches = initial(&txn, &mut plan, observed, &mut report)?;
+    let started = Instant::now();
+    let (catalog, result) = checkpoint(txn, batches, &plan, options, after, &mut report)?;
+    report.commit_time += started.elapsed().saturating_sub(after_time.get());
+    finish_report(&mut report, &catalog, &plan, true, None, None);
+    Ok((report, result))
+}
+
+/// Commits `batches` and the plan's kept roots as a new checkpoint, then
+/// runs `after` on it.
+fn checkpoint<T>(
+    mut txn: Transaction,
+    batches: Vec<ferret_catalog::Batch>,
+    plan: &Plan,
+    options: &IndexOptions,
+    after: impl FnOnce(&Catalog) -> T,
+    report: &mut Report,
+) -> Result<(Catalog, T), IndexError> {
+    txn.set_policy(fingerprint(options));
+    for batch in batches {
+        txn.add(batch);
+    }
+    for root in &plan.keep {
+        txn.keep(root.as_os_str().as_bytes())
+            .map_err(IndexError::Keep)?;
+    }
+    txn.commit_then(after)
+        .map_err(|e| undurable(IndexError::Commit(e), report))
 }
 
 /// Recrawls using a resident session, retaining its lookups and writer lock.
