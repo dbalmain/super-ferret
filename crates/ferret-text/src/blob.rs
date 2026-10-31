@@ -92,6 +92,10 @@ pub fn base64_runs(bytes: &[u8], mut emit: impl FnMut(Range<usize>)) {
         while at < bytes.len() && base64_byte(bytes[at]) {
             at += 1;
         }
+        // Trimming only shortens a run, so most words end here.
+        if at - start < BASE64_MIN {
+            continue;
+        }
         let (start, body_end) = trim_written(bytes, start..at);
         let mut end = body_end;
         if body_end == at {
