@@ -7613,3 +7613,40 @@ inside the window, `dir/b` is stat'd or read through the detached
 directory and reported under the old path. Option A notices; B and C
 report what the directory held when last checked, for up to 100 µs (B)
 or the rest of the query (C).
+
+## D136 — Whether `ferret index` holds a second buffer to overlap its drains
+
+**Question:** Should the no-daemon `ferret index` drain each full buffer on a
+second thread while it fills a fresh pair of buffers, which saves another tenth
+of the index time, at the cost of holding two full buffers at once?
+
+Since a966936 a pass may write many segments. It drains each full buffer on the
+writer thread, then writes the two drained segment files on a second thread
+while it reads on. Only the drained writers, roughly the segment's own size, are
+held twice. The drains still stop reading: on the tree corpus they are about
+half of the flush time.
+
+Fresh index of the tree corpus (48,206 files, 988 MB, 17 segments), index on
+tmpfs, mean of four runs:
+
+| Flush                                       | Wall   | Max RSS |
+| ------------------------------------------- | ------ | ------- |
+| One segment per pass (before a966936)       | 4.38 s | 360 MB  |
+| Files written while reading (a966936)       | 3.97 s | 360 MB  |
+| Drains and files while reading (prototype)  | 3.52 s | 490 MB  |
+| Same, both buffers halved (32 MiB)          | 4.55 s | 400 MB  |
+
+Halving the buffers to keep memory level loses: twice the segments, and the
+merges that follow cost more than the overlap saves.
+
+| Option | Costs | Buys |
+| ------ | ----- | ---- |
+| A. Keep a966936: overlap the file writes only | Nothing more. | 9% off the index; peak memory unchanged. |
+| B. Also drain on the second thread, with a second buffer pair | About 130 MB more peak memory while indexing: a second 64 MiB term buffer and a second 48 MB trigram reservation. D70's fixed reservation would count it for this command. | A further 11% (3.97 to 3.52 s). |
+| C. B for the daemon's explicit follow too | B's memory inside the daemon, against D70's budget. Daemon passes publish to queries only at a pass's end, so a pass of many segments delays what queries see while a large tree indexes. | The same speed for `ferret index` run through the daemon. |
+
+**Recommendation:** A. The memory is held only while an index is built, but I
+read the standing density-over-speed rule as covering peak memory, and a 36%
+higher peak for 11% is the wrong side of it. The fact that would change it:
+indexing time on a large tree becoming the complaint, on machines where 130 MB
+does not matter (then B).
