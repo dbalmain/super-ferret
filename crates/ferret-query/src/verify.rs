@@ -1776,24 +1776,31 @@ impl<Task> Feed<Task> {
         let polls = Cell::new(0u32);
         let closed = Cell::new(false);
         let flushed = Cell::new(false);
-        let push = || {
+        // Pushes the batch; at a batch's end, then waits under the same lock
+        // for room for the next one.
+        let push = |room: bool| {
             first.set(None);
             flushed.set(true);
             let mut state = lock(&self.state);
-            if state.closed {
-                closed.set(true);
-                return;
+            if !state.closed {
+                state.tasks.extend(batch.borrow_mut().drain(..));
+                let wake = if self.indexed {
+                    state.sleeping > 0
+                } else {
+                    state.sleeping >= state.tasks.len()
+                };
+                if wake {
+                    self.ready.notify_one();
+                }
             }
-            state.tasks.extend(batch.borrow_mut().drain(..));
-            let wake = if self.indexed {
-                state.sleeping > 0
-            } else {
-                state.sleeping >= state.tasks.len()
-            };
-            drop(state);
-            if wake {
-                self.ready.notify_one();
+            while room && state.tasks.len() >= self.capacity && !state.closed {
+                state.full = true;
+                state = wait(&self.room, state);
             }
+            if room {
+                state.full = false;
+            }
+            closed.set(state.closed);
         };
         // Reading the clock on every poll cost about 5 ms of a 60 ms walk.
         let due = || {
@@ -1805,22 +1812,11 @@ impl<Task> Feed<Task> {
         };
         let poll = || {
             if due() {
-                push();
+                push(false);
             }
             closed.get() || stopped()
         };
         loop {
-            {
-                let mut state = lock(&self.state);
-                while state.tasks.len() >= self.capacity && !state.closed {
-                    state.full = true;
-                    state = wait(&self.room, state);
-                }
-                state.full = false;
-                if state.closed {
-                    return;
-                }
-            }
             // Gathers until the batch is full or due; a push from a poll ends
             // it too, so the capacity is checked again.
             flushed.set(false);
@@ -1829,26 +1825,28 @@ impl<Task> Feed<Task> {
                     return;
                 }
                 let Some(task) = next(&poll) else {
-                    push();
+                    push(false);
                     return;
                 };
                 let mut gathered = batch.borrow_mut();
                 gathered.push(task);
-                let full = gathered.len() >= batch_len;
+                let (len, full) = (gathered.len(), gathered.len() >= batch_len);
                 drop(gathered);
                 if first.get().is_none() {
                     first.set(Some(Instant::now()));
                 }
+                // Every fourth path reads the clock, as polls do every 64th.
                 if full
                     || flushed.get()
-                    || first
-                        .get()
-                        .is_some_and(|first| first.elapsed() >= BATCH_WAIT)
+                    || len.is_multiple_of(4)
+                        && first
+                            .get()
+                            .is_some_and(|first| first.elapsed() >= BATCH_WAIT)
                 {
                     break;
                 }
             }
-            push();
+            push(true);
             if closed.get() {
                 return;
             }
