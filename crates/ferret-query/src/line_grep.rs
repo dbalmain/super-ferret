@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferret_verify::{Grep, GrepFlags, LineFlags};
+use ferret_verify::{Grep, GrepFlags, LineFlags, Search};
 
 mod args;
 mod context;
@@ -478,49 +478,7 @@ fn scan_records(
     let mut before = context::Before::new(before_lines, stopped, plan.spill_dir.clone());
     let mut trailing = 0;
     let mut limited = false;
-    let mut emit = |line: Line<'_>| {
-        // A context line matches only under inversion; otherwise it is never
-        // searched. Lines after `-m` arrive with their highlights resolved
-        // (none): they are context and never searched, also under `-v` (D98).
-        if line.kind == LineKind::Context && (!plan.invert || line.highlights.is_some()) {
-            return emit(Line {
-                highlights: Some(&[]),
-                ..line
-            });
-        }
-        if plan.replacement.is_some() {
-            return replacement::line(plan, line, stopped, &mut emit);
-        }
-        if line.kind == LineKind::Context && plan.only_matching && plan.invert {
-            let mut printed = false;
-            for span in search.spans(line.bytes) {
-                if stopped() {
-                    return Err(io::ErrorKind::ConnectionAborted.into());
-                }
-                // D79 D: `-o` never prints an empty record.
-                if !span.is_empty() {
-                    printed = true;
-                    emit(Line {
-                        bytes: &line.bytes[span],
-                        fragment: true,
-                        ..line
-                    })?;
-                }
-            }
-            if printed {
-                return Ok(());
-            }
-            // An empty fragment prints nothing; it keeps the line in the
-            // window.
-            emit(Line {
-                bytes: &line.bytes[..0],
-                fragment: true,
-                ..line
-            })
-        } else {
-            emit(line)
-        }
-    };
+    let mut emit = |line: Line<'_>| render(plan, &search, stopped, line, &mut emit);
     crate::scan::runs(
         input,
         size,
@@ -591,30 +549,10 @@ fn scan_records(
                         let hit = match hit_line {
                             Some(hit) if hit >= start => hit,
                             _ => {
-                                let rest = &text[start..];
-                                let hit = search.matching_line(rest).map_or(usize::MAX, |hit| {
-                                    start
-                                        + memchr::memrchr(b'\n', &rest[..hit])
-                                            .map_or(0, |at| at + 1)
-                                });
-                                hit_boundary = Some(if hit == usize::MAX {
-                                    let end =
-                                        if !terminated && binary.is_none() && text.ends_with(b"\n")
-                                        {
-                                            text.len() - 1
-                                        } else {
-                                            text.len()
-                                        };
-                                    start
-                                        + context::tail_start(
-                                            &text[start..end.max(start)],
-                                            before_lines.max(1),
-                                        )
-                                } else if hit == start {
-                                    start
-                                } else {
-                                    start + context::tail_start(&text[start..hit - 1], before_lines)
-                                });
+                                let open = !terminated && binary.is_none();
+                                let (hit, boundary) =
+                                    next_hit(&search, text, start, open, before_lines);
+                                hit_boundary = Some(boundary);
                                 hit_line = Some(hit);
                                 hit
                             }
@@ -701,38 +639,15 @@ fn scan_records(
                         before.emit(&mut emit).map_err(ScanError::Output)?;
                     }
                     trailing = number.saturating_add(after);
-                    if (plan.only_matching || plan.output == Output::CountMatches) && !plan.invert {
-                        let fragments = plan.output == Output::Lines && plan.replacement.is_none();
-                        let mut printed = false;
-                        for span in search.spans(line) {
-                            if stopped() {
-                                return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
-                            }
-                            result.count += 1;
-                            // D79 D: `-o` never prints an empty record.
-                            if fragments && !span.is_empty() {
-                                printed = true;
-                                emit(at.line(&line[span], LineKind::Match, true))
-                                    .map_err(ScanError::Output)?;
-                            }
-                        }
-                        if fragments && !printed {
-                            // An empty fragment prints nothing; it keeps this
-                            // selected line in the context window.
-                            emit(at.line(&line[..0], LineKind::Match, true))
-                                .map_err(ScanError::Output)?;
-                        }
-                        if plan.output == Output::Lines && plan.replacement.is_some() {
-                            emit(at.line(line, LineKind::Match, false))
-                                .map_err(ScanError::Output)?;
-                        }
-                    } else {
-                        result.count += 1;
-                        if plan.output == Output::Lines {
-                            emit(at.line(line, LineKind::Match, false))
-                                .map_err(ScanError::Output)?;
-                        }
-                    }
+                    emit_selected(
+                        plan,
+                        &search,
+                        stopped,
+                        at,
+                        line,
+                        &mut result.count,
+                        &mut emit,
+                    )?;
                     if plan.max_count.is_some_and(|limit| selected_lines >= limit) {
                         limited = true;
                         if after == 0 {
@@ -753,6 +668,131 @@ fn scan_records(
             Ok(ControlFlow::Continue(()))
         },
     )?;
+    Ok(())
+}
+
+/// Passes one scanned line on as it renders: context lines unhighlighted,
+/// `-r` through [`replacement`], and inverted `-o` context split into its
+/// spans.
+fn render(
+    plan: &Plan,
+    search: &Search<'_>,
+    stopped: &dyn Fn() -> bool,
+    line: Line<'_>,
+    emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    // A context line matches only under inversion; otherwise it is never
+    // searched. Lines after `-m` arrive with their highlights resolved
+    // (none): they are context and never searched, also under `-v` (D98).
+    if line.kind == LineKind::Context && (!plan.invert || line.highlights.is_some()) {
+        return emit(Line {
+            highlights: Some(&[]),
+            ..line
+        });
+    }
+    if plan.replacement.is_some() {
+        return replacement::line(plan, line, stopped, emit);
+    }
+    if line.kind == LineKind::Context && plan.only_matching && plan.invert {
+        let mut printed = false;
+        for span in search.spans(line.bytes) {
+            if stopped() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            // D79 D: `-o` never prints an empty record.
+            if !span.is_empty() {
+                printed = true;
+                emit(Line {
+                    bytes: &line.bytes[span],
+                    fragment: true,
+                    ..line
+                })?;
+            }
+        }
+        if printed {
+            return Ok(());
+        }
+        // An empty fragment prints nothing; it keeps the line in the
+        // window.
+        emit(Line {
+            bytes: &line.bytes[..0],
+            fragment: true,
+            ..line
+        })
+    } else {
+        emit(line)
+    }
+}
+
+/// The start of the next selected line in `text` from `start`, or
+/// `usize::MAX` when none is, with where the lines worth visiting before it
+/// begin: the last `before` lines, or the run's last line when nothing more is
+/// selected. `open` says a final LF may still be followed by more input.
+fn next_hit(
+    search: &Search<'_>,
+    text: &[u8],
+    start: usize,
+    open: bool,
+    before: u64,
+) -> (usize, usize) {
+    let rest = &text[start..];
+    let hit = search.matching_line(rest).map_or(usize::MAX, |hit| {
+        start + memchr::memrchr(b'\n', &rest[..hit]).map_or(0, |at| at + 1)
+    });
+    let boundary = if hit == usize::MAX {
+        let end = if open && text.ends_with(b"\n") {
+            text.len() - 1
+        } else {
+            text.len()
+        };
+        start + context::tail_start(&text[start..end.max(start)], before.max(1))
+    } else if hit == start {
+        start
+    } else {
+        start + context::tail_start(&text[start..hit - 1], before)
+    };
+    (hit, boundary)
+}
+
+/// Counts and emits a selected line: its spans under `-o` or a match count,
+/// else the whole line.
+fn emit_selected(
+    plan: &Plan,
+    search: &Search<'_>,
+    stopped: &dyn Fn() -> bool,
+    at: Position,
+    line: &[u8],
+    count: &mut u64,
+    emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+) -> Result<(), ScanError> {
+    if (plan.only_matching || plan.output == Output::CountMatches) && !plan.invert {
+        let fragments = plan.output == Output::Lines && plan.replacement.is_none();
+        let mut printed = false;
+        for span in search.spans(line) {
+            if stopped() {
+                return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
+            }
+            *count += 1;
+            // D79 D: `-o` never prints an empty record.
+            if fragments && !span.is_empty() {
+                printed = true;
+                emit(at.line(&line[span], LineKind::Match, true)).map_err(ScanError::Output)?;
+            }
+        }
+        if fragments && !printed {
+            // An empty fragment prints nothing; it keeps this
+            // selected line in the context window.
+            emit(at.line(&line[..0], LineKind::Match, true)).map_err(ScanError::Output)?;
+        }
+        if plan.output == Output::Lines && plan.replacement.is_some() {
+            emit(at.line(line, LineKind::Match, false)).map_err(ScanError::Output)?;
+        }
+    } else {
+        *count += 1;
+        if plan.output == Output::Lines {
+            emit(at.line(line, LineKind::Match, false)).map_err(ScanError::Output)?;
+        }
+    }
     Ok(())
 }
 
