@@ -814,11 +814,11 @@ fn answer_requests(
             }
             Err(_) => break,
         };
-        if !answer(host, destination, cancelled, &line)? {
-            break;
-        }
-        if cancelled.load(Ordering::Acquire) {
-            break;
+        match answer(host, destination, cancelled, &line)? {
+            Answer::Rejected => continue,
+            Answer::Ran if cancelled.load(Ordering::Acquire) => break,
+            Answer::Ran => {}
+            Answer::Stop => break,
         }
     }
     Ok(())
@@ -847,28 +847,40 @@ fn greet(host: &Host, destination: &Destination, cancelled: &AtomicBool) -> io::
     Ok(true)
 }
 
-/// Answers one request line; `false` when the connection must stop.
+/// How one request line ended, which decides whether the connection checks
+/// for cancellation before reading the next.
+enum Answer {
+    /// Refused before running: too long or unparsable. The next line is read
+    /// without a cancellation check.
+    Rejected,
+    /// Ran to its end block.
+    Ran,
+    /// Cancelled or draining before it was admitted.
+    Stop,
+}
+
+/// Answers one request line.
 fn answer(
     host: &Host,
     destination: &Destination,
     cancelled: &AtomicBool,
     line: &[u8],
-) -> io::Result<bool> {
+) -> io::Result<Answer> {
     if line.len() > protocol::MAX_LINE_BYTES {
         let id = protocol::recover_id(line);
         crate::batch::request_error(destination, id.as_deref(), "LineTooLong")?;
-        return Ok(true);
+        return Ok(Answer::Rejected);
     }
     let request = match protocol::parse_request(line) {
         Ok(request) => request,
         Err(error) => {
             crate::batch::request_error(destination, error.id.as_deref(), &error.kind.to_string())?;
-            return Ok(true);
+            return Ok(Answer::Rejected);
         }
     };
     let _permit = if matches!(request.op, Op::Search | Op::Find | Op::Grep) {
         let Some(permit) = admit(host, cancelled) else {
-            return Ok(false);
+            return Ok(Answer::Stop);
         };
         Some(permit)
     } else {
@@ -893,7 +905,7 @@ fn answer(
                 .str("message", "query panicked");
         })?,
     }
-    Ok(true)
+    Ok(Answer::Ran)
 }
 
 fn runtime_status(request: &Request) -> u8 {
