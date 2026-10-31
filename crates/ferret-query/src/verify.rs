@@ -1774,7 +1774,9 @@ impl<Task> Feed<Task> {
         stopped: &dyn Fn() -> bool,
     ) {
         let batch_len = if self.indexed { RUN_TASKS } else { 1 };
-        let batch = RefCell::new(Vec::with_capacity(batch_len));
+        // A deque, so the push moves the batch with one bulk copy under the
+        // lock rather than a copy per task.
+        let batch = RefCell::new(VecDeque::with_capacity(batch_len));
         let first = Cell::new(None::<Instant>);
         let polls = Cell::new(0u32);
         let closed = Cell::new(false);
@@ -1786,7 +1788,7 @@ impl<Task> Feed<Task> {
             flushed.set(true);
             let mut state = lock(&self.state);
             if !state.closed {
-                state.tasks.extend(batch.borrow_mut().drain(..));
+                state.tasks.append(&mut batch.borrow_mut());
                 let wake = if self.indexed {
                     state.sleeping > 0
                 } else {
@@ -1832,7 +1834,7 @@ impl<Task> Feed<Task> {
                     return;
                 };
                 let mut gathered = batch.borrow_mut();
-                gathered.push(task);
+                gathered.push_back(task);
                 let (len, full) = (gathered.len(), gathered.len() >= batch_len);
                 drop(gathered);
                 if first.get().is_none() {
