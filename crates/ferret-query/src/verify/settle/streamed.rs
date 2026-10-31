@@ -4,7 +4,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use ferret_catalog::NameId;
 use ferret_verify::TextMatcher;
 
-use super::settle::{Hand, Outcome, stream, streams, verify};
+use super::{Hand, Outcome, stream, streams, verify};
 use crate::{Query, ReadRequest, ReadVersion};
 
 /// Hands out `bytes` 1 to `most` at a time.

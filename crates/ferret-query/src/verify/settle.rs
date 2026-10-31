@@ -22,7 +22,7 @@ pub(super) enum Outcome {
 pub(super) struct Matched {
     time: Duration,
     regex: Duration,
-    pub(super) matching: MatchStats,
+    matching: MatchStats,
 }
 
 pub(super) enum Settled {
@@ -45,7 +45,7 @@ pub(super) struct Hand<'r, 'a> {
     /// This thread's own copy of each grep atom's search, by atom: a regex
     /// shared between threads hands each a match cache from a pool, which
     /// many threads at once contend on.
-    pub(super) regexes: Vec<Option<Search<'static>>>,
+    regexes: Vec<Option<Search<'static>>>,
 }
 
 impl<'r, 'a> Hand<'r, 'a> {
@@ -182,7 +182,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
 
 /// Reads `name`'s document into `bytes` and runs every atom over it,
 /// unless `stopped` says to stop first; the reader is given `stopped` too.
-pub(super) fn verify(
+fn verify(
     atoms: &[ContentAtom],
     regexes: &[Option<Search<'_>>],
     read: &mut Reader<'_>,
@@ -279,7 +279,7 @@ pub(super) fn streams(atoms: &[ContentAtom]) -> bool {
 /// [`verify`] asks it between atoms. A stopped document, whatever the host
 /// returned, counts the atoms that had finished: those that matched, and
 /// those the last run was searched for without a match.
-pub(super) fn stream(
+fn stream(
     regexes: &[Option<Search<'_>>],
     read: &mut Reader<'_>,
     buffer: &mut Vec<u8>,
@@ -383,3 +383,10 @@ fn add(sum: &mut MatchStats, more: &MatchStats) {
     sum.whole += more.whole;
     sum.tokenized += more.tokenized;
 }
+
+/// [`stream`] against [`verify`], the whole-document search, on the same
+/// bytes: every answer and count agree for line-local patterns, with the
+/// bytes arriving a few at a time, so runs end at every kind of place, and
+/// with a line longer than the buffer.
+#[cfg(test)]
+mod streamed;

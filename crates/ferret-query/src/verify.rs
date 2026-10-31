@@ -131,8 +131,8 @@ pub(crate) enum Readers<'r, 'a> {
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
     pub verified: u64,
-    /// Reads that failed or found a new version; not a read a stop ended
-    /// ([`unread`]).
+    /// Reads that failed or found a new version; not a read a stop ended,
+    /// which settles as unread.
     pub changed: u64,
     pub time: Duration,
     pub regex: Duration,
@@ -971,10 +971,3 @@ pub(crate) mod seam {
 /// thread's path, with a predicate that says stop after the first atom.
 #[cfg(test)]
 mod partial;
-
-/// [`stream`] against [`verify`], the whole-document search, on the same
-/// bytes: every answer and count agree for line-local patterns, with the
-/// bytes arriving a few at a time, so runs end at every kind of place, and
-/// with a line longer than the buffer.
-#[cfg(test)]
-mod streamed;
