@@ -783,61 +783,19 @@ fn observe(
     for root in &plan.refresh {
         let bulk_read = matches!(source, Source::Rebuild(..))
             || plan.selections.get(root).is_none_or(|s| s.whole_root());
-        if bulk_read
-            && let Source::Bounded(session, ..) = source
-            && let Some(control) = &options.bulk
-        {
-            // Between roots is a safe phase boundary. A refusal drops all
-            // unpublished batches; no partial listing is published or
-            // cancelled.
-            control
-                .admit(ferret_catalog::bulk::Kind::FullRewalk, &session.view())
-                .map_err(IndexError::DeferredBulk)?;
+        if bulk_read {
+            admit_bulk(source, options)?;
         }
         if !plan.selections.contains_key(root)
             && let Some(watch) = &options.watch
         {
             watch.begin_policy_root(root);
         }
-        let walk_options = WalkOptions {
-            workers: options.bulk.as_ref().map_or(options.workers, |control| {
-                control.workers().min(options.workers.max(1))
-            }),
-            boundaries: plan.boundaries(root),
-        };
-        let mut visitors = walk_parallel(
-            root,
-            options.global.as_deref(),
-            options.config,
-            &walk_options,
-            || {
-                let mut hasher = Hasher::with_source(source, &cache, root);
-                hasher.watch = options.watch.as_deref();
-                // An unpaced bulk control is an explicit command. Its workers
-                // keep the spawning thread's nice; background crawls still
-                // lower.
-                hasher.lower_priority = options.bulk.as_ref().is_none_or(|control| control.paced());
-                if bulk_read {
-                    hasher.reader.limiter = options
-                        .bulk
-                        .as_ref()
-                        .filter(|control| control.paced())
-                        .map(|control| control.limiter());
-                }
-                hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
-                hasher
-            },
-        );
+        let mut visitors = walk_root(source, &cache, root, plan, options, bulk_read);
         if let Some(error) = visitors.iter_mut().find_map(|v| v.priority_error.take()) {
             return Err(IndexError::Priority(error));
         }
-        if let Source::Bounded(_, _, budget) = source
-            && budget.exceeded()
-        {
-            return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
-                budget.usage(),
-            )));
-        }
+        within_budget(source)?;
         let outputs: Vec<Output> = visitors
             .into_iter()
             .map(|v| v.finish(&mut faults))
@@ -847,13 +805,7 @@ fn observe(
         for mut output in outputs {
             output.resolve(&cache);
             output.batch.seal();
-            if let Source::Bounded(_, _, budget) = source
-                && budget.exceeded()
-            {
-                return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
-                    budget.usage(),
-                )));
-            }
+            within_budget(source)?;
             let (rows, bytes) = output.batch.observation_peak();
             observation_rows += rows;
             observation_bytes += bytes;
@@ -880,6 +832,72 @@ fn observe(
     }
     report.coverage_faults = faults;
     Ok((Observed { batches, owners }, report))
+}
+
+/// Admits a bulk read of the next root from a bounded source with a bulk
+/// control. Between roots is a safe phase boundary: a refusal drops all
+/// unpublished batches, and no partial listing is published or cancelled.
+fn admit_bulk(source: Source<'_>, options: &IndexOptions) -> Result<(), IndexError> {
+    if let Source::Bounded(session, ..) = source
+        && let Some(control) = &options.bulk
+    {
+        control
+            .admit(ferret_catalog::bulk::Kind::FullRewalk, &session.view())
+            .map_err(IndexError::DeferredBulk)?;
+    }
+    Ok(())
+}
+
+/// Fails with the input limit once a bounded source's budget is spent.
+fn within_budget(source: Source<'_>) -> Result<(), IndexError> {
+    if let Source::Bounded(_, _, budget) = source
+        && budget.exceeded()
+    {
+        return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
+            budget.usage(),
+        )));
+    }
+    Ok(())
+}
+
+/// Walks `root` in parallel, returning each worker's hasher. A bulk read
+/// paces its reads by the bulk control's limiter.
+fn walk_root<'a>(
+    source: Source<'a>,
+    cache: &'a Cache,
+    root: &'a Path,
+    plan: &'a Plan,
+    options: &'a IndexOptions,
+    bulk_read: bool,
+) -> Vec<Hasher<'a>> {
+    let walk_options = WalkOptions {
+        workers: options.bulk.as_ref().map_or(options.workers, |control| {
+            control.workers().min(options.workers.max(1))
+        }),
+        boundaries: plan.boundaries(root),
+    };
+    walk_parallel(
+        root,
+        options.global.as_deref(),
+        options.config,
+        &walk_options,
+        || {
+            let mut hasher = Hasher::with_source(source, cache, root);
+            hasher.watch = options.watch.as_deref();
+            // An unpaced bulk control is an explicit command. Its workers
+            // keep the spawning thread's nice; background crawls still lower.
+            hasher.lower_priority = options.bulk.as_ref().is_none_or(|control| control.paced());
+            if bulk_read {
+                hasher.reader.limiter = options
+                    .bulk
+                    .as_ref()
+                    .filter(|control| control.paced())
+                    .map(|control| control.limiter());
+            }
+            hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
+            hasher
+        },
+    )
 }
 
 /// Settles an initial checkpoint's faults. D26 directory EACCES is opaque even
