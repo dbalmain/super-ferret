@@ -358,27 +358,7 @@ pub(crate) fn render(result: &Result<Report, IndexError>) -> Rendered {
         }
         Err(IndexError::Coverage { faults, report }) => {
             content_faults(report, &mut diagnostics);
-            append_error(
-                &mut diagnostics,
-                &format!(
-                    "nothing published: {} directory or entry could not be read, so the walk may \
-                 have missed entries; the previous index is unchanged",
-                    faults.len()
-                ),
-            );
-            let mut text = String::new();
-            for fault in faults.iter().take(SHOWN) {
-                let _ = writeln!(text, "  {fault}");
-            }
-            if faults.len() > SHOWN {
-                let _ = writeln!(text, "  … and {} more", faults.len() - SHOWN);
-            }
-            if faults.iter().any(|f| f.on_root) {
-                text.push_str(
-                    "  a root that is gone can be dropped with `ferret roots remove DIR`\n",
-                );
-            }
-            diagnostics.push_str(&text);
+            unpublished_coverage(faults, &mut diagnostics);
             (Exit::Error, "coverage")
         }
         Err(IndexError::Undurable { error, report }) => {
@@ -428,6 +408,29 @@ pub(crate) fn render(result: &Result<Report, IndexError>) -> Rendered {
         stdout,
         diagnostics,
     }
+}
+/// Explains a run that published nothing because `faults` left its walk
+/// incomplete, listing the first few.
+fn unpublished_coverage(faults: &[ferret_crawl::CoverageFault], diagnostics: &mut String) {
+    append_error(
+        diagnostics,
+        &format!(
+            "nothing published: {} directory or entry could not be read, so the walk may have \
+             missed entries; the previous index is unchanged",
+            faults.len()
+        ),
+    );
+    let mut text = String::new();
+    for fault in faults.iter().take(SHOWN) {
+        let _ = writeln!(text, "  {fault}");
+    }
+    if faults.len() > SHOWN {
+        let _ = writeln!(text, "  … and {} more", faults.len() - SHOWN);
+    }
+    if faults.iter().any(|f| f.on_root) {
+        text.push_str("  a root that is gone can be dropped with `ferret roots remove DIR`\n");
+    }
+    diagnostics.push_str(&text);
 }
 fn append_error(output: &mut String, message: &str) {
     let _ = writeln!(output, "ferret: {message}");
