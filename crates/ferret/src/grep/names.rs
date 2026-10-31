@@ -359,6 +359,24 @@ impl Listing<'_> {
                 }
             }
         }
+        self.list(source, &visibility, policy, writer, listed, errors)
+    }
+
+    /// Lists one directory operand's names from `source` on this thread.
+    /// Returns whether the output closed.
+    fn list(
+        &self,
+        mut source: sources::Directory,
+        visibility: &Visibility<'_>,
+        mut policy: Option<live::Policy>,
+        writer: &mut impl Write,
+        listed: &mut Listed,
+        errors: &mut bool,
+    ) -> Result<bool, String> {
+        let (plan, runtime) = (self.plan, self.runtime);
+        let cancelled = runtime.cancelled;
+        let flush_each = self.flush_each();
+        let stopped = || cancelled.load(Ordering::Acquire);
         let mut descend = true;
         while let Some(entry) = source.next_with_cancel(descend, &mut || Ok(()), &mut || {
             cancelled.load(Ordering::Acquire)
@@ -367,14 +385,9 @@ impl Listing<'_> {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    if diagnostic(
-                        writer,
-                        runtime,
-                        &format!("grep: {}: {}", error.path.display(), error.error),
-                    )? {
+                    if walk_error(writer, runtime, &error.path, &error.error, errors)? {
                         return Ok(true);
                     }
-                    *errors = true;
                     continue;
                 }
             };
@@ -387,14 +400,9 @@ impl Listing<'_> {
                 }
                 Ok(Visit::Skip) => {}
                 Err(refusal) => {
-                    if diagnostic(
-                        writer,
-                        runtime,
-                        &format!("grep: {}: {}", refusal.path.display(), refusal.error),
-                    )? {
+                    if walk_error(writer, runtime, &refusal.path, &refusal.error, errors)? {
                         return Ok(true);
                     }
-                    *errors = true;
                 }
             }
         }
@@ -422,6 +430,24 @@ impl Listing<'_> {
         }
         Ok(false)
     }
+}
+
+/// Writes a walk error's diagnostic for `path` and notes it in `errors`.
+/// Returns whether the output closed.
+fn walk_error(
+    writer: &mut impl Write,
+    runtime: &Runtime<'_>,
+    path: &Path,
+    error: &impl std::fmt::Display,
+    errors: &mut bool,
+) -> Result<bool, String> {
+    let closed = diagnostic(
+        writer,
+        runtime,
+        &format!("grep: {}: {error}", path.display()),
+    )?;
+    *errors |= !closed;
+    Ok(closed)
 }
 
 /// Flush accepted names before a diagnostic so stderr cannot overtake them.
