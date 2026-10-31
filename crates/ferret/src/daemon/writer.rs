@@ -18,6 +18,7 @@ use ferret_crawl::{IndexOptions, Refresh, RefreshReason, RootChange};
 use super::{Host, Loaded, duration};
 use crate::engine::Engine;
 use crate::find_json::{emit_to, generation};
+use crate::lock;
 use crate::protocol::{Op, Request};
 use crate::transport::Destination;
 
@@ -146,21 +147,14 @@ pub(super) struct Status {
 struct Operation<'a>(&'a Host);
 impl<'a> Operation<'a> {
     fn start(host: &'a Host, name: &'static str) -> Self {
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .operation = Some(name);
+        lock(&host.writer_status).operation = Some(name);
         host.writer_running.store(true, Ordering::Release);
         Self(host)
     }
 }
 impl Drop for Operation<'_> {
     fn drop(&mut self) {
-        self.0
-            .writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .operation = None;
+        lock(&self.0.writer_status).operation = None;
         self.0.writer_running.store(false, Ordering::Release);
         super::wake_listener(self.0);
     }
@@ -182,10 +176,7 @@ pub(super) fn start(
         Box::new(crate::politeness::Linux::from_env()),
         Arc::new(ferret_catalog::bulk::Monotonic::default()),
     ));
-    host.writer_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .scheduler = Some(scheduler.clone());
+    lock(&host.writer_status).scheduler = Some(scheduler.clone());
     let signal_host = host.clone();
     let signals = scheduler.clone();
     std::thread::spawn(move || {
@@ -206,20 +197,14 @@ pub(super) fn start(
             let Some(error) = stopped_cause(result) else {
                 return;
             };
-            let mut loaded = host
-                .engine
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut loaded = lock(&host.engine);
             let loading = matches!(*loaded, Loaded::Loading);
             if loading {
                 *loaded = Loaded::Failed(error.clone());
             }
             drop(loaded);
             host.engine_ready.notify_all();
-            host.writer_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .error = Some(error.clone());
+            lock(&host.writer_status).error = Some(error.clone());
             host.writer_pending.store(0, Ordering::Release);
             if loading {
                 super::wake_listener(&host);
@@ -281,13 +266,7 @@ fn serve(
     // of how long their local query takes to run under CPU contention.
     #[cfg(debug_assertions)]
     if let Some(gate) = std::env::var_os("FERRET_DAEMON_TEST_LOAD_GATE").map(PathBuf::from) {
-        while gate.exists()
-            && !host.stop.load(Ordering::Acquire)
-            && !host
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .draining
+        while gate.exists() && !host.stop.load(Ordering::Acquire) && !lock(&host.lifecycle).draining
         {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -316,17 +295,11 @@ fn serve(
         Watch::new_blocking(config).ok().map(Arc::new)
     });
     scheduler.watch(watch.clone());
-    host.writer_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .watch = watch.clone();
+    lock(&host.writer_status).watch = watch.clone();
     if let Some(watch) = &watch {
         watch.backstop(RefreshReason::Backstop);
     }
-    *host
-        .engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Loaded::Ready(engine.clone());
+    *lock(&host.engine) = Loaded::Ready(engine.clone());
     host.engine_ready.notify_all();
     drop(loading);
     if let Some(watch) = &watch {
@@ -398,10 +371,7 @@ fn serve(
     let mut refresh_log = RefreshLog::default();
     let mut retry_due: Option<Duration> = None;
     let mut initial = watch.is_none();
-    host.writer_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .fallback_backstop = initial;
+    lock(&host.writer_status).fallback_backstop = initial;
     let mut content_due = Instant::now();
     let mut content_state = content::State::default();
     loop {
@@ -423,11 +393,7 @@ fn serve(
         {
             deadline = deadline.min(due);
         }
-        let draining = host
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .draining;
+        let draining = lock(&host.lifecycle).draining;
         // Drain forbids background work, so its deadlines never advance and
         // an expired one would spin until stop. Only a command or the stop
         // intake can change anything.
@@ -484,12 +450,7 @@ fn serve(
             Ok(Message::Intake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if host
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .draining
-        {
+        if lock(&host.lifecycle).draining {
             continue;
         }
         if Instant::now() >= full_due {
@@ -497,10 +458,7 @@ fn serve(
                 w.backstop(RefreshReason::Backstop);
             } else {
                 initial = true;
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .fallback_backstop = true;
+                lock(&host.writer_status).fallback_backstop = true;
             }
             full_due = Instant::now() + hourly;
         }
@@ -519,10 +477,7 @@ fn serve(
             } else {
                 initial = true;
                 poll_issued = true;
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .fallback_backstop = true;
+                lock(&host.writer_status).fallback_backstop = true;
             }
             poll_due = Instant::now() + polling;
         }
@@ -557,10 +512,7 @@ fn serve(
             continue;
         }
         if paused.is_none() {
-            host.writer_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .blocked = None;
+            lock(&host.writer_status).blocked = None;
         }
         let started = Instant::now();
         // The burst taken above holds any poll issued before it.
@@ -620,23 +572,14 @@ fn serve(
                 // A budget checkpoint may keep sequence unchanged. It did not
                 // observe the queued work; resolve the complete marker again.
                 initial = true;
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .fallback_backstop = watch.is_none();
+                lock(&host.writer_status).fallback_backstop = watch.is_none();
                 retry_due = Some(scheduler.now());
             }
             Ok(_) if deferred.is_some() => {
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .blocked = deferred;
+                lock(&host.writer_status).blocked = deferred;
                 if watch.is_none() {
                     initial = true;
-                    host.writer_status
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .fallback_backstop = true;
+                    lock(&host.writer_status).fallback_backstop = true;
                 }
                 retry_due = Some(scheduler.now() + Duration::from_secs(1));
             }
@@ -647,10 +590,7 @@ fn serve(
                     .is_none_or(|b| b.reason() != RefreshReason::Burst)
                     && report.report.coverage_faults.is_empty();
                 successful(host, &report.report, complete);
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .last_reason = Some(reason);
+                lock(&host.writer_status).last_reason = Some(reason);
                 if let Some(w) = &watch {
                     w.adopt_aliases(&report.view);
                     if burst.as_ref().is_none_or(|b| b.reconcile_watches()) {
@@ -662,10 +602,7 @@ fn serve(
                 content_due = Instant::now();
             }
             Err(error) => {
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .error = Some(error.to_string());
+                lock(&host.writer_status).error = Some(error.to_string());
                 retry_due = Some(scheduler.now() + Duration::from_secs(1));
             }
         }
@@ -801,27 +738,18 @@ fn run_explicit(
             _ => None,
         };
         if let Some(reason) = deferred {
-            host.writer_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .blocked = Some(reason);
+            lock(&host.writer_status).blocked = Some(reason);
             if let Some(w) = watch {
                 w.backstop(RefreshReason::Backstop);
             } else {
                 arm_fallback = true;
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .fallback_backstop = true;
+                lock(&host.writer_status).fallback_backstop = true;
             }
         }
         if let Some(w) = watch {
             w.abort_policy_roots();
         }
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .error = Some(error.to_string());
+        lock(&host.writer_status).error = Some(error.to_string());
         if matches!(
             error,
             ferret_crawl::IndexError::Update(_)
@@ -946,10 +874,7 @@ impl RefreshLog {
     }
 }
 fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
-    let mut status = host
-        .writer_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut status = lock(&host.writer_status);
     status.last_refresh = Some(timestamp());
     status.refreshes += 1;
     status.input_usage = report.input_usage;
@@ -963,13 +888,8 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
 // A merge does not keep an otherwise idle host alive: writer teardown
 // cancels and joins it before close_writer and socket removal (D110).
 pub(super) fn busy(host: &Host) -> bool {
-    matches!(
-        *host
-            .engine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        Loaded::Loading
-    ) || host.writer_running.load(Ordering::Acquire)
+    matches!(*lock(&host.engine), Loaded::Loading)
+        || host.writer_running.load(Ordering::Acquire)
         || host.writer_pending.load(Ordering::Acquire) != 0
 }
 pub(super) fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
@@ -1061,10 +981,7 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
     })
 }
 pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
-    let s = host
-        .writer_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let s = lock(&host.writer_status);
     if let Some(w) = &s.watch {
         let w = w.status();
         o.int("watch_installed", w.installed as u64)

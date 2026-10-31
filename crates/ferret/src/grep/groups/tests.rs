@@ -5,8 +5,8 @@ use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
 use std::cell::Cell;
 use std::io::IoSlice;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 
 impl From<&str> for JobPath {
     fn from(path: &str) -> Self {

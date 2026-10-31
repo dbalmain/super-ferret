@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
+use crate::lock;
 use ferret_catalog::{Catalog, Generation, OpenError, Section, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
 use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged, Pinned};
@@ -181,14 +182,8 @@ impl Engine {
     /// prevents a replacement host from winning the endpoint but losing the
     /// still-live old engine's writer lock.
     pub(crate) fn close_writer(&self) {
-        self.content
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        lock(&self.content).take();
+        lock(&self.writer).take();
     }
 
     /// Published log budget of the resident writer. `None` when this engine
@@ -198,11 +193,7 @@ impl Engine {
     /// commit between [`Engine::pin`] and this read moves the budget ahead of
     /// that pin.
     pub(crate) fn log_budget(&self) -> Option<ferret_catalog::BudgetUsage> {
-        self.writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(WriterSession::budget_usage)
+        lock(&self.writer).as_ref().map(WriterSession::budget_usage)
     }
 
     /// Pins the selected generation without holding a lock during execution.
@@ -310,10 +301,7 @@ impl Engine {
     /// Checkpoint epochs still owned by the current view or an internal pin.
     pub fn pinned_epochs(&self) -> Vec<u64> {
         let current = self.pin();
-        let mut retired = self
-            .retired
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retired = lock(&self.retired);
         retired.retain(|(_, names)| names.strong_count() != 0);
         let mut epochs = retired.iter().map(|(epoch, _)| *epoch).collect::<Vec<_>>();
         epochs.push(current.generation().checkpoint);
@@ -507,10 +495,7 @@ impl Engine {
             Some(previous.name_index()),
         )));
         let derived = Derived::adopt(&previous, &view);
-        let mut retired = self
-            .retired
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retired = lock(&self.retired);
         retired.retain(|(_, names)| names.strong_count() != 0);
         retired.push((
             previous.generation().checkpoint,

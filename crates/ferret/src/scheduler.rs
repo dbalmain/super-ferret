@@ -10,6 +10,7 @@ use ferret_catalog::Catalog;
 use ferret_catalog::bulk::{Blocked, Clock, Control, Kind, Limiter};
 
 use crate::config::Controller as Config;
+use crate::lock;
 use crate::politeness::{Idle, Sample, Signals};
 
 #[derive(Clone, Debug)]
@@ -75,18 +76,11 @@ impl Scheduler {
     pub fn sample(&self) {
         // Proc/sys reads and an optional compositor probe never hold the state
         // mutex needed by query status or by a writer admission decision.
-        let sample = self
-            .source
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sample();
+        let sample = lock(&self.source).sample();
         self.update(sample);
     }
     fn update(&self, sample: Sample) {
-        let mut m = self
-            .machine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = lock(&self.machine);
         let paused =
             (self.config.battery_pause && sample.battery == Some(true)).then_some(Blocked::Battery);
         let desired = if paused.is_some() || sample.cpu.is_none_or(|cpu| cpu > 20.0) {
@@ -118,17 +112,10 @@ impl Scheduler {
         self.clock.now()
     }
     pub fn status(&self) -> Status {
-        self.machine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status
-            .clone()
+        lock(&self.machine).status.clone()
     }
     pub fn watch(&self, watch: Option<Arc<ferret_crawl::watch::Watch>>) {
-        self.machine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .watch = watch;
+        lock(&self.machine).watch = watch;
     }
     pub fn rate_status(&self) -> ferret_catalog::bulk::RateStatus {
         self.limiter.status()
@@ -174,19 +161,11 @@ impl Scheduler {
         disk_bytes: u64,
     ) -> Result<(), Blocked> {
         let disk = ferret_crawl::available_disk(&self.index).ok();
-        let watch = self
-            .machine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .watch
-            .clone();
+        let watch = lock(&self.machine).watch.clone();
         // Charge sparse state only at bulk boundaries; small bursts never scan
         // the complete descriptor/dependency map just to estimate its heap.
         let watch_bytes = watch.as_ref().map_or(0, |w| w.resource_bytes());
-        let mut m = self
-            .machine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = lock(&self.machine);
         let configured_memory = match kind {
             Kind::FullRewalk => self.config.full_memory,
             Kind::Checkpoint => self.config.checkpoint_memory,

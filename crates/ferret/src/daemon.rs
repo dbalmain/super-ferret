@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::{Engine, QuerySession};
 use crate::find_json::{emit_to, generation};
+use crate::lock;
 use crate::protocol::{self, Op, Request};
 use crate::transport::Destination;
 use endpoint::Endpoint;
@@ -189,10 +190,10 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     fs::create_dir_all(&index)?;
     let index = fs::canonicalize(index)?;
     let endpoint = Endpoint::open(&index)?;
-    let lock = endpoint.private_file("lock")?;
+    let endpoint_lock = endpoint.private_file("lock")?;
     let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
     loop {
-        match lock.try_lock() {
+        match endpoint_lock.try_lock() {
             Ok(()) => break,
             Err(fs::TryLockError::WouldBlock) => {
                 if owner_responds(&endpoint.socket()) {
@@ -224,7 +225,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     fs::set_permissions(endpoint.socket(), fs::Permissions::from_mode(0o600))?;
     let (server_send, server_receive) = mpsc::channel();
     let accept_send = server_send.clone();
-    let accept_lock = lock.try_clone()?;
+    let accept_lock = endpoint_lock.try_clone()?;
     std::thread::spawn(move || {
         let _lock = &accept_lock;
         // One line per streak. A persistent EMFILE would otherwise fill stderr.
@@ -288,18 +289,11 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     // the writer before the socket is removed (D110).
     let mut exit_error = None;
     loop {
-        let draining = host
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .draining;
+        let draining = lock(&host.lifecycle).draining;
         let clients = host.clients.load(Ordering::Acquire);
         // A dead writer's pending count can be stale, so a failed service
         // waits only for connections, which its drain has already woken.
-        let fatal = *host
-            .fatal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fatal = *lock(&host.fatal);
         if let Some(service) = fatal
             && clients == 0
         {
@@ -355,11 +349,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     host.stop.store(true, Ordering::Release);
     host.writer_send.wake();
     let _ = writer.join();
-    if let Loaded::Ready(engine) = &*host
-        .engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    if let Loaded::Ready(engine) = &*lock(&host.engine) {
         engine.close_writer();
     }
     // The lifetime-held endpoint lock excludes starters through cleanup. Never
@@ -373,7 +363,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         Ok(())
     };
     drop(cleanup);
-    drop(lock);
+    drop(endpoint_lock);
     // The accept error is why this host left. A removal failure still runs
     // through SocketCleanup above; surfacing it instead would hide the cause.
     if let Some(error) = exit_error {
@@ -399,14 +389,8 @@ fn wake_listener(host: &Host) {
     let _ = host.server_send.send(ServerEvent::Wake);
 }
 fn cancel(host: &Host, cancelled: &AtomicBool) {
-    let _engine = host
-        .engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _lifecycle = host
-        .lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _engine = lock(&host.engine);
+    let _lifecycle = lock(&host.lifecycle);
     cancelled.store(true, Ordering::Release);
     host.engine_ready.notify_all();
     host.lifecycle_changed.notify_all();
@@ -436,10 +420,7 @@ fn advertised_format() -> u64 {
 }
 fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
     let (state, selected, error) = {
-        let loaded = host
-            .engine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let loaded = lock(&host.engine);
         match &*loaded {
             Loaded::Loading => ("loading", None, None),
             Loaded::Ready(engine) => ("ready", Some(engine.generation()), None),
@@ -524,11 +505,7 @@ impl Drop for ClientCount<'_> {
 struct QueryPermit<'a>(&'a Host);
 impl Drop for QueryPermit<'_> {
     fn drop(&mut self) {
-        self.0
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queries -= 1;
+        lock(&self.0.lifecycle).queries -= 1;
         self.0.lifecycle_changed.notify_one();
     }
 }
@@ -591,9 +568,7 @@ impl Permits {
     }
 
     fn lock(&self) -> MutexGuard<'_, PermitState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock(&self.state)
     }
 }
 impl Grant<'_> {
@@ -618,10 +593,7 @@ impl Drop for Grant<'_> {
 }
 fn admit<'a>(host: &'a Host, cancelled: &AtomicBool) -> Option<QueryPermit<'a>> {
     loop {
-        let mut state = host
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&host.lifecycle);
         if state.draining || cancelled.load(Ordering::Acquire) {
             return None;
         }
@@ -645,11 +617,7 @@ fn admit<'a>(host: &'a Host, cancelled: &AtomicBool) -> Option<QueryPermit<'a>> 
 /// admission and drain do not consult the engine, so the clone admits
 /// nothing the held guard would have refused.
 fn pin(host: &Host) -> io::Result<QuerySession> {
-    let engine = match &*host
-        .engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    let engine = match &*lock(&host.engine) {
         Loaded::Ready(engine) => engine.clone(),
         Loaded::Loading | Loaded::Failed(_) => {
             return Err(io::Error::other("engine is not ready"));
@@ -689,34 +657,21 @@ impl Drop for ConnectionRegistration<'_> {
     }
 }
 fn unregister(host: &Host, id: usize) {
-    host.lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .connections
-        .remove(&id);
+    lock(&host.lifecycle).connections.remove(&id);
 }
 /// A service thread stopped after the engine was ready. Logs the cause and
 /// drains, so the host exits 3 through the ordered teardown (D110) and the
 /// next client starts a fresh daemon.
 fn fatal(host: &Host, service: &'static str, cause: &dyn std::fmt::Display) {
     crate::cli::error(&format!("daemon: {service}: {cause}"));
-    host.fatal
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_or_insert(service);
+    lock(&host.fatal).get_or_insert(service);
     drain(host);
 }
 fn drain(host: &Host) {
     // Match the engine -> lifecycle lock order used by cancellation and the
     // loading waiter, so drain cannot be lost between its check and wait.
-    let _loaded = host
-        .engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut state = host
-        .lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _loaded = lock(&host.engine);
+    let mut state = lock(&host.lifecycle);
     state.draining = true;
     for send in state.connections.values() {
         let _ = send.try_send(ClientMessage::Wake);
@@ -730,10 +685,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     let destination = Destination::socket(stream.try_clone()?, cancelled.clone())?;
     let (send, receive) = mpsc::sync_channel(1);
     let registration = {
-        let mut state = host
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&host.lifecycle);
         if state.draining {
             return Ok(());
         }
@@ -800,54 +752,30 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     });
     let result = (|| {
         if !hello(&destination, host)? {
-            let mut loaded = host
-                .engine
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut loaded = lock(&host.engine);
             while matches!(*loaded, Loaded::Loading)
                 && !cancelled.load(Ordering::Acquire)
-                && !host
-                    .lifecycle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .draining
+                && !lock(&host.lifecycle).draining
             {
                 loaded = host
                     .engine_ready
                     .wait(loaded)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            if cancelled.load(Ordering::Acquire)
-                || host
-                    .lifecycle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .draining
-            {
+            if cancelled.load(Ordering::Acquire) || lock(&host.lifecycle).draining {
                 return Ok(());
             }
             drop(loaded);
             hello(&destination, host)?;
         }
         loop {
-            if host
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .draining
-            {
+            if lock(&host.lifecycle).draining {
                 break;
             }
             let line = match receive.recv() {
                 Ok(ClientMessage::Line(line)) => line,
                 Ok(ClientMessage::Wake) => {
-                    if cancelled.load(Ordering::Acquire)
-                        || host
-                            .lifecycle
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .draining
-                    {
+                    if cancelled.load(Ordering::Acquire) || lock(&host.lifecycle).draining {
                         break;
                     }
                     continue;
@@ -931,11 +859,7 @@ fn stats_report(host: &Host, request: &Request, session: &QuerySession) -> Optio
     {
         return None;
     }
-    let engine = match &*host
-        .engine
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    let engine = match &*lock(&host.engine) {
         Loaded::Ready(engine) => engine.clone(),
         Loaded::Loading | Loaded::Failed(_) => return None,
     };
@@ -960,10 +884,7 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
     }
     #[cfg(debug_assertions)]
     if request.op == Op::Status {
-        let status = host
-            .writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = lock(&host.writer_status);
         if let Some(watch) = &status.watch {
             if request
                 .capabilities
@@ -1097,10 +1018,7 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
                         .integers("worker_grants", running.into_iter().map(|n| n as u64));
                     crate::status::resources(o);
                     crate::status::catalog_fields(o, &session);
-                    let engine = host
-                        .engine
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let engine = lock(&host.engine);
                     if let Loaded::Ready(engine) = &*engine {
                         o.integers("pinned_internal_epochs", engine.pinned_epochs());
                     }

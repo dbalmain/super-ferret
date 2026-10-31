@@ -13,7 +13,7 @@ mod tests;
 mod walk;
 
 use super::*;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use crate::lock;
 
 pub(super) use job::{Observed, observe_streaming};
 pub(super) use publish::run;
@@ -28,7 +28,3 @@ pub(super) const GROUP_BYTES: usize = 4 << 20;
 const ENTRY_BYTES: usize = 64 << 10;
 const CACHE_BYTES: usize = 16 << 20;
 const CHUNK: usize = 64 << 10;
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}

@@ -16,6 +16,7 @@ use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError, mark_output_fai
 
 use crate::find::FindSource;
 use crate::json::Object;
+use crate::lock;
 use crate::protocol::{ChildStdin, Request};
 use crate::transport::Destination;
 
@@ -256,9 +257,7 @@ impl Effects for FrameOutput<'_> {
             return Err(io::Error::other("Noninteractive"));
         }
         static PROMPT: Mutex<()> = Mutex::new(());
-        let _prompt = PROMPT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _prompt = lock(&PROMPT);
         let mut bytes = b"< ".to_vec();
         bytes.extend_from_slice(program.as_bytes());
         bytes.extend_from_slice(b" ... ");
@@ -301,30 +300,17 @@ impl FrameOutput<'_> {
         if self.record.load(Ordering::Acquire) > 0 && self.panic.swap(false, Ordering::AcqRel) {
             panic!("injected find worker panic");
         }
-        self.destination.cancelled()
-            || self
-                .transport_error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
+        self.destination.cancelled() || lock(&self.transport_error).is_some()
     }
     pub(crate) fn check_transport(&self) -> io::Result<()> {
-        match self
-            .transport_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+        match lock(&self.transport_error).take() {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
     fn track(&self, result: io::Result<()>) -> io::Result<()> {
         if let Err(error) = &result {
-            let mut saved = self
-                .transport_error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut saved = lock(&self.transport_error);
             if saved.is_none() {
                 *saved = Some(io::Error::new(error.kind(), error.to_string()));
             }

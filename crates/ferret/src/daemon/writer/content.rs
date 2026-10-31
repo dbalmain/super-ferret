@@ -14,6 +14,7 @@ use ferret_catalog::bulk::Control;
 
 use super::{Host, Operation};
 use crate::engine::Engine;
+use crate::lock;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -33,11 +34,7 @@ fn urgent(host: &Host, scheduler: &crate::scheduler::Scheduler) -> bool {
     host.stop.load(Ordering::Acquire)
         || host.writer_pending.load(Ordering::Acquire) != 0
         || scheduler.status().paused.is_some()
-        || host
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .draining
+        || lock(&host.lifecycle).draining
 }
 
 pub(super) fn turn(
@@ -54,10 +51,7 @@ pub(super) fn turn(
     let started = Instant::now();
     let should_interrupt = || {
         urgent(host, scheduler)
-            || host
-                .writer_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            || lock(&host.writer_status)
                 .watch
                 .as_ref()
                 .and_then(|w| w.next_due())
@@ -109,16 +103,10 @@ pub(super) fn turn(
         return Ok(Duration::from_secs(3600));
     };
     if let Err(reason) = scheduler.admit_merge(pin.catalog(), memory, disk) {
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .blocked = Some(reason);
+        lock(&host.writer_status).blocked = Some(reason);
         return Ok(Duration::from_secs(1));
     }
-    host.writer_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .blocked = None;
+    lock(&host.writer_status).blocked = None;
     state.cancelled.store(false, Ordering::Release);
     let cancelled = state.cancelled.clone();
     let host = host.clone();
@@ -140,20 +128,13 @@ pub(super) fn turn(
 struct MergeOperation(Arc<Host>);
 impl MergeOperation {
     fn start(host: &Arc<Host>) -> Self {
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .merge_running = true;
+        lock(&host.writer_status).merge_running = true;
         Self(host.clone())
     }
 }
 impl Drop for MergeOperation {
     fn drop(&mut self) {
-        self.0
-            .writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .merge_running = false;
+        lock(&self.0.writer_status).merge_running = false;
         self.0.writer_send.wake();
         super::super::wake_listener(&self.0);
     }
@@ -242,14 +223,7 @@ fn content_checkpoint(host: &Host, phase: &str, checks: u64, interrupted: &dyn F
 /// is not the background `follow` gate.
 pub(super) fn follow_explicit(host: &Host, engine: &Engine) -> Result<(), String> {
     loop {
-        let stop = || {
-            host.stop.load(Ordering::Acquire)
-                || host
-                    .lifecycle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .draining
-        };
+        let stop = || host.stop.load(Ordering::Acquire) || lock(&host.lifecycle).draining;
         // A fresh counter per pass. The background follow's gate is a
         // different phase, and this command must not park in it.
         #[cfg(debug_assertions)]

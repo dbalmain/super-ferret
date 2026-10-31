@@ -322,11 +322,7 @@ impl Output {
                 written
             }
             #[cfg(test)]
-            Self::Test(writer) => write(
-                &mut **writer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ),
+            Self::Test(writer) => write(&mut **crate::lock(writer)),
         }
     }
     #[cfg(test)]

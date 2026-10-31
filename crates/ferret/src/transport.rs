@@ -1,6 +1,7 @@
 //! Event destinations shared by batch, JSON find and the socket host. Encoding
 //! stays in batch/find_json; destinations batch writes at event boundaries.
 
+use crate::lock;
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,9 +108,7 @@ impl Destination {
         let Self::Socket { writer, .. } = self else {
             return Err(io::Error::other("raw output requires a socket"));
         };
-        let mut writer = writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut writer = lock(writer);
         let SocketWriter { stream, buffer } = &mut *writer;
         buffer.send_payload(header, payload, |bytes| stream.write_all(bytes))
     }
@@ -131,9 +130,7 @@ impl Destination {
         match self {
             Self::Stdout => Ok(()),
             Self::Socket { writer, .. } => {
-                let mut writer = writer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut writer = lock(writer);
                 let SocketWriter { stream, buffer } = &mut *writer;
                 stream.write_all(&buffer.pending)?;
                 buffer.pending.clear();
@@ -143,18 +140,12 @@ impl Destination {
     }
     pub(crate) fn send(&self, line: &[u8]) -> io::Result<()> {
         match self {
-            Self::Stdout => stdout_buffer()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .send(line, |bytes| {
-                    let mut stdout = io::stdout().lock();
-                    stdout.write_all(bytes)?;
-                    stdout.flush()
-                }),
-            Self::Socket { writer, .. } => writer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .send(line),
+            Self::Stdout => lock(stdout_buffer()).send(line, |bytes| {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(bytes)?;
+                stdout.flush()
+            }),
+            Self::Socket { writer, .. } => lock(writer).send(line),
         }
     }
 }
