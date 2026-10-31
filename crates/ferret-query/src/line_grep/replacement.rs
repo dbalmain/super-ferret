@@ -205,7 +205,7 @@ fn line_feeds(bytes: &[u8], stopped: &dyn Fn() -> bool) -> io::Result<u64> {
     let mut count = 0;
     for chunk in bytes.chunks(crate::scan::BUFFER) {
         cancelled(stopped)?;
-        count += memchr::memchr_iter(b'\n', chunk).count() as u64;
+        count += count_lf(chunk);
     }
     Ok(count)
 }

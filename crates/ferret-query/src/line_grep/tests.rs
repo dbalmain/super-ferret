@@ -873,3 +873,16 @@ fn binary_sentinel_stops_before_another_read_or_buffer_growth() {
         }
     }
 }
+
+#[test]
+fn count_lf_counts_across_its_byte_sized_chunks() {
+    // A chunk of 255 LFs fills the byte counter exactly; 256 and 511 cross
+    // into the next chunk.
+    for n in [0, 1, 254, 255, 256, 510, 511, 1000] {
+        assert_eq!(super::count_lf(&vec![b'\n'; n]), n as u64);
+    }
+    let mixed: Vec<u8> = (0..1000)
+        .map(|i| if i % 3 == 0 { b'\n' } else { b'x' })
+        .collect();
+    assert_eq!(super::count_lf(&mixed), 334);
+}

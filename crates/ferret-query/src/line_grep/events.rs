@@ -25,7 +25,7 @@ pub(super) fn scan(
                 if stopped() {
                     return Err(io::ErrorKind::ConnectionAborted.into());
                 }
-                lines += memchr::memchr_iter(b'\n', chunk).count() as u64;
+                lines += count_lf(chunk);
             }
             stats.matched_lines += lines;
             // Quiet reports the same stats as the events it suppresses (D91 A).

@@ -360,6 +360,21 @@ pub struct Line<'a> {
     pub highlights: Option<&'a [std::ops::Range<usize>]>,
 }
 
+/// The LFs in `bytes`. Counted 255 bytes at a time into a byte, which
+/// the compiler vectorises; `memchr_iter` pays per hit on dense text.
+fn count_lf(bytes: &[u8]) -> u64 {
+    bytes
+        .chunks(255)
+        .map(|chunk| {
+            u64::from(
+                chunk
+                    .iter()
+                    .fold(0u8, |count, &byte| count + u8::from(byte == b'\n')),
+            )
+        })
+        .sum()
+}
+
 /// Rg's binary test for a recursive file's first window: any NUL byte.
 pub fn binary_window(head: &[u8]) -> bool {
     memchr::memchr(0, head).is_some()
@@ -550,7 +565,7 @@ fn scan_records(
                         offset += remaining.len() as u64 + u64::from(terminated);
                         result.bytes_searched = offset;
                         if count_lines {
-                            number += memchr::memchr_iter(b'\n', remaining).count() as u64
+                            number += count_lf(remaining)
                                 + u64::from(
                                     terminated
                                         || binary.is_some()
@@ -563,7 +578,7 @@ fn scan_records(
                     let end = memchr::memchr(b'\n', &remaining[hit..])
                         .map_or(remaining.len(), |at| hit + at);
                     if count_lines {
-                        number += memchr::memchr_iter(b'\n', &remaining[..first]).count() as u64;
+                        number += count_lf(&remaining[..first]);
                     }
                     offset += first as u64;
                     if end < remaining.len() {
@@ -616,7 +631,7 @@ fn scan_records(
                             if stopped() {
                                 return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                             }
-                            number += memchr::memchr_iter(b'\n', &text[start..jump]).count() as u64;
+                            number += count_lf(&text[start..jump]);
                             offset += (jump - start) as u64;
                             result.bytes_searched = offset;
                             next = Some(jump);
