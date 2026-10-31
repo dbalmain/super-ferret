@@ -8,7 +8,7 @@ use crate::threads::lock;
 /// three calls per directory on the timing tree.
 const LISTING_BUFFER: usize = 64 * 1024;
 
-/// A child read from a directory: its name's range in `LiveWalk::names`.
+/// A child read from a directory: its name's range in [`Children`]' buffer.
 #[derive(Clone, Copy, Debug)]
 struct Child {
     name: (usize, usize),
@@ -16,6 +16,83 @@ struct Child {
     target: Option<Target>,
     parent: Option<InoId>,
     id: Option<NameId>,
+}
+
+/// The walk's child stack: every open level's children in order, their names
+/// in one buffer.
+#[derive(Default)]
+struct Children {
+    rows: Vec<Child>,
+    names: Vec<u8>,
+}
+
+impl Children {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn names_len(&self) -> usize {
+        self.names.len()
+    }
+
+    fn push(
+        &mut self,
+        name: &[u8],
+        kind: Option<FileKind>,
+        target: Option<Target>,
+        parent: Option<InoId>,
+        id: Option<NameId>,
+    ) {
+        let start = self.names.len();
+        self.names.extend_from_slice(name);
+        self.rows.push(Child {
+            name: (start, self.names.len()),
+            kind,
+            target,
+            parent,
+            id,
+        });
+    }
+
+    fn name(&self, child: &Child) -> &[u8] {
+        &self.names[child.name.0..child.name.1]
+    }
+
+    /// Drops every child from row `rows` and every name from byte `names`.
+    fn truncate(&mut self, rows: usize, names: usize) {
+        self.rows.truncate(rows);
+        self.names.truncate(names);
+    }
+
+    /// Sorts the children from row `start` by name.
+    fn sort_from(&mut self, start: usize) {
+        let names = &self.names;
+        self.rows[start..]
+            .sort_unstable_by(|a, b| names[a.name.0..a.name.1].cmp(&names[b.name.0..b.name.1]));
+    }
+
+    /// The children in `rows` as a fresh stack, names and all.
+    fn copy(&self, rows: std::ops::Range<usize>) -> Self {
+        let mut copy = Self::default();
+        for child in &self.rows[rows] {
+            copy.push(
+                self.name(child),
+                child.kind,
+                child.target,
+                child.parent,
+                child.id,
+            );
+        }
+        copy
+    }
+}
+
+impl std::ops::Index<usize> for Children {
+    type Output = Child;
+
+    fn index(&self, index: usize) -> &Child {
+        &self.rows[index]
+    }
 }
 
 /// An open directory. Its children occupy `start..end` of the walk's child
@@ -93,8 +170,7 @@ pub struct LiveWalk {
     levels: Vec<Level>,
     boundary: usize,
     suspended: bool,
-    children: Vec<Child>,
-    names: Vec<u8>,
+    children: Children,
     buffer: Vec<MaybeUninit<u8>>,
     cancelled: bool,
     #[cfg(test)]
@@ -165,8 +241,7 @@ impl LiveWalk {
             levels: Vec::new(),
             boundary: 0,
             suspended: false,
-            children: Vec::new(),
-            names: Vec::new(),
+            children: Children::default(),
             buffer: Vec::new(),
             cancelled: false,
             #[cfg(test)]
@@ -262,18 +337,7 @@ impl LiveWalk {
             Share::Idle(idle) if unvisited <= idle => level.next,
             Share::Half | Share::Idle(_) => level.next + unvisited / 2,
         };
-        let mut names = Vec::new();
-        let children: Vec<Child> = self.children[middle..level.end]
-            .iter()
-            .map(|child| {
-                let start = names.len();
-                names.extend_from_slice(&self.names[child.name.0..child.name.1]);
-                Child {
-                    name: (start, names.len()),
-                    ..*child
-                }
-            })
-            .collect();
+        let children = self.children.copy(middle..level.end);
         let mut levels: Vec<_> = self.levels[..=index].to_vec();
         // Ancestors own no children here; the donated level owns them all.
         for ancestor in &mut levels[..index] {
@@ -292,7 +356,6 @@ impl LiveWalk {
         walk.levels = levels;
         walk.boundary = index + 1;
         walk.children = children;
-        walk.names = names;
         walk.cancelled = self.cancelled;
         #[cfg(test)]
         {
@@ -361,7 +424,7 @@ impl LiveWalk {
             None
         };
         let start = self.children.len();
-        let names_start = self.names.len();
+        let names_start = self.children.names_len();
         let mut seen = 0usize;
         for child in catalog.entries(dir) {
             seen += 1;
@@ -370,8 +433,7 @@ impl LiveWalk {
                 listed();
             }
             if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                self.children.truncate(start);
-                self.names.truncate(names_start);
+                self.children.truncate(start, names_start);
                 self.cancelled = true;
                 return Ok(());
             }
@@ -417,15 +479,13 @@ impl LiveWalk {
                     continue;
                 }
             }
-            let name_start = self.names.len();
-            self.names.extend_from_slice(child.bytes);
-            self.children.push(Child {
-                name: (name_start, self.names.len()),
-                kind: Some(catalog_kind(child.kind)),
-                target: Some(child.target),
-                parent: Some(dir),
-                id: Some(child.name),
-            });
+            self.children.push(
+                child.bytes,
+                Some(catalog_kind(child.kind)),
+                Some(child.target),
+                Some(dir),
+                Some(child.name),
+            );
         }
         // Nested roots have no name row in the outer crawl (D34).
         let first = self
@@ -442,32 +502,26 @@ impl LiveWalk {
                 listed();
             }
             if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                self.children.truncate(start);
-                self.names.truncate(names_start);
+                self.children.truncate(start, names_start);
                 self.cancelled = true;
                 return Ok(());
             }
             added = true;
-            let name_start = self.names.len();
-            self.names.extend_from_slice(name);
-            self.children.push(Child {
-                name: (name_start, self.names.len()),
-                kind: Some(FileKind::Directory),
-                target: Some(Target::Inode(*id)),
-                parent: Some(dir),
-                id: None,
-            });
+            self.children.push(
+                name,
+                Some(FileKind::Directory),
+                Some(Target::Inode(*id)),
+                Some(dir),
+                None,
+            );
         }
         if cancelled() {
-            self.children.truncate(start);
-            self.names.truncate(names_start);
+            self.children.truncate(start, names_start);
             self.cancelled = true;
             return Ok(());
         }
         if added {
-            self.children[start..].sort_unstable_by(|a, b| {
-                self.names[a.name.0..a.name.1].cmp(&self.names[b.name.0..b.name.1])
-            });
+            self.children.sort_from(start);
         }
         if catalog.has_children(dir) == Some(true) || added {
             before_directory().map_err(|error| entry.error(error))?;
@@ -517,7 +571,7 @@ impl LiveWalk {
         let separator = !entry.path.ends_with(b"/");
         let follow = self.options.follow == Follow::All;
         let start = self.children.len();
-        let names_start = self.names.len();
+        let names_start = self.children.names_len();
         let mut first = None;
         let mut hidden = self.options.hidden_names.then(Vec::new);
         if self.buffer.is_empty() {
@@ -529,8 +583,7 @@ impl LiveWalk {
             let item = match item {
                 Ok(item) => item,
                 Err(error) => {
-                    self.children.truncate(start);
-                    self.names.truncate(names_start);
+                    self.children.truncate(start, names_start);
                     return Err(WalkError {
                         path: entry.path().to_owned(),
                         error: error.into(),
@@ -543,8 +596,7 @@ impl LiveWalk {
                 listed();
             }
             if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                self.children.truncate(start);
-                self.names.truncate(names_start);
+                self.children.truncate(start, names_start);
                 self.cancelled = true;
                 return Ok(());
             }
@@ -576,27 +628,17 @@ impl LiveWalk {
                 hidden.extend_from_slice(name);
                 hidden.push(0);
             }
-            let name_start = self.names.len();
-            self.names.extend_from_slice(name);
-            self.children.push(Child {
-                name: (name_start, self.names.len()),
-                kind,
-                target,
-                parent: None,
-                id: None,
-            });
+            self.children.push(name, kind, target, None, None);
         }
         if cancelled() {
-            self.children.truncate(start);
-            self.names.truncate(names_start);
+            self.children.truncate(start, names_start);
             self.cancelled = true;
             return Ok(());
         }
         if self.children.len() > start
             && let Err(error) = before_directory()
         {
-            self.children.truncate(start);
-            self.names.truncate(names_start);
+            self.children.truncate(start, names_start);
             return Err(WalkError {
                 path: entry.path().to_owned(),
                 error,
@@ -620,8 +662,7 @@ impl LiveWalk {
             match handle.metadata() {
                 Ok(stat) => (None, Some((stat.dev(), stat.ino()))),
                 Err(error) => {
-                    self.children.truncate(start);
-                    self.names.truncate(names_start);
+                    self.children.truncate(start, names_start);
                     own.restore(entry);
                     return Err(entry.error(error));
                 }
@@ -667,8 +708,7 @@ impl LiveWalk {
                 return None;
             }
             if let Some(level) = self.levels.pop_if(|level| level.next == level.end) {
-                self.children.truncate(level.start);
-                self.names.truncate(level.names_start);
+                self.children.truncate(level.start, level.names_start);
                 if self.options.depth_first {
                     self.entry.path.truncate(level.path_len);
                     level.own.restore(&mut self.entry);
@@ -786,9 +826,7 @@ impl LiveWalk {
         if level.separator {
             entry.path.push(b'/');
         }
-        entry
-            .path
-            .extend_from_slice(&self.names[child.name.0..child.name.1]);
+        entry.path.extend_from_slice(self.children.name(&child));
         entry.state.follow = self.options.follow == Follow::All;
         entry.state.followed_symlink = false;
         entry.state.directory = level.handle.clone();
