@@ -98,7 +98,7 @@ mod tests;
 pub(crate) use fingerprint::inherit as inherit_fingerprint;
 pub use fingerprint::{RECORD_BLOCK, fingerprint};
 pub use invert::Inverter;
-pub(crate) use invert::term_hash;
+pub(crate) use invert::{TermTable, term_hash};
 pub use read::{Hit, Info, PostingCursor, Postings, ReadAt, Segment, TermEntry, Terms};
 pub use trigram::{KeySet, TrigramInverter};
 pub use write::{Sizes, Writer};

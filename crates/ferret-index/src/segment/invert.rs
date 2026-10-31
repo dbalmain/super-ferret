@@ -17,7 +17,7 @@ const PER_TERM: usize = 64;
 /// the bound the caller set.
 #[derive(Debug)]
 pub struct Inverter {
-    terms: HashMap<Key, Docs, BuildHasherDefault<Passed>>,
+    terms: TermTable<Docs>,
     memory: usize,
     bound: usize,
     last: Option<u32>,
@@ -29,7 +29,7 @@ impl Inverter {
     /// estimated memory reaches `bound` bytes.
     pub fn new(bound: usize) -> Self {
         Self {
-            terms: HashMap::default(),
+            terms: TermTable::default(),
             memory: 0,
             bound,
             last: None,
@@ -56,12 +56,9 @@ impl Inverter {
             return Err(WriteError::DocOrder);
         }
         self.last = Some(doc);
-        let probe: &dyn Lookup = &(hash, term);
-        let Some(docs) = self.terms.get_mut(probe) else {
-            let key = Key::new(hash, term);
+        let Some(docs) = self.terms.get_mut(hash, term) else {
             self.memory += term.len() + PER_TERM;
-            self.payload_capacity += key.heap_bytes();
-            self.terms.insert(key, Docs::One(doc));
+            self.payload_capacity += self.terms.insert(hash, term, Docs::One(doc));
             return Ok(());
         };
         let grown = docs.push(doc) * size_of::<u32>();
@@ -83,16 +80,16 @@ impl Inverter {
     }
 
     fn table_bytes(&self) -> usize {
-        if self.terms.capacity() == 0 {
+        if self.terms.0.capacity() == 0 {
             return 0;
         }
-        let buckets = (self.terms.capacity() + 1).next_power_of_two();
+        let buckets = (self.terms.0.capacity() + 1).next_power_of_two();
         buckets * (size_of::<(Key, Docs)>() + 1) + 16
     }
 
     /// Capacity charge including the vector of entries needed at drain.
     pub fn flush_bytes(&self) -> usize {
-        self.allocated_bytes() + self.terms.len() * size_of::<(Key, Docs)>()
+        self.allocated_bytes() + self.terms.0.len() * size_of::<(Key, Docs)>()
     }
 
     /// Whether the estimate has reached the bound.
@@ -101,7 +98,7 @@ impl Inverter {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty()
+        self.terms.0.is_empty()
     }
 
     /// Drains everything added into a [`Writer`] over `[first, last]`, which
@@ -154,7 +151,7 @@ impl Inverter {
         mut observe: impl FnMut(usize),
     ) -> Result<Writer, WriteError> {
         let payload = self.payload_capacity;
-        let mut terms: Vec<_> = self.terms.drain().collect();
+        let mut terms: Vec<_> = self.terms.0.drain().collect();
         let allocated = payload + self.table_bytes() + terms.capacity() * size_of::<(Key, Docs)>();
         self.memory = 0;
         self.payload_capacity = 0;
@@ -220,6 +217,43 @@ impl Docs {
 pub(crate) fn term_hash(term: &[u8]) -> u64 {
     static SEED: LazyLock<RandomState> = LazyLock::new(RandomState::new);
     SEED.hash_one(term)
+}
+
+/// A table keyed by terms, each with its [`term_hash`], which the table uses
+/// as given rather than hashing the bytes again.
+#[derive(Debug)]
+pub(crate) struct TermTable<V>(HashMap<Key, V, BuildHasherDefault<Passed>>);
+
+impl<V> Default for TermTable<V> {
+    fn default() -> Self {
+        Self(HashMap::default())
+    }
+}
+
+impl<V> TermTable<V> {
+    pub fn get_mut(&mut self, hash: u64, term: &[u8]) -> Option<&mut V> {
+        let probe: &dyn Lookup = &(hash, term);
+        self.0.get_mut(probe)
+    }
+
+    /// Files `value` under `term`, which must not be in the table, returning
+    /// the bytes its key allocated off the table.
+    pub fn insert(&mut self, hash: u64, term: &[u8], value: V) -> usize {
+        debug_assert_eq!(hash, term_hash(term));
+        let key = Key::new(hash, term);
+        let heap = key.heap_bytes();
+        let old = self.0.insert(key, value);
+        debug_assert!(old.is_none(), "a term filed twice");
+        heap
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// A term as a table key: its bytes and its [`term_hash`], which the table

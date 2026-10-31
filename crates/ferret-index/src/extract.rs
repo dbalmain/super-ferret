@@ -3,12 +3,12 @@
 //! then only appends each document's postings, in DocId order, so a pass
 //! with several readers writes the same segment as a pass with one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Condvar, Mutex, mpsc};
 
 use ferret_text::{Scratch, cap, tokenize_terms};
 
-use crate::segment::{KeySet, term_hash};
+use crate::segment::{KeySet, TermTable, term_hash};
 use crate::store::{Fault, Reader};
 
 /// Documents a reader thread may run ahead of the writer, per reader. The
@@ -20,15 +20,17 @@ use crate::store::{Fault, Reader};
 /// 3.7 s to 3.2 s, for 25 MB more at peak.
 const AHEAD: usize = 64;
 
-/// Bytes of extractions the window may hold ahead of the writer, however
-/// few documents they are: a document's trigram keys alone take up to four
-/// times its bytes, and the window is thousands of documents.
+/// Bytes of extractions ahead of the writer past which readers claim no
+/// more documents, however few they are: a document's trigram keys alone
+/// take up to four times its bytes, and the window is thousands of
+/// documents. Extractions already claimed may still finish past it.
 const HELD: usize = 64 << 20;
 
 /// Distinct terms a reader remembers across documents before it forgets
-/// them all: enough for a project's vocabulary, small beside the document
-/// it is reading.
-const REMEMBERED: usize = 1 << 16;
+/// them all. A short term's key costs no allocation to file again, so
+/// remembering more buys nothing: 65,536 a reader took 60 MB more of a
+/// fresh 48k-file index's peak, at the same speed (2026-10-31).
+const REMEMBERED: usize = 1 << 13;
 
 /// One document's postings: its length, distinct trigram keys and distinct
 /// terms.
@@ -71,7 +73,7 @@ struct Extractor {
     scratch: Scratch,
     bytes: Vec<u8>,
     /// The last document each remembered term was found in.
-    last: HashMap<Box<[u8]>, u32>,
+    last: TermTable<u32>,
 }
 
 impl Extractor {
@@ -80,7 +82,7 @@ impl Extractor {
             keys: KeySet::new(),
             scratch: Scratch::default(),
             bytes: Vec::new(),
-            last: HashMap::new(),
+            last: TermTable::default(),
         }
     }
 
@@ -103,21 +105,22 @@ impl Extractor {
         let last = &mut self.last;
         tokenize_terms(&self.bytes, &mut self.scratch, |token| {
             let term = cap(token.bytes);
-            let fresh = match last.get_mut(term) {
+            let hash = term_hash(term);
+            let fresh = match last.get_mut(hash, term) {
                 Some(seen) if *seen == doc => false,
                 Some(seen) => {
                     *seen = doc;
                     true
                 }
                 None => {
-                    last.insert(term.into(), doc);
+                    last.insert(hash, term, doc);
                     true
                 }
             };
             if fresh {
                 out.text.extend_from_slice(term);
                 out.ends.push(out.text.len());
-                out.hashes.push(term_hash(term));
+                out.hashes.push(hash);
             }
         });
         Ok(())
