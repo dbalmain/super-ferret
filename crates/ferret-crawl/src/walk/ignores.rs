@@ -1,5 +1,6 @@
 //! A directory's ignore files, and the `.git` probe that decides whether it
-//! starts a work tree and where that tree's `info/exclude` lives.
+//! starts a work tree and where that tree's `info/exclude` lives; and
+//! [`load_policy`], which reads them for one directory outside a walk.
 
 use super::*;
 
@@ -480,6 +481,124 @@ impl<V: EventVisitor> Walker<'_, V> {
         self.fail_child(IoOp::ProbeGit, token, OsStr::new(DOT_GIT), error);
         self.pop(length);
     }
+}
+
+/// Loads one directory's policy with the same ignore reads, Git probes and
+/// diagnostics as the crawler, without enumerating or reading its contents.
+/// `parent` supplies inherited rules; `None` starts a configured root with
+/// `global` and `config`. The directory itself is opened without following a
+/// symlink, unless `listed` supplies it already open. Policy names are then
+/// probed directly; with `listed`, only names its listing held are opened.
+///
+/// I/O faults within policy inputs are reported as [`Event::Io`], and bad
+/// patterns as [`Event::Pattern`]. Valid patterns still apply. The caller
+/// decides whether input faults prevent using the returned rules. Failure to
+/// open the directory itself is returned directly.
+pub fn load_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    config: Config,
+    listed: Option<Listed<'_>>,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    load_query_policy(path, parent, global, config, false, listed, visit)
+}
+
+/// A directory its caller already holds open and has listed, so loading its
+/// policy reads through `dir` and opens only the inputs `contains` names,
+/// with no open of its path and no probe per input. `contains` answers for
+/// names beginning with `.`; every policy input is one.
+#[derive(Clone, Copy)]
+pub struct Listed<'a> {
+    pub dir: BorrowedFd<'a>,
+    pub contains: &'a dyn Fn(&OsStr) -> bool,
+}
+
+/// Loads rg's git, `.ignore` and `.rgignore` inputs with the crawler's scoped
+/// reads. Ferret ignore files are not consulted; content has no size cap.
+/// As in rg, a symlinked `.git` is followed. A target that does not resolve
+/// — a loop, a dangling link, or a component that cannot be traversed —
+/// starts no work tree. An execute-only directory still does: it is opened
+/// `O_PATH` and `info/exclude` is read by name. A `.git` file contributes
+/// `info/exclude` only through a `commondir`, including when that directory
+/// is execute-only. Diagnostics and directory-open failures follow
+/// [`load_policy`].
+pub fn load_grep_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    listed: Option<Listed<'_>>,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    load_query_policy(
+        path,
+        parent,
+        global,
+        Config { size_cap: u64::MAX },
+        true,
+        listed,
+        visit,
+    )
+}
+
+fn load_query_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    config: Config,
+    grep: bool,
+    listed: Option<Listed<'_>>,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    // Without a listing, policy inputs are probed by name, so grep can load
+    // an ancestor it may search but not read, as rg does.
+    let opened;
+    let fd = match listed {
+        Some(listed) => listed.dir,
+        None => {
+            opened = open_path(
+                path,
+                if grep {
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC
+                } else {
+                    child_dir_flags()
+                },
+                Mode::empty(),
+            )?;
+            opened.as_fd()
+        }
+    };
+    let boundaries = BoundaryIndex::default();
+    let mut walker = Walker::new(path, &boundaries, visit);
+    walker.rg_git = grep;
+    let loaded = walker.load_ignores(
+        fd,
+        |name| {
+            if grep && name == ".ferretignore" {
+                return false;
+            }
+            match listed {
+                Some(listed) => (listed.contains)(OsStr::new(name)),
+                None => !matches!(
+                    statat(fd, name, AtFlags::SYMLINK_NOFOLLOW),
+                    Err(Errno::NOENT)
+                ),
+            }
+        },
+        parent.is_some_and(DirRules::in_work_tree),
+        (),
+    );
+    let (rules, errors) = if let Some(parent) = parent {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "policy directory has no name")
+        })?;
+        parent.enter(name, loaded.files())
+    } else {
+        DirRules::root(path, global, loaded.files(), config)
+    };
+    walker.patterns(errors);
+    Ok(rules)
 }
 
 /// `.` and `..` resolved lexically; `..` at the top stays at the top. Git
