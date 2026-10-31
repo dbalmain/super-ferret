@@ -480,130 +480,174 @@ fn observe_reconcile(
                 changes: None,
             });
         };
-        let previous = session.view();
-        // A deleted last refreshed alias supplies no stat. Rewalk its kept
-        // root so nlink/ctime and content are observed, rather than publishing
-        // a stale shared row. M6 can narrow this to handle-relative alias
-        // scopes.
-        let observed: BTreeSet<_> = final_changes
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                ferret_catalog::log::Record::InodePut { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        let missing: BTreeSet<_> = final_changes
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                ferret_catalog::log::Record::LifePut {
-                    id, names, kind, ..
-                } if *kind != ferret_catalog::Kind::Dir
-                    && previous.is_live_inode(InoId(*id))
-                    && *names > 0
-                    && *names < session.name_references(InoId(*id))
-                    && !observed.contains(id) =>
-                {
-                    Some(*id)
-                }
-                _ => None,
-            })
-            .collect();
-        if missing.is_empty() {
-            return Ok(Reconciled {
-                batches: walked.batches,
-                report,
-                changes,
-            });
-        }
-        let mut extra = BTreeSet::new();
-        let removed: BTreeSet<_> = final_changes
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                ferret_catalog::log::Record::NameDelete { id } => Some(*id),
-                _ => None,
-            })
-            .collect();
-        let mut expanded = false;
-        for id in &missing {
-            for name in session
-                .names_for(InoId(*id))
-                .filter(|n| !removed.contains(&n.0))
-            {
-                let edge = previous.name(name);
-                let mut root = edge.parent;
-                while let Some(name) = previous.dir_name(root) {
-                    root = previous.name(name).parent;
-                }
-                let Some(path) = previous
-                    .roots()
-                    .find(|(id, _)| *id == root)
-                    .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
-                else {
-                    continue;
-                };
-                if let Some(selection) = plan.selections.get(&path) {
-                    let mut alias = Vec::new();
-                    previous.path(name, &mut alias);
-                    if let Ok(relative) = Path::new(OsStr::from_bytes(&alias)).strip_prefix(&path)
-                        && !selection.includes(relative)
-                    {
-                        selection.promote(relative);
-                        expanded = true;
-                    }
-                } else if plan.keep.contains(&path) {
-                    extra.insert(path);
-                }
+        match rewalk(session, plan, final_changes) {
+            Rewalk::Nothing => {
+                return Ok(Reconciled {
+                    batches: walked.batches,
+                    report,
+                    changes,
+                });
+            }
+            Rewalk::Expanded => {
+                // Re-observe the expanded final scopes together: duplicate root
+                // token graphs from a second partial pass cannot be reconciled.
+                let (fresh, fresh_report) = observe(source, plan, options)?;
+                walked = fresh;
+                let failed = std::mem::take(&mut report.failed_roots);
+                report = fresh_report;
+                report.failed_roots = failed;
+            }
+            Rewalk::Roots(extra) => {
+                observe_kept(source, plan, options, extra, &mut walked, &mut report)?;
             }
         }
-        if expanded {
-            // Re-observe the expanded final scopes together: duplicate root
-            // token graphs from a second partial pass cannot be reconciled.
-            let (fresh, fresh_report) = observe(source, plan, options)?;
-            walked = fresh;
-            let failed = std::mem::take(&mut report.failed_roots);
-            report = fresh_report;
-            report.failed_roots = failed;
-            continue;
-        }
-        if extra.is_empty() {
-            return Ok(Reconciled {
-                batches: walked.batches,
-                report,
-                changes,
-            });
-        }
-        let extra: Vec<_> = extra.into_iter().collect();
-        plan.keep.retain(|p| !extra.contains(p));
-        plan.refresh.extend(extra.iter().cloned());
-        plan.refresh.sort();
-        let added = Plan {
-            roots: plan.roots.clone(),
-            refresh: extra,
-            keep: Vec::new(),
-            dropped: Vec::new(),
-            selections: BTreeMap::new(),
-        };
-        let (more, mut extra_report) = observe(source, &added, options)?;
-        walked.batches.extend(more.batches);
-        walked.owners.extend(more.owners);
-        report.counts.add(&extra_report.counts);
-        report.walk_time += extra_report.walk_time;
-        report.hash_time += extra_report.hash_time;
-        report
-            .content_faults
-            .append(&mut extra_report.content_faults);
-        report
-            .pattern_errors
-            .append(&mut extra_report.pattern_errors);
-        report
-            .coverage_faults
-            .append(&mut extra_report.coverage_faults);
-        report.refreshed.clone_from(&plan.refresh);
-        report.kept.clone_from(&plan.keep);
     }
+}
+
+/// What a reconciliation's stale aliases still need observed.
+enum Rewalk {
+    /// Every refreshed alias supplied its stat.
+    Nothing,
+    /// Selections were widened to the aliases; observe every scope again.
+    Expanded,
+    /// Kept roots holding aliases, to refresh as well.
+    Roots(Vec<PathBuf>),
+}
+
+/// A deleted last refreshed alias supplies no stat. Rewalk its kept root so
+/// nlink/ctime and content are observed, rather than publishing a stale shared
+/// row. M6 can narrow this to handle-relative alias scopes.
+fn rewalk(
+    session: &WriterSession,
+    plan: &Plan,
+    changes: &ferret_catalog::log::ChangeSet,
+) -> Rewalk {
+    let previous = session.view();
+    let missing = stale_aliases(session, &previous, changes);
+    if missing.is_empty() {
+        return Rewalk::Nothing;
+    }
+    let mut extra = BTreeSet::new();
+    let removed: BTreeSet<_> = changes
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            ferret_catalog::log::Record::NameDelete { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let mut expanded = false;
+    for id in &missing {
+        for name in session
+            .names_for(InoId(*id))
+            .filter(|n| !removed.contains(&n.0))
+        {
+            let edge = previous.name(name);
+            let mut root = edge.parent;
+            while let Some(name) = previous.dir_name(root) {
+                root = previous.name(name).parent;
+            }
+            let Some(path) = previous
+                .roots()
+                .find(|(id, _)| *id == root)
+                .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
+            else {
+                continue;
+            };
+            if let Some(selection) = plan.selections.get(&path) {
+                let mut alias = Vec::new();
+                previous.path(name, &mut alias);
+                if let Ok(relative) = Path::new(OsStr::from_bytes(&alias)).strip_prefix(&path)
+                    && !selection.includes(relative)
+                {
+                    selection.promote(relative);
+                    expanded = true;
+                }
+            } else if plan.keep.contains(&path) {
+                extra.insert(path);
+            }
+        }
+    }
+    if expanded {
+        Rewalk::Expanded
+    } else if extra.is_empty() {
+        Rewalk::Nothing
+    } else {
+        Rewalk::Roots(extra.into_iter().collect())
+    }
+}
+
+/// Live non-directory inodes that lost some but not all names and were not
+/// re-observed, so they have no fresh stat to publish.
+fn stale_aliases(
+    session: &WriterSession,
+    previous: &Catalog,
+    changes: &ferret_catalog::log::ChangeSet,
+) -> BTreeSet<u32> {
+    let observed: BTreeSet<_> = changes
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            ferret_catalog::log::Record::InodePut { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    changes
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            ferret_catalog::log::Record::LifePut {
+                id, names, kind, ..
+            } if *kind != ferret_catalog::Kind::Dir
+                && previous.is_live_inode(InoId(*id))
+                && *names > 0
+                && *names < session.name_references(InoId(*id))
+                && !observed.contains(id) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Refreshes kept roots `extra` and folds their walk into this pass's.
+fn observe_kept(
+    source: Source<'_>,
+    plan: &mut Plan,
+    options: &IndexOptions,
+    extra: Vec<PathBuf>,
+    walked: &mut Observed,
+    report: &mut Report,
+) -> Result<(), IndexError> {
+    plan.keep.retain(|p| !extra.contains(p));
+    plan.refresh.extend(extra.iter().cloned());
+    plan.refresh.sort();
+    let added = Plan {
+        roots: plan.roots.clone(),
+        refresh: extra,
+        keep: Vec::new(),
+        dropped: Vec::new(),
+        selections: BTreeMap::new(),
+    };
+    let (more, mut extra_report) = observe(source, &added, options)?;
+    walked.batches.extend(more.batches);
+    walked.owners.extend(more.owners);
+    report.counts.add(&extra_report.counts);
+    report.walk_time += extra_report.walk_time;
+    report.hash_time += extra_report.hash_time;
+    report
+        .content_faults
+        .append(&mut extra_report.content_faults);
+    report
+        .pattern_errors
+        .append(&mut extra_report.pattern_errors);
+    report
+        .coverage_faults
+        .append(&mut extra_report.coverage_faults);
+    report.refreshed.clone_from(&plan.refresh);
+    report.kept.clone_from(&plan.keep);
+    Ok(())
 }
 
 /// Resolves a bounded observation's faults to protection. When some fault has
