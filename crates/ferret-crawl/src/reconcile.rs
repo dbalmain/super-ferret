@@ -631,7 +631,38 @@ impl<'a> Final<'a> {
         protection: &crate::coverage::Protection,
     ) -> Result<(), Error> {
         let Tree { dirs, tokens } = tree;
-        let mut files: Vec<File> = batches
+        let mut files = self.observed_files(tree, batches, protection);
+        self.reuse_files(tree, batches, protection, &mut files)?;
+        let file = |loc: File| loc.observation(batches);
+        files.sort_unstable_by(|&a, &b| {
+            let a = file(a);
+            let b = file(b);
+            (a.stat.dev, a.stat.ino)
+                .cmp(&(b.stat.dev, b.stat.ino))
+                .then_with(|| {
+                    (dirs[tokens[&a.parent]].id, a.name).cmp(&(dirs[tokens[&b.parent]].id, b.name))
+                })
+        });
+        let same = |a: File, b: File| {
+            let (a, b) = (file(a).stat, file(b).stat);
+            (a.dev, a.ino) == (b.dev, b.ino)
+        };
+        for group in files.chunk_by(|&a, &b| same(a, b)) {
+            self.place_inode(tree, batches, group)?;
+        }
+        Ok(())
+    }
+
+    /// The batches' file observations, less those under a blocked or opaque
+    /// directory or behind a protected name edge.
+    fn observed_files(
+        &self,
+        tree: &Tree<'_>,
+        batches: &[Batch],
+        protection: &crate::coverage::Protection,
+    ) -> Vec<File> {
+        let Tree { dirs, tokens } = tree;
+        batches
             .iter()
             .enumerate()
             .flat_map(|(b, batch)| {
@@ -653,15 +684,26 @@ impl<'a> Final<'a> {
                 }
                 true
             })
-            .collect();
-        let file = |loc: File| loc.observation(batches);
+            .collect()
+    }
+
+    /// Carries forward each reused file whose directory continues and which is
+    /// no alias of an observed file; adds the rest to `files` to place.
+    fn reuse_files(
+        &mut self,
+        tree: &Tree<'_>,
+        batches: &[Batch],
+        protection: &crate::coverage::Protection,
+        files: &mut Vec<File>,
+    ) -> Result<(), Error> {
+        let Tree { dirs, tokens } = tree;
         // An unmatched observation may be another alias of a compacted row,
         // even with st_nlink == 1 (bind mounts). Expand that residue's
         // equal aliases so conflicts and canonical first-observation
         // selection remain unchanged.
         let mut aliases = Seen::new(self.old.next_inode().0);
-        for &loc in &files {
-            let st = file(loc).stat;
+        for &loc in files.iter() {
+            let st = loc.observation(batches).stat;
             if let Some(id) = self.session.identity((st.dev, st.ino)) {
                 aliases.insert(id.0);
             }
@@ -702,74 +744,62 @@ impl<'a> Final<'a> {
                 }
             }
         }
-        files.sort_unstable_by(|&a, &b| {
-            let a = file(a);
-            let b = file(b);
-            (a.stat.dev, a.stat.ino)
-                .cmp(&(b.stat.dev, b.stat.ino))
-                .then_with(|| {
-                    (dirs[tokens[&a.parent]].id, a.name).cmp(&(dirs[tokens[&b.parent]].id, b.name))
-                })
+        Ok(())
+    }
+
+    /// Places one identity's inode, its link target, and an edge per name.
+    fn place_inode(
+        &mut self,
+        tree: &Tree<'_>,
+        batches: &[Batch],
+        group: &[File],
+    ) -> Result<(), Error> {
+        let Tree { dirs, tokens } = tree;
+        let first = group[0].observation(batches);
+        let kind = Kind::from_mode(first.stat.mode);
+        let id = match self
+            .session
+            .identity((first.stat.dev, first.stat.ino))
+            .filter(|&id| self.old.kind(id) == kind)
+        {
+            Some(id) => id.0,
+            None => allocate(&mut self.changes.counters[0], u32::MAX - 16)?,
+        };
+        let conflict = group.iter().any(|&loc| {
+            let other = loc.observation(batches);
+            other.stat != first.stat
+                || other.content != first.content
+                || other.target != first.target
         });
-        let mut at = 0;
-        while at < files.len() {
-            let first = file(files[at]);
-            // Same-identity runs are almost always length 1, so scan forward: a
-            // binary search over the remaining slice per run is O(n log n).
-            let mut end = at + 1;
-            while end < files.len() {
-                let st = file(files[end]).stat;
-                if (st.dev, st.ino) != (first.stat.dev, first.stat.ino) {
-                    break;
-                }
-                end += 1;
-            }
-            let kind = Kind::from_mode(first.stat.mode);
-            let id = match self
-                .session
-                .identity((first.stat.dev, first.stat.ino))
-                .filter(|&id| self.old.kind(id) == kind)
-            {
-                Some(id) => id.0,
-                None => allocate(&mut self.changes.counters[0], u32::MAX - 16)?,
-            };
-            let conflict = files[at..end].iter().any(|&loc| {
-                let other = file(loc);
-                other.stat != first.stat
-                    || other.content != first.content
-                    || other.target != first.target
-            });
-            self.observe_inode(
-                id,
-                kind,
-                first.stat,
-                if conflict {
-                    Content::Fault
-                } else {
-                    first.content
+        self.observe_inode(
+            id,
+            kind,
+            first.stat,
+            if conflict {
+                Content::Fault
+            } else {
+                first.content
+            },
+        )?;
+        if kind == Kind::Symlink
+            && (!self.old.is_live_inode(InoId(id))
+                || self.old.link_target(InoId(id)) != first.target)
+        {
+            push(
+                &self.budget,
+                &mut self.changes.records,
+                Record::LinkPut {
+                    id,
+                    target: first.target.unwrap_or_default().to_vec(),
                 },
             )?;
-            if kind == Kind::Symlink
-                && (!self.old.is_live_inode(InoId(id))
-                    || self.old.link_target(InoId(id)) != first.target)
-            {
-                push(
-                    &self.budget,
-                    &mut self.changes.records,
-                    Record::LinkPut {
-                        id,
-                        target: first.target.unwrap_or_default().to_vec(),
-                    },
-                )?;
-            }
-            for &loc in &files[at..end] {
-                let f = file(loc);
-                let parent = dirs[tokens[&f.parent]]
-                    .id
-                    .ok_or_else(|| invalid("collapsed file parent"))?;
-                self.edge(parent, id, f.name, f.revealed)?;
-            }
-            at = end;
+        }
+        for &loc in group {
+            let f = loc.observation(batches);
+            let parent = dirs[tokens[&f.parent]]
+                .id
+                .ok_or_else(|| invalid("collapsed file parent"))?;
+            self.edge(parent, id, f.name, f.revealed)?;
         }
         Ok(())
     }
