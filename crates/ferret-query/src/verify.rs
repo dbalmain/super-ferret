@@ -64,6 +64,7 @@
 //! read. The ring holds finished rows, not documents: a path and a few
 //! words per position.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::ops::{ControlFlow, Range};
@@ -1757,16 +1758,57 @@ impl<Task> Feed<Task> {
     }
 
     /// Runs `next` without holding a feed or run lock. An indexed producer
-    /// gathers a batch (see [`BATCH_WAIT`]) and pushes it under one lock:
-    /// pushing each path alone contended with every returning worker, and
-    /// `grep -l fn` over `~/w` on 16 workers fell from 114 to 83 ms. A
-    /// batch may carry the feed past its capacity by less than a run.
+    /// gathers a batch and pushes it under one lock: pushing each path
+    /// alone contended with every returning worker, and `grep -l fn` over
+    /// `~/w` on 16 workers fell from 114 to 83 ms. The batch is pushed when
+    /// full, or once [`BATCH_WAIT`] has passed since its first path, which
+    /// `next` observes through its cancellation polls, so a long scan of
+    /// rejected entries cannot hold a gathered path back. A batch may carry
+    /// the feed past its capacity by less than a run.
     fn produce(
         &self,
         next: &mut impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
         stopped: &dyn Fn() -> bool,
     ) {
-        let mut batch = Vec::new();
+        let batch_len = if self.indexed { RUN_TASKS } else { 1 };
+        let batch = RefCell::new(Vec::with_capacity(batch_len));
+        let first = Cell::new(None::<Instant>);
+        let polls = Cell::new(0u32);
+        let closed = Cell::new(false);
+        let flushed = Cell::new(false);
+        let push = || {
+            first.set(None);
+            flushed.set(true);
+            let mut state = lock(&self.state);
+            if state.closed {
+                closed.set(true);
+                return;
+            }
+            state.tasks.extend(batch.borrow_mut().drain(..));
+            let wake = if self.indexed {
+                state.sleeping > 0
+            } else {
+                state.sleeping >= state.tasks.len()
+            };
+            drop(state);
+            if wake {
+                self.ready.notify_one();
+            }
+        };
+        // Reading the clock on every poll cost about 5 ms of a 60 ms walk.
+        let due = || {
+            polls.set(polls.get().wrapping_add(1));
+            polls.get().is_multiple_of(64)
+                && first
+                    .get()
+                    .is_some_and(|first| first.elapsed() >= BATCH_WAIT)
+        };
+        let poll = || {
+            if due() {
+                push();
+            }
+            closed.get() || stopped()
+        };
         loop {
             {
                 let mut state = lock(&self.state);
@@ -1779,41 +1821,35 @@ impl<Task> Feed<Task> {
                     return;
                 }
             }
-            let batch_len = if self.indexed { RUN_TASKS } else { 1 };
-            let mut ended = false;
-            let mut first = None;
-            while batch.len() < batch_len
-                && first.is_none_or(|first: Instant| first.elapsed() < BATCH_WAIT)
-            {
-                if stopped() {
+            // Gathers until the batch is full or due; a push from a poll ends
+            // it too, so the capacity is checked again.
+            flushed.set(false);
+            loop {
+                if poll() {
                     return;
                 }
-                match next(stopped) {
-                    Some(task) => {
-                        batch.push(task);
-                        first.get_or_insert_with(Instant::now);
-                    }
-                    None => {
-                        ended = true;
-                        break;
-                    }
+                let Some(task) = next(&poll) else {
+                    push();
+                    return;
+                };
+                let mut gathered = batch.borrow_mut();
+                gathered.push(task);
+                let full = gathered.len() >= batch_len;
+                drop(gathered);
+                if first.get().is_none() {
+                    first.set(Some(Instant::now()));
+                }
+                if full
+                    || flushed.get()
+                    || first
+                        .get()
+                        .is_some_and(|first| first.elapsed() >= BATCH_WAIT)
+                {
+                    break;
                 }
             }
-            let mut state = lock(&self.state);
-            if state.closed {
-                return;
-            }
-            state.tasks.extend(batch.drain(..));
-            let wake = if self.indexed {
-                state.sleeping > 0
-            } else {
-                state.sleeping >= state.tasks.len()
-            };
-            drop(state);
-            if wake {
-                self.ready.notify_one();
-            }
-            if ended {
+            push();
+            if closed.get() {
                 return;
             }
         }
@@ -1982,8 +2018,9 @@ impl<G> Held<G> {
 pub enum GroupSchedule {
     /// A producer that may block: wake a worker for each available task.
     Streaming(usize),
-    /// Catalog enumeration: take bounded runs with stealing and wake at 16
-    /// queued tasks, or when enumeration ends.
+    /// Catalog enumeration: take bounded runs with stealing. Tasks are
+    /// pushed and a worker woken a batch at a time: 16 tasks, or fewer once
+    /// the first has waited 100 µs, or when enumeration ends.
     Indexed(usize),
 }
 
@@ -3164,33 +3201,37 @@ mod group_tests {
     // The first task is a quiet hit and the producer then blocks until that
     // hit cancels the run, as grep's filtering producer can. A worker that
     // fetched the hit and called the producer again before working it would
-    // wait forever (grep-why P2); isolate a regression's deadlock.
+    // wait forever (grep-why P2); isolate a regression's deadlock. An
+    // indexed producer holding the hit in its batch must push it from its
+    // polls (Astra, 2026-10-31).
     #[test]
     fn a_first_task_hit_reaches_a_worker_while_the_producer_blocks() {
         if completion_child("a_first_task_hit_reaches_a_worker_while_the_producer_blocks") {
             return;
         }
-        let cancelled = AtomicBool::new(false);
-        let mut calls = 0;
-        completion_groups(
-            GroupSchedule::Streaming(2),
-            &cancelled,
-            |stopped| {
-                calls += 1;
-                if calls == 1 {
-                    return Some((1, ()));
-                }
-                while !stopped() {
-                    std::thread::yield_now();
-                }
-                None
-            },
-            || (),
-            |_, (), _| cancelled.store(true, Ordering::Release),
-            |_| 0,
-            |()| ControlFlow::Continue(()),
-        );
-        assert!(cancelled.load(Ordering::Acquire));
+        for schedule in [GroupSchedule::Streaming(2), GroupSchedule::Indexed(2)] {
+            let cancelled = AtomicBool::new(false);
+            let mut calls = 0;
+            completion_groups(
+                schedule,
+                &cancelled,
+                |stopped| {
+                    calls += 1;
+                    if calls == 1 {
+                        return Some((1, ()));
+                    }
+                    while !stopped() {
+                        std::thread::yield_now();
+                    }
+                    None
+                },
+                || (),
+                |_, (), _| cancelled.store(true, Ordering::Release),
+                |_| 0,
+                |()| ControlFlow::Continue(()),
+            );
+            assert!(cancelled.load(Ordering::Acquire));
+        }
     }
 
     // Small groups travel in batches, so more are prepared before the queue
