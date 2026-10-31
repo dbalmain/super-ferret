@@ -696,6 +696,17 @@ impl Overlay {
         Ok(())
     }
     fn validate_delta(&self, view: &Catalog, parent: &Overlay) -> Result<(), OpenError> {
+        let (mut docs, changed) = self.delta_touches(view)?;
+        self.count_references(view, parent, changed, &mut docs)?;
+        self.check_documents_moved(view, parent, docs)
+    }
+    /// The documents this delta's records name, each with a zero reference
+    /// delta, and the inodes it changes; rejects a link or work tree on an
+    /// inode of the wrong kind.
+    fn delta_touches(
+        &self,
+        view: &Catalog,
+    ) -> Result<(BTreeMap<u32, i64>, BTreeSet<u32>), OpenError> {
         let mut docs = BTreeMap::<u32, i64>::new();
         let mut changed = BTreeSet::new();
         for r in &self.delta {
@@ -719,6 +730,17 @@ impl Overlay {
                 _ => {}
             }
         }
+        Ok((docs, changed))
+    }
+    /// Adds to `docs` the reference each `changed` inode moved from its
+    /// parent document to its document in `view`.
+    fn count_references(
+        &self,
+        view: &Catalog,
+        parent: &Overlay,
+        changed: BTreeSet<u32>,
+        docs: &mut BTreeMap<u32, i64>,
+    ) -> Result<(), OpenError> {
         for id in changed {
             let old = parent
                 .inode(id)
@@ -747,6 +769,17 @@ impl Overlay {
                 }
             }
         }
+        Ok(())
+    }
+    /// Checks each document's references in `view` against its parent's plus
+    /// `docs`, that no retired document returns or changes hash, and the live
+    /// document count.
+    fn check_documents_moved(
+        &self,
+        view: &Catalog,
+        parent: &Overlay,
+        docs: BTreeMap<u32, i64>,
+    ) -> Result<(), OpenError> {
         let mut count = i64::from(parent.manifest.counts[3]);
         for (id, delta) in docs {
             let prior = match parent.projection(Family::Docs).get(DOC, id) {
