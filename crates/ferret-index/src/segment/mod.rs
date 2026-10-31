@@ -284,7 +284,7 @@ impl fmt::Display for WriteError {
 impl std::error::Error for WriteError {}
 
 /// BLAKE3-128, the catalog's `checkpoint_checksum` convention.
-fn checksum(bytes: &[u8]) -> [u8; 16] {
+pub(crate) fn checksum(bytes: &[u8]) -> [u8; 16] {
     let mut digest = [0; 16];
     digest.copy_from_slice(&blake3::hash(bytes).as_bytes()[..16]);
     digest
@@ -342,13 +342,13 @@ fn take(bytes: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
+pub(crate) fn u32_at(bytes: &[u8], at: usize) -> u32 {
     let mut word = [0; 4];
     word.copy_from_slice(&bytes[at..at + 4]);
     u32::from_le_bytes(word)
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
+pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     let mut word = [0; 8];
     word.copy_from_slice(&bytes[at..at + 8]);
     u64::from_le_bytes(word)

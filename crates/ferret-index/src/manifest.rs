@@ -40,7 +40,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::regular;
-use crate::segment::Info;
+use crate::segment::{Info, checksum, u32_at, u64_at};
 
 const MAGIC: [u8; 8] = *b"ferretix";
 
@@ -373,24 +373,6 @@ fn read_exact(source: &impl FileExt, buf: &mut [u8], offset: u64) -> io::Result<
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e),
     }
-}
-
-fn checksum(bytes: &[u8]) -> [u8; 16] {
-    let mut digest = [0; 16];
-    digest.copy_from_slice(&blake3::hash(bytes).as_bytes()[..16]);
-    digest
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    let mut word = [0; 4];
-    word.copy_from_slice(&bytes[at..at + 4]);
-    u32::from_le_bytes(word)
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    let mut word = [0; 8];
-    word.copy_from_slice(&bytes[at..at + 8]);
-    u64::from_le_bytes(word)
 }
 
 #[cfg(test)]
