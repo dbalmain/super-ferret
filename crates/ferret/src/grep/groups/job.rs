@@ -174,14 +174,16 @@ impl From<PathBuf> for JobPath {
     }
 }
 
+/// A job's path is its display spelling, relative to the client's cwd where
+/// it is relative; a worker resolves it against that cwd only to open it.
 pub(in super::super) enum Job {
-    /// An explicit file: display spelling and absolute lookup path.
-    Direct(PathBuf, PathBuf),
+    /// An explicit file.
+    Direct(JobPath),
     /// A walked file and the directory it was listed in, which it is opened
     /// beneath, never through a symlink; then whether to probe binary as rg
     /// does, and whether to read it once without the changed-during-read
     /// check, as an uncovered scan does (D123).
-    Listed(JobPath, PathBuf, engine::reader::Parent, bool, bool),
+    Listed(JobPath, engine::reader::Parent, bool, bool),
     Checked(JobPath, NameId, u32),
     /// A catalogued file omitted from content indexing: oversized, or binary
     /// under -a. Read through the checked catalog walk, uncached.
@@ -193,8 +195,9 @@ pub(in super::super) enum Job {
 impl Job {
     pub(super) fn path(&self) -> &Path {
         match self {
-            Self::Direct(p, _) | Self::Failed(p, _) => p,
-            Self::Listed(p, _, _, _, _)
+            Self::Failed(p, _) => p,
+            Self::Direct(p)
+            | Self::Listed(p, _, _, _)
             | Self::Checked(p, _, _)
             | Self::Unindexed(p, _)
             | Self::Absent(p) => p.as_path(),
@@ -206,7 +209,7 @@ impl Job {
     /// would otherwise keep its directory's descriptor open.
     pub(super) fn finished(self) -> Self {
         match self {
-            Self::Listed(path, actual, _, _, _) => Self::Direct(path.as_path().to_owned(), actual),
+            Self::Listed(path, _, _, _) => Self::Direct(path),
             job => job,
         }
     }
@@ -260,9 +263,9 @@ pub(super) struct Worker<'a> {
     read: Option<Box<CheckedReader<'a>>>,
 }
 impl<'a> Worker<'a> {
-    pub(super) fn new(plan: Plan, read: Option<Box<CheckedReader<'a>>>) -> Self {
+    pub(super) fn new(plan: Plan, cwd: PathBuf, read: Option<Box<CheckedReader<'a>>>) -> Self {
         Self {
-            scratch: Scratch::new(plan),
+            scratch: Scratch::new(plan, cwd),
             read,
         }
     }
@@ -290,16 +293,18 @@ impl<'a> Worker<'a> {
     }
 }
 
-/// One search thread's own plan clone and reusable read buffer, for the feed
-/// and the live walk alike.
+/// One search thread's own plan clone, the client's cwd, and a reusable read
+/// buffer, for the feed and the live walk alike.
 pub(super) struct Scratch {
     plan: Plan,
+    cwd: PathBuf,
     buffer: Vec<u8>,
 }
 impl Scratch {
-    pub(super) fn new(plan: Plan) -> Self {
+    pub(super) fn new(plan: Plan, cwd: PathBuf) -> Self {
         Self {
             plan,
+            cwd,
             buffer: Vec::new(),
         }
     }
@@ -320,7 +325,7 @@ impl Scratch {
         ),
     ) -> io::Result<Observed> {
         let observed = search_job(
-            &self.plan,
+            (&self.plan, &self.cwd),
             &mut self.buffer,
             read,
             job,
@@ -335,7 +340,7 @@ impl Scratch {
 }
 
 fn search_job(
-    plan: &Plan,
+    (plan, cwd): (&Plan, &Path),
     buffer: &mut Vec<u8>,
     read: Option<&mut CheckedReader<'_>>,
     job: &Job,
@@ -427,17 +432,27 @@ fn search_job(
                 target,
             )?
         }
-        Job::Direct(_, actual) => observe_streaming(
+        Job::Direct(path) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file(actual, None, plan, each, stopped),
+            &mut |each| read_file(cwd, path.as_path(), None, plan, each, stopped),
             false,
             target,
         )?,
-        Job::Listed(_, actual, directory, rg, once) => observe_streaming(
+        Job::Listed(path, directory, rg, once) => observe_streaming(
             &render,
             buffer,
-            &mut |each| read_file_policy(actual, Some(directory), plan, each, stopped, *rg, *once),
+            &mut |each| {
+                read_file_policy(
+                    (cwd, path.as_path()),
+                    Some(directory),
+                    plan,
+                    each,
+                    stopped,
+                    *rg,
+                    *once,
+                )
+            },
             false,
             target,
         )?,

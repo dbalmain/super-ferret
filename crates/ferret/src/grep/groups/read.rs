@@ -8,18 +8,20 @@ use std::io::BufRead;
 /// Reads an explicit operand by `path`, following symlinks, or, given the
 /// `listed` directory a walk found it in, a walked file by its name beneath
 /// that directory without following one (D21).
+/// `path` is read relative to `cwd`, the client's.
 pub(in super::super) fn read_file(
+    cwd: &Path,
     path: &Path,
     listed: Option<&engine::reader::Parent>,
     plan: &Plan,
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
 ) -> ReadOutcome {
-    read_file_policy(path, listed, plan, each, stopped, false, false)
+    read_file_policy((cwd, path), listed, plan, each, stopped, false, false)
 }
 
 pub(super) fn read_file_policy(
-    path: &Path,
+    (cwd, path): (&Path, &Path),
     listed: Option<&engine::reader::Parent>,
     plan: &Plan,
     each: ferret_query::Consumer<'_>,
@@ -38,8 +40,8 @@ pub(super) fn read_file_policy(
         }
     };
     match listed {
-        None => engine::reader::direct(path, cap, &mut pass, stopped),
-        Some(parent) => engine::reader::listed(parent, path, !once, cap, &mut pass, stopped),
+        None => engine::reader::direct(&cwd.join(path), cap, &mut pass, stopped),
+        Some(parent) => engine::reader::listed(parent, cwd, path, !once, cap, &mut pass, stopped),
     }
 }
 

@@ -525,6 +525,7 @@ impl Execution<'_> {
                     let result = groups::run(
                         &mut host,
                         |stopped| source.next(stopped),
+                        cwd,
                         &fork,
                         names,
                         threads,
@@ -918,7 +919,14 @@ impl<W: Write> Host<'_, W> {
             ))
         });
         self.transaction(path, &mut |each| {
-            groups::read_file(path, directory.as_ref(), plan, each, &stopped)
+            groups::read_file(
+                Path::new(""),
+                path,
+                directory.as_ref(),
+                plan,
+                each,
+                &stopped,
+            )
         })
     }
 

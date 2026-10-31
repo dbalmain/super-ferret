@@ -142,7 +142,6 @@ impl Filter<'_> {
                 0,
                 Job::Listed(
                     JobPath::new(entry.path()),
-                    self.cwd.join(entry.path()),
                     engine::reader::Parent::Followed,
                     true,
                     once,
@@ -169,7 +168,6 @@ impl Filter<'_> {
             0,
             Job::Listed(
                 JobPath::new(entry.path()),
-                self.cwd.join(entry.path()),
                 parent,
                 uncovered,
                 // Uncovered scans read once, as rg does (D123).
@@ -334,7 +332,7 @@ impl<'a> Source<'a> {
             }
             match self.inputs.next()? {
                 Input::File(path, size) => {
-                    return Some((size, Job::Direct(path.clone(), self.filter.cwd.join(path))));
+                    return Some((size, Job::Direct(path.clone().into())));
                 }
                 Input::Failed(path, error) => {
                     return Some((0, Job::Failed(path, error.to_string())));

@@ -56,7 +56,7 @@ pub(in super::super) fn walk<W: Write>(
                 stopped,
                 found: &found,
                 live: live.is_some(),
-                scratch: Scratch::new(search.plan.clone()),
+                scratch: Scratch::new(search.plan.clone(), filter.cwd.clone()),
             };
             let mut first = walker(0);
             // A walker's panic stops the lanes too: a sibling may be waiting
@@ -67,9 +67,7 @@ pub(in super::super) fn walk<W: Write>(
                     break;
                 }
                 let go = match input {
-                    Input::File(path, size) => {
-                        first.search(size, Job::Direct(path.clone(), filter.cwd.join(path)))
-                    }
+                    Input::File(path, size) => first.search(size, Job::Direct(path.clone().into())),
                     Input::Failed(path, error) => {
                         first.search(0, Job::Failed(path, error.to_string()))
                     }

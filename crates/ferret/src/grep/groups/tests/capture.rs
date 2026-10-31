@@ -138,6 +138,7 @@ fn heavy_files_capture_concurrently_behind_a_stream() {
     run(
         &mut host,
         |_| jobs.next().map(|job| (0, job)),
+        Path::new(""),
         &fork,
         None,
         4,
@@ -211,6 +212,7 @@ fn full_capture_budget_still_lets_the_streamer_finish() {
             }
             Some((0, job))
         },
+        Path::new(""),
         &fork,
         None,
         3,
@@ -329,6 +331,7 @@ fn full_capture_waiters_stop_on_cancellation_and_broken_pipe() {
         let result = run(
             &mut host,
             |_| jobs.next().map(|job| (0, job)),
+            Path::new(""),
             &fork,
             None,
             3,

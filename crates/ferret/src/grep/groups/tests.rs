@@ -51,19 +51,17 @@ fn host<W: Write>(plan: &Plan, writer: W) -> Host<'_, W> {
 // D111: a spilled fallback parent must reopen under the client cwd,
 // while output keeps the original operand spelling.
 #[test]
-fn a_closed_listed_parent_uses_the_lookup_path_not_the_display_path() {
+fn a_closed_listed_parent_reopens_under_the_client_cwd() {
     use std::os::unix::fs::MetadataExt;
-    let directory =
-        std::env::temp_dir().join(format!("ferret-grep-listed-cwd-{}", std::process::id()));
-    fs::create_dir(&directory).unwrap();
-    let actual = directory.join("file");
-    fs::write(&actual, b"red\n").unwrap();
+    let cwd = std::env::temp_dir().join(format!("ferret-grep-listed-cwd-{}", std::process::id()));
+    let directory = cwd.join("display");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("file"), b"red\n").unwrap();
     let stat = directory.metadata().unwrap();
     let plan = plan(&["red"]);
     let mut host = host(&plan, Vec::new());
     let mut job = Some(Job::Listed(
         "display/file".into(),
-        actual,
         engine::reader::Parent::Closed(stat.dev(), stat.ino()),
         false,
         false,
@@ -72,6 +70,7 @@ fn a_closed_listed_parent_uses_the_lookup_path_not_the_display_path() {
     run(
         &mut host,
         |_| job.take().map(|job| (4, job)),
+        &cwd,
         &fork,
         None,
         1,
@@ -80,7 +79,7 @@ fn a_closed_listed_parent_uses_the_lookup_path_not_the_display_path() {
     .unwrap();
     assert_eq!(host.writer, b"display/file:red\n");
     assert!(!host.errors);
-    fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(cwd).unwrap();
 }
 
 // Drive the real handoff with groups just over the capture threshold.
@@ -140,6 +139,7 @@ fn parallel_publication_keeps_large_groups_whole() {
     let result = run(
         &mut host,
         |_| jobs.next().map(|job| (bytes.len() as u64, job)),
+        Path::new(""),
         &fork,
         None,
         8,
@@ -182,6 +182,7 @@ fn single_thread_publication_keeps_walk_order() {
     run(
         &mut host,
         |_| jobs.next().map(|job| (4, job)),
+        Path::new(""),
         &fork,
         None,
         1,
@@ -227,6 +228,7 @@ fn publication_fault_stops_waiting_workers() {
     let error = run(
         &mut host,
         |_| jobs.next().map(|job| (4, job)),
+        Path::new(""),
         &fork,
         None,
         8,
@@ -258,6 +260,7 @@ fn publication_fault_stops_waiting_workers() {
         let error = run(
             &mut streaming_host,
             |_| jobs.next().map(|job| (bytes.len() as u64, job)),
+            Path::new(""),
             &fork,
             None,
             4,
@@ -319,6 +322,7 @@ fn completed_group_publishes_before_a_slow_earlier_file() {
     run(
         &mut host,
         |_| jobs.next().map(|job| (4, job)),
+        Path::new(""),
         &fork,
         None,
         2,
@@ -397,6 +401,7 @@ fn held_group_before_slow_file(args: &[&str], expected: [&str; 3]) {
     run(
         &mut host,
         |_| jobs.next().map(|job| (4, job)),
+        Path::new(""),
         &fork,
         None,
         2,
@@ -452,6 +457,7 @@ fn live_source_diagnostics_wait_for_the_published_group() {
             );
             jobs.next().map(|job| (4, job))
         },
+        Path::new(""),
         &fork,
         None,
         8,
@@ -649,7 +655,7 @@ fn duplicate_records_require_fresh_stats_and_current_results_stay_local() {
         }
         ReadOutcome::Stable(version)
     };
-    let mut worker = Worker::new(plan(&["red"]), Some(Box::new(read)));
+    let mut worker = Worker::new(plan(&["red"]), PathBuf::new(), Some(Box::new(read)));
     let cache = Mutex::new(Cache::default());
     let mut outputs = Vec::new();
     for (name, path, doc) in [
@@ -704,7 +710,11 @@ fn cached_context_replays_kinds_gaps_and_each_paths_heading() {
         }
         ReadOutcome::Stable(ReadVersion::Catalogued)
     };
-    let mut worker = Worker::new(plan(&["--heading", "-nC1", "red"]), Some(Box::new(read)));
+    let mut worker = Worker::new(
+        plan(&["--heading", "-nC1", "red"]),
+        PathBuf::new(),
+        Some(Box::new(read)),
+    );
     let cache = Mutex::new(Cache::default());
     for (name, path) in [(0, "copy-a"), (1, "copy-b")] {
         let Observed::Ready(mut group) = worker
@@ -748,6 +758,7 @@ fn multiline_cache_replays_original_cross_line_highlights() {
     };
     let mut worker = Worker::new(
         plan(&["-Un", "--color=always", "red\\nblue"]),
+        PathBuf::new(),
         Some(Box::new(read)),
     );
     let cache = Mutex::new(Cache::default());
@@ -799,6 +810,7 @@ fn replacement_cache_retains_source_boundaries_and_expanded_highlights() {
     };
     let mut worker = Worker::new(
         plan(&["-UnC1", "--color=always", "-r", "<$2/$1>", "(red)\\n(blue)"]),
+        PathBuf::new(),
         Some(Box::new(read)),
     );
     let cache = Mutex::new(Cache::default());
@@ -873,6 +885,7 @@ fn quiet_hit_cancels_an_earlier_in_progress_reader() {
         run(
             &mut host,
             move |_| jobs.next().map(|job| (4, job)),
+            Path::new(""),
             &fork,
             None,
             2,
@@ -1053,6 +1066,7 @@ fn quiet_hit_stops_a_producer_filtering_catalog_entries() {
     run(
         &mut host,
         move |stopped| source.next(stopped),
+        &base,
         &fork,
         None,
         2,
@@ -1176,6 +1190,7 @@ fn check_quiet_listing(opaque: bool) {
     run(
         &mut host,
         move |stopped| source.next(stopped),
+        &base,
         &fork,
         None,
         2,
@@ -1219,7 +1234,11 @@ fn json_cached_aliases_retain_offsets_submatches_and_their_own_paths() {
         }
         ReadOutcome::Stable(ReadVersion::Catalogued)
     };
-    let mut worker = Worker::new(plan(&["--json", "-B1", "red"]), Some(Box::new(read)));
+    let mut worker = Worker::new(
+        plan(&["--json", "-B1", "red"]),
+        PathBuf::new(),
+        Some(Box::new(read)),
+    );
     let cache = Mutex::new(Cache::default());
     for (name, path) in [(0, "first"), (1, "second")] {
         let Observed::Ready(mut group) = worker
@@ -1307,6 +1326,7 @@ fn panicking_stream_worker_releases_the_publisher() {
         run(
             &mut host,
             |_| jobs.next().map(|job| (bytes.len() as u64, job)),
+            Path::new(""),
             &fork,
             None,
             2,
@@ -1352,7 +1372,11 @@ fn cached_records_stream_when_an_escaped_alias_amplifies_output() {
         }
         ReadOutcome::Stable(ReadVersion::Catalogued)
     };
-    let mut worker = Worker::new(plan(&["--json", "red"]), Some(Box::new(read)));
+    let mut worker = Worker::new(
+        plan(&["--json", "red"]),
+        PathBuf::new(),
+        Some(Box::new(read)),
+    );
     let cache = Mutex::new(Cache::default());
     let first = worker
         .prepare(

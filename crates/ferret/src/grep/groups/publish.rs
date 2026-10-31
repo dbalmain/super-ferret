@@ -185,6 +185,7 @@ fn publish_handoff<W: Write>(
 pub(in super::super) fn run<'a, W: Write>(
     host: &mut Host<'_, W>,
     mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Job)> + Send,
+    cwd: &Path,
     fork: &Fork<'a>,
     names: Option<&ferret_query::DocNames>,
     threads: usize,
@@ -208,7 +209,7 @@ pub(in super::super) fn run<'a, W: Write>(
                 .then(|| lock(&search.publication));
             next(stopped)
         },
-        || Worker::new(search.plan.clone(), fork()),
+        || Worker::new(search.plan.clone(), cwd.to_owned(), fork()),
         |worker, job, stopped, handoff, concurrent| {
             let eligible = matches!(&job, Job::Checked(_,_,doc) if names.is_some_and(|names| names.names(*doc).len() > 1));
             search.work(job, stopped, handoff, concurrent, |job, target| {
