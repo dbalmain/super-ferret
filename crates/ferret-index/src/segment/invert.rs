@@ -233,13 +233,20 @@ fn sort_terms(terms: &mut [(Key, Docs)]) {
     });
 }
 
-/// A term's documents. Most terms in a segment occur in one document, so
-/// that one lives in the table slot and only a second document allocates.
+/// A term's documents. Most terms in a segment occur in one document and
+/// many in a few, so up to [`FEW`] live in the table slot and only a
+/// further document allocates.
 #[derive(Debug)]
 enum Docs {
     One(u32),
+    Few(u8, [u32; FEW]),
     Many(Vec<u32>),
 }
+
+/// Documents a term keeps in its table slot, as many as fit beside the
+/// list form's niche.
+const FEW: usize = 3;
+const _: () = assert!(size_of::<Docs>() == size_of::<Vec<u32>>());
 
 impl Docs {
     /// Appends `doc` unless it is already last, returning how many `u32`s of
@@ -247,12 +254,23 @@ impl Docs {
     fn push(&mut self, doc: u32) -> usize {
         match self {
             Self::One(first) if *first == doc => 0,
-            Self::One(first) => {
-                // Four, as `Vec`'s first growth of a `u32` list would give.
-                let mut docs = Vec::with_capacity(4);
-                docs.extend([*first, doc]);
-                let capacity = docs.capacity();
-                *self = Self::Many(docs);
+            &mut Self::One(first) => {
+                *self = Self::Few(2, [first, doc, 0]);
+                0
+            }
+            Self::Few(len, docs) if docs[usize::from(*len) - 1] == doc => 0,
+            Self::Few(len, docs) if usize::from(*len) < FEW => {
+                docs[usize::from(*len)] = doc;
+                *len += 1;
+                0
+            }
+            Self::Few(_, docs) => {
+                // Eight, as `Vec`'s growth from the inline three would give.
+                let mut many = Vec::with_capacity(2 * (FEW + 1));
+                many.extend_from_slice(docs);
+                many.push(doc);
+                let capacity = many.capacity();
+                *self = Self::Many(many);
                 capacity
             }
             Self::Many(docs) if docs.last() == Some(&doc) => 0,
@@ -267,6 +285,7 @@ impl Docs {
     fn as_slice(&self) -> &[u32] {
         match self {
             Self::One(doc) => std::slice::from_ref(doc),
+            Self::Few(len, docs) => &docs[..usize::from(*len)],
             Self::Many(docs) => docs,
         }
     }
