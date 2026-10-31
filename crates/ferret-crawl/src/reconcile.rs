@@ -1194,6 +1194,16 @@ impl Final<'_> {
         Ok(())
     }
     fn finish_inodes(&mut self) -> Result<(), Error> {
+        let roots = self.live_roots();
+        self.settle_inodes(&roots)?;
+        self.move_documents();
+        for record in std::mem::take(&mut self.puts).into_values() {
+            push(&self.budget, &mut self.changes.records, record)?;
+        }
+        self.settle_documents()
+    }
+    /// The roots once this crawl's changes apply.
+    fn live_roots(&self) -> BTreeSet<u32> {
         let mut roots: BTreeSet<_> = self.old.roots().map(|(id, _)| id.0).collect();
         for record in &self.changes.records {
             match record {
@@ -1206,6 +1216,11 @@ impl Final<'_> {
                 _ => {}
             }
         }
+        roots
+    }
+    /// Deletes each inode this crawl left with no names and no root, and
+    /// writes the new name count of each other inode it touched.
+    fn settle_inodes(&mut self, roots: &BTreeSet<u32>) -> Result<(), Error> {
         for (&id, &delta) in &self.references {
             let live = self.old.is_live_inode(InoId(id));
             let names = i64::from(self.session.name_references(InoId(id))) + delta;
@@ -1271,6 +1286,11 @@ impl Final<'_> {
                 )?;
             }
         }
+        Ok(())
+    }
+    /// Moves document references from each inode's old document to the one
+    /// its put names.
+    fn move_documents(&mut self) {
         for (&id, record) in &self.puts {
             let Record::InodePut { doc, .. } = record else {
                 continue;
@@ -1290,9 +1310,10 @@ impl Final<'_> {
                 }
             }
         }
-        for record in std::mem::take(&mut self.puts).into_values() {
-            push(&self.budget, &mut self.changes.records, record)?;
-        }
+    }
+    /// Deletes each document this crawl left unreferenced, and writes the new
+    /// reference count of each other document it touched.
+    fn settle_documents(&mut self) -> Result<(), Error> {
         let hashes: BTreeMap<_, _> = self
             .new_docs
             .iter()
