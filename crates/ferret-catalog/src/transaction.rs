@@ -476,34 +476,7 @@ impl Transaction {
         // The old generation is done with once the batches are filled; only
         // its documents and id counter reach the build.
         let previous_generation = self.previous.as_ref().map(Catalog::generation);
-        let mut generation = match previous_generation {
-            Some(old) if checkpoint => Generation {
-                checkpoint: old
-                    .checkpoint
-                    .checked_add(1)
-                    .filter(|&n| n != u64::MAX)
-                    .ok_or(CommitError::Encode(DecodeError::Corrupt(
-                        "checkpoint exhausted",
-                    )))?,
-                ..old
-            },
-            Some(old) => old.successor().map_err(CommitError::Encode)?,
-            None => Generation::fresh().map_err(CommitError::Write)?,
-        };
-        // An abandoned checkpoint is never adopted or overwritten.
-        while ["snapshot", "changes"].iter().any(|prefix| {
-            self.dir
-                .join(format!("{prefix}.{}", generation.checkpoint))
-                .exists()
-        }) {
-            generation.checkpoint = generation
-                .checkpoint
-                .checked_add(1)
-                .filter(|&n| n != u64::MAX)
-                .ok_or(CommitError::Encode(DecodeError::Corrupt(
-                    "checkpoint exhausted",
-                )))?;
-        }
+        let generation = self.next_generation(previous_generation, checkpoint)?;
         if let Some(retained_at) = self
             .batches
             .iter()
@@ -532,6 +505,52 @@ impl Transaction {
         let batches = std::mem::take(&mut self.batches);
         drop(docs);
 
+        let catalog = self.write_checked(plan, batches, generation)?;
+        if let Some(old) = previous_generation {
+            let _ = fs::remove_file(self.dir.join(format!("snapshot.{}", old.checkpoint)));
+            let _ = fs::remove_file(self.dir.join(format!("changes.{}", old.checkpoint)));
+        }
+        // The legacy file remains available until the new manifest is durable.
+        let _ = fs::remove_file(self.dir.join(read::FILE));
+        Ok(catalog)
+    }
+
+    /// The generation this commit publishes after `previous`: a new
+    /// checkpoint, or the next sequence in the previous one. An abandoned
+    /// checkpoint is never adopted or overwritten, so numbers whose files
+    /// exist are skipped.
+    fn next_generation(
+        &self,
+        previous: Option<Generation>,
+        checkpoint: bool,
+    ) -> Result<Generation, CommitError> {
+        let mut generation = match previous {
+            Some(old) if checkpoint => Generation {
+                checkpoint: next_checkpoint(old.checkpoint)?,
+                ..old
+            },
+            Some(old) => old.successor().map_err(CommitError::Encode)?,
+            None => Generation::fresh().map_err(CommitError::Write)?,
+        };
+        while ["snapshot", "changes"].iter().any(|prefix| {
+            self.dir
+                .join(format!("{prefix}.{}", generation.checkpoint))
+                .exists()
+        }) {
+            generation.checkpoint = next_checkpoint(generation.checkpoint)?;
+        }
+        Ok(generation)
+    }
+
+    /// Writes the planned catalog to the temporary file, reads it back
+    /// through the decoder's checks and publishes it. On failure the
+    /// temporary file is removed.
+    fn write_checked(
+        &self,
+        plan: build::Plan,
+        batches: Vec<Batch>,
+        generation: Generation,
+    ) -> Result<Catalog, CommitError> {
         let temp = self.dir.join(TEMP);
         let checked = write_synced(&temp, |out| {
             build::write(plan, batches, out, generation, self.policy)
@@ -543,22 +562,21 @@ impl Transaction {
             publish(&self.dir, &temp, &catalog)?;
             Ok(catalog)
         });
-        let catalog = match checked {
-            Ok(catalog) => catalog,
-            Err(e) => {
-                // Best effort: the error that matters is the first.
-                let _ = remove_temp(&self.dir);
-                return Err(e);
-            }
-        };
-        if let Some(old) = previous_generation {
-            let _ = fs::remove_file(self.dir.join(format!("snapshot.{}", old.checkpoint)));
-            let _ = fs::remove_file(self.dir.join(format!("changes.{}", old.checkpoint)));
+        if checked.is_err() {
+            // Best effort: the error that matters is the first.
+            let _ = remove_temp(&self.dir);
         }
-        // The legacy file remains available until the new manifest is durable.
-        let _ = fs::remove_file(self.dir.join(read::FILE));
-        Ok(catalog)
+        checked
     }
+}
+
+/// The checkpoint number after `n`; `u64::MAX` is never used.
+fn next_checkpoint(n: u64) -> Result<u64, CommitError> {
+    n.checked_add(1)
+        .filter(|&n| n != u64::MAX)
+        .ok_or(CommitError::Encode(DecodeError::Corrupt(
+            "checkpoint exhausted",
+        )))
 }
 
 #[cfg(test)]
