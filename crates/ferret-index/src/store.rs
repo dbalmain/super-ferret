@@ -840,13 +840,7 @@ impl IndexWriter {
         if docs == 0 {
             // Nothing survives: drop the inputs without writing. Their
             // range stays below the frontier, so it is not re-covered.
-            let retired: Vec<_> = manifest.segments.drain(run.clone()).collect();
-            let mut segments = self.current.segments.clone();
-            segments.drain(run.clone());
-            let mut trigrams = self.current.trigrams.clone();
-            trigrams.drain(run);
-            self.publish(manifest, segments, trigrams)?;
-            retire(&self.dir, &retired);
+            let retired = self.replace_run(manifest, run, None)?;
             return Ok(Some(Merged {
                 inputs: retired.len(),
                 read,
@@ -906,18 +900,13 @@ impl IndexWriter {
                 move |file| fill(&trigram_inputs, file, true),
             ),
         );
-        let (entry, segment, trigram) = result?;
+        let written = result?;
+        let entry = written.0;
 
         if (budget.cancelled)() {
             return Err(Error::Cancelled);
         }
-        let retired: Vec<_> = manifest.segments.splice(run.clone(), [entry]).collect();
-        let mut segments = self.current.segments.clone();
-        segments.splice(run.clone(), [segment]);
-        let mut trigrams = self.current.trigrams.clone();
-        trigrams.splice(run, [trigram]);
-        self.publish(manifest, segments, trigrams)?;
-        retire(&self.dir, &retired);
+        let retired = self.replace_run(manifest, run, Some(written))?;
         Ok(Some(Merged {
             inputs: retired.len(),
             read,
@@ -927,6 +916,29 @@ impl IndexWriter {
             records_removed: changes.1,
             segment: Some(entry),
         }))
+    }
+
+    /// Publishes `manifest` with the segments at `run` replaced by `merged`,
+    /// or dropped when there is none, then retires the replaced files.
+    /// Returns their entries.
+    fn replace_run(
+        &mut self,
+        mut manifest: Manifest,
+        run: std::ops::Range<usize>,
+        merged: Option<WrittenPair>,
+    ) -> Result<Vec<SegmentEntry>, Error> {
+        let (entry, segment, trigram) = match merged {
+            Some((entry, segment, trigram)) => (Some(entry), Some(segment), Some(trigram)),
+            None => (None, None, None),
+        };
+        let retired: Vec<_> = manifest.segments.splice(run.clone(), entry).collect();
+        let mut segments = self.current.segments.clone();
+        segments.splice(run.clone(), segment);
+        let mut trigrams = self.current.trigrams.clone();
+        trigrams.splice(run, trigram);
+        self.publish(manifest, segments, trigrams)?;
+        retire(&self.dir, &retired);
+        Ok(retired)
     }
 
     /// Writes, checks and installs both outputs before manifest publication.
