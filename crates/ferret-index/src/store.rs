@@ -36,6 +36,7 @@ use std::thread::ScopedJoinHandle;
 
 use ferret_text::{TERM_VERSION, TRIGRAM_VERSION};
 
+use crate::extract::Extracted;
 use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
 use crate::merge;
@@ -673,172 +674,83 @@ impl IndexWriter {
     ) -> Result<Followed, Error> {
         self.reconcile(catalog)?;
         let live = catalog.live;
-        let mut manifest = self.current.manifest.clone();
-        let before = manifest.unreadable.len();
-        manifest.unreadable.retain(|&doc| live.contains(doc));
-        let mut followed = Followed {
-            docs: 0,
-            bytes: 0,
-            unreadable: 0,
-            pruned: (before - manifest.unreadable.len()) as u64,
-            segment: None,
-            written: 0,
-            stopped: Stopped::Covered,
-            remaining: 0,
-        };
-
-        let mut inverter = Inverter::new(budget.buffer);
-        // The current segment's range and document count.
-        let mut range: Option<(u32, u32)> = None;
-        let mut docs = 0;
-        let mut frontier = live.bound();
-        let mut oversized = false;
+        let mut pass = Pass::new(self.current.manifest.clone(), live, budget.buffer);
         // The pass holds the trigram buffer, so that it can publish each
         // segment it completes while it reads on.
         let mut trigrams = std::mem::take(&mut self.trigrams);
         let dir = self.dir.clone();
         let codec = self.codec;
-        // Segments this pass has published from a second thread.
-        let mut published = 0;
         let result = std::thread::scope(|scope| -> Result<(), Error> {
             // A full buffer's files, being written on their own thread, and
             // the frontier to publish with them.
             let mut writing: Option<(ScopedJoinHandle<'_, Result<WrittenPair, Error>>, u32)> = None;
             let trigrams = &mut trigrams;
-            let order = live.range(manifest.frontier, live.bound());
+            let order = live.range(pass.manifest.frontier, live.bound());
             crate::extract::in_order(order, readers, |doc, extracted| -> Result<bool, Error> {
-                // The first document is read before the pause is consulted, so
-                // a pass that keeps outlasting its time still makes progress.
-                // The pause comes before a full buffer's stop: a caller that
-                // goes straight on after a full buffer must still see it.
-                if followed.docs + followed.unreadable != 0 && (budget.cancelled)() {
-                    followed.stopped = Stopped::Asked;
-                    frontier = doc;
-                    return Ok(false);
-                }
-                // A document whose trigrams the buffer has no room left for
-                // fills it as surely as the bound does.
-                let overflows = extracted
-                    .as_ref()
-                    .is_ok_and(|e| !PairBuffer::fits(trigrams.len(), e.keys.len()));
-                let full = docs != 0
-                    && (overflows || PairBuffer::full(&inverter, trigrams, budget.buffer));
-                let hand_off = full
-                    && followed.bytes < budget.bytes
-                    && published + usize::from(writing.is_some()) + 1 < budget.segments;
-                if docs != 0 && followed.bytes >= budget.bytes || full && !hand_off {
-                    followed.stopped = if full {
-                        Stopped::Buffer
-                    } else {
-                        Stopped::Bytes
-                    };
-                    frontier = doc;
-                    return Ok(false);
-                }
-                if hand_off && let Some((first, last)) = range.take() {
-                    if let Some(written) = writing.take() {
-                        self.publish_written(&mut manifest, &mut followed, live, written)?;
-                        published += 1;
-                    }
-                    let number = manifest.next_number;
-                    manifest.next_number += 1;
-                    let full = std::mem::replace(&mut inverter, Inverter::new(budget.buffer));
-                    let held = full.terms();
-                    let (terms, trigram_writer) =
-                        drain_buffers((first, last), codec, full, trigrams)?;
-                    // The next segment is likely the size of this one, whose
-                    // table is gone now that it has drained.
-                    inverter.reserve(held);
-                    let (dir, pace, docs) = (&dir, budget.pace, std::mem::take(&mut docs));
-                    #[cfg(test)]
-                    let inherit = seams();
-                    let handle = scope.spawn(move || {
-                        #[cfg(test)]
-                        inherit();
-                        write_drained(
-                            dir,
-                            number,
-                            docs,
-                            (first, last),
-                            pace,
-                            terms,
-                            trigram_writer,
-                        )
-                    });
-                    writing = Some((handle, doc));
-                }
-                match extracted {
-                    Ok(extracted) => {
-                        match PairBuffer::admit(trigrams, doc, &extracted.keys)? {
-                            Some(_) => {}
-                            None => {
-                                // A document that overflows a buffer holding
-                                // others stopped or handed off above.
-                                debug_assert_eq!(docs, 0);
-                                trigrams.add_keys(doc, &extracted.keys, usize::MAX, |_| {})?;
-                                oversized = true;
+                match pass.next(&extracted, trigrams, budget, writing.is_some()) {
+                    Next::Stop(stopped) => return Ok(pass.stop(stopped, doc)),
+                    Next::HandOff => {
+                        if let Some(range) = pass.range.take() {
+                            if let Some(written) = writing.take() {
+                                self.publish_written(&mut pass, live, written)?;
                             }
+                            let held = pass.inverter.terms();
+                            let drained = pass.seal(range, codec, trigrams, budget.buffer)?;
+                            // The next segment is likely the size of this
+                            // one, whose table is gone now that it has drained.
+                            pass.inverter.reserve(held);
+                            let (dir, pace) = (&dir, budget.pace);
+                            #[cfg(test)]
+                            let inherit = seams();
+                            let handle = scope.spawn(move || {
+                                #[cfg(test)]
+                                inherit();
+                                drained.write(dir, pace)
+                            });
+                            writing = Some((handle, doc));
                         }
-                        for (hash, term) in extracted.terms() {
-                            inverter.add_hashed(doc, hash, term)?;
-                        }
-                        followed.docs += 1;
-                        docs += 1;
-                        followed.bytes += extracted.len;
                     }
-                    Err(Fault::Unreadable) => {
-                        manifest.unreadable.push(doc);
-                        followed.unreadable += 1;
-                    }
-                    Err(Fault::Stop) => {
-                        followed.stopped = Stopped::Asked;
-                        frontier = doc;
-                        return Ok(false);
-                    }
+                    Next::Read => {}
                 }
-                range = Some((range.map_or(doc, |(first, _)| first), doc));
-                if oversized {
-                    followed.stopped = Stopped::Buffer;
-                    frontier = doc + 1;
-                    return Ok(false);
-                }
-                Ok(true)
+                pass.add(doc, extracted, trigrams)
             })?;
             if let Some(written) = writing.take() {
-                self.publish_written(&mut manifest, &mut followed, live, written)?;
+                self.publish_written(&mut pass, live, written)?;
             }
             Ok(())
         });
         self.trigrams = trigrams;
         result?;
-        if range.is_none() && frontier == manifest.frontier && followed.pruned == 0 {
-            followed.remaining = live.count(frontier, live.bound()).into();
-            return Ok(followed);
+        self.publish_pass(pass, live, budget)
+    }
+
+    /// Publishes what a follow pass read since its last published segment,
+    /// unless it read, skipped and pruned nothing.
+    fn publish_pass(
+        &mut self,
+        mut pass: Pass,
+        live: &DocSet,
+        budget: &Budget,
+    ) -> Result<Followed, Error> {
+        let frontier = pass.frontier;
+        if pass.range.is_none() && frontier == pass.manifest.frontier && pass.followed.pruned == 0 {
+            pass.followed.remaining = live.count(frontier, live.bound()).into();
+            return Ok(pass.followed);
         }
 
         let mut opened = None;
-        if let Some((first, last)) = range {
-            let number = manifest.next_number;
-            manifest.next_number += 1;
-            let (terms, trigrams) =
-                drain_buffers((first, last), self.codec, inverter, &mut self.trigrams)?;
-            let (entry, segment, trigram) = write_drained(
-                &self.dir,
-                number,
-                docs,
-                (first, last),
-                budget.pace,
-                terms,
-                trigrams,
-            )?;
-            followed.segment = Some(entry);
-            followed.written += entry.total_bytes();
-            manifest.segments.push(entry);
+        if let Some(range) = pass.range {
+            let drained = pass.seal(range, self.codec, &mut self.trigrams, budget.buffer)?;
+            let (entry, segment, trigram) = drained.write(&self.dir, budget.pace)?;
+            pass.followed.segment = Some(entry);
+            pass.followed.written += entry.total_bytes();
+            pass.manifest.segments.push(entry);
             opened = Some((segment, trigram));
         }
-        if oversized {
+        if pass.oversized {
             self.trigrams = TrigramInverter::with_capacity(PairBuffer::CAPACITY);
         }
+        let mut manifest = pass.manifest;
         manifest.last_follow = Some(timestamp());
         manifest.frontier = frontier;
         manifest.high_water = manifest.high_water.max(live.bound());
@@ -849,8 +761,8 @@ impl IndexWriter {
             trigrams.push(trigram);
         }
         self.publish(manifest, segments, trigrams)?;
-        followed.remaining = live.count(frontier, live.bound()).into();
-        Ok(followed)
+        pass.followed.remaining = live.count(frontier, live.bound()).into();
+        Ok(pass.followed)
     }
 
     /// Publishes a segment that a follow pass wrote on a second thread, with
@@ -858,18 +770,17 @@ impl IndexWriter {
     /// what a pass that had stopped there would have published.
     fn publish_written(
         &mut self,
-        manifest: &mut Manifest,
-        followed: &mut Followed,
+        pass: &mut Pass,
         live: &DocSet,
         (writing, frontier): (ScopedJoinHandle<'_, Result<WrittenPair, Error>>, u32),
     ) -> Result<(), Error> {
         let (entry, segment, trigram) = writing
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
-        manifest.segments.push(entry);
-        manifest.frontier = frontier;
-        manifest.high_water = manifest.high_water.max(live.bound());
-        let mut stopped = manifest.clone();
+        pass.manifest.segments.push(entry);
+        pass.manifest.frontier = frontier;
+        pass.manifest.high_water = pass.manifest.high_water.max(live.bound());
+        let mut stopped = pass.manifest.clone();
         stopped.last_follow = Some(timestamp());
         // Documents found unreadable since are past this frontier.
         stopped.unreadable.retain(|&doc| doc < frontier);
@@ -878,9 +789,10 @@ impl IndexWriter {
         let mut trigrams = self.current.trigrams.clone();
         trigrams.push(trigram);
         self.publish(stopped, segments, trigrams)?;
-        manifest.sequence = self.current.manifest.sequence;
-        followed.segment = Some(entry);
-        followed.written += entry.total_bytes();
+        pass.manifest.sequence = self.current.manifest.sequence;
+        pass.followed.segment = Some(entry);
+        pass.followed.written += entry.total_bytes();
+        pass.published += 1;
         Ok(())
     }
 
@@ -1170,6 +1082,196 @@ fn alive(segment: &SegmentEntry, live: &DocSet, unreadable: &[u32]) -> u32 {
         .filter(|&&doc| doc >= segment.first && doc < end && live.contains(doc))
         .count() as u32;
     live.count(segment.first, end) - skipped
+}
+
+/// A follow pass's progress: the manifest it will publish, what it has
+/// done, and the segment it is filling.
+struct Pass {
+    manifest: Manifest,
+    followed: Followed,
+    inverter: Inverter,
+    /// The current segment's range and document count.
+    range: Option<(u32, u32)>,
+    docs: u32,
+    frontier: u32,
+    /// Whether the current segment holds one document too big for the
+    /// trigram buffer.
+    oversized: bool,
+    /// Segments this pass has published from a second thread.
+    published: usize,
+}
+
+/// What a follow pass does before reading its next document.
+enum Next {
+    Read,
+    /// Hand the full buffers to a second thread to write, then read on.
+    HandOff,
+    Stop(Stopped),
+}
+
+impl Pass {
+    /// A pass over `live` from `manifest`, whose unreadable documents the
+    /// catalog has since dropped are pruned.
+    fn new(mut manifest: Manifest, live: &DocSet, buffer: usize) -> Self {
+        let before = manifest.unreadable.len();
+        manifest.unreadable.retain(|&doc| live.contains(doc));
+        let followed = Followed {
+            docs: 0,
+            bytes: 0,
+            unreadable: 0,
+            pruned: (before - manifest.unreadable.len()) as u64,
+            segment: None,
+            written: 0,
+            stopped: Stopped::Covered,
+            remaining: 0,
+        };
+        Self {
+            manifest,
+            followed,
+            inverter: Inverter::new(buffer),
+            range: None,
+            docs: 0,
+            frontier: live.bound(),
+            oversized: false,
+            published: 0,
+        }
+    }
+
+    /// Whether to read `extracted`, hand off first, or stop before it.
+    fn next(
+        &self,
+        extracted: &Result<&Extracted, Fault>,
+        trigrams: &TrigramInverter,
+        budget: &Budget,
+        writing: bool,
+    ) -> Next {
+        // The first document is read before the pause is consulted, so a pass
+        // that keeps outlasting its time still makes progress. The pause comes
+        // before a full buffer's stop: a caller that goes straight on after a
+        // full buffer must still see it.
+        if self.followed.docs + self.followed.unreadable != 0 && (budget.cancelled)() {
+            return Next::Stop(Stopped::Asked);
+        }
+        // A document whose trigrams the buffer has no room left for fills it
+        // as surely as the bound does.
+        let overflows = extracted
+            .as_ref()
+            .is_ok_and(|e| !PairBuffer::fits(trigrams.len(), e.keys.len()));
+        let full = self.docs != 0
+            && (overflows || PairBuffer::full(&self.inverter, trigrams, budget.buffer));
+        let hand_off = full
+            && self.followed.bytes < budget.bytes
+            && self.published + usize::from(writing) + 1 < budget.segments;
+        if self.docs != 0 && self.followed.bytes >= budget.bytes || full && !hand_off {
+            Next::Stop(if full {
+                Stopped::Buffer
+            } else {
+                Stopped::Bytes
+            })
+        } else if hand_off {
+            Next::HandOff
+        } else {
+            Next::Read
+        }
+    }
+
+    /// Stops the pass with `frontier` as the first document left unread.
+    /// Returns false, for the extraction loop.
+    fn stop(&mut self, stopped: Stopped, frontier: u32) -> bool {
+        self.followed.stopped = stopped;
+        self.frontier = frontier;
+        false
+    }
+
+    /// Adds `doc` to the current segment, or to the unreadable set. Returns
+    /// whether to read on.
+    fn add(
+        &mut self,
+        doc: u32,
+        extracted: Result<&Extracted, Fault>,
+        trigrams: &mut TrigramInverter,
+    ) -> Result<bool, Error> {
+        match extracted {
+            Ok(extracted) => {
+                match PairBuffer::admit(trigrams, doc, &extracted.keys)? {
+                    Some(_) => {}
+                    None => {
+                        // A document that overflows a buffer holding others
+                        // stopped or handed off above.
+                        debug_assert_eq!(self.docs, 0);
+                        trigrams.add_keys(doc, &extracted.keys, usize::MAX, |_| {})?;
+                        self.oversized = true;
+                    }
+                }
+                for (hash, term) in extracted.terms() {
+                    self.inverter.add_hashed(doc, hash, term)?;
+                }
+                self.followed.docs += 1;
+                self.docs += 1;
+                self.followed.bytes += extracted.len;
+            }
+            Err(Fault::Unreadable) => {
+                self.manifest.unreadable.push(doc);
+                self.followed.unreadable += 1;
+            }
+            Err(Fault::Stop) => return Ok(self.stop(Stopped::Asked, doc)),
+        }
+        self.range = Some((self.range.map_or(doc, |(first, _)| first), doc));
+        if self.oversized {
+            return Ok(self.stop(Stopped::Buffer, doc + 1));
+        }
+        Ok(true)
+    }
+
+    /// Drains the current segment's buffers over `range` as the next segment
+    /// number's writers, leaving both empty.
+    fn seal(
+        &mut self,
+        range: (u32, u32),
+        codec: u32,
+        trigrams: &mut TrigramInverter,
+        buffer: usize,
+    ) -> Result<Drained, Error> {
+        let number = self.manifest.next_number;
+        self.manifest.next_number += 1;
+        let full = std::mem::replace(&mut self.inverter, Inverter::new(buffer));
+        let (terms, trigrams) = drain_buffers(range, codec, full, trigrams)?;
+        let docs = std::mem::take(&mut self.docs);
+        Ok(Drained {
+            number,
+            docs,
+            range,
+            terms,
+            trigrams,
+        })
+    }
+}
+
+/// A sealed segment's writers, ready to write as its pair.
+struct Drained {
+    number: u64,
+    docs: u32,
+    range: (u32, u32),
+    terms: Writer,
+    trigrams: Writer,
+}
+
+impl Drained {
+    fn write(
+        self,
+        dir: &Path,
+        pace: &(dyn Fn(usize) -> io::Result<()> + Sync),
+    ) -> Result<WrittenPair, Error> {
+        write_drained(
+            dir,
+            self.number,
+            self.docs,
+            self.range,
+            pace,
+            self.terms,
+            self.trigrams,
+        )
+    }
 }
 
 /// Drains a follow's buffers into a segment pair's writers, leaving
