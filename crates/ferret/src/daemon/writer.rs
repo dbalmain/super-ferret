@@ -279,21 +279,7 @@ fn serve(
     engine
         .attach_content(&host.index)
         .map_err(io::Error::other)?;
-    let watch = Limits::read().ok().and_then(|limits| {
-        let mut config = Config::from_limits(&limits);
-        if let Ok(cap) = std::env::var("FERRET_WATCH_CAP")
-            && let Ok(cap) = cap.parse()
-        {
-            config.watch_cap = cap;
-        }
-        #[cfg(debug_assertions)]
-        if let Ok(cap) = std::env::var("FERRET_WATCH_TEST_SCOPES")
-            && let Ok(cap) = cap.parse()
-        {
-            config.scopes = cap;
-        }
-        Watch::new_blocking(config).ok().map(Arc::new)
-    });
+    let watch = open_watch();
     scheduler.watch(watch.clone());
     lock(&host.writer_status).watch = watch.clone();
     if let Some(watch) = &watch {
@@ -303,27 +289,7 @@ fn serve(
     host.engine_ready.notify_all();
     drop(loading);
     if let Some(watch) = &watch {
-        let watch = watch.clone();
-        let intake_host = host.clone();
-        std::thread::Builder::new()
-            .name("ferret-intake".into())
-            .spawn(move || {
-                // Without intake the catalog would go stale behind a ready
-                // host, refreshed only by the hourly backstop. A panic or a
-                // read error stops the host as a failed writer does.
-                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    watch.run_intake(|| {
-                        intake_host.writer_send.wake();
-                        !intake_host.stop.load(Ordering::Acquire)
-                    })
-                }));
-                let cause = match ran {
-                    Ok(Ok(())) => return,
-                    Ok(Err(error)) => io::Error::from(error).to_string(),
-                    Err(panic) => panic_message(panic.as_ref()),
-                };
-                super::fatal(&intake_host, "watch intake stopped", &cause);
-            })?;
+        spawn_intake(host, watch.clone())?;
     }
     let context = crate::cli::Context {
         index: host.index.clone(),
@@ -335,26 +301,7 @@ fn serve(
     // runs here and its crawl workers inherit this nice. The writer then
     // lowers itself to nice 19 for background refresh and follow, and blocks
     // here until the command finishes, which keeps a watch refresh queued.
-    let (job_send, job_recv) = mpsc::channel();
-    let command_host = host.clone();
-    let command_engine = engine.clone();
-    let command_scheduler = scheduler.clone();
-    let command_watch = watch.clone();
-    let command_thread = std::thread::Builder::new()
-        .name("ferret-command".into())
-        .spawn(move || {
-            command_loop(
-                command_host,
-                command_engine,
-                command_scheduler,
-                command_watch,
-                job_recv,
-            )
-        })?;
-    let lane = CommandLane {
-        jobs: Some(job_send),
-        thread: Some(command_thread),
-    };
+    let lane = CommandLane::spawn(host, &engine, &scheduler, &watch)?;
     ferret_crawl::lower_index_priority()?;
     let mut options = IndexOptions {
         watch: watch.clone(),
@@ -403,47 +350,9 @@ fn serve(
         );
         match message {
             Ok(Message::Command(command)) => {
-                let mut command_options = options.clone();
-                command_options.workers = scheduler.configured_workers();
-                command_options.bulk = Some(scheduler.command_control());
-                let _operation = Operation::start(
-                    host,
-                    if command.request.op == Op::Index {
-                        "index"
-                    } else {
-                        "roots-remove"
-                    },
-                );
-                // The test delay stays on this thread, before the crawl, so a
-                // queued command is already `writer_running`.
-                #[cfg(debug_assertions)]
-                std::thread::sleep(duration("FERRET_WRITER_TEST_COMMAND_DELAY_MS", 0));
-                let (done, outcome) = mpsc::sync_channel(1);
-                lane.jobs
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("command thread stopped"))?
-                    .send(CommandJob {
-                        request: command.request,
-                        options: command_options,
-                        done,
-                    })
-                    .map_err(|_| io::Error::other("command thread stopped"))?;
-                let reply = match outcome
-                    .recv()
-                    .map_err(|_| io::Error::other("command thread stopped"))?
-                {
-                    Ok(reply) => reply,
-                    Err(payload) => std::panic::resume_unwind(payload),
-                };
-                if reply.arm_fallback {
+                if run_command(host, &lane, &options, &scheduler, *command)? {
                     initial = true;
                 }
-                // The reply is detached from socket backpressure. Publication,
-                // watch adoption and the unpaced content follow finish before
-                // the next command begins.
-                let _ = command.reply.send(reply);
-                release_pending(&host.writer_pending);
-                release_freed_memory();
                 content_due = Instant::now();
                 continue;
             }
@@ -630,6 +539,133 @@ fn serve(
     }
     Ok(())
 }
+/// The inotify watch sized from the process's limits, or `None` when they
+/// cannot be read or the watch cannot start, which leaves the writer polling.
+fn open_watch() -> Option<Arc<Watch>> {
+    Limits::read().ok().and_then(|limits| {
+        let mut config = Config::from_limits(&limits);
+        if let Ok(cap) = std::env::var("FERRET_WATCH_CAP")
+            && let Ok(cap) = cap.parse()
+        {
+            config.watch_cap = cap;
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(cap) = std::env::var("FERRET_WATCH_TEST_SCOPES")
+            && let Ok(cap) = cap.parse()
+        {
+            config.scopes = cap;
+        }
+        Watch::new_blocking(config).ok().map(Arc::new)
+    })
+}
+
+/// Starts the thread that turns inotify events into writer wakeups.
+fn spawn_intake(host: &Arc<Host>, watch: Arc<Watch>) -> io::Result<()> {
+    let intake_host = host.clone();
+    std::thread::Builder::new()
+        .name("ferret-intake".into())
+        .spawn(move || {
+            // Without intake the catalog would go stale behind a ready
+            // host, refreshed only by the hourly backstop. A panic or a
+            // read error stops the host as a failed writer does.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                watch.run_intake(|| {
+                    intake_host.writer_send.wake();
+                    !intake_host.stop.load(Ordering::Acquire)
+                })
+            }));
+            let cause = match ran {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => io::Error::from(error).to_string(),
+                Err(panic) => panic_message(panic.as_ref()),
+            };
+            super::fatal(&intake_host, "watch intake stopped", &cause);
+        })
+        .map(drop)
+}
+
+impl CommandLane {
+    fn spawn(
+        host: &Arc<Host>,
+        engine: &Arc<Engine>,
+        scheduler: &Arc<crate::scheduler::Scheduler>,
+        watch: &Option<Arc<Watch>>,
+    ) -> io::Result<Self> {
+        let (job_send, job_recv) = mpsc::channel();
+        let command_host = host.clone();
+        let command_engine = engine.clone();
+        let command_scheduler = scheduler.clone();
+        let command_watch = watch.clone();
+        let thread = std::thread::Builder::new()
+            .name("ferret-command".into())
+            .spawn(move || {
+                command_loop(
+                    command_host,
+                    command_engine,
+                    command_scheduler,
+                    command_watch,
+                    job_recv,
+                )
+            })?;
+        Ok(Self {
+            jobs: Some(job_send),
+            thread: Some(thread),
+        })
+    }
+}
+
+/// Runs one explicit command on the command lane, at the process's starting
+/// nice, and replies to its client. Returns whether the command asks for a
+/// fallback backstop.
+fn run_command(
+    host: &Host,
+    lane: &CommandLane,
+    options: &IndexOptions,
+    scheduler: &Arc<crate::scheduler::Scheduler>,
+    command: Command,
+) -> io::Result<bool> {
+    let mut command_options = options.clone();
+    command_options.workers = scheduler.configured_workers();
+    command_options.bulk = Some(scheduler.command_control());
+    let _operation = Operation::start(
+        host,
+        if command.request.op == Op::Index {
+            "index"
+        } else {
+            "roots-remove"
+        },
+    );
+    // The test delay stays on this thread, before the crawl, so a
+    // queued command is already `writer_running`.
+    #[cfg(debug_assertions)]
+    std::thread::sleep(duration("FERRET_WRITER_TEST_COMMAND_DELAY_MS", 0));
+    let (done, outcome) = mpsc::sync_channel(1);
+    lane.jobs
+        .as_ref()
+        .ok_or_else(|| io::Error::other("command thread stopped"))?
+        .send(CommandJob {
+            request: command.request,
+            options: command_options,
+            done,
+        })
+        .map_err(|_| io::Error::other("command thread stopped"))?;
+    let reply = match outcome
+        .recv()
+        .map_err(|_| io::Error::other("command thread stopped"))?
+    {
+        Ok(reply) => reply,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    let arm_fallback = reply.arm_fallback;
+    // The reply is detached from socket backpressure. Publication,
+    // watch adoption and the unpaced content follow finish before
+    // the next command begins.
+    let _ = command.reply.send(reply);
+    release_pending(&host.writer_pending);
+    release_freed_memory();
+    Ok(arm_fallback)
+}
+
 fn command_loop(
     host: Arc<Host>,
     engine: Arc<Engine>,
