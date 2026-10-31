@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::Catalog;
+use crate::lock;
 
 /// Allocation class requested under the retained writer lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,26 +115,17 @@ impl Limiter {
     /// transfer, never after this one or after durable publication.
     pub fn transfer<T>(&self, bytes: usize, run: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         if self.rate == 0 {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = lock(&self.state);
             state.bytes = state.bytes.saturating_add(bytes as u64);
             drop(state);
             return run();
         }
-        let _transfer = self
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _transfer = lock(&self.transfer);
         if bytes == 0 {
             return run();
         }
         let delay = {
-            let mut s = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = lock(&self.state);
             s.bytes = s.bytes.saturating_add(bytes as u64);
             let delay = s.next.saturating_sub(self.clock.now());
             if !delay.is_zero() {
@@ -144,16 +136,10 @@ impl Limiter {
         };
         if !delay.is_zero() {
             self.clock.sleep(delay);
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .waiting -= 1;
+            lock(&self.state).waiting -= 1;
         }
         let result = run();
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next = self
+        lock(&self.state).next = self
             .clock
             .now()
             .saturating_add(Duration::from_secs_f64(bytes as f64 / self.rate as f64));
@@ -162,16 +148,10 @@ impl Limiter {
     /// Advice failure is diagnostic and never turns readable content into a
     /// fault.
     pub fn advice_failed(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .advice_failures += 1;
+        lock(&self.state).advice_failures += 1;
     }
     pub fn status(&self) -> RateStatus {
-        let s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = lock(&self.state);
         RateStatus {
             bytes_per_second: self.rate,
             reserved_bytes: s.bytes,

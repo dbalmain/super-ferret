@@ -1,4 +1,5 @@
 //! Unpublished crawl input guard, independent of published log budgets.
+use crate::lock;
 use std::sync::Mutex;
 
 /// Provisional ceilings for changed observations and reconciliation scratch.
@@ -44,16 +45,10 @@ impl InputBudget {
         self.exceeded.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn usage(&self) -> InputUsage {
-        *self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *lock(&self.usage)
     }
     pub fn charge(&self, records: usize, bytes: usize) -> Result<(), crate::log::Error> {
-        let mut usage = self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut usage = lock(&self.usage);
         if usage.exceeded
             || records > self.limits.records.saturating_sub(usage.records)
             || bytes > self.limits.owned_bytes.saturating_sub(usage.owned_bytes)

@@ -37,6 +37,7 @@ mod live;
 mod metadata;
 mod resolve;
 
+use crate::threads::lock;
 pub use live::LiveWalk;
 pub use metadata::Metadata;
 pub(super) use metadata::{Stat, metadata};
@@ -291,21 +292,13 @@ impl Entry {
         };
         let count = self.state.catalog.as_ref()?.entry_count(id)?;
         let removed = self.removed_children.as_ref().map_or(0, |children| {
-            children
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .children
-                .get(&id)
-                .copied()
-                .unwrap_or(0)
+            lock(children).children.get(&id).copied().unwrap_or(0)
         });
         Some(count > removed)
     }
     pub(super) fn note_deleted(&self) {
         if let (Some(parent), Some(children)) = (self.state.parent, &self.removed_children) {
-            let mut removed = children
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut removed = lock(children);
             if let Some(Target::Inode(id)) = self.state.target {
                 removed.entries.insert(id);
             }

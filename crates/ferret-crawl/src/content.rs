@@ -23,7 +23,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::Duration;
 
 use ferret_catalog::bulk::Limiter;
@@ -31,6 +31,7 @@ use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 
 use crate::ContentFault;
+use crate::lock;
 use crate::observe::{BulkRead, Opened, Reader, bracket, bracket_search, catalog_stat};
 
 /// Streams an explicit regular file or live-fallback file, using the same
@@ -780,10 +781,6 @@ fn out_of_descriptors<T>(opened: &Result<T, ContentFault>) -> bool {
     let errno = error.raw_os_error();
     errno == Some(rustix::io::Errno::MFILE.raw_os_error())
         || errno == Some(rustix::io::Errno::NFILE.raw_os_error())
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 static PROCESS: OnceLock<Budget> = OnceLock::new();

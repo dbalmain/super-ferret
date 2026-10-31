@@ -12,6 +12,7 @@ pub mod schedule;
 mod test;
 mod walk;
 
+use crate::threads::lock;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -248,9 +249,7 @@ pub trait Effects {
     /// Writes an output-file record through the evaluator's entry adapter.
     fn file(&mut self, file: &action::SharedFile, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        let mut guard = file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = lock(file);
         let writer = guard.as_mut().ok_or_else(|| {
             io::Error::other("output file target was not opened during preparation")
         })?;

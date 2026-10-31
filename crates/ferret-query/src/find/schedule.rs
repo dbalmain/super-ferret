@@ -11,6 +11,7 @@
 //! whose next step is such a search says so ([`Visitor::holding`]), and the
 //! task then lends before it rather than after.
 
+use crate::threads::lock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
@@ -205,7 +206,7 @@ impl<S, T> Drop for PanicStop<'_, '_, '_, S, T> {
 
 impl<S, T> Pool<'_, '_, S, T> {
     fn lock(&self) -> MutexGuard<'_, Queue<S, T>> {
-        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.queue)
     }
 }
 

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{Effects, WalkError};
+use crate::threads::lock;
 
 const MEMORY_LIMIT: usize = 64 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -389,9 +390,7 @@ pub(super) fn commit_stdout(
 }
 
 fn commit(gate: &Mutex<()>, write: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-    let _gate = gate
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _gate = lock(gate);
     write()
 }
 
@@ -421,9 +420,7 @@ impl<E: Effects> EntryEffects<'_, E> {
             } else {
                 let result = self.host.output(&mut self.record.stdout).and_then(|()| {
                     for (file, spool) in &mut self.record.files {
-                        let mut guard = file
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut guard = lock(file);
                         let file = guard.as_mut().ok_or_else(|| {
                             io::Error::other("output file target was not opened during preparation")
                         })?;

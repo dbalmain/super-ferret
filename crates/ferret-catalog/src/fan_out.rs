@@ -4,6 +4,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
+use crate::lock;
+
 /// Runs `work` on each of `items` and returns the results in `items`'
 /// order, on the calling thread and up to `threads - 1` helpers.
 ///
@@ -69,10 +71,6 @@ pub(crate) fn cores() -> usize {
         return cores;
     }
     std::thread::available_parallelism().map_or(1, |n| n.get())
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn spawn<'scope>(

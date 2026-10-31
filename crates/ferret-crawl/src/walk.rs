@@ -574,9 +574,7 @@ pub(crate) static IO_HOOKS: std::sync::Mutex<Vec<(PathBuf, IoHook)>> =
     std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 fn inject(root: &Path, point: IoPoint, rel: &Path) -> Option<(IoOp, io::Error)> {
-    let hook = IO_HOOKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    let hook = crate::lock(&IO_HOOKS)
         .iter()
         .find(|(r, _)| r == root)
         .map(|(_, h)| h.clone());

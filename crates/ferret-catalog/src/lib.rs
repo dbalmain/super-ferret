@@ -37,6 +37,14 @@ mod resident_names;
 mod session;
 pub mod transaction;
 
+/// Locks `mutex`, taking the guard even if a panicking holder poisoned it,
+/// as every lock in this crate does.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests;
 

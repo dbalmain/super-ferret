@@ -3,6 +3,7 @@
 //! descriptors in queued jobs stay within [`MAX_OPEN_JOBS`].
 
 use super::*;
+use crate::lock;
 
 const MAX_OPEN_JOBS: usize = 128;
 
@@ -28,10 +29,7 @@ impl<D> Shared<D> {
     }
 
     fn take(&self) -> Option<Job<D>> {
-        let mut jobs = self
-            .jobs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut jobs = lock(&self.jobs);
         loop {
             if self.cancelled.load(Ordering::Acquire) {
                 return None;
@@ -79,10 +77,7 @@ impl<D> Shared<D> {
         if local.is_empty() || self.idle.load(Ordering::SeqCst) == 0 {
             return;
         }
-        let mut jobs = self
-            .jobs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut jobs = lock(&self.jobs);
         // Nearest the root is likely to expose the most independent work.
         let Some(oldest) = local.pop_front() else {
             return;
@@ -97,10 +92,7 @@ impl<D> Shared<D> {
         if self.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Synchronize with a worker about to wait, or it can miss this
             // wake.
-            let _jobs = self
-                .jobs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _jobs = lock(&self.jobs);
             self.ready.notify_all();
         }
     }
@@ -111,10 +103,7 @@ pub(super) fn run_guarded<V: EventVisitor>(walker: Walker<'_, V>, shared: &Share
         Ok(visitor) => visitor,
         Err(panic) => {
             shared.cancelled.store(true, Ordering::Release);
-            let _jobs = shared
-                .jobs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _jobs = lock(&shared.jobs);
             shared.ready.notify_all();
             std::panic::resume_unwind(panic);
         }

@@ -18,6 +18,7 @@ use rustix::fs::inotify::{self, ReadFlags, WatchFlags};
 use rustix::fs::{Mode, OFlags, fstat, openat};
 use rustix::io::Errno;
 
+use crate::lock;
 use crate::{RefreshReason, RefreshRequest, RefreshScope, RenameHint};
 
 mod aliases;
@@ -312,11 +313,7 @@ impl Watch {
             self.policy_path(root, root);
         }
         if rustix::fs::fstatfs(fd).map_or(true, |s| policy::unreliable(s.f_type as u64)) {
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .unreliable
-                .insert(root.to_owned());
+            lock(&self.state).unreliable.insert(root.to_owned());
         }
         let parent_identity = if relative.as_os_str().is_empty() {
             None
@@ -331,10 +328,7 @@ impl Watch {
             .ok()
             .map(|s| (s.st_dev, s.st_ino))
         };
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&self.state);
         let path = root.join(relative);
         let parent = if relative.as_os_str().is_empty() {
             None
@@ -463,10 +457,7 @@ impl Watch {
         }
     }
     fn gap(&self, root: &Path) {
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock(&self.state);
         fail(&mut s, root, Failed::<fn() -> PathBuf>::Lost);
     }
     /// Reads until EAGAIN. Kernel buffers are always consumed even when the
@@ -547,10 +538,7 @@ impl Watch {
         None
     }
     fn event(&self, wd: i32, flags: ReadFlags, cookie: u32, name: &[u8]) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&self.state);
         if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
             // Overflow may have dropped expected IGNORED records as well. A
             // stale tombstone cannot be trusted at a later descriptor reuse.
@@ -656,10 +644,7 @@ impl Watch {
     /// Debug-build move endpoint at an installed directory locator.
     #[cfg(debug_assertions)]
     pub fn inject_move(&self, path: &Path, name: &[u8], cookie: u32, from: bool) {
-        let wd = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let wd = lock(&self.state)
             .descriptors
             .iter()
             .find(|(_, d)| d.iter().any(|d| d.path() == path))
@@ -680,21 +665,12 @@ impl Watch {
 
     /// Collapses pending hints to a new complete all-roots observation marker.
     pub fn backstop(&self, reason: RefreshReason) {
-        loss(
-            &mut self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            reason,
-        );
+        loss(&mut lock(&self.state), reason);
     }
     /// Conservative live heap plus kernel-watch estimate for bulk reserves.
     /// Shared ancestor Arcs may be counted more than once, deliberately.
     pub fn resource_bytes(&self) -> u64 {
-        let s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = lock(&self.state);
         let directories: usize = s
             .descriptors
             .values()
@@ -739,10 +715,7 @@ impl Watch {
     }
     /// Snapshots intake coverage and monotonic pending age under a short lock.
     pub fn status(&self) -> Status {
-        let s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = lock(&self.state);
         let failed = s.failures.values().map(Failures::reported).sum::<usize>();
         Status {
             installed: s.identities.len(),
@@ -787,10 +760,7 @@ impl Watch {
     }
     /// Earliest time at which accumulated hints can be detached.
     pub fn next_due(&self) -> Option<Instant> {
-        let s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = lock(&self.state);
         if s.backstop.is_some() || !s.scoped_roots.is_empty() {
             return Some(Instant::now());
         }
@@ -801,18 +771,11 @@ impl Watch {
     }
     /// Schedules a known local watch gap for scoped polling.
     pub fn scoped_roots(&self, roots: Vec<PathBuf>) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .scoped_roots
-            .extend(roots);
+        lock(&self.state).scoped_roots.extend(roots);
     }
     /// Roots with missing/unreliable watches or unobserved hard-link names.
     pub fn polling_roots(&self, view: &Catalog) -> Vec<PathBuf> {
-        let s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = lock(&self.state);
         let roots = s
             .gaps
             .iter()
@@ -837,10 +800,7 @@ impl Watch {
     /// Leaves bulk markers queued during a controller pause. Intake keeps
     /// coalescing under the same bounds; ordinary scoped hints remain eligible.
     pub fn take_admitted(&self, bulk: bool) -> Option<Burst> {
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock(&self.state);
         if s.running
             || (!bulk && s.backstop.is_some())
             || (s.backstop.is_none()
@@ -866,10 +826,7 @@ impl Watch {
     /// Acknowledges this watermark on success, or retains complete work after
     /// failure. A new loss watermark is never cleared by an older observation.
     pub fn finish(&self, burst: Burst, success: bool) {
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock(&self.state);
         s.running = false;
         let observed_first = s.inflight_first.take();
         if success {
@@ -890,10 +847,7 @@ impl Watch {
     /// Restores a burst refused before its observation began. Its locators and
     /// age remain eligible when bulk admission opens again.
     pub fn defer(&self, burst: Burst) {
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock(&self.state);
         s.running = false;
         let observed_first = s.inflight_first.take();
         s.first = s.first.into_iter().chain(observed_first).min();
@@ -928,10 +882,7 @@ impl Watch {
             .filter_map(|id| crate::refresh::containing_root(view, id).ok())
             .collect::<BTreeSet<_>>();
         let snapshot = {
-            let mut s = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = lock(&self.state);
             s.file_aliases.retain(|_, aliases| {
                 aliases.names.retain(|_, owners| {
                     owners.retain(|r| roots.contains(r));
@@ -990,10 +941,7 @@ impl Watch {
                 .filter(|d| d.resolve(view).is_some())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut s = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = lock(&self.state);
             if s.descriptors.get(&wd).is_none_or(|ds| {
                 ds.len() != directories.len()
                     || ds.iter().zip(&directories).any(|(a, b)| !Arc::ptr_eq(a, b))

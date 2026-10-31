@@ -2,6 +2,7 @@
 //! listing, held level by level so a walk can split between workers.
 
 use super::*;
+use crate::threads::lock;
 
 /// getdents64 buffer. One call reads a typical directory whole; 8 KiB took
 /// three calls per directory on the timing tree.
@@ -394,7 +395,7 @@ impl LiveWalk {
                             .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
                     };
                     entry.path.truncate(own_len);
-                    let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| removed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.contains(&id)));
+                    let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| lock(removed).entries.contains(&id)));
                     if missing && (child.kind != Kind::Dir || removed_here) {
                         continue;
                     }

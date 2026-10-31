@@ -603,9 +603,7 @@ pub(crate) static PROBES: std::sync::Mutex<Vec<(PathBuf, ProbeHook)>> =
 
 #[cfg(test)]
 fn hook(root: &Path, probe: Probe<'_>) {
-    let found = PROBES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    let found = crate::lock(&PROBES)
         .iter()
         .find(|(r, _)| r == root)
         .map(|(_, hook)| std::sync::Arc::clone(hook));

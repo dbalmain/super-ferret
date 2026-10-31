@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use super::output::OutputBuffer;
 use super::printf::Format;
 use super::{DirectoryHandle, Effects, Entry, EvaluationError, FileKind, WalkError};
+use crate::threads::lock;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -66,9 +67,7 @@ impl Target {
         let Self::File(path, file) = self else {
             return Ok(());
         };
-        let mut guard = file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = lock(file);
         if guard.is_some() {
             return Ok(());
         }
@@ -116,11 +115,7 @@ fn flush_files(files: &[SharedFile]) -> io::Result<()> {
         // `None` here means this target's `prepare`-time open is the one
         // still pending (or failed and already reported); either way there
         // is nothing committed yet to flush.
-        if let Some(writer) = file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-        {
+        if let Some(writer) = lock(file).as_mut() {
             writer.flush()?;
         }
     }
@@ -186,11 +181,7 @@ pub(super) fn flush_shared(
     quit: &AtomicBool,
 ) -> io::Result<u64> {
     let mut errors = 0;
-    let mut batches = std::mem::take(
-        &mut *shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
+    let mut batches = std::mem::take(&mut *lock(shared));
     for batch in batches.values_mut() {
         errors += u64::from(!batch.run(effects, gate, quit)?);
     }
@@ -227,9 +218,7 @@ impl Batch {
         }
         let mut ready = Vec::new();
         {
-            let mut batches = shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut batches = lock(shared);
             let batch = batches.entry(self.exec.id).or_insert_with(|| {
                 Self::new(&self.exec, self.directory.clone(), self.handle.clone())
             });
@@ -630,9 +619,7 @@ fn spawn_batch(
 
 pub(super) fn confirm(program: &OsStr, path: &Path) -> io::Result<bool> {
     static PROMPT: Mutex<()> = Mutex::new(());
-    let _prompt = PROMPT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _prompt = lock(&PROMPT);
     let mut stderr = io::stderr().lock();
     stderr.write_all(b"< ")?;
     stderr.write_all(program.as_bytes())?;

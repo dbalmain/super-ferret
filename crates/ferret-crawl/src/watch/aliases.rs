@@ -1,6 +1,7 @@
 //! Sparse physical hard-link proofs. A file with an unindexed link needs
 //! polling because directory events do not cover writes through that name.
 use super::*;
+use crate::lock;
 
 type PhysicalName = ((u64, u64), Vec<u8>);
 
@@ -37,10 +38,7 @@ impl Watch {
             self.gap(root);
             return;
         };
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock(&self.state);
         let alias = s
             .file_aliases
             .entry(identity)
@@ -63,10 +61,7 @@ impl Watch {
     /// Retired names cannot inflate the number of observable physical links.
     pub fn adopt_aliases(&self, view: &Catalog) {
         let (mut aliases, parents) = {
-            let s = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let s = lock(&self.state);
             let parents = s
                 .file_aliases
                 .values()
@@ -108,9 +103,6 @@ impl Watch {
             });
             alias.nlink > 1 && !alias.names.is_empty()
         });
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .file_aliases = aliases;
+        lock(&self.state).file_aliases = aliases;
     }
 }

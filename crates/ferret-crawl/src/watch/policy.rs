@@ -3,6 +3,7 @@
 use std::os::fd::AsFd;
 
 use super::*;
+use crate::lock;
 
 /// Linux's `MAXSYMLINKS`: past this many links, path resolution fails with
 /// `ELOOP`. Following a policy input's link chain for ancestor watches stops
@@ -114,10 +115,7 @@ fn root_epoch(s: &mut State, root: &Path) -> (Arc<Path>, u64) {
 impl Watch {
     /// Starts dependency retirement only for a complete root observation.
     pub(crate) fn begin_policy_root(&self, root: &Path) {
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock(&self.state);
         let (_, epoch) = root_epoch(&mut s, root);
         if let Some(current) = s.policy_epochs.get_mut(root) {
             *current = epoch.wrapping_add(1);
@@ -127,11 +125,7 @@ impl Watch {
     }
     /// Failed commands cannot later retire dependencies through a partial scan.
     pub fn abort_policy_roots(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .policy_refreshed
-            .clear();
+        lock(&self.state).policy_refreshed.clear();
     }
 
     /// Registers one actual policy consultation, including a missing input.
@@ -162,18 +156,11 @@ impl Watch {
                     candidate = parent.to_owned();
                 }
                 Err(_) => {
-                    failure(
-                        &mut self
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        root,
-                        || {
-                            std::fs::canonicalize(parent)
-                                .map(|p| p.join(candidate.file_name().unwrap_or_default()))
-                                .unwrap_or_else(|_| path.to_owned())
-                        },
-                    );
+                    failure(&mut lock(&self.state), root, || {
+                        std::fs::canonicalize(parent)
+                            .map(|p| p.join(candidate.file_name().unwrap_or_default()))
+                            .unwrap_or_else(|_| path.to_owned())
+                    });
                     return;
                 }
             }
@@ -202,14 +189,7 @@ impl Watch {
                         prefix.file_name().unwrap_or_default(),
                         hops,
                     ),
-                    Err(_) => failure(
-                        &mut self
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        root,
-                        || prefix.clone(),
-                    ),
+                    Err(_) => failure(&mut lock(&self.state), root, || prefix.clone()),
                 }
             }
         }
@@ -236,11 +216,7 @@ impl Watch {
         };
         let identity = (stat.st_dev, stat.st_ino);
         if rustix::fs::fstatfs(parent).map_or(true, |s| unreliable(s.f_type as u64)) {
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .unreliable
-                .insert(root.to_owned());
+            lock(&self.state).unreliable.insert(root.to_owned());
         }
         for name in names {
             self.input_of(root, &proc, identity, name, hops);
@@ -248,10 +224,7 @@ impl Watch {
     }
     /// One input of a parent whose `identity` was just read through `proc`.
     fn input_of(&self, root: &Path, proc: &Path, identity: (u64, u64), name: &OsStr, hops: u32) {
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock(&self.state);
         let mask = WatchFlags::CREATE
             | WatchFlags::DELETE
             | WatchFlags::MOVED_FROM
@@ -322,14 +295,7 @@ impl Watch {
                 // A link chain longer than the kernel follows, a cycle
                 // included, cannot resolve: the input is a failure, as when
                 // canonicalizing it fails, not a deeper walk.
-                Ok(_) if hops >= MAX_HOPS => failure(
-                    &mut self
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    root,
-                    || key,
-                ),
+                Ok(_) if hops >= MAX_HOPS => failure(&mut lock(&self.state), root, || key),
                 Ok(target) => {
                     let target = if target.is_absolute() {
                         target
@@ -346,24 +312,10 @@ impl Watch {
                     // it come back.
                     match canonical_or_missing(&target) {
                         Ok(target) if target != key => self.path_input(root, &target, hops + 1),
-                        _ => failure(
-                            &mut self
-                                .state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                            root,
-                            || key,
-                        ),
+                        _ => failure(&mut lock(&self.state), root, || key),
                     }
                 }
-                _ => failure(
-                    &mut self
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    root,
-                    || key,
-                ),
+                _ => failure(&mut lock(&self.state), root, || key),
             }
         }
     }

@@ -17,6 +17,7 @@ use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind};
 use ferret_policy::Config;
 
 use crate::index::{DRAIN_MIN, Deferred, Hasher, PROBES, Probe, content_faults};
+use crate::lock;
 use crate::{
     ContentFault, IndexError, IndexOptions, IoOp, Refresh, Report, RootChange, index, index_change,
 };
@@ -191,9 +192,7 @@ impl Hook {
 
 impl Drop for Hook {
     fn drop(&mut self) {
-        let mut probes = PROBES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut probes = lock(&PROBES);
         probes.retain(|(root, _)| root != &self.root);
     }
 }

@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::lock;
 use ferret_catalog::{Content, Hash, Stat};
 use rustix::fs::{FileType, OFlags, fstat, openat};
 
@@ -161,14 +162,6 @@ impl Cache {
     pub(crate) fn len(&self) -> usize {
         self.shards.iter().map(|s| lock(s).len()).sum()
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    // A poisoned shard means a worker panicked while holding it; the panic
-    // ends the walk anyway, and the map itself is never left half-written.
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// What an alias records, given the stored observation and its own `lstat`:

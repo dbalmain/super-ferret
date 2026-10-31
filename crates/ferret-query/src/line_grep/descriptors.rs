@@ -1,7 +1,8 @@
 //! Admission for grep's descriptor-using operations. The host charges both
 //! listing/policy steps and complete reads, including their context spools.
 
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use crate::threads::lock;
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 /// Shared admission for grep reads and listings. One admission reserves the
@@ -104,10 +105,6 @@ fn capacity(limit: Option<u64>) -> usize {
 // Never more requests than complete allowances, so no share rounds to zero.
 fn requests(slots: usize, maximum: usize) -> usize {
     maximum.clamp(1, slots)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
