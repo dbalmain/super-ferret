@@ -515,14 +515,7 @@ impl Query {
     ) -> Result<Stats, RunError> {
         let stopped = || cancelled.is_some_and(|flag| flag.load(Ordering::Acquire));
         let mut advance = Advance::new(&stopped);
-        let check = || {
-            if stopped() {
-                Err(RunError::Index(ferret_index::ReadError::Cancelled))
-            } else {
-                Ok(())
-            }
-        };
-        check()?;
+        checked(&stopped)?;
         if !self.has_content() {
             return self.run_indexed_until(catalog, index, None, cancelled, emit);
         }
@@ -553,23 +546,11 @@ impl Query {
             });
         }
 
-        // The cheapest content conjunct that no document-less row holds.
-        let driver = self
-            .residual
-            .iter()
-            .filter(|tree| tree.is_content() && !tree.holds_without_document())
-            .map(|tree| (tree, estimate(tree, &atoms, u64::from(live))))
-            .min_by_key(|&(_, estimate)| estimate);
-        let side = match driver {
-            Some((_, estimate)) => {
-                let rows = estimate.saturating_mul(INODES_PER_DOC.0) / INODES_PER_DOC.1;
-                if rows <= self.name_estimate(catalog, index)? {
-                    Side::Content
-                } else {
-                    Side::Names
-                }
-            }
-            None => Side::Names,
+        let driver = self.content_driver(catalog, index, &atoms, live)?;
+        let side = if driver.is_some() {
+            Side::Content
+        } else {
+            Side::Names
         };
 
         let mut grep_plans = plan.greps.iter();
@@ -587,82 +568,29 @@ impl Query {
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
         catalog.load(&[Section::Doc])?;
-        let (mut ids, mut docs) = (Vec::new(), Vec::new());
-        match (side, driver) {
-            (Side::Content, Some((tree, _))) => {
-                let mut top = pinned
+        let (ids, docs) = match driver {
+            Some(tree) => {
+                let top = pinned
                     .top(compile(tree, &read_atoms, pinned, &stopped).map_err(RunError::Index)?);
-                let mut target = 0;
-                loop {
-                    check()?;
-                    let next = if cancelled.is_some() {
-                        top.next_geq_until(target, &mut advance)
-                            .map_err(RunError::Index)?
-                    } else {
-                        top.next_geq(target)
-                    };
-                    let Some((doc, _)) = next else {
-                        break;
-                    };
-                    docs.push(doc);
-                    for chunk in content.docs.names(doc).chunks(1024) {
-                        check()?;
-                        ids.extend_from_slice(chunk);
-                    }
-                    let Some(next) = doc.checked_add(1) else {
-                        break;
-                    };
-                    target = next;
-                }
-                check()?;
-                ids.sort_unstable();
-                check()?;
+                content_candidates(
+                    top,
+                    content.docs,
+                    cancelled.is_some(),
+                    &mut advance,
+                    &stopped,
+                )?
             }
-            _ => {
-                self.s1_indexed(catalog, index, None, None, cancelled, |row| {
-                    ids.push(row.name);
-                    if let Some(doc) = catalog.doc(row.inode) {
-                        docs.push(doc.0);
-                    }
-                    ControlFlow::Continue(())
-                })?;
-                check()?;
-                docs.sort_unstable();
-                check()?;
-                docs.dedup();
-                check()?;
-            }
-        }
-
-        // Each atom's certainty on each document, probed in DocId order.
+            None => self.name_candidates(catalog, index, cancelled, &stopped)?,
+        };
         let width = read_atoms.len();
-        check()?;
-        let cells = docs.len() * width;
-        let mut table = Vec::new();
-        while table.len() < cells {
-            check()?;
-            table.resize((table.len() + 4096).min(cells), None);
-        }
-        for (i, atom) in read_atoms.iter().enumerate() {
-            check()?;
-            let mut cursor = atom
-                .cursor_until(pinned, &stopped)
-                .map_err(RunError::Index)?;
-            for (j, &doc) in docs.iter().enumerate() {
-                check()?;
-                let next = if cancelled.is_some() {
-                    cursor
-                        .next_geq_until(doc, &mut advance)
-                        .map_err(RunError::Index)?
-                } else {
-                    cursor.next_geq(doc)
-                };
-                table[j * width + i] = match next {
-                    Some((found, certainty)) if found == doc => Some(certainty),
-                    _ => None,
-                };
-            }
-        }
+        let table = probe(
+            &read_atoms,
+            &docs,
+            pinned,
+            cancelled.is_some(),
+            &mut advance,
+            &stopped,
+        )?;
 
         let mut report = ContentReport {
             driver: side,
@@ -706,6 +634,53 @@ impl Query {
         report.threads = tally.threads;
         stats.content = Some(report);
         Ok(stats)
+    }
+
+    /// The content side's driving tree: the cheapest content conjunct that
+    /// no document-less row holds, when its rows undercut the name side's.
+    fn content_driver(
+        &self,
+        catalog: &Catalog,
+        index: &NameIndex,
+        atoms: &[(u64, Certainty, u64)],
+        live: u32,
+    ) -> Result<Option<&Node<Test>>, RunError> {
+        let driver = self
+            .residual
+            .iter()
+            .filter(|tree| tree.is_content() && !tree.holds_without_document())
+            .map(|tree| (tree, estimate(tree, atoms, u64::from(live))))
+            .min_by_key(|&(_, estimate)| estimate);
+        let Some((tree, estimate)) = driver else {
+            return Ok(None);
+        };
+        let rows = estimate.saturating_mul(INODES_PER_DOC.0) / INODES_PER_DOC.1;
+        Ok((rows <= self.name_estimate(catalog, index)?).then_some(tree))
+    }
+
+    /// The name side's candidates: S1's rows, and their documents, sorted
+    /// and deduplicated.
+    fn name_candidates(
+        &self,
+        catalog: &Catalog,
+        index: &NameIndex,
+        cancelled: Option<&AtomicBool>,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(Vec<NameId>, Vec<u32>), RunError> {
+        let (mut ids, mut docs) = (Vec::new(), Vec::new());
+        self.s1_indexed(catalog, index, None, None, cancelled, |row| {
+            ids.push(row.name);
+            if let Some(doc) = catalog.doc(row.inode) {
+                docs.push(doc.0);
+            }
+            ControlFlow::Continue(())
+        })?;
+        checked(stopped)?;
+        docs.sort_unstable();
+        checked(stopped)?;
+        docs.dedup();
+        checked(stopped)?;
+        Ok((ids, docs))
     }
 
     /// The name side's row estimate: D54's count for a name test, else
@@ -786,6 +761,94 @@ impl Query {
             .iter()
             .for_each(|tree| walk(tree, &mut sections));
         sections
+    }
+}
+
+/// The content side's candidates: the driving cursor's documents, and their
+/// names sorted.
+fn content_candidates(
+    mut top: Cursor<'_>,
+    names: &DocNames,
+    cancellable: bool,
+    advance: &mut Advance<'_>,
+    stopped: &impl Fn() -> bool,
+) -> Result<(Vec<NameId>, Vec<u32>), RunError> {
+    let (mut ids, mut docs) = (Vec::new(), Vec::new());
+    let mut target = 0;
+    loop {
+        checked(stopped)?;
+        let next = if cancellable {
+            top.next_geq_until(target, advance)
+                .map_err(RunError::Index)?
+        } else {
+            top.next_geq(target)
+        };
+        let Some((doc, _)) = next else {
+            break;
+        };
+        docs.push(doc);
+        for chunk in names.names(doc).chunks(1024) {
+            checked(stopped)?;
+            ids.extend_from_slice(chunk);
+        }
+        let Some(next) = doc.checked_add(1) else {
+            break;
+        };
+        target = next;
+    }
+    checked(stopped)?;
+    ids.sort_unstable();
+    checked(stopped)?;
+    Ok((ids, docs))
+}
+
+/// Each atom's certainty on each document, probed in DocId order:
+/// `table[j * width + i]` is atom `i` on `docs[j]`.
+fn probe(
+    atoms: &[ReadAtom],
+    docs: &[u32],
+    pinned: &Pinned<'_>,
+    cancellable: bool,
+    advance: &mut Advance<'_>,
+    stopped: &impl Fn() -> bool,
+) -> Result<Vec<Option<Certainty>>, RunError> {
+    let width = atoms.len();
+    checked(stopped)?;
+    let cells = docs.len() * width;
+    let mut table = Vec::new();
+    while table.len() < cells {
+        checked(stopped)?;
+        table.resize((table.len() + 4096).min(cells), None);
+    }
+    for (i, atom) in atoms.iter().enumerate() {
+        checked(stopped)?;
+        let mut cursor = atom
+            .cursor_until(pinned, stopped)
+            .map_err(RunError::Index)?;
+        for (j, &doc) in docs.iter().enumerate() {
+            checked(stopped)?;
+            let next = if cancellable {
+                cursor
+                    .next_geq_until(doc, advance)
+                    .map_err(RunError::Index)?
+            } else {
+                cursor.next_geq(doc)
+            };
+            table[j * width + i] = match next {
+                Some((found, certainty)) if found == doc => Some(certainty),
+                _ => None,
+            };
+        }
+    }
+    Ok(table)
+}
+
+/// `Cancelled` once `stopped` holds.
+fn checked(stopped: &impl Fn() -> bool) -> Result<(), RunError> {
+    if stopped() {
+        Err(RunError::Index(ferret_index::ReadError::Cancelled))
+    } else {
+        Ok(())
     }
 }
 
