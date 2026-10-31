@@ -188,51 +188,34 @@ pub fn refresh(
     options: &IndexOptions,
 ) -> Result<RefreshReport, IndexError> {
     session.set_bulk_control(options.bulk.clone());
+    let base = request.expected_generation;
     if let Err(error) = session.compact_if_needed() {
         if let ferret_catalog::log::Error::Deferred(reason) = error {
-            return Ok(RefreshReport {
-                base_generation: request.expected_generation,
-                outcome: RefreshOutcome::DeferredBulk(reason),
-                view: session.view(),
-                report: Report::default(),
-            });
+            return Ok(RefreshReport::unrun(
+                base,
+                RefreshOutcome::DeferredBulk(reason),
+                session.view(),
+            ));
         }
         return Err(IndexError::Update(error));
     }
     let view = session.view();
-    if let Err(stale) = view.generation().check(request.expected_generation) {
-        return Ok(RefreshReport {
-            base_generation: request.expected_generation,
-            outcome: RefreshOutcome::RetryFromCurrent(stale),
+    if let Err(stale) = view.generation().check(base) {
+        return Ok(RefreshReport::unrun(
+            base,
+            RefreshOutcome::RetryFromCurrent(stale),
             view,
-            report: Report::default(),
-        });
+        ));
     }
     let roots: Vec<_> = view
         .roots()
         .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
         .collect();
-    let mut selected: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
-    if request.reason == RefreshReason::Burst {
-        for scope in &request.scopes {
-            let (root, relative) = match scope {
-                RefreshScope::Entry { parent, basename } => entry_scope(&view, *parent, basename)?,
-                RefreshScope::Directory(id) => relative_scope(&view, *id)?,
-                RefreshScope::Root(path) => (path.clone(), PathBuf::new()),
-            };
-            selected.entry(root).or_default().insert(relative);
-        }
-        for hint in &request.rename_hints {
-            for (parent, name) in [
-                (hint.old_parent, &hint.old_name),
-                (hint.new_parent, &hint.new_name),
-            ] {
-                if let Ok((root, relative)) = entry_scope(&view, parent, name) {
-                    selected.entry(root).or_default().insert(relative);
-                }
-            }
-        }
-    }
+    let selected = if request.reason == RefreshReason::Burst {
+        burst_scopes(&view, &request)?
+    } else {
+        BTreeMap::new()
+    };
     let named: Vec<_> = selected.keys().cloned().collect();
     // A selection that covers its whole root selects nothing out: the root
     // is walked like a backstop's, without a per-entry selection lookup, and
@@ -253,19 +236,17 @@ pub fn refresh(
         match crate::index::recrawl_scoped(session, &roots, scope, options, selections) {
             Ok(result) => result,
             Err(IndexError::DeferredBulk(reason)) => {
-                return Ok(RefreshReport {
-                    base_generation: request.expected_generation,
-                    outcome: RefreshOutcome::DeferredBulk(reason),
-                    view: session.view(),
-                    report: Report::default(),
-                });
+                return Ok(RefreshReport::unrun(
+                    base,
+                    RefreshOutcome::DeferredBulk(reason),
+                    session.view(),
+                ));
             }
             Err(error) => return Err(error),
         };
     Ok(RefreshReport {
-        base_generation: request.expected_generation,
-        outcome: if session.view().generation().checkpoint != request.expected_generation.checkpoint
-        {
+        base_generation: base,
+        outcome: if session.view().generation().checkpoint != base.checkpoint {
             RefreshOutcome::Checkpointed
         } else if changes.records.is_empty() {
             RefreshOutcome::Unchanged
@@ -275,4 +256,44 @@ pub fn refresh(
         view: session.view(),
         report,
     })
+}
+
+/// Each root a burst touched, with the paths below it to observe: its
+/// scopes, and both ends of each rename hint that still resolve.
+fn burst_scopes(
+    view: &Catalog,
+    request: &RefreshRequest,
+) -> Result<BTreeMap<PathBuf, BTreeSet<PathBuf>>, IndexError> {
+    let mut selected: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    for scope in &request.scopes {
+        let (root, relative) = match scope {
+            RefreshScope::Entry { parent, basename } => entry_scope(view, *parent, basename)?,
+            RefreshScope::Directory(id) => relative_scope(view, *id)?,
+            RefreshScope::Root(path) => (path.clone(), PathBuf::new()),
+        };
+        selected.entry(root).or_default().insert(relative);
+    }
+    for hint in &request.rename_hints {
+        for (parent, name) in [
+            (hint.old_parent, &hint.old_name),
+            (hint.new_parent, &hint.new_name),
+        ] {
+            if let Ok((root, relative)) = entry_scope(view, parent, name) {
+                selected.entry(root).or_default().insert(relative);
+            }
+        }
+    }
+    Ok(selected)
+}
+
+impl RefreshReport {
+    /// A refresh of `base` that observed nothing, ending in `outcome`.
+    fn unrun(base: Generation, outcome: RefreshOutcome, view: Catalog) -> Self {
+        Self {
+            base_generation: base,
+            outcome,
+            view,
+            report: Report::default(),
+        }
+    }
 }
