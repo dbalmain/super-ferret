@@ -1985,10 +1985,18 @@ fn a_reader_panic_reaches_the_caller() {
     let dir = Dir::new("reader-panic");
     let catalog = Catalog::new(40, &[]);
     let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
-    // Reader 0 panics on the first document it claims; reader 1 runs on
-    // until the claim window fills.
-    let mut panics = |_, _: &mut Vec<u8>| -> Result<(), Fault> { panic!("reader") };
+    // Reader 0 panics on the first document it claims. Reader 1 holds its
+    // first document until then, so it cannot drain the whole catalog
+    // inside one claim window before reader 0 claims anything.
+    let claimed = AtomicBool::new(false);
+    let mut panics = |_, _: &mut Vec<u8>| -> Result<(), Fault> {
+        claimed.store(true, Ordering::Release);
+        panic!("reader")
+    };
     let mut reads = |_, bytes: &mut Vec<u8>| {
+        while !claimed.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
         bytes.extend_from_slice(b"amber");
         Ok(())
     };
