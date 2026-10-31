@@ -99,7 +99,7 @@ child copy of its own binary.
 
 | Variable                                          | Owning test module                        |
 | ------------------------------------------------- | ----------------------------------------- |
-| `FERRET_TEST_COMPLETION_CHILD`                    | `ferret-query/src/verify.rs`              |
+| `FERRET_TEST_COMPLETION_CHILD`                    | `ferret-query/src/completion.rs`          |
 | `FERRET_TEST_CONTROLLER_CASE`                     | `ferret/src/config.rs`                    |
 | `FERRET_TEST_LATE_SPILL`                          | `ferret/src/grep/groups.rs`               |
 | `FERRET_TEST_STREAM_PANIC`                        | `ferret/src/grep/groups.rs`               |

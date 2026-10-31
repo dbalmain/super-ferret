@@ -3,6 +3,7 @@
 //! [`Shortfall`] a run reports when the system refuses some.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{Scope, ScopedJoinHandle};
 
 /// Starts thread `i` on the scope, named so profiles can tell it apart. The
@@ -85,4 +86,14 @@ fn grow_descriptor_table() {
     };
     // Dropped at once: the table keeps its size after the slot is freed.
     let _ = rustix::io::fcntl_dupfd_cloexec(std::io::stderr().as_fd(), top);
+}
+
+/// A pool lock; a panicking worker holds none across user code, so what it
+/// guards is consistent.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub(crate) fn wait<'a, T>(signal: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    signal.wait(guard).unwrap_or_else(PoisonError::into_inner)
 }

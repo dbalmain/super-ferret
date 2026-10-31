@@ -107,6 +107,8 @@ pub mod find;
 mod grep;
 pub mod line_grep;
 
+mod budget;
+mod completion;
 pub mod name_index;
 mod pattern;
 mod plan;
@@ -120,6 +122,7 @@ mod verify;
 #[cfg(test)]
 mod tests;
 
+pub use budget::IN_FLIGHT_BYTES;
 pub use content::{ContentAtom, TextAtom, answered_by_trigrams};
 pub use grep::{GrepAtom, GrepReport};
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
@@ -131,10 +134,10 @@ pub use query::{GREP_PREFIX, ParseError, Query, Strategy};
 pub use read::{CheckedReader, ReadFault, ReadOperation, ReadOutcome, retry_read};
 pub use run::{Row, RunError, Stats};
 pub use threads::{Shortfall, reserve_descriptor_table};
-pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers};
+pub use verify::{Fork, KEPT_BUFFER, Workers};
 
 /// Shared bounded scheduling for completed grep file groups.
-pub use verify::{
+pub use completion::{
     GroupSchedule, Lane, Reservation, completion_groups, completion_groups_with_handoff,
     lane_groups,
 };
