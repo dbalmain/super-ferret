@@ -815,7 +815,10 @@ fn active_lane_streams_release_budget_waiters_and_channel_senders() {
                             std::thread::yield_now();
                         }
                         assert!(lanes[0].hand(Handoff::Held, 0).is_continue());
-                        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                        // A rendezvous: each send returns once the publisher
+                        // has taken the chunk, so the owner that panics after
+                        // its first chunk has delivered exactly one.
+                        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
                         assert!(lanes[0].handoff(Handoff::Stream(receiver), stopped));
                         for chunk in 0..32 {
                             if sender.send(chunk).is_err() {
