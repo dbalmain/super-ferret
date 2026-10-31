@@ -368,6 +368,150 @@ impl Resolver<'_> {
         }
         Some(())
     }
+
+    /// Protects what one fault's typed context names; None when the fault
+    /// has no trustworthy anchor.
+    fn record(&mut self, fault: &CoverageFault) -> Option<()> {
+        match (&fault.context, fault.op) {
+            (CoverageContext::Root, IoOp::OpenDir | IoOp::Lstat | IoOp::List) => {
+                let id = self
+                    .old
+                    .roots()
+                    .find(|(_, path)| *path == fault.root.as_os_str().as_bytes())?
+                    .0;
+                if let Some(token) = self
+                    .dirs
+                    .values()
+                    .find(|d| d.parent.is_none() && d.name == fault.root.as_os_str().as_bytes())
+                    .map(|d| d.token)
+                {
+                    if self.directory(token) != Some(id) {
+                        return None;
+                    }
+                    self.out.tokens.insert(token);
+                }
+                self.out.directories.insert(id.0);
+                self.out.markers.insert(id.0);
+            }
+            (
+                CoverageContext::Directory(token),
+                IoOp::List | IoOp::OpenDir | IoOp::Reopen | IoOp::ReadIgnore | IoOp::ProbeGit,
+            ) => {
+                // A new unreadable child directory is opaque, without inventing
+                // an old subtree; a replaced one protects its old parent.
+                if matches!(fault.op, IoOp::List | IoOp::OpenDir | IoOp::Reopen)
+                    && let Some(d) = self.dirs.get(token).copied()
+                    && let Some(parent) = d.parent
+                {
+                    self.child_directory(parent, d.name)?;
+                } else {
+                    self.protect(*token)?;
+                }
+            }
+            (CoverageContext::Child { parent, name }, IoOp::OpenDir) => {
+                self.child_directory(*parent, name)?;
+            }
+            (CoverageContext::Child { parent, name }, IoOp::Lstat | IoOp::Readlink) => {
+                self.child_edge(*parent, name)?;
+            }
+            (CoverageContext::Child { parent, .. }, IoOp::ReadIgnore | IoOp::ProbeGit) => {
+                self.protect(*parent)?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// Overlapping scopes collapse by old graph ancestry, independent of
+    /// worker event order and without walking any protected descendant.
+    fn collapse(&mut self) {
+        let old = &self.old;
+        let directories = self
+            .out
+            .directories
+            .iter()
+            .copied()
+            .filter(|&id| outermost(old, &self.out.directories, InoId(id)))
+            .collect();
+        self.out.directories = directories;
+        let out = &mut self.out;
+        out.markers
+            .retain(|&id| outermost(old, &out.directories, InoId(id)));
+        out.edges.retain(|&id| {
+            let p = old.name(ferret_catalog::NameId(id)).parent;
+            !out.directories.contains(&p.0) && outermost(old, &out.directories, p)
+        });
+    }
+
+    /// A new opaque scope beneath an old protected scope is discarded along
+    /// with the rest of that ancestor's observations, not counted
+    /// separately.
+    fn keep_unprotected_opaque(&mut self) -> Option<()> {
+        let mut opaque = BTreeSet::new();
+        for token in self.out.opaque.iter().copied().collect::<Vec<_>>() {
+            let mut parent = self.dirs.get(&token)?.parent;
+            let mut protected = false;
+            let mut visited = BTreeSet::new();
+            while let Some(p) = parent {
+                if !visited.insert(p) {
+                    return None;
+                }
+                if self.out.tokens.contains(&p)
+                    || self
+                        .directory(p)
+                        .is_some_and(|id| self.out.directories.contains(&id.0))
+                {
+                    protected = true;
+                    break;
+                }
+                parent = self.dirs.get(&p)?.parent;
+            }
+            if !protected {
+                opaque.insert(token);
+            }
+        }
+        self.out.opaque = opaque;
+        Some(())
+    }
+
+    /// Root-boundary edits are normalised plan paths. Compare them only with
+    /// paths derived from checked graph IDs, never use paths to guess a
+    /// scope. A disjoint root edit does not invalidate an unchanged
+    /// protected subtree.
+    fn refuse_root_edits(&mut self, changed: &[&PathBuf]) -> Option<()> {
+        let mut path = Vec::new();
+        for &id in &self.out.directories {
+            path.clear();
+            self.old.dir_path(InoId(id), &mut path);
+            let scope = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+            if changed.iter().any(|root| root.starts_with(scope)) {
+                return None;
+            }
+        }
+        for token in self.out.opaque.iter().copied().collect::<Vec<_>>() {
+            let d = *self.dirs.get(&token)?;
+            let parent = self.directory(d.parent?)?;
+            path.clear();
+            self.old.dir_path(parent, &mut path);
+            let scope = PathBuf::from(std::ffi::OsStr::from_bytes(&path))
+                .join(std::ffi::OsStr::from_bytes(d.name));
+            if changed.iter().any(|root| root.starts_with(&scope)) {
+                return None;
+            }
+        }
+        Some(())
+    }
+}
+
+/// Whether no proper ancestor of `id` in the old graph is in `set`.
+fn outermost(old: &Catalog, set: &BTreeSet<u32>, mut id: InoId) -> bool {
+    while let Some(name) = old.dir_name(id) {
+        id = old.name(name).parent;
+        if set.contains(&id.0) {
+            return false;
+        }
+    }
+    true
 }
 
 /// None means the fault has no trustworthy anchor or the root/policy transition
@@ -429,128 +573,11 @@ pub(crate) fn resolve(
         if directory_denied(fault) {
             continue;
         }
-        match (&fault.context, fault.op) {
-            (CoverageContext::Root, IoOp::OpenDir | IoOp::Lstat | IoOp::List) => {
-                let id = r
-                    .old
-                    .roots()
-                    .find(|(_, path)| *path == fault.root.as_os_str().as_bytes())?
-                    .0;
-                if let Some(token) = r
-                    .dirs
-                    .values()
-                    .find(|d| d.parent.is_none() && d.name == fault.root.as_os_str().as_bytes())
-                    .map(|d| d.token)
-                {
-                    if r.directory(token) != Some(id) {
-                        return None;
-                    }
-                    r.out.tokens.insert(token);
-                }
-                r.out.directories.insert(id.0);
-                r.out.markers.insert(id.0);
-            }
-            (
-                CoverageContext::Directory(token),
-                IoOp::List | IoOp::OpenDir | IoOp::Reopen | IoOp::ReadIgnore | IoOp::ProbeGit,
-            ) => {
-                // A new unreadable child directory is opaque, without inventing
-                // an old subtree; a replaced one protects its old parent.
-                if matches!(fault.op, IoOp::List | IoOp::OpenDir | IoOp::Reopen)
-                    && let Some(d) = r.dirs.get(token).copied()
-                    && let Some(parent) = d.parent
-                {
-                    r.child_directory(parent, d.name)?;
-                } else {
-                    r.protect(*token)?;
-                }
-            }
-            (CoverageContext::Child { parent, name }, IoOp::OpenDir) => {
-                r.child_directory(*parent, name)?;
-            }
-            (CoverageContext::Child { parent, name }, IoOp::Lstat | IoOp::Readlink) => {
-                r.child_edge(*parent, name)?;
-            }
-            (CoverageContext::Child { parent, .. }, IoOp::ReadIgnore | IoOp::ProbeGit) => {
-                r.protect(*parent)?;
-            }
-            _ => return None,
-        }
+        r.record(fault)?;
     }
-    // Overlapping scopes collapse by old graph ancestry, independent of worker
-    // event order and without walking any protected descendant.
-    let outermost = |set: &BTreeSet<u32>, mut id: InoId| {
-        while let Some(name) = r.old.dir_name(id) {
-            id = r.old.name(name).parent;
-            if set.contains(&id.0) {
-                return false;
-            }
-        }
-        true
-    };
-    let directories = r
-        .out
-        .directories
-        .iter()
-        .copied()
-        .filter(|&id| outermost(&r.out.directories, InoId(id)))
-        .collect();
-    r.out.directories = directories;
-    r.out
-        .markers
-        .retain(|&id| outermost(&r.out.directories, InoId(id)));
-    r.out.edges.retain(|&id| {
-        let p = r.old.name(ferret_catalog::NameId(id)).parent;
-        !r.out.directories.contains(&p.0) && outermost(&r.out.directories, p)
-    });
-    // A new opaque scope beneath an old protected scope is discarded along
-    // with the rest of that ancestor's observations, not counted separately.
-    let mut opaque = BTreeSet::new();
-    for token in r.out.opaque.iter().copied().collect::<Vec<_>>() {
-        let mut parent = r.dirs.get(&token)?.parent;
-        let mut protected = false;
-        let mut visited = BTreeSet::new();
-        while let Some(p) = parent {
-            if !visited.insert(p) {
-                return None;
-            }
-            if r.out.tokens.contains(&p)
-                || r.directory(p)
-                    .is_some_and(|id| r.out.directories.contains(&id.0))
-            {
-                protected = true;
-                break;
-            }
-            parent = r.dirs.get(&p)?.parent;
-        }
-        if !protected {
-            opaque.insert(token);
-        }
-    }
-    r.out.opaque = opaque;
-    // Root-boundary edits are normalised plan paths. Compare them only with
-    // paths derived from checked graph IDs, never use paths to guess a scope.
-    // A disjoint root edit does not invalidate an unchanged protected subtree.
-    let mut path = Vec::new();
-    for &id in &r.out.directories {
-        path.clear();
-        r.old.dir_path(InoId(id), &mut path);
-        let scope = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
-        if changed.iter().any(|root| root.starts_with(scope)) {
-            return None;
-        }
-    }
-    for token in r.out.opaque.iter().copied().collect::<Vec<_>>() {
-        let d = *r.dirs.get(&token)?;
-        let parent = r.directory(d.parent?)?;
-        path.clear();
-        r.old.dir_path(parent, &mut path);
-        let scope = PathBuf::from(std::ffi::OsStr::from_bytes(&path))
-            .join(std::ffi::OsStr::from_bytes(d.name));
-        if changed.iter().any(|root| root.starts_with(&scope)) {
-            return None;
-        }
-    }
+    r.collapse();
+    r.keep_unprotected_opaque()?;
+    r.refuse_root_edits(&changed)?;
     Some(r.out)
 }
 
