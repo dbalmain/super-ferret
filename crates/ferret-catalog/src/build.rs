@@ -807,7 +807,29 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
         .collect();
     drop(file_pos);
     keys.sort_unstable();
+    let grouped = group_files(index, batches, keys)?;
+    number_groups(plan, grouped)
+}
 
+/// Files grouped by identity: each file's group, or `NONE`, and each
+/// group's kept observation and whether it is a fault.
+struct Grouped {
+    group_of: Vec<u32>,
+    groups: Vec<(u32, bool)>,
+}
+
+/// The observation each group of a file's identity keeps, and whether it is
+/// a fault, with each file's group, from `keys` sorted by fingerprint.
+fn group_files(
+    index: &Index,
+    batches: &[Batch],
+    mut keys: Vec<(u64, u32, u32)>,
+) -> Result<Grouped, BuildError> {
+    let identity = |f: u32| -> (u64, u64) {
+        let (b, i) = index.file(f as usize);
+        let s: &Stat = &batches[b].file_stats[i];
+        (s.dev, s.ino)
+    };
     // Each identity's observations, in name order, become one group: the
     // observation it keeps, and whether it is a fault. Nearly every run is
     // one file, which is its own winner and cannot disagree with itself, so
@@ -847,9 +869,17 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
             at += len;
         }
     }
-    drop(keys);
+    Ok(Grouped { group_of, groups })
+}
 
-    // Number the groups by their first name: the names in order again.
+/// Numbers the groups by their first name, the names in order again, and
+/// records each inode's kept observation and each file's inode.
+fn number_groups(plan: &mut Plan, grouped: Grouped) -> Result<(), BuildError> {
+    let Grouped {
+        mut group_of,
+        groups,
+    } = grouped;
+    let index = &plan.index;
     let dirs = index.dirs;
     let mut inode_of_group = vec![NONE; groups.len()];
     plan.winner.reserve_exact(groups.len());
