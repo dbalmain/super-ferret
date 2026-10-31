@@ -35,7 +35,7 @@ use ferret_verify::MatchStats;
 
 use crate::content::ReadAtom;
 use crate::expr::{Node, Test, Truth};
-use crate::query::{Cmp, MetaTest, Query};
+use crate::query::{Cmp, MetaTest, NameTest, Query};
 use crate::verify::{Probed, Readers, Workers};
 use crate::{NameIndex, Row, RunError, Stats};
 
@@ -961,7 +961,95 @@ pub struct Bounds {
     pub maybe: u64,
 }
 
+/// A content plan's bounds as they are estimated, with a report for each
+/// node.
+struct Estimate<'a> {
+    catalog: &'a Catalog,
+    index: &'a NameIndex,
+    atoms: &'a [(u64, Certainty, u64)],
+    live: u64,
+    reports: Vec<NodeReport>,
+}
+
+impl Estimate<'_> {
+    fn report(&mut self, expression: &str, bounds: Bounds) {
+        self.reports.push(NodeReport {
+            expression: expression.into(),
+            bounds,
+        });
+    }
+
+    /// The names the name index estimates `test` matches.
+    fn name(&self, test: &NameTest) -> Result<Bounds, RunError> {
+        Ok(Bounds {
+            possible: self
+                .index
+                .select(self.catalog, None, &[], |name| test.matches(name))
+                .map_err(RunError::Stale)?
+                .estimate
+                .hits
+                .min(self.live),
+            maybe: 0,
+        })
+    }
+
+    /// The bounds of `tree`, reporting each node after its children.
+    fn node(&mut self, tree: &Node<Test>) -> Result<Bounds, RunError> {
+        let live = self.live;
+        let bounds = match tree {
+            Node::Leaf(Test::Content(i)) => {
+                let possible = self.atoms[*i].0.min(live);
+                Bounds {
+                    possible,
+                    maybe: self.atoms[*i].2.min(possible),
+                }
+            }
+            Node::Leaf(Test::Name(test)) => self.name(test)?,
+            Node::Leaf(_) => Bounds::all(live),
+            Node::Not(inner) => Bounds {
+                possible: live,
+                maybe: self.node(inner)?.maybe,
+            },
+            Node::And(all) => {
+                let mut bounds = Bounds::all(live);
+                for child in all {
+                    bounds = bounds.and(self.node(child)?);
+                }
+                bounds
+            }
+            Node::Or(any) => {
+                let mut bounds = Bounds {
+                    possible: 0,
+                    maybe: 0,
+                };
+                for child in any {
+                    let b = self.node(child)?;
+                    bounds.possible = bounds.possible.saturating_add(b.possible).min(live);
+                    bounds.maybe = bounds.maybe.saturating_add(b.maybe).min(live);
+                }
+                bounds
+            }
+        };
+        let expression = tree.describe(&|test| match test {
+            Test::Content(i) => format!("content[{i}]"),
+            Test::Name(_) => "name".into(),
+            Test::Path(_) => "path".into(),
+            Test::Meta(_) => "metadata".into(),
+        });
+        self.reports.push(NodeReport { bounds, expression });
+        Ok(bounds)
+    }
+}
+
 impl Bounds {
+    /// Every one of `live` documents possible, none read yet.
+    fn all(live: u64) -> Self {
+        Self {
+            possible: live,
+            maybe: 0,
+        }
+    }
+
     fn and(self, other: Self) -> Self {
         let possible = self.possible.min(other.possible);
         Self {
@@ -997,113 +1085,30 @@ impl Query {
         atoms: &[(u64, Certainty, u64)],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ContentPlan, RunError> {
-        fn node(
-            tree: &Node<Test>,
-            catalog: &Catalog,
-            index: &NameIndex,
-            atoms: &[(u64, Certainty, u64)],
-            live: u64,
-            reports: &mut Vec<NodeReport>,
-        ) -> Result<Bounds, RunError> {
-            let bounds = match tree {
-                Node::Leaf(Test::Content(i)) => {
-                    let possible = atoms[*i].0.min(live);
-                    Bounds {
-                        possible,
-                        maybe: atoms[*i].2.min(possible),
-                    }
-                }
-                Node::Leaf(Test::Name(test)) => Bounds {
-                    possible: index
-                        .select(catalog, None, &[], |name| test.matches(name))
-                        .map_err(RunError::Stale)?
-                        .estimate
-                        .hits
-                        .min(live),
-                    maybe: 0,
-                },
-                Node::Leaf(_) => Bounds {
-                    possible: live,
-                    maybe: 0,
-                },
-                Node::Not(inner) => Bounds {
-                    possible: live,
-                    maybe: node(inner, catalog, index, atoms, live, reports)?.maybe,
-                },
-                Node::And(all) => {
-                    let mut bounds = Bounds {
-                        possible: live,
-                        maybe: 0,
-                    };
-                    for child in all {
-                        bounds = bounds.and(node(child, catalog, index, atoms, live, reports)?);
-                    }
-                    bounds
-                }
-                Node::Or(any) => {
-                    let mut bounds = Bounds {
-                        possible: 0,
-                        maybe: 0,
-                    };
-                    for child in any {
-                        let b = node(child, catalog, index, atoms, live, reports)?;
-                        bounds.possible = bounds.possible.saturating_add(b.possible).min(live);
-                        bounds.maybe = bounds.maybe.saturating_add(b.maybe).min(live);
-                    }
-                    bounds
-                }
-            };
-            reports.push(NodeReport {
-                bounds,
-                expression: tree.describe(&|test| match test {
-                    Test::Content(i) => format!("content[{i}]"),
-                    Test::Name(_) => "name".into(),
-                    Test::Path(_) => "path".into(),
-                    Test::Meta(_) => "metadata".into(),
-                }),
-            });
-            Ok(bounds)
-        }
         let live = u64::from(pinned.live().len());
-        let mut reports = Vec::new();
+        let mut estimate = Estimate {
+            catalog,
+            index,
+            atoms,
+            live,
+            reports: Vec::new(),
+        };
         for test in &self.names {
-            reports.push(NodeReport {
-                expression: "name".into(),
-                bounds: Bounds {
-                    possible: index
-                        .select(catalog, None, &[], |name| test.matches(name))
-                        .map_err(RunError::Stale)?
-                        .estimate
-                        .hits
-                        .min(live),
-                    maybe: 0,
-                },
-            });
+            let bounds = estimate.name(test)?;
+            estimate.report("name", bounds);
         }
         for _ in &self.paths {
-            reports.push(NodeReport {
-                expression: "path".into(),
-                bounds: Bounds {
-                    possible: live,
-                    maybe: 0,
-                },
-            });
+            estimate.report("path", Bounds::all(live));
         }
         for _ in &self.meta {
-            reports.push(NodeReport {
-                expression: "metadata".into(),
-                bounds: Bounds {
-                    possible: live,
-                    maybe: 0,
-                },
-            });
+            estimate.report("metadata", Bounds::all(live));
         }
         let mut bounds = Bounds {
             possible: self.name_estimate(catalog, index)?.min(live),
             maybe: 0,
         };
         for tree in &self.residual {
-            bounds = bounds.and(node(tree, catalog, index, atoms, live, &mut reports)?);
+            bounds = bounds.and(estimate.node(tree)?);
         }
         let mut greps = Vec::new();
         for atom in &self.atoms {
@@ -1111,6 +1116,7 @@ impl Query {
                 greps.push(crate::grep::explain(grep, pinned, cancelled).map_err(RunError::Index)?);
             }
         }
+        let reports = estimate.reports;
         Ok(ContentPlan {
             root: bounds,
             nodes: reports,
