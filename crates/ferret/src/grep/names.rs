@@ -188,45 +188,12 @@ struct Listing<'a> {
     runtime: &'a Runtime<'a>,
 }
 impl Listing<'_> {
-    fn run(self, writer: &mut impl Write) -> Result<Exit, String> {
-        let Self {
-            plan,
-            selection,
-            inputs,
-            catalog,
-            live,
-            threads,
-            cwd,
-            runtime,
-        } = self;
+    fn run(mut self, writer: &mut impl Write) -> Result<Exit, String> {
+        let inputs = std::mem::take(&mut self.inputs);
+        let (plan, runtime) = (self.plan, self.runtime);
         let cancelled = runtime.cancelled;
-        let flush_each = plan.presentation.null || plan.traversal.live || runtime.tty;
-        for input in &inputs {
-            if let Input::Directory(path) = input
-                && let Some(anchors) = live.filter(|anchors| anchors.walks(path))
-            {
-                anchors
-                    .validate(path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-            }
-        }
-        if let Some(catalog) = catalog {
-            for input in &inputs {
-                if let Input::Directory(path) = input
-                    && !live.is_some_and(|anchors| anchors.walks(path))
-                    && let Some(Err(error)) =
-                        sources::Directory::new(path, Some(catalog), cwd, false, false)
-                            .map_err(|e| e.to_string())?
-                            .next(true)
-                {
-                    return Err(format!(
-                        "{}: {}; refresh the index with ferret index DIR, or use -u to search current files",
-                        error.path.display(),
-                        error.error
-                    ));
-                }
-            }
-        }
+        let flush_each = self.flush_each();
+        self.check_directories(&inputs)?;
         let mut errors = false;
         for input in &inputs {
             if let Input::Failed(path, error) = input {
@@ -248,151 +215,22 @@ impl Listing<'_> {
             if cancelled.load(Ordering::Acquire) {
                 break;
             }
-            match input {
-                Input::File(path, _) => {
-                    if emit(plan, writer, cancelled, &path, flush_each, &mut listed)? {
-                        return Ok(Exit::Ok);
-                    }
+            let closed = match input {
+                Input::File(path, _) | Input::Stream(path) => {
+                    emit(plan, writer, cancelled, &path, flush_each, &mut listed)?
                 }
-                Input::Stream(path) => {
-                    if emit(plan, writer, cancelled, &path, flush_each, &mut listed)? {
-                        return Ok(Exit::Ok);
-                    }
-                }
-                Input::Failed(_, _) => {}
-                Input::Directory(path) => {
-                    let stopped = || cancelled.load(Ordering::Acquire);
-                    let mut policy = live
-                        .as_ref()
-                        .filter(|anchors| anchors.walks(&path))
-                        .map(|anchors| anchors.start(&path, &stopped))
-                        .transpose()
-                        .map_err(|e| e.to_string())?;
-                    let mut source = sources::Directory::new(
-                        &path,
-                        catalog,
-                        cwd,
-                        plan.traversal.unrestricted,
-                        policy.is_some(),
-                    )
-                    .map_err(|e| e.to_string())?
-                    .following_links(plan.traversal.follow);
-                    let visibility = Visibility {
-                        selection: &selection,
-                        revealed: catalog.filter(|_| plan.traversal.rg),
-                        cwd,
-                        max_depth: plan.traversal.max_depth,
-                        content: false,
-                    };
-                    // A sort or `-q` needs every name, or only the first, in
-                    // walk order; anything else may list a live walk on
-                    // several workers.
-                    // A parallel listing that ran leaves the operand-boundary
-                    // flush below to order its names before the next operand's
-                    // warnings.
-                    'walk: {
-                        if threads > 1
-                            && listed.held.is_none()
-                            && !plan.quiet
-                            && let sources::Directory::Live(walk) = source
-                        {
-                            let parallel = parallel::Walk {
-                                plan,
-                                visibility: &visibility,
-                                threads,
-                                flush_each,
-                                cancelled,
-                            };
-                            match parallel.run(walk, policy.take(), writer, runtime)? {
-                                parallel::Listed::Done {
-                                    any,
-                                    errors: failed,
-                                } => {
-                                    listed.any |= any;
-                                    errors |= failed;
-                                    break 'walk;
-                                }
-                                parallel::Listed::Closed => return Ok(Exit::Ok),
-                                parallel::Listed::Refused(refused) => {
-                                    let (walk, refused) = *refused;
-                                    source = sources::Directory::Live(walk);
-                                    policy = refused;
-                                }
-                            }
-                        }
-                        let mut descend = true;
-                        while let Some(entry) =
-                            source.next_with_cancel(descend, &mut || Ok(()), &mut || {
-                                cancelled.load(Ordering::Acquire)
-                            })
-                        {
-                            descend = false;
-                            let entry = match entry {
-                                Ok(entry) => entry,
-                                Err(error) => {
-                                    if diagnostic(
-                                        writer,
-                                        runtime,
-                                        &format!("grep: {}: {}", error.path.display(), error.error),
-                                    )? {
-                                        return Ok(Exit::Ok);
-                                    }
-                                    errors = true;
-                                    continue;
-                                }
-                            };
-                            match visibility.select(entry, policy.as_mut(), &stopped) {
-                                Ok(Visit::Descend) => descend = true,
-                                Ok(Visit::File) => {
-                                    if emit(
-                                        plan,
-                                        writer,
-                                        cancelled,
-                                        entry.path(),
-                                        flush_each,
-                                        &mut listed,
-                                    )? {
-                                        return Ok(Exit::Ok);
-                                    }
-                                }
-                                Ok(Visit::Skip) => {}
-                                Err(refusal) => {
-                                    if diagnostic(
-                                        writer,
-                                        runtime,
-                                        &format!(
-                                            "grep: {}: {}",
-                                            refusal.path.display(),
-                                            refusal.error
-                                        ),
-                                    )? {
-                                        return Ok(Exit::Ok);
-                                    }
-                                    errors = true;
-                                }
-                            }
-                        }
-                    }
-                }
+                Input::Failed(_, _) => false,
+                Input::Directory(path) => self.walk(&path, writer, &mut listed, &mut errors)?,
+            };
+            if closed {
+                return Ok(Exit::Ok);
             }
             if !flush_each && let Some(error) = flush_output(writer, cancelled)? {
                 return Ok(error);
             }
         }
-        if let (Some(held), Some(sort)) = (listed.held.take(), plan.sort) {
-            let mut held: Vec<_> = modified(cwd, &held).into_iter().zip(held).collect();
-            // Stable, so equal times keep walk order both ways. No time
-            // sorts as the newest, as rg places `<stdin>`.
-            let key = |time: Option<SystemTime>| (time.is_none(), time);
-            match sort {
-                Sort::Oldest => held.sort_by_key(|&(time, _)| key(time)),
-                Sort::Newest => held.sort_by_key(|&(time, _)| Reverse(key(time))),
-            }
-            for (_, path) in held {
-                if emit(plan, writer, cancelled, &path, false, &mut listed)? {
-                    return Ok(Exit::Ok);
-                }
-            }
+        if self.emit_sorted(writer, &mut listed)? {
+            return Ok(Exit::Ok);
         }
         if let Some(exit) = flush_output(writer, cancelled)? {
             return Ok(exit);
@@ -404,6 +242,185 @@ impl Listing<'_> {
         } else {
             Exit::NoMatch
         })
+    }
+
+    fn flush_each(&self) -> bool {
+        self.plan.presentation.null || self.plan.traversal.live || self.runtime.tty
+    }
+
+    /// Refuses before any output when a live operand's anchors fail to
+    /// validate, or a catalogued operand's walk cannot start.
+    fn check_directories(&self, inputs: &[Input]) -> Result<(), String> {
+        let Self {
+            catalog, live, cwd, ..
+        } = *self;
+        for input in inputs {
+            if let Input::Directory(path) = input
+                && let Some(anchors) = live.filter(|anchors| anchors.walks(path))
+            {
+                anchors
+                    .validate(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+        }
+        if let Some(catalog) = catalog {
+            for input in inputs {
+                if let Input::Directory(path) = input
+                    && !live.is_some_and(|anchors| anchors.walks(path))
+                    && let Some(Err(error)) =
+                        sources::Directory::new(path, Some(catalog), cwd, false, false)
+                            .map_err(|e| e.to_string())?
+                            .next(true)
+                {
+                    return Err(format!(
+                        "{}: {}; refresh the index with ferret index DIR, or use -u to search current files",
+                        error.path.display(),
+                        error.error
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists one directory operand, on several workers when it may. Returns
+    /// whether the output closed.
+    fn walk(
+        &self,
+        path: &Path,
+        writer: &mut impl Write,
+        listed: &mut Listed,
+        errors: &mut bool,
+    ) -> Result<bool, String> {
+        let Self {
+            plan,
+            catalog,
+            live,
+            threads,
+            cwd,
+            runtime,
+            ..
+        } = *self;
+        let cancelled = runtime.cancelled;
+        let flush_each = self.flush_each();
+        let stopped = || cancelled.load(Ordering::Acquire);
+        let mut policy = live
+            .as_ref()
+            .filter(|anchors| anchors.walks(path))
+            .map(|anchors| anchors.start(path, &stopped))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let mut source = sources::Directory::new(
+            path,
+            catalog,
+            cwd,
+            plan.traversal.unrestricted,
+            policy.is_some(),
+        )
+        .map_err(|e| e.to_string())?
+        .following_links(plan.traversal.follow);
+        let visibility = Visibility {
+            selection: &self.selection,
+            revealed: catalog.filter(|_| plan.traversal.rg),
+            cwd,
+            max_depth: plan.traversal.max_depth,
+            content: false,
+        };
+        // A sort or `-q` needs every name, or only the first, in walk order;
+        // anything else may list a live walk on several workers. A parallel
+        // listing that ran leaves `run`'s operand-boundary flush to order its
+        // names before the next operand's warnings.
+        if threads > 1
+            && listed.held.is_none()
+            && !plan.quiet
+            && let sources::Directory::Live(walk) = source
+        {
+            let parallel = parallel::Walk {
+                plan,
+                visibility: &visibility,
+                threads,
+                flush_each,
+                cancelled,
+            };
+            match parallel.run(walk, policy.take(), writer, runtime)? {
+                parallel::Listed::Done {
+                    any,
+                    errors: failed,
+                } => {
+                    listed.any |= any;
+                    *errors |= failed;
+                    return Ok(false);
+                }
+                parallel::Listed::Closed => return Ok(true),
+                parallel::Listed::Refused(refused) => {
+                    let (walk, refused) = *refused;
+                    source = sources::Directory::Live(walk);
+                    policy = refused;
+                }
+            }
+        }
+        let mut descend = true;
+        while let Some(entry) = source.next_with_cancel(descend, &mut || Ok(()), &mut || {
+            cancelled.load(Ordering::Acquire)
+        }) {
+            descend = false;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if diagnostic(
+                        writer,
+                        runtime,
+                        &format!("grep: {}: {}", error.path.display(), error.error),
+                    )? {
+                        return Ok(true);
+                    }
+                    *errors = true;
+                    continue;
+                }
+            };
+            match visibility.select(entry, policy.as_mut(), &stopped) {
+                Ok(Visit::Descend) => descend = true,
+                Ok(Visit::File) => {
+                    if emit(plan, writer, cancelled, entry.path(), flush_each, listed)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(Visit::Skip) => {}
+                Err(refusal) => {
+                    if diagnostic(
+                        writer,
+                        runtime,
+                        &format!("grep: {}: {}", refusal.path.display(), refusal.error),
+                    )? {
+                        return Ok(true);
+                    }
+                    *errors = true;
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Lists the names a sort held. Returns whether the output closed.
+    fn emit_sorted(&self, writer: &mut impl Write, listed: &mut Listed) -> Result<bool, String> {
+        let (Some(held), Some(sort)) = (listed.held.take(), self.plan.sort) else {
+            return Ok(false);
+        };
+        let mut held: Vec<_> = modified(self.cwd, &held).into_iter().zip(held).collect();
+        // Stable, so equal times keep walk order both ways. No time sorts as
+        // the newest, as rg places `<stdin>`.
+        let key = |time: Option<SystemTime>| (time.is_none(), time);
+        match sort {
+            Sort::Oldest => held.sort_by_key(|&(time, _)| key(time)),
+            Sort::Newest => held.sort_by_key(|&(time, _)| Reverse(key(time))),
+        }
+        let cancelled = self.runtime.cancelled;
+        for (_, path) in held {
+            if emit(self.plan, writer, cancelled, &path, false, listed)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
