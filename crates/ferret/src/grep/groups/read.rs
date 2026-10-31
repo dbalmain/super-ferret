@@ -87,7 +87,21 @@ fn read_content(
     if binary {
         Ok(())
     } else {
-        each(&mut buffered, size)
+        each(&mut Probed(buffered), size)
+    }
+}
+
+/// The probed head, then the rest straight from the file. A consumer's reads
+/// are a little under the probe's capacity (its buffer less a carried partial
+/// line), so through `BufReader` every byte would be copied twice.
+struct Probed<R>(io::BufReader<R>);
+
+impl<R: Read> Read for Probed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.0.buffer().is_empty() {
+            true => self.0.get_mut().read(buf),
+            false => self.0.read(buf),
+        }
     }
 }
 
