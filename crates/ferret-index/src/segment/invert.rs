@@ -101,6 +101,18 @@ impl Inverter {
         self.terms.0.is_empty()
     }
 
+    /// Distinct terms held.
+    pub fn terms(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// Makes room for `terms` distinct terms, so filling a segment like the
+    /// last one does not rehash its way up. The estimate [`Inverter::is_full`]
+    /// reads is unchanged.
+    pub fn reserve(&mut self, terms: usize) {
+        self.terms.0.reserve(terms);
+    }
+
     /// Drains everything added into a [`Writer`] over `[first, last]`, which
     /// must contain every document added, and leaves the inverter empty.
     pub fn drain_into(&mut self, first: u32, last: u32) -> Result<Writer, WriteError> {

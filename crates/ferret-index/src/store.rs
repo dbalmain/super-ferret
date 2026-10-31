@@ -738,8 +738,12 @@ impl IndexWriter {
                     let number = manifest.next_number;
                     manifest.next_number += 1;
                     let full = std::mem::replace(&mut inverter, Inverter::new(budget.buffer));
+                    let held = full.terms();
                     let (terms, trigram_writer) =
                         drain_buffers((first, last), codec, full, trigrams)?;
+                    // The next segment is likely the size of this one, whose
+                    // table is gone now that it has drained.
+                    inverter.reserve(held);
                     let (dir, pace, docs) = (&dir, budget.pace, std::mem::take(&mut docs));
                     #[cfg(test)]
                     let inherit = seams();
