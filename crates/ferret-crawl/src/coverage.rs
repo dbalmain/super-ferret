@@ -586,7 +586,7 @@ pub(crate) fn resolve(
 /// edges. None refuses unrepresentable coverage before publishing anything.
 pub(crate) fn checkpoint_observations(
     session: &WriterSession,
-    mut batches: Vec<Batch>,
+    batches: Vec<Batch>,
     protection: &Protection,
     configured: &[PathBuf],
 ) -> Option<Vec<Batch>> {
@@ -616,121 +616,178 @@ pub(crate) fn checkpoint_observations(
         active: BTreeSet::new(),
         out: Protection::default(),
     };
-    let mut carried = session.checkpoint_batch(0);
-    let mut live = BTreeSet::new();
-    let mut coverage = BTreeMap::new();
-    let mut overridden: BTreeMap<DirToken, BTreeSet<Vec<u8>>> = BTreeMap::new();
-    let mut represented = BTreeSet::new();
+    let mut replay = Replay {
+        old: &old,
+        protection,
+        carried: session.checkpoint_batch(0),
+        live: BTreeSet::new(),
+        coverage: BTreeMap::new(),
+        overridden: BTreeMap::new(),
+        represented: BTreeSet::new(),
+    };
     while let Some(token) = queue.pop_front() {
+        if replay.visit(&mut resolver, token)? {
+            queue.extend(children.remove(&token).unwrap_or_default());
+        }
+    }
+    replay.fill_roots(&resolver.dirs, configured)?;
+    replay.check_represented()?;
+    drop(resolver);
+    drop(children);
+    Some(replay.apply(batches))
+}
+
+/// A checkpoint replay's state: the batch of old rows it carries, and per new
+/// token whether it is live, its coverage, and the old names it overrides.
+struct Replay<'a> {
+    old: &'a Catalog,
+    protection: &'a Protection,
+    carried: Batch,
+    live: BTreeSet<DirToken>,
+    coverage: BTreeMap<DirToken, Option<u64>>,
+    overridden: BTreeMap<DirToken, BTreeSet<Vec<u8>>>,
+    represented: BTreeSet<u32>,
+}
+
+impl Replay<'_> {
+    /// Replays directory `token`: copies a protected subtree whole, records
+    /// an opaque directory's coverage, or carries its protected old edges.
+    /// `Some(true)` when its children are to be replayed too; `None` refuses.
+    fn visit(&mut self, resolver: &mut Resolver<'_>, token: DirToken) -> Option<bool> {
+        let (old, protection) = (self.old, self.protection);
         let d = *resolver.dirs.get(&token)?;
         let parent = match d.parent {
-            Some(p) => live.contains(&p).then_some(Some(p))?,
+            Some(p) => self.live.contains(&p).then_some(Some(p))?,
             None => None,
         };
         if d.parent.is_some_and(|p| {
-            overridden
+            self.overridden
                 .get(&p)
                 .is_some_and(|names| names.contains(d.name))
         }) {
-            continue;
+            return Some(false);
         }
         if protection.tokens.contains(&token) {
             let id = resolver.directory(token)?;
             copy_subtree(
-                &old,
-                &mut carried,
+                old,
+                &mut self.carried,
                 id,
                 parent,
                 d.name,
                 d.revealed,
                 &protection.markers,
             )?;
-            represented.insert(id.0);
-            continue;
+            self.represented.insert(id.0);
+            return Some(false);
         }
-        live.insert(token);
+        self.live.insert(token);
         let opaque = protection.denied.contains(&token) || protection.opaque.contains(&token);
         if opaque {
-            coverage.insert(token, None);
-            continue;
+            self.coverage.insert(token, None);
+            return Some(false);
         }
         if let Some(id) = resolver.directory(token) {
             if protection.markers.contains(&id.0) {
-                coverage.insert(token, retained_sequence(&old, id));
+                self.coverage.insert(token, retained_sequence(old, id));
             }
             for name in old.children(id) {
                 let edge = old.name(name);
                 let retained_dir = matches!(edge.target(), ferret_catalog::Target::Inode(child) if old.is_directory(child) && protection.directories.contains(&child.0));
                 if protection.edges.contains(&name.0) || retained_dir {
-                    overridden
+                    self.overridden
                         .entry(token)
                         .or_default()
                         .insert(edge.bytes.to_vec());
-                    copy_edge(&old, &mut carried, token, name, &protection.markers)?;
-                    represented.insert(edge.child.0);
+                    copy_edge(old, &mut self.carried, token, name, &protection.markers)?;
+                    self.represented.insert(edge.child.0);
                 }
             }
         }
-        queue.extend(children.remove(&token).unwrap_or_default());
+        Some(true)
     }
-    // A failed root open can have no token. Only a checked old configured root
-    // is allowed to fill that absence; new unanchored roots abort.
-    for root in configured {
-        if !resolver
-            .dirs
-            .values()
-            .any(|d| d.parent.is_none() && d.name == root.as_os_str().as_bytes())
-        {
-            let (id, path) = old
-                .roots()
-                .find(|(_, path)| *path == root.as_os_str().as_bytes())?;
-            if !protection.directories.contains(&id.0) {
-                return None;
+
+    /// A failed root open can have no token. Only a checked old configured
+    /// root is allowed to fill that absence; new unanchored roots abort.
+    fn fill_roots(
+        &mut self,
+        dirs: &BTreeMap<DirToken, DirectoryObservation<'_>>,
+        configured: &[PathBuf],
+    ) -> Option<()> {
+        for root in configured {
+            if !dirs
+                .values()
+                .any(|d| d.parent.is_none() && d.name == root.as_os_str().as_bytes())
+            {
+                let (id, path) = self
+                    .old
+                    .roots()
+                    .find(|(_, path)| *path == root.as_os_str().as_bytes())?;
+                if !self.protection.directories.contains(&id.0) {
+                    return None;
+                }
+                copy_subtree(
+                    self.old,
+                    &mut self.carried,
+                    id,
+                    None,
+                    path,
+                    false,
+                    &self.protection.markers,
+                )?;
+                self.represented.insert(id.0);
             }
-            copy_subtree(
-                &old,
-                &mut carried,
-                id,
-                None,
-                path,
-                false,
-                &protection.markers,
-            )?;
-            represented.insert(id.0);
         }
+        Some(())
     }
-    for &id in &protection.directories {
-        let mut dir = InoId(id);
-        while !represented.contains(&dir.0) {
-            dir = old.name(old.dir_name(dir)?).parent;
+
+    /// Every protected directory has a represented ancestor, or is one.
+    fn check_represented(&self) -> Option<()> {
+        for &id in &self.protection.directories {
+            let mut dir = InoId(id);
+            while !self.represented.contains(&dir.0) {
+                dir = self.old.name(self.old.dir_name(dir)?).parent;
+            }
         }
+        Some(())
     }
-    drop(resolver);
-    drop(children);
-    let mut mapping: BTreeMap<_, _> = batches
-        .iter()
-        .flat_map(|batch| batch.checkpoint_tokens(|token| live.contains(&token)))
-        .collect();
-    mapping.extend(carried.checkpoint_tokens(|_| true));
-    for batch in &mut batches {
-        batch.checkpoint_coverage(&coverage);
-        batch.retain_checkpoint(&mapping, |parent, name| {
-            !protection.denied.contains(&parent)
-                && !protection.opaque.contains(&parent)
-                && !overridden
-                    .get(&parent)
-                    .is_some_and(|names| names.contains(name))
-        });
+
+    /// Maps the replay onto `batches`, then appends the carried batch when it
+    /// holds anything.
+    fn apply(self, mut batches: Vec<Batch>) -> Vec<Batch> {
+        let Self {
+            protection,
+            mut carried,
+            live,
+            coverage,
+            overridden,
+            ..
+        } = self;
+        let mut mapping: BTreeMap<_, _> = batches
+            .iter()
+            .flat_map(|batch| batch.checkpoint_tokens(|token| live.contains(&token)))
+            .collect();
+        mapping.extend(carried.checkpoint_tokens(|_| true));
+        for batch in &mut batches {
+            batch.checkpoint_coverage(&coverage);
+            batch.retain_checkpoint(&mapping, |parent, name| {
+                !protection.denied.contains(&parent)
+                    && !protection.opaque.contains(&parent)
+                    && !overridden
+                        .get(&parent)
+                        .is_some_and(|names| names.contains(name))
+            });
+        }
+        carried.retain_checkpoint(&mapping, |_, _| true);
+        carried.seal();
+        if carried.directories().next().is_some()
+            || carried.file_count() > 0
+            || carried.ignored_entries().next().is_some()
+        {
+            batches.push(carried);
+        }
+        batches
     }
-    carried.retain_checkpoint(&mapping, |_, _| true);
-    carried.seal();
-    if carried.directories().next().is_some()
-        || carried.file_count() > 0
-        || carried.ignored_entries().next().is_some()
-    {
-        batches.push(carried);
-    }
-    Some(batches)
 }
 
 fn retained_sequence(old: &Catalog, id: InoId) -> Option<u64> {
