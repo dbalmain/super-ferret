@@ -251,162 +251,228 @@ pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::R
     let (bytes, len) = head.encode();
     crate::bulk::write_at(out, &bytes, 0)?;
     let layout = format::decode_table(&bytes, len).map_err(io::Error::other)?;
-    let column = |c: Column| ColumnWriter::start(out, &layout, c, &dicts[c as usize]);
-    let section = |s: Section| At::new(out, layout.range(s).0 as u64);
-    let (mut parents, mut children, mut offsets) = (
-        column(Column::NameParent)?,
-        column(Column::NameChild)?,
-        column(Column::NameOffset)?,
-    );
-    let mut heap = section(Section::NameHeap);
-    // Names are renumbered in this order, so the new ids rise.
-    let mut revealed = section(Section::Revealed);
-    let mut new_name = 0u32;
-    let mut offset = 0;
-    for (parent, &dir) in plan.order[..plan.dirs].iter().enumerate() {
-        for id in view.children(dir) {
-            let name = view.name(id);
-            if view.is_revealed(id) {
-                format::put_u32(&mut revealed, new_name)?;
-            }
-            new_name += 1;
-            parents.value(parent as u64)?;
-            children.value(u64::from(plan.child(name.target())))?;
-            offsets.value(offset)?;
-            heap.write_all(name.bytes)?;
-            heap.write_all(&[0])?;
-            offset += name.bytes.len() as u64 + 1;
-        }
-    }
-    parents.finish()?;
-    children.finish()?;
-    offsets.finish()?;
-    heap.finish()?;
-    revealed.finish()?;
-    let (mut names, mut entries, mut retained) = (
-        column(Column::DirName)?,
-        column(Column::Entries)?,
-        column(Column::RetainedAt)?,
-    );
-    let (mut traversed, mut bits) = (section(Section::Traversed), Bits::new(1));
-    for (row, &dir) in plan.order[..plan.dirs].iter().enumerate() {
-        names.nullable((plan.dir_names[row] != NONE).then_some(u64::from(plan.dir_names[row])))?;
-        entries.nullable(view.entry_count(dir).map(u64::from))?;
-        retained.nullable(view.retained_at(dir))?;
-        bits.push(&mut traversed, u8::from(view.is_traversed(dir)))?;
-    }
-    names.finish()?;
-    entries.finish()?;
-    retained.finish()?;
-    bits.finish(&mut traversed)?;
-    if head.lens[Section::Traversed as usize] > plan.dirs.div_ceil(8) as u64 {
-        let mut suppressed = Bits::new(1);
-        for &dir in &plan.order[..plan.dirs] {
-            suppressed.push(&mut traversed, u8::from(view.is_search_suppressed(dir)))?;
-        }
-        suppressed.finish(&mut traversed)?;
-    }
-    traversed.finish()?;
+    let file = Output {
+        file: out,
+        layout,
+        dicts,
+    };
+    plan.write_names(view, &file)?;
+    plan.write_dirs(view, &file, head.lens[Section::Traversed as usize])?;
     plan.dir_names = Vec::new();
-
-    let (mut roots, mut links, mut specials, mut trees, mut strings) = (
-        section(Section::Roots),
-        section(Section::Links),
-        section(Section::Specials),
-        section(Section::WorkTrees),
-        section(Section::Strings),
-    );
-    let mut offset = 0u32;
-    let root_paths: std::collections::BTreeMap<_, _> = view.roots().collect();
-    for &old in &plan.roots {
-        let path = root_paths
-            .get(&old)
-            .ok_or_else(|| invalid("missing root"))?;
-        format::put_pair(&mut roots, plan.remap[old.0 as usize], offset)?;
-        strings.write_all(path)?;
-        strings.write_all(&[0])?;
-        offset += path.len() as u32 + 1;
-    }
-    for (new, &old) in plan.order.iter().enumerate() {
-        match view.kind(old) {
-            Kind::Symlink => {
-                let target = view
-                    .link_target(old)
-                    .ok_or_else(|| invalid("missing link target"))?;
-                format::put_pair(&mut links, new as u32, offset)?;
-                strings.write_all(target)?;
-                strings.write_all(&[0])?;
-                offset += target.len() as u32 + 1;
-            }
-            Kind::Dir | Kind::File => {}
-            kind => format::put_pair(&mut specials, new as u32, kind as u32)?,
-        }
-    }
-    for &old in &plan.work_trees {
-        let row = view
-            .work_tree(old)
-            .ok_or_else(|| invalid("missing work tree"))?;
-        format::put_work_tree(
-            &mut trees,
-            plan.remap[old.0 as usize],
-            offset,
-            row.common_id,
-            row.kind as u8,
-        )?;
-        strings.write_all(row.common_dir)?;
-        strings.write_all(&[0])?;
-        offset += row.common_dir.len() as u32 + 1;
-    }
-    roots.finish()?;
-    links.finish()?;
-    specials.finish()?;
-    trees.finish()?;
-    strings.finish()?;
+    plan.write_strings(view, &file)?;
     plan.remap = Vec::new();
-    let mut stat_columns: Vec<_> = STAT_COLUMNS
-        .into_iter()
-        .map(|field| column(field).map(|writer| (field, writer)))
-        .collect::<io::Result<_>>()?;
-    let (mut doc, mut states, mut bits) =
-        (column(Column::Doc)?, section(Section::States), Bits::new(2));
-    for &old in &plan.order {
-        let inode = view.inode(old);
-        for (field, writer) in &mut stat_columns {
-            let value = stat_field(*field, &inode.stat);
-            match field.coding() {
-                Coding::Dictionary => {
-                    writer.index(dicts[*field as usize].partition_point(|&known| known < value))?
-                }
-                _ => writer.value(value)?,
-            }
-        }
-        doc.nullable(inode.doc.map(|id| u64::from(id.0)))?;
-        bits.push(&mut states, inode.state as u8)?;
-    }
-    for (_, writer) in stat_columns {
-        writer.finish()?;
-    }
-    doc.finish()?;
-    bits.finish(&mut states)?;
-    states.finish()?;
+    plan.write_inodes(view, &file)?;
     plan.order = Vec::new();
-    let mut ids = column(Column::DocId)?;
-    let mut hashes = At::new(out, (layout.range(Section::Docs).0 + layout.hashes) as u64);
-    let mut refs = section(Section::DocRefs);
-    for (&id, count) in plan.docs.iter().zip(plan.refs) {
-        ids.value(u64::from(id.0))?;
-        hashes.write_all(
-            &view
-                .doc_hash(id)
-                .ok_or_else(|| invalid("missing document hash"))?,
-        )?;
-        format::put_u32(&mut refs, count)?;
-    }
-    ids.finish()?;
-    hashes.finish()?;
-    refs.finish()?;
-    let mut policy = section(Section::Policy);
+    plan.write_docs(view, &file)?;
+    let mut policy = file.section(Section::Policy);
     policy.write_all(&view.policy())?;
     policy.finish()?;
     format::seal(out)
+}
+
+/// The file `write` fills, placed by the head it wrote first.
+struct Output<'f> {
+    file: &'f File,
+    layout: format::Layout,
+    dicts: [Vec<u64>; COLUMNS.len()],
+}
+
+impl<'f> Output<'f> {
+    fn column(&self, column: Column) -> io::Result<ColumnWriter<'f>> {
+        ColumnWriter::start(
+            self.file,
+            &self.layout,
+            column,
+            &self.dicts[column as usize],
+        )
+    }
+
+    fn section(&self, section: Section) -> At<'f> {
+        At::new(self.file, self.layout.range(section).0 as u64)
+    }
+}
+
+impl Plan {
+    /// The name rows, in directory order, with the name heap and the
+    /// revealed list.
+    fn write_names(&self, view: &Catalog, out: &Output) -> io::Result<()> {
+        let (mut parents, mut children, mut offsets) = (
+            out.column(Column::NameParent)?,
+            out.column(Column::NameChild)?,
+            out.column(Column::NameOffset)?,
+        );
+        let mut heap = out.section(Section::NameHeap);
+        // Names are renumbered in this order, so the new ids rise.
+        let mut revealed = out.section(Section::Revealed);
+        let mut new_name = 0u32;
+        let mut offset = 0;
+        for (parent, &dir) in self.order[..self.dirs].iter().enumerate() {
+            for id in view.children(dir) {
+                let name = view.name(id);
+                if view.is_revealed(id) {
+                    format::put_u32(&mut revealed, new_name)?;
+                }
+                new_name += 1;
+                parents.value(parent as u64)?;
+                children.value(u64::from(self.child(name.target())))?;
+                offsets.value(offset)?;
+                heap.write_all(name.bytes)?;
+                heap.write_all(&[0])?;
+                offset += name.bytes.len() as u64 + 1;
+            }
+        }
+        parents.finish()?;
+        children.finish()?;
+        offsets.finish()?;
+        heap.finish()?;
+        revealed.finish()?;
+        Ok(())
+    }
+
+    /// The directory columns and the traversed (and search-suppressed) bits.
+    fn write_dirs(&self, view: &Catalog, out: &Output, traversed_len: u64) -> io::Result<()> {
+        let (mut names, mut entries, mut retained) = (
+            out.column(Column::DirName)?,
+            out.column(Column::Entries)?,
+            out.column(Column::RetainedAt)?,
+        );
+        let (mut traversed, mut bits) = (out.section(Section::Traversed), Bits::new(1));
+        for (row, &dir) in self.order[..self.dirs].iter().enumerate() {
+            names.nullable(
+                (self.dir_names[row] != NONE).then_some(u64::from(self.dir_names[row])),
+            )?;
+            entries.nullable(view.entry_count(dir).map(u64::from))?;
+            retained.nullable(view.retained_at(dir))?;
+            bits.push(&mut traversed, u8::from(view.is_traversed(dir)))?;
+        }
+        names.finish()?;
+        entries.finish()?;
+        retained.finish()?;
+        bits.finish(&mut traversed)?;
+        if traversed_len > self.dirs.div_ceil(8) as u64 {
+            let mut suppressed = Bits::new(1);
+            for &dir in &self.order[..self.dirs] {
+                suppressed.push(&mut traversed, u8::from(view.is_search_suppressed(dir)))?;
+            }
+            suppressed.finish(&mut traversed)?;
+        }
+        traversed.finish()?;
+        Ok(())
+    }
+
+    /// Roots, symlink targets, specials and work trees, which share the
+    /// strings section.
+    fn write_strings(&self, view: &Catalog, out: &Output) -> io::Result<()> {
+        let (mut roots, mut links, mut specials, mut trees, mut strings) = (
+            out.section(Section::Roots),
+            out.section(Section::Links),
+            out.section(Section::Specials),
+            out.section(Section::WorkTrees),
+            out.section(Section::Strings),
+        );
+        let mut offset = 0u32;
+        let root_paths: std::collections::BTreeMap<_, _> = view.roots().collect();
+        for &old in &self.roots {
+            let path = root_paths
+                .get(&old)
+                .ok_or_else(|| invalid("missing root"))?;
+            format::put_pair(&mut roots, self.remap[old.0 as usize], offset)?;
+            strings.write_all(path)?;
+            strings.write_all(&[0])?;
+            offset += path.len() as u32 + 1;
+        }
+        for (new, &old) in self.order.iter().enumerate() {
+            match view.kind(old) {
+                Kind::Symlink => {
+                    let target = view
+                        .link_target(old)
+                        .ok_or_else(|| invalid("missing link target"))?;
+                    format::put_pair(&mut links, new as u32, offset)?;
+                    strings.write_all(target)?;
+                    strings.write_all(&[0])?;
+                    offset += target.len() as u32 + 1;
+                }
+                Kind::Dir | Kind::File => {}
+                kind => format::put_pair(&mut specials, new as u32, kind as u32)?,
+            }
+        }
+        for &old in &self.work_trees {
+            let row = view
+                .work_tree(old)
+                .ok_or_else(|| invalid("missing work tree"))?;
+            format::put_work_tree(
+                &mut trees,
+                self.remap[old.0 as usize],
+                offset,
+                row.common_id,
+                row.kind as u8,
+            )?;
+            strings.write_all(row.common_dir)?;
+            strings.write_all(&[0])?;
+            offset += row.common_dir.len() as u32 + 1;
+        }
+        roots.finish()?;
+        links.finish()?;
+        specials.finish()?;
+        trees.finish()?;
+        strings.finish()?;
+        Ok(())
+    }
+
+    /// The inode stat columns, document bindings and states.
+    fn write_inodes(&self, view: &Catalog, out: &Output) -> io::Result<()> {
+        let mut stat_columns: Vec<_> = STAT_COLUMNS
+            .into_iter()
+            .map(|field| out.column(field).map(|writer| (field, writer)))
+            .collect::<io::Result<_>>()?;
+        let (mut doc, mut states, mut bits) = (
+            out.column(Column::Doc)?,
+            out.section(Section::States),
+            Bits::new(2),
+        );
+        for &old in &self.order {
+            let inode = view.inode(old);
+            for (field, writer) in &mut stat_columns {
+                let value = stat_field(*field, &inode.stat);
+                match field.coding() {
+                    Coding::Dictionary => writer.index(
+                        out.dicts[*field as usize].partition_point(|&known| known < value),
+                    )?,
+                    _ => writer.value(value)?,
+                }
+            }
+            doc.nullable(inode.doc.map(|id| u64::from(id.0)))?;
+            bits.push(&mut states, inode.state as u8)?;
+        }
+        for (_, writer) in stat_columns {
+            writer.finish()?;
+        }
+        doc.finish()?;
+        bits.finish(&mut states)?;
+        states.finish()?;
+        Ok(())
+    }
+
+    /// Document ids, hashes and reference counts.
+    fn write_docs(&self, view: &Catalog, out: &Output) -> io::Result<()> {
+        let mut ids = out.column(Column::DocId)?;
+        let mut hashes = At::new(
+            out.file,
+            (out.layout.range(Section::Docs).0 + out.layout.hashes) as u64,
+        );
+        let mut refs = out.section(Section::DocRefs);
+        for (&id, &count) in self.docs.iter().zip(&self.refs) {
+            ids.value(u64::from(id.0))?;
+            hashes.write_all(
+                &view
+                    .doc_hash(id)
+                    .ok_or_else(|| invalid("missing document hash"))?,
+            )?;
+            format::put_u32(&mut refs, count)?;
+        }
+        ids.finish()?;
+        hashes.finish()?;
+        refs.finish()?;
+        Ok(())
+    }
 }
