@@ -106,45 +106,40 @@ pub fn stream<R: ReadAt>(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Sizes, Error> {
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();
-    // Each input's current entry; the heap orders (term, input), so equal
-    // terms pop in input order, which is range order.
+    // Each input's current term and entry, `None` once it is exhausted. The
+    // buffers are reused, so stepping a cursor allocates nothing.
+    let mut terms: Vec<Vec<u8>> = vec![Vec::new(); inputs.len()];
     let mut entries: Vec<Option<TermEntry>> = vec![None; inputs.len()];
-    let mut heap = BinaryHeap::new();
     for (i, cursor) in cursors.iter_mut().enumerate() {
-        if let Some((term, entry)) = next(cursor)? {
-            entries[i] = Some(entry);
-            heap.push(Reverse((term, i)));
-        }
+        entries[i] = next(cursor, &mut terms[i])?;
     }
-    let (mut docs, mut list) = (Vec::new(), Vec::new());
+    // Orders inputs by (term, input), exhausted last, so equal terms win in
+    // input order, which is range order. An exhausted input's term is stale.
+    let before = |entries: &[Option<TermEntry>], terms: &[Vec<u8>], a: usize, b: usize| {
+        (entries[a].is_none(), &terms[a], a) < (entries[b].is_none(), &terms[b], b)
+    };
+    let mut tournament = Tournament::new(inputs.len(), |a, b| before(&entries, &terms, a, b));
+    let (mut term, mut docs, mut list) = (Vec::new(), Vec::new(), Vec::new());
     let mut midway = false;
-    while let Some(Reverse((term, i))) = heap.pop() {
+    while let Some(Some(_)) = entries.get(tournament.winner) {
         if cancelled() {
             return Err(Error::Cancelled);
         }
+        term.clear();
+        term.extend_from_slice(&terms[tournament.winner]);
         docs.clear();
-        let mut taken = vec![i];
-        while heap
-            .peek()
-            .is_some_and(|Reverse((other, _))| *other == term)
-        {
-            if let Some(Reverse((_, j))) = heap.pop() {
-                taken.push(j);
-            }
-        }
-        for &j in &taken {
-            let Some(entry) = entries[j].take() else {
-                continue;
+        loop {
+            let j = tournament.winner;
+            let Some(entry) = entries[j].filter(|_| terms[j] == term) else {
+                break;
             };
             match cursors[j].read(&entry)? {
                 Hit::Single(doc) => list.push(doc),
                 Hit::Postings(postings) => postings.decode(&mut list),
             }
             docs.extend(list.drain(..).filter(|&doc| live.contains(doc)));
-            if let Some((term, entry)) = next(&mut cursors[j])? {
-                entries[j] = Some(entry);
-                heap.push(Reverse((term, j)));
-            }
+            entries[j] = next(&mut cursors[j], &mut terms[j])?;
+            tournament.replay(j, |a, b| before(&entries, &terms, a, b));
         }
         if !docs.is_empty() {
             writer.push(&term, &docs)?;
@@ -187,15 +182,109 @@ pub fn stream<R: ReadAt>(
     Ok(sizes)
 }
 
-fn next<R: ReadAt>(cursor: &mut Terms<'_, R>) -> Result<Option<(Vec<u8>, TermEntry)>, ReadError> {
-    Ok(cursor
-        .next_term()?
-        .map(|(term, entry)| (term.to_vec(), entry)))
+/// Steps `cursor`, copying its term into `term`; `None` once it is done.
+fn next<R: ReadAt>(
+    cursor: &mut Terms<'_, R>,
+    term: &mut Vec<u8>,
+) -> Result<Option<TermEntry>, ReadError> {
+    Ok(cursor.next_term()?.map(|(bytes, entry)| {
+        term.clear();
+        term.extend_from_slice(bytes);
+        entry
+    }))
+}
+
+/// A loser tree over `k` inputs: `winner` is the input first in the order
+/// `before` gives, and replaying after it changes costs one comparison a
+/// level, where a heap pays a pop and a push.
+///
+/// Nodes `1..k` are internal, each holding the input that lost there;
+/// inputs are the leaves `k..2k`, input `i` at `k + i`.
+struct Tournament {
+    losers: Vec<usize>,
+    winner: usize,
+}
+
+impl Tournament {
+    fn new(k: usize, before: impl Fn(usize, usize) -> bool) -> Self {
+        fn play(
+            node: usize,
+            k: usize,
+            losers: &mut [usize],
+            before: &impl Fn(usize, usize) -> bool,
+        ) -> usize {
+            if node >= k {
+                return node - k;
+            }
+            let (a, b) = (
+                play(2 * node, k, losers, before),
+                play(2 * node + 1, k, losers, before),
+            );
+            let (winner, loser) = if before(b, a) { (b, a) } else { (a, b) };
+            losers[node] = loser;
+            winner
+        }
+        let mut losers = vec![0; k];
+        let winner = if k > 1 {
+            play(1, k, &mut losers, &before)
+        } else {
+            0
+        };
+        Self { losers, winner }
+    }
+
+    /// Re-runs `input`'s matches up to the root after it changed.
+    fn replay(&mut self, input: usize, before: impl Fn(usize, usize) -> bool) {
+        let mut winner = input;
+        let mut node = (self.losers.len() + input) / 2;
+        while node > 0 {
+            if before(self.losers[node], winner) {
+                std::mem::swap(&mut self.losers[node], &mut winner);
+            }
+            node /= 2;
+        }
+        self.winner = winner;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tournament_drains_in_key_then_input_order() {
+        // Every k up to 13, so trees that are not powers of two are
+        // covered; few distinct keys, so ties between inputs are common.
+        for k in 1..=13 {
+            let mut keys: Vec<Vec<u32>> = (0..k)
+                .map(|i| (0..5).map(|j| ((i * 7 + j * 3) % 4) as u32).collect())
+                .collect();
+            for list in &mut keys {
+                list.sort_unstable();
+            }
+            let mut at = vec![0; k];
+            let key = |at: &[usize], i: usize| keys[i].get(at[i]).copied();
+            let before = |at: &[usize], a: usize, b: usize| {
+                let (x, y) = (key(at, a), key(at, b));
+                (x.is_none(), x, a) < (y.is_none(), y, b)
+            };
+            let mut tournament = Tournament::new(k, |a, b| before(&at, a, b));
+            let mut drained = Vec::new();
+            while let Some(value) = key(&at, tournament.winner) {
+                drained.push((value, tournament.winner));
+                at[tournament.winner] += 1;
+                let winner = tournament.winner;
+                tournament.replay(winner, |a, b| before(&at, a, b));
+            }
+            let mut expected: Vec<(u32, usize)> = keys
+                .iter()
+                .enumerate()
+                .flat_map(|(i, list)| list.iter().map(move |&value| (value, i)))
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(drained, expected, "k = {k}");
+        }
+    }
 
     #[test]
     fn keyed_versions_survive_ordinary_and_full_spilling_merges() {
