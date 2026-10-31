@@ -176,6 +176,26 @@ impl GrepSelection {
         })
     }
 
+    /// Whether a file named `name` is left out wherever it lies, by the
+    /// globs and types alone. False unless [`Self::whitelists_names`], under
+    /// which hidden filtering never decides: a name is admitted by a match
+    /// or rejected for want of one.
+    pub fn rejects_name(&self, name: &[u8]) -> bool {
+        self.whitelists_names() && !self.allows_components(&[name], true)
+    }
+
+    /// Whether the globs and types admit only the files they match, judging
+    /// each by its name alone: some `-g` or `-t` admits, and no glob reads
+    /// more of the path than its last component. Exclusions alone are not
+    /// counted; they reject too few names to repay judging every one.
+    pub fn whitelists_names(&self) -> bool {
+        (self.positive || self.typed)
+            && self
+                .rules
+                .iter()
+                .all(|(_, alternatives)| alternatives.iter().all(Pattern::is_shared_basename))
+    }
+
     fn allows_components(&self, components: &[&[u8]], hidden: bool) -> bool {
         let name = components.last().copied().unwrap_or_default();
         self.decision(components, false).unwrap_or_else(|| {
@@ -511,6 +531,64 @@ mod tests {
                         "descend {:?} depth {depth} hidden {hidden}",
                         path.escape_ascii().to_string(),
                     );
+                }
+            }
+        }
+    }
+
+    /// A name rejected alone is rejected at every path and under every
+    /// walk, whitelisted or not. The discriminating rows: `src/*.toml`
+    /// reads a directory, so `a.toml` is not rejected by name though no
+    /// glob matches it alone; `**/*.toml` reads only the name; an exclusion
+    /// alone rejects nothing by name, but beside `-t` it does.
+    #[test]
+    fn a_name_rejected_alone_is_rejected_everywhere() {
+        // Globs, types, names rejected, names kept.
+        type Row<'a> = (&'a [&'a str], &'a [&'a str], &'a [&'a str], &'a [&'a str]);
+        let rows: &[Row] = &[
+            (&["*.toml"], &[], &["a.rs", "toml"], &["a.toml", ".a.toml"]),
+            (
+                &["*.toml", "!Cargo.toml"],
+                &[],
+                &["Cargo.toml", "a.rs"],
+                &["a.toml"],
+            ),
+            (&["**/*.toml"], &[], &["a.rs"], &["a.toml"]),
+            (&["!*.lock"], &[], &[], &["a.lock", "a.rs", ".a"]),
+            (&["!*.lock"], &["rust"], &["a.lock", "a.toml"], &["a.rs"]),
+            (&["src/*.toml"], &[], &[], &["a.toml", "a.rs"]),
+            (&["*.toml", "!src/a.toml"], &[], &[], &["a.toml", "a.rs"]),
+            (&[], &["rust"], &["a.toml", ".a"], &["a.rs", ".a.rs"]),
+            (&[], &[], &[], &["a.rs", ".a"]),
+        ];
+        let dirs: &[&[u8]] = &[b"", b"src/", b"x/src/", b".h/", b"a/.b/src/"];
+        for (globs, types, rejected, kept) in rows {
+            let mut selection = GrepSelection::default();
+            for glob in *globs {
+                selection.push(glob).unwrap();
+            }
+            for name in *types {
+                selection.push_type(name, true).unwrap();
+            }
+            for name in *rejected {
+                assert!(selection.rejects_name(name.as_bytes()), "{globs:?} {name}");
+            }
+            for name in *kept {
+                assert!(!selection.rejects_name(name.as_bytes()), "{globs:?} {name}");
+            }
+            for name in rejected.iter().chain(*kept) {
+                if !selection.rejects_name(name.as_bytes()) {
+                    continue;
+                }
+                for dir in dirs {
+                    let path = [*dir, name.as_bytes()].concat();
+                    for hidden in [false, true] {
+                        let selection = selection.clone().with_hidden(hidden);
+                        assert!(!selection.allows(&path), "{globs:?} {path:?}");
+                        for whitelisted in [false, true] {
+                            assert!(!selection.selects(&path, &path, 3, false, whitelisted));
+                        }
+                    }
                 }
             }
         }

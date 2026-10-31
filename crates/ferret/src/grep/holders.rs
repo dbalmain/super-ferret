@@ -5,11 +5,13 @@
 
 use super::groups::Candidates;
 use ferret_catalog::{Catalog, Contents, InoId, NameId, OpenError, Section, Target};
+use ferret_policy::GrepSelection;
 use std::os::unix::ffi::OsStrExt;
 
 /// Directories whose subtree holds a name the walk can yield a job for.
 /// Every other catalogued directory is left unlisted. Their files would each
-/// be dropped by [`Filter`](super::groups::Filter) as a non-candidate, and
+/// be dropped by [`Filter`](super::groups::Filter) as a non-candidate, or by
+/// the walk's selection for a name its globs and types reject, and
 /// they hold no directory listed live, so skipping them changes only which
 /// files count as searched (D99), which the caller settles separately.
 pub(super) struct Holders {
@@ -21,7 +23,8 @@ const NO_PARENT: u32 = u32::MAX;
 
 impl Holders {
     /// One pass over the catalog's names, a run at a time. Holds the
-    /// directory of each candidate document's names; of each file the index
+    /// directory of each candidate document's names that `selection` does
+    /// not reject by name alone; of each file the index
     /// cannot vouch for (oversized, or binary under `text`), which is
     /// searched live; and each directory or root whose contents are not
     /// catalogued, which the walk lists live or reports as unreadable. Then
@@ -29,6 +32,7 @@ impl Holders {
     pub fn new(
         catalog: &Catalog,
         candidates: &dyn Candidates,
+        selection: &GrepSelection,
         text: bool,
         stopped: &dyn Fn() -> bool,
     ) -> Result<Option<Self>, OpenError> {
@@ -53,7 +57,7 @@ impl Holders {
                 continue;
             };
             if let Some(doc) = catalog.doc(inode) {
-                if candidates.contains(doc.0, stopped) {
+                if candidates.contains(doc.0, stopped) && !selection.rejects_name(name.bytes) {
                     held.push(name.parent);
                 }
             } else if catalog.is_directory(inode) {

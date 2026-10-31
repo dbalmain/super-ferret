@@ -796,8 +796,10 @@ fn a_positive_glob_reveals_ignored_files_under_rg() {
 // It must still reach every name of a hard-linked candidate, a nested root,
 // and the files the index cannot vouch for: one over the size cap, and a
 // binary one under `-a`. With no path, D99 still finds the files below the
-// directories it skipped: `-t md` with no match exits 1, not 2. (A positive
-// `-g` walks live under `--rg`, so it never prunes.)
+// directories it skipped: `-t md` with no match exits 1, not 2. Under `-t`
+// a name the globs and types reject is not held, though every document is a
+// candidate, and the type still admits the held hidden `.dot.txt`. (A
+// positive `-g` walks live under `--rg`, so it never prunes.)
 #[test]
 fn a_pruned_walk_still_reaches_what_it_must() {
     let fixture = Fixture::new("pruned-walk");
@@ -817,6 +819,7 @@ fn a_pruned_walk_still_reaches_what_it_must() {
     );
     fixture.write("binary/deep/blob", b"\0\0zebra\n");
     fixture.write("nested/root/inner.txt", b"zebra\n");
+    fixture.write("hid/deep/.dot.txt", b"zebra\n");
     assert!(fixture.ferret(&["index", "."], None).status.success());
     assert!(
         fixture
@@ -836,6 +839,13 @@ fn a_pruned_walk_still_reaches_what_it_must() {
     assert_eq!(none.status.code(), Some(1), "{none:?}");
     let excluded = fixture.compare(&["-l", "-t", "c", "zebra"], None);
     assert_eq!(excluded.status.code(), Some(2), "{excluded:?}");
+    let typed = fixture.compare(&["-l", "-t", "txt", "-g", "!needle.txt", "zebra"], None);
+    let typed = String::from_utf8(typed.stdout).unwrap();
+    assert!(
+        typed.contains(".dot.txt") && !typed.contains("needle"),
+        "{typed}"
+    );
+    fixture.compare(&["-c", "-t", "txt", "e"], None);
 }
 
 // A nested root indexed while unreadable has no name row and no catalogued

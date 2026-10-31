@@ -399,12 +399,21 @@ impl Execution<'_> {
         {
             return runtime.failure(&error.to_string());
         }
-        // Past one candidate a document, every directory may hold one.
+        // Past one candidate a document, every directory may hold one,
+        // unless the globs and types admit files by name.
         let holders = match candidates.as_ref().zip(pin).filter(|(candidates, pin)| {
-            prune && candidates.bound() < u64::from(pin.catalog().doc_count())
+            prune
+                && (candidates.bound() < u64::from(pin.catalog().doc_count())
+                    || selection.whitelists_names())
         }) {
             Some((candidates, pin)) => {
-                match holders::Holders::new(pin.catalog(), candidates, plan.text, &stopped) {
+                match holders::Holders::new(
+                    pin.catalog(),
+                    candidates,
+                    selection,
+                    plan.text,
+                    &stopped,
+                ) {
                     Ok(holders) => holders,
                     Err(error) => return runtime.failure(&error.to_string()),
                 }
