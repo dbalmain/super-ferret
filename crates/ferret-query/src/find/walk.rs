@@ -214,6 +214,13 @@ impl Entry {
         catalog.lookup(parent, self.name())
     }
 
+    /// The target a catalog listing read with this entry's name: `None` where
+    /// [`Entry::catalog_name`] looks the name up instead.
+    pub fn catalog_target(&self) -> Option<ferret_catalog::Target> {
+        self.state.catalog.as_ref()?;
+        self.state.id.and(self.state.target)
+    }
+
     /// Depth relative to the current start path, which has depth zero.
     pub fn depth(&self) -> usize {
         self.state.depth

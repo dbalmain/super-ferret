@@ -57,6 +57,12 @@ impl Filter<'_> {
             max_depth: self.traversal.max_depth,
             content: true,
         };
+        // The listing already read a catalogued name's target.
+        let target = |catalog: &ferret_catalog::Catalog, name| {
+            entry
+                .catalog_target()
+                .unwrap_or_else(|| ferret_catalog::Target::from_child(catalog.name(name).child))
+        };
         let uncovered = policy.as_ref().is_some_and(|policy| policy.uncovered());
         // A `-u` walk never consults the index, so it reads once as an
         // uncovered scan does; `--live` keeps the checked read (D123).
@@ -80,14 +86,14 @@ impl Filter<'_> {
                     .holders
                     .zip(self.catalog)
                     .is_none_or(|(holders, catalog)| {
-                        entry.catalog_name().is_none_or(|name| {
-                            match ferret_catalog::Target::from_child(catalog.name(name).child) {
+                        entry
+                            .catalog_name()
+                            .is_none_or(|name| match target(catalog, name) {
                                 ferret_catalog::Target::Inode(directory) => {
                                     holders.holds(directory)
                                 }
                                 ferret_catalog::Target::Ignored(_) => true,
-                            }
-                        })
+                            })
                     });
                 return None;
             }
@@ -102,13 +108,16 @@ impl Filter<'_> {
         }
         *searched = true;
         if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
-            let inode = catalog.name(name).child;
+            let inode = match target(catalog, name) {
+                ferret_catalog::Target::Inode(inode) => inode,
+                ferret_catalog::Target::Ignored(_) => catalog.name(name).child,
+            };
             let Some(doc) = catalog.doc(inode) else {
-                if catalog.inode(inode).stat.size > ferret_policy::DEFAULT_SIZE_CAP
+                if catalog.size(inode) > ferret_policy::DEFAULT_SIZE_CAP
                     || self.text && catalog.state(inode) == ferret_catalog::ContentState::Binary
                 {
                     return Some((
-                        catalog.inode(inode).stat.size,
+                        catalog.size(inode),
                         Job::Unindexed(entry.path().to_owned(), name),
                     ));
                 }
@@ -124,7 +133,7 @@ impl Filter<'_> {
                 return None;
             }
             return Some((
-                catalog.inode(inode).stat.size,
+                catalog.size(inode),
                 Job::Checked(entry.path().to_owned(), name, doc.0),
             ));
         }
