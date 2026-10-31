@@ -198,97 +198,13 @@ impl Log {
         let mut transactions = Vec::new();
         let mut read = HEADER;
         while at < m.log_end {
-            if m.log_end - at < 96 {
-                return Err(corrupt("log transaction truncated"));
-            }
-            let mut head = [0; 64];
-            file.read_exact_at(&mut head, at).map_err(io_error)?;
-            if &head[..8] != TX_MAGIC
-                || u32_at(&head, 8) != crate::format::VERSION
-                || head[52..64] != [0; 12]
-            {
-                return Err(corrupt("log transaction header"));
-            }
-            let count = u32_at(&head, 12) as usize;
-            let length = u64_at(&head, 16);
-            let next = u64_at(&head, 24);
-            if count == 0
-                || count > 4
-                || length < 96 + 48 * count as u64
-                || !length.is_multiple_of(8)
-                || length > m.log_end - at
-                || sequence.checked_add(1) != Some(next)
-                || next == u64::MAX
-                || u64_at(&head, 32) != sequence
-            {
-                return Err(corrupt("log transaction framing/sequence"));
-            }
-            let next_counters = std::array::from_fn(|i| u32_at(&head, 40 + i * 4));
-            if next_counters[0] > NONE - 16
-                || next_counters[1] == NONE
-                || next_counters.iter().zip(counters).any(|(a, b)| *a < b)
-            {
-                return Err(corrupt("log allocation counters"));
-            }
-            let mut framing = head.to_vec();
-            framing.resize(64 + count * 48, 0);
-            file.read_exact_at(&mut framing[64..], at + 64)
-                .map_err(io_error)?;
-            let mut footer = [0; 32];
-            file.read_exact_at(&mut footer, at + length - 32)
-                .map_err(io_error)?;
-            if u64_at(&footer, 0) != next
-                || u64_at(&footer, 8) != length
-                || footer[16..] != checksum(&framing)
-            {
-                return Err(corrupt("log transaction footer/checksum"));
-            }
-            let mut cursor = framing.len() as u64;
-            let mut seen = [false; 4];
-            let mut blocks = Vec::new();
-            for d in framing[64..].chunks_exact(48) {
-                let family = u16::from_le_bytes([d[0], d[1]]) as usize;
-                let offset = u64_at(d, 8);
-                let size = u64_at(d, 16);
-                let records = u32_at(d, 4);
-                if family >= 4
-                    || seen[family]
-                    || d[2..4] != [0; 2]
-                    || d[40..48] != [0; 8]
-                    || offset != cursor
-                    || size == 0
-                    || !size.is_multiple_of(8)
-                    || records == 0
-                    || u64::from(records) > size / 16
-                    || size > length - 32 - cursor
-                {
-                    return Err(corrupt("log block descriptor"));
-                }
-                seen[family] = true;
-                cursor += size;
-                let mut digest = [0; 16];
-                digest.copy_from_slice(&d[24..40]);
-                blocks.push(Block {
-                    family: FAMILIES[family],
-                    count: records,
-                    offset: at + offset,
-                    length: usize::try_from(size).map_err(|_| corrupt("log block length"))?,
-                    digest,
-                    records: OnceLock::new(),
-                });
-            }
-            if cursor != length - 32 {
-                return Err(corrupt("log block tiling"));
-            }
-            read += framing.len() as u64 + 32;
-            transactions.push(Envelope {
-                sequence: next,
-                counters: next_counters,
-                blocks,
-            });
+            let (envelope, length, framed) =
+                read_envelope(&file, at, m.log_end - at, sequence, counters)?;
+            read += framed;
             at += length;
-            sequence = next;
-            counters = next_counters;
+            sequence = envelope.sequence;
+            counters = envelope.counters;
+            transactions.push(envelope);
         }
         if sequence != m.generation.sequence || counters != m.counters {
             return Err(corrupt("log manifest sequence/counters"));
@@ -371,6 +287,113 @@ impl Log {
                 })
         })
     }
+}
+
+/// Reads and checks the transaction at `at`, with `room` bytes of log
+/// left, following `sequence` and `counters`. Returns it, its length, and
+/// the bytes of its header, descriptors and footer, which open reads.
+fn read_envelope(
+    file: &File,
+    at: u64,
+    room: u64,
+    sequence: u64,
+    counters: [u32; 3],
+) -> Result<(Envelope, u64, u64), OpenError> {
+    if room < 96 {
+        return Err(corrupt("log transaction truncated"));
+    }
+    let mut head = [0; 64];
+    file.read_exact_at(&mut head, at).map_err(io_error)?;
+    if &head[..8] != TX_MAGIC
+        || u32_at(&head, 8) != crate::format::VERSION
+        || head[52..64] != [0; 12]
+    {
+        return Err(corrupt("log transaction header"));
+    }
+    let count = u32_at(&head, 12) as usize;
+    let length = u64_at(&head, 16);
+    let next = u64_at(&head, 24);
+    if count == 0
+        || count > 4
+        || length < 96 + 48 * count as u64
+        || !length.is_multiple_of(8)
+        || length > room
+        || sequence.checked_add(1) != Some(next)
+        || next == u64::MAX
+        || u64_at(&head, 32) != sequence
+    {
+        return Err(corrupt("log transaction framing/sequence"));
+    }
+    let next_counters = std::array::from_fn(|i| u32_at(&head, 40 + i * 4));
+    if next_counters[0] > NONE - 16
+        || next_counters[1] == NONE
+        || next_counters.iter().zip(counters).any(|(a, b)| *a < b)
+    {
+        return Err(corrupt("log allocation counters"));
+    }
+    let mut framing = head.to_vec();
+    framing.resize(64 + count * 48, 0);
+    file.read_exact_at(&mut framing[64..], at + 64)
+        .map_err(io_error)?;
+    let mut footer = [0; 32];
+    file.read_exact_at(&mut footer, at + length - 32)
+        .map_err(io_error)?;
+    if u64_at(&footer, 0) != next
+        || u64_at(&footer, 8) != length
+        || footer[16..] != checksum(&framing)
+    {
+        return Err(corrupt("log transaction footer/checksum"));
+    }
+    let blocks = read_blocks(&framing, at, length)?;
+    let framed = framing.len() as u64 + 32;
+    let envelope = Envelope {
+        sequence: next,
+        counters: next_counters,
+        blocks,
+    };
+    Ok((envelope, length, framed))
+}
+
+/// The blocks a transaction's descriptors place, which must tile its body.
+fn read_blocks(framing: &[u8], at: u64, length: u64) -> Result<Vec<Block>, OpenError> {
+    let mut cursor = framing.len() as u64;
+    let mut seen = [false; 4];
+    let mut blocks = Vec::new();
+    for d in framing[64..].chunks_exact(48) {
+        let family = u16::from_le_bytes([d[0], d[1]]) as usize;
+        let offset = u64_at(d, 8);
+        let size = u64_at(d, 16);
+        let records = u32_at(d, 4);
+        if family >= 4
+            || seen[family]
+            || d[2..4] != [0; 2]
+            || d[40..48] != [0; 8]
+            || offset != cursor
+            || size == 0
+            || !size.is_multiple_of(8)
+            || records == 0
+            || u64::from(records) > size / 16
+            || size > length - 32 - cursor
+        {
+            return Err(corrupt("log block descriptor"));
+        }
+        seen[family] = true;
+        cursor += size;
+        let mut digest = [0; 16];
+        digest.copy_from_slice(&d[24..40]);
+        blocks.push(Block {
+            family: FAMILIES[family],
+            count: records,
+            offset: at + offset,
+            length: usize::try_from(size).map_err(|_| corrupt("log block length"))?,
+            digest,
+            records: OnceLock::new(),
+        });
+    }
+    if cursor != length - 32 {
+        return Err(corrupt("log block tiling"));
+    }
+    Ok(blocks)
 }
 
 /// A failed append never remains a usable session. Reopen under the lock to
