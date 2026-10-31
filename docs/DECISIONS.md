@@ -7639,10 +7639,23 @@ tmpfs, mean of four runs:
 Halving the buffers to keep memory level loses: twice the segments, and the
 merges that follow cost more than the overlap saves.
 
+**Revised (f29075c).** The figures above understate B. Until f29075c a pass
+ended, rather than handing off, when the next document's trigrams overflowed
+the buffer, and that overflow ended nine of every ten segments; only the rest
+overlapped anything. Now every segment hands off. Re-measured on f29075c,
+mean of four, same corpus and setup (prototype saved as `d136b.patch`):
+
+| Flush                                       | Wall   | Max RSS |
+| ------------------------------------------- | ------ | ------- |
+| Files written while reading (f29075c)       | 3.81 s | 336 MB  |
+| Drains and files while reading (prototype)  | 2.94 s | 458 MB  |
+
+B now buys 23% for 122 MB (36% more peak), where it bought 11% for 130 MB.
+
 | Option | Costs | Buys |
 | ------ | ----- | ---- |
 | A. Keep a966936: overlap the file writes only | Nothing more. | 9% off the index; peak memory unchanged. |
-| B. Also drain on the second thread, with a second buffer pair | About 130 MB more peak memory while indexing: a second 64 MiB term buffer and a second 48 MB trigram reservation. D70's fixed reservation would count it for this command. | A further 11% (3.97 to 3.52 s). |
+| B. Also drain on the second thread, with a second buffer pair | About 120 MB more peak memory while indexing: a second 64 MiB term buffer and a second 48 MB trigram reservation. D70's fixed reservation would count it for this command. | A further 23% (3.81 to 2.94 s, revised). |
 | C. B for the daemon's explicit follow too | B's memory inside the daemon, against D70's budget. Daemon passes publish to queries only at a pass's end, so a pass of many segments delays what queries see while a large tree indexes. | The same speed for `ferret index` run through the daemon. |
 
 **Recommendation:** A. The memory is held only while an index is built, but I
@@ -7650,3 +7663,7 @@ read the standing density-over-speed rule as covering peak memory, and a 36%
 higher peak for 11% is the wrong side of it. The fact that would change it:
 indexing time on a large tree becoming the complaint, on machines where 130 MB
 does not matter (then B).
+
+Revised: still A, narrowly. A quarter off the build for a third more peak is
+close to even; if the density rule is about the index and not a build's peak,
+take B.
