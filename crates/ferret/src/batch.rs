@@ -534,12 +534,9 @@ pub(crate) fn request_error(
 ) -> io::Result<()> {
     let mut line = Vec::new();
     let mut o = Object::new(&mut line);
-    if let Some(id) = id {
-        o.str("id", id);
-    } else {
-        o.null("id");
-    }
-    o.str("event", "error").str("message", message);
+    o.opt_str("id", id)
+        .str("event", "error")
+        .str("message", message);
     o.end();
     destination.send(&line)
 }

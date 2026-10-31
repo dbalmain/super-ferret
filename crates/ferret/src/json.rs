@@ -193,6 +193,14 @@ impl<'a> Object<'a> {
         self.out.extend_from_slice(fields);
     }
 
+    /// `"key":null`, or the string.
+    pub fn opt_str(&mut self, key: &str, value: Option<&str>) -> &mut Self {
+        match value {
+            Some(v) => self.str(key, v),
+            None => self.null(key),
+        }
+    }
+
     /// `"key":null`, or the number.
     pub fn opt_int(&mut self, key: &str, value: Option<impl Into<i128>>) -> &mut Self {
         match value {

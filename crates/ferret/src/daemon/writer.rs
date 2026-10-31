@@ -1093,39 +1093,7 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
 }
 pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
     let s = lock(&host.writer_status);
-    if let Some(w) = &s.watch {
-        let w = w.status();
-        o.int("watch_installed", w.installed as u64)
-            .int("watch_needed", w.needed as u64)
-            .int("watch_failed", w.failed as u64)
-            .int("pending_scopes", w.pending as u64)
-            .int("pending_bytes", w.bytes as u64)
-            .byte_strings(
-                "polling_roots",
-                w.polling_roots.iter().map(|p| p.as_os_str().as_bytes()),
-            )
-            .opt_int("oldest_pending_ms", w.oldest.map(|d| d.as_millis() as i128))
-            .bool("watch_uncovered", w.uncovered);
-        if let Some(reason) = w.backstop {
-            o.str("backstop_reason", &format!("{reason:?}"));
-        } else {
-            o.null("backstop_reason");
-        }
-    } else {
-        o.bool("watch_uncovered", true)
-            .int("watch_installed", 0)
-            .int("watch_needed", 0)
-            .int("watch_failed", 0)
-            .int("pending_scopes", u64::from(s.fallback_backstop))
-            .int("pending_bytes", 0)
-            .null("polling_roots")
-            .null("oldest_pending_ms");
-        if s.fallback_backstop {
-            o.str("backstop_reason", "Backstop");
-        } else {
-            o.null("backstop_reason");
-        }
-    }
+    s.watch_fields(o);
     o.bool("host_running", true)
         .str(
             "current_operation",
@@ -1136,12 +1104,11 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
             },
         )
         .bool("merge_running", s.merge_running)
-        .int("refreshes", s.refreshes);
-    if let Some(reason) = s.last_reason {
-        o.str("last_refresh_reason", &format!("{reason:?}"));
-    } else {
-        o.null("last_refresh_reason");
-    }
+        .int("refreshes", s.refreshes)
+        .opt_str(
+            "last_refresh_reason",
+            s.last_reason.map(|reason| format!("{reason:?}")).as_deref(),
+        );
     o.object("writer_input_usage", |o| {
         o.int("records", s.input_usage.records as u64)
             .int("owned_bytes", s.input_usage.owned_bytes as u64)
@@ -1155,79 +1122,117 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
         )
         .bool("writer_busy", host.writer_running.load(Ordering::Acquire));
     if let Some(scheduler) = &s.scheduler {
-        let c = scheduler.status();
-        o.object("controller", |o| {
-            for (key, value) in [
-                ("cpu_psi_some_avg10", c.sample.cpu),
-                ("io_psi_some_avg10", c.sample.io),
-                ("load", c.sample.load),
-            ] {
-                if let Some(value) = value {
-                    o.number(key, value);
-                } else {
-                    o.str(key, "unavailable");
-                }
-            }
-            if let Some(battery) = c.sample.battery {
-                o.bool("on_battery", battery);
-            } else {
-                o.str("on_battery", "unavailable");
-            }
-            match c.sample.idle {
-                crate::politeness::Idle::Unknown => {
-                    o.str("idle", "unknown");
-                }
-                crate::politeness::Idle::Headless => {
-                    o.str("idle", "headless");
-                }
-                crate::politeness::Idle::Desktop(duration) => {
-                    o.int("idle_seconds", duration.as_secs());
-                }
-            }
-            o.int("worker_target", c.workers as u64)
-                .opt_int("available_memory_bytes", c.sample.memory)
-                .opt_int("available_disk_bytes", c.available_disk)
-                .int("required_memory_bytes", c.required_memory)
-                .int("required_disk_bytes", c.required_disk)
-                .str("priority", "per-thread nice 19")
-                .bool("no_reuse_advice", false);
-            if let Some(reason) = c.paused.or(s.blocked) {
-                o.str("blocked_reason", reason.status());
-            } else {
-                o.null("blocked_reason");
-            }
-            if let Some((kind, result)) = c.admission {
-                o.str(
-                    "admission_kind",
-                    match kind {
-                        ferret_catalog::bulk::Kind::Checkpoint => "checkpoint",
-                        ferret_catalog::bulk::Kind::FullRewalk => "full-rewalk",
-                    },
-                );
-                o.str(
-                    "admission",
-                    result.err().map_or("admitted", |reason| reason.status()),
-                );
-            } else {
-                o.null("admission_kind").null("admission");
-            }
-            let rate = scheduler.rate_status();
-            o.object("rate_limit", |o| {
-                o.int("bytes_per_second", rate.bytes_per_second)
-                    .int("reserved_bytes", rate.reserved_bytes)
-                    .int("waits", rate.waits)
-                    .int("waiting", rate.waiting)
-                    .int("sequential_advice_failures", rate.advice_failures);
-            });
-        });
+        o.object("controller", |o| controller_fields(scheduler, s.blocked, o));
     } else {
         o.null("controller");
     }
-    if let Some(error) = &s.error {
-        o.str("refresh_error", error);
-    } else {
-        o.null("refresh_error");
+    o.opt_str("refresh_error", s.error.as_deref());
+}
+impl Status {
+    /// The watch's coverage and backlog, or what the fallback backstop
+    /// stands in for them.
+    fn watch_fields(&self, o: &mut crate::json::Object<'_>) {
+        let Some(w) = &self.watch else {
+            o.bool("watch_uncovered", true)
+                .int("watch_installed", 0)
+                .int("watch_needed", 0)
+                .int("watch_failed", 0)
+                .int("pending_scopes", u64::from(self.fallback_backstop))
+                .int("pending_bytes", 0)
+                .null("polling_roots")
+                .null("oldest_pending_ms")
+                .opt_str(
+                    "backstop_reason",
+                    self.fallback_backstop.then_some("Backstop"),
+                );
+            return;
+        };
+        let w = w.status();
+        o.int("watch_installed", w.installed as u64)
+            .int("watch_needed", w.needed as u64)
+            .int("watch_failed", w.failed as u64)
+            .int("pending_scopes", w.pending as u64)
+            .int("pending_bytes", w.bytes as u64)
+            .byte_strings(
+                "polling_roots",
+                w.polling_roots.iter().map(|p| p.as_os_str().as_bytes()),
+            )
+            .opt_int("oldest_pending_ms", w.oldest.map(|d| d.as_millis() as i128))
+            .bool("watch_uncovered", w.uncovered)
+            .opt_str(
+                "backstop_reason",
+                w.backstop.map(|reason| format!("{reason:?}")).as_deref(),
+            );
     }
+}
+/// The politeness controller's samples, targets and admission.
+fn controller_fields(
+    scheduler: &crate::scheduler::Scheduler,
+    blocked: Option<ferret_catalog::bulk::Blocked>,
+    o: &mut crate::json::Object<'_>,
+) {
+    let c = scheduler.status();
+    for (key, value) in [
+        ("cpu_psi_some_avg10", c.sample.cpu),
+        ("io_psi_some_avg10", c.sample.io),
+        ("load", c.sample.load),
+    ] {
+        if let Some(value) = value {
+            o.number(key, value);
+        } else {
+            o.str(key, "unavailable");
+        }
+    }
+    if let Some(battery) = c.sample.battery {
+        o.bool("on_battery", battery);
+    } else {
+        o.str("on_battery", "unavailable");
+    }
+    match c.sample.idle {
+        crate::politeness::Idle::Unknown => {
+            o.str("idle", "unknown");
+        }
+        crate::politeness::Idle::Headless => {
+            o.str("idle", "headless");
+        }
+        crate::politeness::Idle::Desktop(duration) => {
+            o.int("idle_seconds", duration.as_secs());
+        }
+    }
+    o.int("worker_target", c.workers as u64)
+        .opt_int("available_memory_bytes", c.sample.memory)
+        .opt_int("available_disk_bytes", c.available_disk)
+        .int("required_memory_bytes", c.required_memory)
+        .int("required_disk_bytes", c.required_disk)
+        .str("priority", "per-thread nice 19")
+        .bool("no_reuse_advice", false)
+        .opt_str(
+            "blocked_reason",
+            c.paused.or(blocked).map(|reason| reason.status()),
+        );
+    if let Some((kind, result)) = c.admission {
+        o.str(
+            "admission_kind",
+            match kind {
+                ferret_catalog::bulk::Kind::Checkpoint => "checkpoint",
+                ferret_catalog::bulk::Kind::FullRewalk => "full-rewalk",
+            },
+        );
+        o.str(
+            "admission",
+            result.err().map_or("admitted", |reason| reason.status()),
+        );
+    } else {
+        o.null("admission_kind").null("admission");
+    }
+    let rate = scheduler.rate_status();
+    o.object("rate_limit", |o| {
+        o.int("bytes_per_second", rate.bytes_per_second)
+            .int("reserved_bytes", rate.reserved_bytes)
+            .int("waits", rate.waits)
+            .int("waiting", rate.waiting)
+            .int("sequential_advice_failures", rate.advice_failures);
+    });
 }
 
 #[cfg(test)]
