@@ -124,6 +124,22 @@ pub(crate) fn opaque_checkpoint(
     if denied.is_empty() {
         return None;
     }
+    let mut batch = txn.batch();
+    let mapped = replay_directories(&mut batch, batches, &dirs, &denied)?;
+    replay_entries(&mut batch, batches, &denied, &mapped);
+    batch.finish_observations();
+    Some(vec![batch])
+}
+
+/// Replays the directories in `dirs` root first, mapping each token to its
+/// new token. A denied directory is replayed without its entry count or
+/// children.
+fn replay_directories(
+    batch: &mut Batch,
+    batches: &[Batch],
+    dirs: &BTreeMap<DirToken, DirectoryObservation<'_>>,
+    denied: &BTreeSet<DirToken>,
+) -> Option<BTreeMap<DirToken, DirToken>> {
     let counts: BTreeMap<_, _> = batches.iter().flat_map(Batch::entry_counts).collect();
     let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
     let mut queue = VecDeque::new();
@@ -134,7 +150,6 @@ pub(crate) fn opaque_checkpoint(
             queue.push_back(d.token);
         }
     }
-    let mut batch = txn.batch();
     let mut mapped = BTreeMap::new();
     while let Some(token) = queue.pop_front() {
         let d = dirs.get(&token)?;
@@ -157,6 +172,17 @@ pub(crate) fn opaque_checkpoint(
             queue.extend(children.remove(&token).unwrap_or_default());
         }
     }
+    Some(mapped)
+}
+
+/// Replays every file, ignored entry and work tree whose parent was replayed
+/// and is not denied.
+fn replay_entries(
+    batch: &mut Batch,
+    batches: &[Batch],
+    denied: &BTreeSet<DirToken>,
+    mapped: &BTreeMap<DirToken, DirToken>,
+) {
     for old in batches {
         for f in (0..old.file_count()).map(|i| old.file_observation(i)) {
             if !denied.contains(&f.parent)
@@ -188,8 +214,6 @@ pub(crate) fn opaque_checkpoint(
             }
         }
     }
-    batch.finish_observations();
-    Some(vec![batch])
 }
 
 struct Resolver<'a> {
