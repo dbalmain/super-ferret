@@ -100,19 +100,10 @@ pub(crate) fn serve(
         Ok(cwd) => cwd,
         Err(message) => return Ok(runtime.failure(message)),
     };
-    let args: Vec<_> = request
-        .args
-        .iter()
-        .cloned()
-        .map(OsString::from_vec)
-        .collect();
-    let mut files = options.pattern_files.iter();
-    let parsed = line_grep::parse_with(&args, &mut |_| {
-        files
-            .next()
-            .cloned()
-            .ok_or_else(|| io::Error::other("missing grep pattern-file bytes"))
-    });
+    let parsed = match parse(request, options) {
+        Ok(command) => command,
+        Err(message) => return Ok(runtime.failure(&message)),
+    };
     let flush = || {
         crate::find_json::emit_to(destination, &request.id, "stdout", |o| {
             o.str("bytes", "").bool("flush", true);
@@ -123,39 +114,23 @@ pub(crate) fn serve(
         emit: &emit,
         flush: &flush,
     };
-    let mut plan = match parsed {
-        Ok(line_grep::Command::Search(plan)) => *plan,
-        Ok(line_grep::Command::Files(mut plan)) => {
+    let plan = match parsed {
+        line_grep::Command::Search(plan) => *plan,
+        line_grep::Command::Files(mut plan) => {
             present(&mut plan.presentation, options);
             return Ok(list(&plan, pin, &cwd, options.tty, writer, &runtime));
         }
-        Ok(_) => return Ok(runtime.failure("socket grep requires a search or file listing")),
-        Err(error) => return Ok(runtime.failure(&error.to_string())),
+        _ => return Ok(runtime.failure("socket grep requires a search or file listing")),
     };
-    present(&mut plan.presentation, options);
-    plan.line_number = options.numbers;
-    plan.spill_dir = Some(Arc::from(Path::new(std::ffi::OsStr::from_bytes(
-        &options.temp_dir,
-    ))));
-    // Before operands, as in the local host: a refused combination or `-m0`
-    // never depends on the operands or the pin.
-    let selection = match super::preflight::prepare(&plan) {
-        Ok(super::preflight::Prepared::Search(selection)) => selection,
-        Ok(super::preflight::Prepared::NoMatch) => return Ok(Exit::NoMatch),
-        Err(refusal) => return Ok(runtime.failure(&refusal.into_message())),
+    let Settled {
+        plan,
+        selection,
+        inputs,
+    } = match settle(plan, options, &cwd) {
+        Ok(Some(settled)) => settled,
+        Ok(None) => return Ok(Exit::NoMatch),
+        Err(message) => return Ok(runtime.failure(&message)),
     };
-    let paths = if plan.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        plan.paths.clone()
-    };
-    let inputs = resolve_inputs_at(&paths, false, &cwd);
-    if plan.traversal.live
-        || plan.traversal.unrestricted
-        || inputs.iter().any(|input| matches!(input, Input::Stream(_)))
-    {
-        return Ok(runtime.failure("socket grep requires indexed directory operands without stdin"));
-    }
     let Some(pin) = pin else {
         return Ok(runtime.failure("no index available"));
     };
@@ -185,6 +160,66 @@ pub(crate) fn serve(
         block_stdout(&plan) && !options.tty,
         |writer| execution.run(inputs, writer),
     ))
+}
+
+/// The request's command, parsed from the client's arguments and
+/// pattern-file bytes.
+fn parse(request: &Request, options: &GrepOptions) -> Result<line_grep::Command, String> {
+    let args: Vec<_> = request
+        .args
+        .iter()
+        .cloned()
+        .map(OsString::from_vec)
+        .collect();
+    let mut files = options.pattern_files.iter();
+    line_grep::parse_with(&args, &mut |_| {
+        files
+            .next()
+            .cloned()
+            .ok_or_else(|| io::Error::other("missing grep pattern-file bytes"))
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// A socket search ready to run once a pin and threads are claimed.
+struct Settled {
+    plan: Plan,
+    selection: GrepSelection,
+    inputs: Vec<Input>,
+}
+
+/// Applies the client's resolved choices to a search, then preflights it
+/// and resolves its operands. `None` is a search that cannot match.
+fn settle(mut plan: Plan, options: &GrepOptions, cwd: &Path) -> Result<Option<Settled>, String> {
+    present(&mut plan.presentation, options);
+    plan.line_number = options.numbers;
+    plan.spill_dir = Some(Arc::from(Path::new(std::ffi::OsStr::from_bytes(
+        &options.temp_dir,
+    ))));
+    // Before operands, as in the local host: a refused combination or `-m0`
+    // never depends on the operands or the pin.
+    let selection = match super::preflight::prepare(&plan) {
+        Ok(super::preflight::Prepared::Search(selection)) => selection,
+        Ok(super::preflight::Prepared::NoMatch) => return Ok(None),
+        Err(refusal) => return Err(refusal.into_message()),
+    };
+    let paths = if plan.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        plan.paths.clone()
+    };
+    let inputs = resolve_inputs_at(&paths, false, cwd);
+    if plan.traversal.live
+        || plan.traversal.unrestricted
+        || inputs.iter().any(|input| matches!(input, Input::Stream(_)))
+    {
+        return Err("socket grep requires indexed directory operands without stdin".into());
+    }
+    Ok(Some(Settled {
+        plan,
+        selection,
+        inputs,
+    }))
 }
 
 /// Applies the client's resolved colour and heading choices.
