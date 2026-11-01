@@ -146,6 +146,12 @@ impl GrepFlags {
             .map_err(|e| GrepError::Derivation(e.to_string()))?;
         let line_local = line_local(&hir);
         let filter = if line_local { filter(&hir) } else { None };
+        let literal = match hir.kind() {
+            HirKind::Literal(literal) if line_local => Some(Box::new(
+                memchr::memmem::Finder::new(&literal.0).into_owned(),
+            )),
+            _ => None,
+        };
         Ok(Grep {
             regex,
             trigrams,
@@ -153,6 +159,7 @@ impl GrepFlags {
             line_local,
             lf_excluded: lf_excluded(&hir),
             filter,
+            literal,
         })
     }
 
@@ -251,6 +258,9 @@ pub struct Grep {
     /// can be ([`Search`]); only for line-local patterns whose matches the
     /// engine cannot find by a literal prefix.
     filter: Option<Filter>,
+    /// The whole pattern when it is one line-local literal, whose first
+    /// occurrence is its first match, so finding it needs no engine call.
+    literal: Option<Box<memchr::memmem::Finder<'static>>>,
 }
 
 impl crate::Matcher for Grep {
@@ -295,6 +305,7 @@ impl Grep {
         Search {
             regex: Cow::Owned(self.regex.clone()),
             filter: self.filter.clone().map(Cow::Owned),
+            literal: self.literal.as_deref().cloned().map(Cow::Owned),
         }
     }
 
@@ -306,6 +317,7 @@ impl Grep {
         Search {
             regex: Cow::Borrowed(&self.regex),
             filter: self.filter.as_ref().map(Cow::Borrowed),
+            literal: self.literal.as_deref().map(Cow::Borrowed),
         }
     }
 
@@ -373,6 +385,7 @@ impl Grep {
 pub struct Search<'a> {
     regex: Cow<'a, Regex>,
     filter: Option<Cow<'a, Filter>>,
+    literal: Option<Cow<'a, memchr::memmem::Finder<'static>>>,
 }
 
 /// [`Search`]'s required run and window.
@@ -437,11 +450,15 @@ impl Search<'_> {
         Search {
             regex: Cow::Borrowed(&self.regex),
             filter: None,
+            literal: None,
         }
     }
 
     /// Offset of the first match's start in `text`.
     pub fn find(&self, text: &[u8]) -> Option<usize> {
+        if let Some(literal) = &self.literal {
+            return literal.find(text);
+        }
         let Some(filter) = &self.filter else {
             return self.regex.find(text).map(|span| span.start);
         };
@@ -473,6 +490,9 @@ impl Search<'_> {
     /// the window. Rendering and counts still search the complete original
     /// line.
     pub fn matching_line(&self, text: &[u8]) -> Option<usize> {
+        if let Some(literal) = &self.literal {
+            return literal.find(text);
+        }
         let Some(filter) = &self.filter else {
             return self.regex.shortest_match(text);
         };
@@ -506,6 +526,13 @@ impl Search<'_> {
     /// a long line's matches, and with Unicode word boundaries over non-ASCII
     /// text the engine's slow fallback runs over all of that.
     pub fn spans<'r, 't>(&'r self, text: &'t [u8]) -> Spans<'r, 't> {
+        if let Some(literal) = &self.literal {
+            return Spans(Windows::Literal {
+                literal,
+                text,
+                at: 0,
+            });
+        }
         match &self.filter {
             None => Spans(Windows::Whole(self.regex.spans(text))),
             Some(filter) => Spans(Windows::Filtered {
@@ -540,6 +567,12 @@ pub struct Spans<'r, 't>(Windows<'r, 't>);
 enum Windows<'r, 't> {
     /// No filter: the engine searches the rest of the text for each match.
     Whole(crate::matcher::Spans<'r, 't>),
+    /// The pattern is a literal: its occurrences, from `at`, never overlap.
+    Literal {
+        literal: &'r memchr::memmem::Finder<'static>,
+        text: &'t [u8],
+        at: usize,
+    },
     /// The windows around the required run, in order, from `at`.
     Filtered {
         regex: &'r Regex,
@@ -556,6 +589,11 @@ impl Iterator for Spans<'_, '_> {
     fn next(&mut self) -> Option<Self::Item> {
         let (regex, filter, text, at, window_end) = match &mut self.0 {
             Windows::Whole(spans) => return spans.next(),
+            Windows::Literal { literal, text, at } => {
+                let start = *at + literal.find(text.get(*at..)?)?;
+                *at = start + literal.needle().len();
+                return Some(start..*at);
+            }
             Windows::Filtered {
                 regex,
                 filter,

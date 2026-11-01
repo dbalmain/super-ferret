@@ -1443,3 +1443,58 @@ fn windowed_spans_match_unwindowed_search_on_seeded_cases() {
         "seed={SEED:#x}: no empty matches compared"
     );
 }
+
+#[test]
+fn a_literal_pattern_is_found_without_the_engine_and_agrees_with_it() {
+    let texts: [&[u8]; 6] = [
+        b"aaaaa",
+        b"x\naaa\nyaa",
+        b"a.b a+b a.b",
+        b"no match here",
+        b"\xff\xfe\xff\xff",
+        b"",
+    ];
+    for pattern in ["aa", "aaa", r"a\.b", "a", r"(?-u:\xff)", "match"] {
+        let grep = flags(false).compile(pattern).unwrap();
+        let search = grep.search();
+        assert!(search.literal.is_some(), "{pattern} is a literal");
+        let engine = search.without_windowing();
+        for text in texts {
+            // Overlapping occurrences (`aa` in `aaaaa`) must yield the
+            // engine's non-overlapping spans, not every occurrence.
+            assert_eq!(
+                search.spans(text).collect::<Vec<_>>(),
+                engine.spans(text).collect::<Vec<_>>(),
+                "{pattern} spans in {text:?}"
+            );
+            assert_eq!(
+                search.find(text),
+                engine.find(text),
+                "{pattern} in {text:?}"
+            );
+            assert_eq!(
+                search.matching_line(text).is_some(),
+                engine.matching_line(text).is_some(),
+                "{pattern} selects in {text:?}"
+            );
+        }
+    }
+    for pattern in [r"\baa", "(aa)", "aa|ab", "(?i)aa", "a\nb"] {
+        let case_insensitive = false;
+        let Ok(grep) = flags(case_insensitive).compile(pattern) else {
+            continue;
+        };
+        assert!(
+            grep.search().literal.is_none(),
+            "{pattern} is not a bare literal"
+        );
+    }
+    assert!(
+        flags(true)
+            .compile("aa")
+            .unwrap()
+            .search()
+            .literal
+            .is_none()
+    );
+}
