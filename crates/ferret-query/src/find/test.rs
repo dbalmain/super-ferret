@@ -87,6 +87,17 @@ pub(super) enum TimeField {
     Modify,
 }
 
+impl TimeField {
+    fn from_letter(letter: u8) -> Self {
+        match letter {
+            b'a' => Self::Access,
+            b'B' => Self::Birth,
+            b'c' => Self::Change,
+            _ => Self::Modify,
+        }
+    }
+}
+
 impl Test {
     pub(super) fn sections(&self, out: &mut Vec<ferret_catalog::Section>) {
         use ferret_catalog::Section::*;
@@ -196,40 +207,34 @@ impl Test {
         })
     }
 
-    pub(super) fn reference(primary: &[u8], path: PathBuf, follow: bool) -> Option<Self> {
-        Some(Self::Reference {
+    pub(super) fn same_file(path: PathBuf, follow: bool) -> Self {
+        Self::Reference {
             path,
             follow,
-            field: match primary {
-                b"-anewer" => TimeField::Access,
-                b"-cnewer" => TimeField::Change,
-                _ => TimeField::Modify,
-            },
+            field: TimeField::Modify,
             reference_field: TimeField::Modify,
-            same_file: primary == b"-samefile",
-        })
+            same_file: true,
+        }
     }
 
-    pub(super) fn newer_xy(
+    /// `-newerXY`, where `-newer`, `-anewer` and `-cnewer` are `mm`, `am` and
+    /// `cm`; a `t` for Y reads the value as a date rather than a file.
+    pub(super) fn newer(
         x: u8,
         y: u8,
-        path: PathBuf,
-        _now: SystemTime,
+        value: &OsStr,
+        now: SystemTime,
         follow: bool,
     ) -> Option<Self> {
-        fn field(code: u8) -> TimeField {
-            match code {
-                b'a' => TimeField::Access,
-                b'B' => TimeField::Birth,
-                b'c' => TimeField::Change,
-                _ => TimeField::Modify,
-            }
+        let field = TimeField::from_letter(x);
+        if y == b't' {
+            return parse_date(value, now).map(|stamp| Self::Newer { field, stamp });
         }
         Some(Self::Reference {
-            path,
+            path: PathBuf::from(value),
             follow,
-            field: field(x),
-            reference_field: field(y),
+            field,
+            reference_field: TimeField::from_letter(y),
             same_file: false,
         })
     }

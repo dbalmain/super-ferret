@@ -530,48 +530,30 @@ impl<'a> Parser<'a> {
                     value.to_string_lossy().into_owned(),
                 ))
             }
-            b"-samefile" | b"-newer" | b"-anewer" | b"-cnewer" => {
+            b"-samefile" => {
                 let follow_references = self.options.follow != Follow::Physical;
                 let value = self.argument(&primary)?;
-                let test = super::test::Test::reference(
-                    primary.as_bytes(),
+                Expression::Test(super::test::Test::same_file(
                     PathBuf::from(value),
                     follow_references,
-                );
-                Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
+                ))
             }
-            b"-newermt" => {
-                let now = self.now;
-                let value = self.argument(&primary)?;
-                let stamp =
-                    super::test::parse_date(value, now).ok_or_else(|| invalid(&primary, value))?;
-                Expression::Test(super::test::Test::Newer {
-                    field: super::test::TimeField::Modify,
-                    stamp,
-                })
-            }
-            bytes if bytes.starts_with(b"-newer") && bytes.len() == 8 => {
-                if !b"aBcm".contains(&bytes[6]) || !b"aBcmt".contains(&bytes[7]) {
-                    return Err(ParseError::Unknown(primary));
-                }
+            bytes if bytes.starts_with(b"-newer") || matches!(bytes, b"-anewer" | b"-cnewer") => {
+                let (x, y) = match bytes {
+                    b"-newer" => (b'm', b'm'),
+                    b"-anewer" => (b'a', b'm'),
+                    b"-cnewer" => (b'c', b'm'),
+                    [b'-', b'n', b'e', b'w', b'e', b'r', x, y]
+                        if b"aBcm".contains(x) && b"aBcmt".contains(y) =>
+                    {
+                        (*x, *y)
+                    }
+                    _ => return Err(ParseError::Unknown(primary)),
+                };
                 let now = self.now;
                 let follow_references = self.options.follow != Follow::Physical;
                 let value = self.argument(&primary)?;
-                let x = bytes[6];
-                let y = bytes[7];
-                let test = if y == b't' {
-                    super::test::parse_date(value, now).map(|stamp| super::test::Test::Newer {
-                        field: match x {
-                            b'a' => super::test::TimeField::Access,
-                            b'B' => super::test::TimeField::Birth,
-                            b'c' => super::test::TimeField::Change,
-                            _ => super::test::TimeField::Modify,
-                        },
-                        stamp,
-                    })
-                } else {
-                    super::test::Test::newer_xy(x, y, PathBuf::from(value), now, follow_references)
-                };
+                let test = super::test::Test::newer(x, y, value, now, follow_references);
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
             b")" | b"," | b"-o" | b"-or" | b"-a" | b"-and" => {

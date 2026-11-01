@@ -1048,3 +1048,63 @@ fn catalog_listing_cancellation_counts_actual_entries() {
 fn opaque_listing_cancellation_counts_actual_entries() {
     check_listing_cancellation(true);
 }
+
+#[test]
+fn newer_spellings_compare_their_own_time_fields() {
+    let tree = Tree::new("newer-fields");
+    let at = |seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+    let reference = tree.0.join("reference");
+    let late = tree.0.join("late");
+    for (path, accessed, modified) in [
+        (&reference, 1_700_000_000, 1_700_000_000),
+        (&late, 1_900_000_000, 1_500_000_000),
+    ] {
+        fs::write(path, b"").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(at(accessed))
+                    .set_modified(at(modified)),
+            )
+            .unwrap();
+    }
+    // Both files changed status just now, after the reference's mtime;
+    // only `late` was read after it, and neither was modified after it.
+    let reference = reference.to_str().unwrap();
+    for (test, value, expected) in [
+        ("-newer", reference, ""),
+        ("-anewer", reference, "late"),
+        ("-cnewer", reference, "late reference"),
+        ("-newerat", "2030-01-01", "late"),
+        ("-newermt", "2030-01-01", ""),
+    ] {
+        let (_, output) = tree.run(&[
+            "(",
+            "-name",
+            "reference",
+            "-o",
+            "-name",
+            "late",
+            ")",
+            test,
+            value,
+        ]);
+        let mut names: Vec<_> = output
+            .bytes
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                Path::new(OsStr::from_bytes(line))
+                    .file_name()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        names.sort();
+        let names = names.join(OsStr::new(" "));
+        assert_eq!(names, OsStr::new(expected), "{test} {value}");
+    }
+}

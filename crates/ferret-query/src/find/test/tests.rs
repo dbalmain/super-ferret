@@ -260,7 +260,14 @@ fn newer_comparison_is_strict_and_preserves_nanoseconds() {
         .unwrap()
         .set_times(FileTimes::new().set_modified(stamp + Duration::from_nanos(1)))
         .unwrap();
-    let reference = Test::reference(b"-newer", reference_path.clone(), false).unwrap();
+    let reference = Test::newer(
+        b'm',
+        b'm',
+        reference_path.as_os_str(),
+        SystemTime::now(),
+        false,
+    )
+    .unwrap();
     assert!(
         !reference
             .evaluate(&Entry::new(equal_path, 0, FileKind::File))
@@ -271,7 +278,7 @@ fn newer_comparison_is_strict_and_preserves_nanoseconds() {
             .evaluate(&Entry::new(newer_path.clone(), 0, FileKind::File))
             .unwrap()
     );
-    let same = Test::reference(b"-samefile", newer_path.clone(), false).unwrap();
+    let same = Test::same_file(newer_path.clone(), false);
     assert!(
         same.evaluate(&Entry::new(newer_path, 0, FileKind::File))
             .unwrap()
@@ -285,8 +292,8 @@ fn reference_symlinks_are_followed_only_when_requested() {
     let link = fixture.0.join("link");
     fs::write(&target, b"").unwrap();
     symlink(&target, &link).unwrap();
-    let physical = Test::reference(b"-samefile", link.clone(), false).unwrap();
-    let followed = Test::reference(b"-samefile", link, true).unwrap();
+    let physical = Test::same_file(link.clone(), false);
+    let followed = Test::same_file(link, true);
     assert!(
         !physical
             .evaluate(&Entry::new(target.clone(), 0, FileKind::File))
@@ -385,8 +392,22 @@ fn cnewer_compares_the_entry_ctime_with_the_reference_mtime() {
         .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000)))
         .unwrap();
     let reference = Entry::new(path, 0, FileKind::File);
-    let cnewer = Test::reference(b"-cnewer", reference.path().to_owned(), false).unwrap();
-    let newer = Test::reference(b"-newer", reference.path().to_owned(), false).unwrap();
+    let cnewer = Test::newer(
+        b'c',
+        b'm',
+        reference.path().as_os_str(),
+        SystemTime::now(),
+        false,
+    )
+    .unwrap();
+    let newer = Test::newer(
+        b'm',
+        b'm',
+        reference.path().as_os_str(),
+        SystemTime::now(),
+        false,
+    )
+    .unwrap();
     assert!(cnewer.evaluate(&reference).unwrap());
     assert!(!newer.evaluate(&reference).unwrap());
 }
