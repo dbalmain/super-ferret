@@ -56,31 +56,6 @@ fn action_plans_open_the_catalog_without_resident_names() {
 }
 
 #[test]
-fn index_precedence_is_explicit_then_nonempty_env_then_data() {
-    // (--index, FERRET_INDEX, XDG data, chosen); "-" is absent.
-    let cases = [
-        ("/explicit", "/env", "/data", "/explicit"),
-        ("-", "/env", "/data", "/env"),
-        ("-", "", "/data", "/data"),
-        ("-", "-", "/data", "/data"),
-        ("-", "", "-", "-"),
-        ("/explicit", "-", "-", "/explicit"),
-    ];
-    let given = |value: &'static str| (value != "-").then_some(value);
-    for (explicit, env, data, expected) in cases {
-        assert_eq!(
-            index_path(
-                given(explicit).map(Path::new),
-                given(env).map(OsString::from),
-                || given(data).map(PathBuf::from),
-            ),
-            given(expected).map(PathBuf::from),
-            "{explicit} {env} {data}"
-        );
-    }
-}
-
-#[test]
 fn config_accepts_one_boolean_and_rejects_ambiguous_settings() {
     assert!(!parse_config("# empty\n").unwrap());
     assert!(parse_config("find_no_ignore = true # GNU mode\n").unwrap());

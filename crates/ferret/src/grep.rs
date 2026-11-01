@@ -836,14 +836,7 @@ fn open_index(index: Option<&Path>) -> Result<Engine, String> {
 }
 
 fn index_path(index: Option<&Path>) -> Result<PathBuf, String> {
-    index
-        .map(Path::to_owned)
-        .or_else(|| {
-            std::env::var_os("FERRET_INDEX")
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| Dirs::from_env().ok().map(|dirs| dirs.data))
+    crate::xdg::index_dir(index, || Dirs::from_env().ok().map(|dirs| dirs.data))
         .ok_or("cannot locate index; set --index or FERRET_INDEX")
         .map_err(str::to_owned)
 }

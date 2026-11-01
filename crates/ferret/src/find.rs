@@ -91,24 +91,9 @@ fn route(plan: &Plan, index: Option<&Path>) -> Result<Route, String> {
     if no_ignore {
         return Ok(Route::Live);
     }
-    index_path(index, std::env::var_os("FERRET_INDEX"), || {
-        Dirs::from_env().ok().map(|dirs| dirs.data)
-    })
-    .map(Route::Indexed)
-    .ok_or_else(|| "cannot locate index; set --index or FERRET_INDEX, or use -I".to_owned())
-}
-
-/// Index precedence: `--index`, then a nonempty `FERRET_INDEX`, then the XDG
-/// data directory.
-fn index_path(
-    explicit: Option<&Path>,
-    env: Option<OsString>,
-    data: impl FnOnce() -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    explicit
-        .map(Path::to_owned)
-        .or_else(|| env.filter(|value| !value.is_empty()).map(PathBuf::from))
-        .or_else(data)
+    crate::xdg::index_dir(index, || Dirs::from_env().ok().map(|dirs| dirs.data))
+        .map(Route::Indexed)
+        .ok_or_else(|| "cannot locate index; set --index or FERRET_INDEX, or use -I".to_owned())
 }
 
 /// Opens the source a resolved route walks.

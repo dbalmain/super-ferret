@@ -238,14 +238,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         _ => {}
     }
     let dirs = Dirs::from_env();
-    let index = args
-        .index
-        .or_else(|| {
-            std::env::var_os("FERRET_INDEX")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| dirs.as_ref().ok().map(|d| d.data.clone()));
+    let index = crate::xdg::index_dir(args.index.as_deref(), || {
+        dirs.as_ref().ok().map(|d| d.data.clone())
+    });
     let Some(index) = index else {
         // Only reachable when HOME is unusable, so `dirs` holds the reason.
         if let Err(e) = &dirs {

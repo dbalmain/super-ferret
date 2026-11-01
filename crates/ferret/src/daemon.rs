@@ -245,10 +245,9 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
 /// The index directory and idle timeout, from the environment and then
 /// `--index` and `--idle-ms`.
 fn arguments(args: impl Iterator<Item = OsString>) -> io::Result<(Option<PathBuf>, Duration)> {
-    let mut index = std::env::var_os("FERRET_INDEX")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::xdg::Dirs::from_env().ok().map(|dirs| dirs.data));
+    let mut index = crate::xdg::index_dir(None, || {
+        crate::xdg::Dirs::from_env().ok().map(|dirs| dirs.data)
+    });
     // Zero: stay up and keep the index fresh between bursts of use (D116).
     let mut idle = duration("FERRET_DAEMON_IDLE_MS", 0);
     let mut args = args;

@@ -55,10 +55,7 @@ pub(crate) fn main(args: impl Iterator<Item = OsString>) -> cli::Exit {
 
 fn process(reader: impl BufRead, protocol_stdin: bool) -> io::Result<()> {
     let dirs = Dirs::from_env().ok();
-    let index = std::env::var_os("FERRET_INDEX")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs.as_ref().map(|dirs| dirs.data.clone()));
+    let index = crate::xdg::index_dir(None, || dirs.as_ref().map(|dirs| dirs.data.clone()));
     let mut engine = index.as_deref().and_then(open_engine);
     let launch_cwd = std::env::current_dir()?;
     let mut line = Vec::new();
@@ -187,10 +184,7 @@ fn status(request: &Request, engine: Option<&Engine>) -> io::Result<()> {
 
 /// Reopens the engine when the published generation moved, then reports it.
 fn reload(request: &Request, engine: &mut Option<Engine>, dirs: Option<&Dirs>) -> io::Result<()> {
-    let next = std::env::var_os("FERRET_INDEX")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs.map(|dirs| dirs.data.clone()));
+    let next = crate::xdg::index_dir(None, || dirs.map(|dirs| dirs.data.clone()));
     // The manifest generation is enough to see that the resident
     // engine is stale. The snapshot and change log open only when
     // Engine::open actually reloads.

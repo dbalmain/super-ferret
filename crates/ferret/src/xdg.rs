@@ -80,6 +80,27 @@ impl Dirs {
     }
 }
 
+/// The index directory: `explicit` (`--index`), then a nonempty
+/// `FERRET_INDEX`, then `data`, normally the XDG data directory.
+pub fn index_dir(
+    explicit: Option<&Path>,
+    data: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    index_path(explicit, std::env::var_os("FERRET_INDEX"), data)
+}
+
+/// Index precedence: `explicit`, then a nonempty `env`, then `data`.
+fn index_path(
+    explicit: Option<&Path>,
+    env: Option<OsString>,
+    data: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    explicit
+        .map(Path::to_owned)
+        .or_else(|| env.filter(|value| !value.is_empty()).map(PathBuf::from))
+        .or_else(data)
+}
+
 fn base(
     var: &impl Fn(&str) -> Option<OsString>,
     name: &'static str,
@@ -170,5 +191,30 @@ mod tests {
                 var: "XDG_CONFIG_HOME"
             })
         );
+    }
+
+    #[test]
+    fn index_precedence_is_explicit_then_nonempty_env_then_data() {
+        // (--index, FERRET_INDEX, XDG data, chosen); "-" is absent.
+        let cases = [
+            ("/explicit", "/env", "/data", "/explicit"),
+            ("-", "/env", "/data", "/env"),
+            ("-", "", "/data", "/data"),
+            ("-", "-", "/data", "/data"),
+            ("-", "", "-", "-"),
+            ("/explicit", "-", "-", "/explicit"),
+        ];
+        let given = |value: &'static str| (value != "-").then_some(value);
+        for (explicit, env, data, expected) in cases {
+            assert_eq!(
+                index_path(
+                    given(explicit).map(Path::new),
+                    given(env).map(OsString::from),
+                    || given(data).map(PathBuf::from),
+                ),
+                given(expected).map(PathBuf::from),
+                "{explicit} {env} {data}"
+            );
+        }
     }
 }
