@@ -106,26 +106,11 @@ impl<'a> Hasher<'a> {
     /// A file the policy sends to the index: carried, taken from another
     /// name's observation, read, or deferred.
     fn index_file(&mut self, decided: &Decided<'_, DirToken>, stat: Stat) {
-        let out = &mut self.out;
-        out.counts.indexed += 1;
-        // An old `Unindexed` means the policy did not send it to the index
-        // then; it does now, so it must be read (D37).
-        match self.txn.carry(&stat) {
-            Some(Content::Unindexed) | None => {}
-            Some(content) => {
-                out.counts.carried += 1;
-                out.batch.revealing(decided.revealed).file(
-                    decided.parent,
-                    decided.name.as_bytes(),
-                    stat,
-                    content,
-                );
-                #[cfg(test)]
-                hook(self.root, Probe::Carried(decided.path));
-                return;
-            }
+        self.out.counts.indexed += 1;
+        if self.carry(decided, stat) {
+            return;
         }
-        let (file, links) = match Reader::open(decided.parent_fd, decided.name, &stat) {
+        let (mut file, links) = match Reader::open(decided.parent_fd, decided.name, &stat) {
             Opened::Ready { file, links } => (file, links),
             Opened::Fault(fault) => {
                 self.record(decided, stat, Err(fault));
@@ -133,40 +118,9 @@ impl<'a> Hasher<'a> {
             }
         };
         let key = (stat.dev, stat.ino);
-        if links > 1 {
-            match self.cache.claim(key) {
-                Lookup::Claimed => {}
-                Lookup::InFlight => {
-                    if !out.reserve(
-                        std::mem::size_of::<Deferred>()
-                            + decided.name.as_bytes().len()
-                            + joined_bytes(self.root, decided.path),
-                    ) {
-                        return;
-                    }
-                    let alias = Deferred {
-                        parent: decided.parent,
-                        name: decided.name.as_bytes().to_vec(),
-                        stat,
-                        path: self.root.join(decided.path),
-                        revealed: decided.revealed,
-                    };
-                    self.out.defer(alias, self.cache);
-                    #[cfg(test)]
-                    hook(self.root, Probe::Deferred);
-                    return;
-                }
-                Lookup::Done(stored) => {
-                    self.out.counts.aliased += 1;
-                    let (stat, content) = observe::consume(stored, &stat);
-                    self.record(decided, stat, content);
-                    return;
-                }
-            }
-            #[cfg(test)]
-            hook(self.root, Probe::Claimed);
+        if links > 1 && !self.claim(decided, stat, key) {
+            return;
         }
-        let mut file = file;
         let content = self.reader.read(&mut file, stat.size);
         #[cfg(test)]
         hook(self.root, Probe::Hashed(decided.path));
@@ -181,6 +135,65 @@ impl<'a> Hasher<'a> {
         #[cfg(test)]
         hook(self.root, Probe::Read(decided.path));
         self.record(decided, stat, content);
+    }
+
+    /// Carries the file's previous content when the transaction still has
+    /// it. An old `Unindexed` means the policy did not send it to the index
+    /// then; it does now, so it must be read (D37).
+    fn carry(&mut self, decided: &Decided<'_, DirToken>, stat: Stat) -> bool {
+        let content = match self.txn.carry(&stat) {
+            Some(Content::Unindexed) | None => return false,
+            Some(content) => content,
+        };
+        self.out.counts.carried += 1;
+        self.out.batch.revealing(decided.revealed).file(
+            decided.parent,
+            decided.name.as_bytes(),
+            stat,
+            content,
+        );
+        #[cfg(test)]
+        hook(self.root, Probe::Carried(decided.path));
+        true
+    }
+
+    /// Claims a hard-linked file's read for this name. Otherwise a name
+    /// still being read defers this one, and a finished one gives it that
+    /// observation; false when either handled it.
+    fn claim(&mut self, decided: &Decided<'_, DirToken>, stat: Stat, key: (u64, u64)) -> bool {
+        match self.cache.claim(key) {
+            Lookup::Claimed => {
+                #[cfg(test)]
+                hook(self.root, Probe::Claimed);
+                true
+            }
+            Lookup::InFlight => {
+                if !self.out.reserve(
+                    std::mem::size_of::<Deferred>()
+                        + decided.name.as_bytes().len()
+                        + joined_bytes(self.root, decided.path),
+                ) {
+                    return false;
+                }
+                let alias = Deferred {
+                    parent: decided.parent,
+                    name: decided.name.as_bytes().to_vec(),
+                    stat,
+                    path: self.root.join(decided.path),
+                    revealed: decided.revealed,
+                };
+                self.out.defer(alias, self.cache);
+                #[cfg(test)]
+                hook(self.root, Probe::Deferred);
+                false
+            }
+            Lookup::Done(stored) => {
+                self.out.counts.aliased += 1;
+                let (stat, content) = observe::consume(stored, &stat);
+                self.record(decided, stat, content);
+                false
+            }
+        }
     }
 
     /// Records a read or aliased file.
