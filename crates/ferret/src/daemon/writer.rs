@@ -1076,27 +1076,20 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
         .is_err()
     {
         release_pending(&host.writer_pending);
-        emit_to(destination, &request.id, "begin", |o| {
-            o.null("generation");
-        })?;
-        return emit_to(destination, &request.id, "end", |o| {
-            o.int("exit", 3).str("error", "WriterUnavailable");
-        });
+        return unavailable(destination, &request.id, None);
     }
     let started = Instant::now();
     let reply = match receive.recv() {
         Ok(reply) => reply,
         Err(_) => {
-            emit_to(destination, &request.id, "begin", |o| {
-                o.null("generation");
-            })?;
-            return emit_to(destination, &request.id, "end", |o| {
-                o.int("exit", 3).str("error", "WriterUnavailable").str(
-                    "message",
+            return unavailable(
+                destination,
+                &request.id,
+                Some(
                     "writer failed; retry the command, and if ferretd is still running, \
                      inspect ferret status --json and restart it",
-                );
-            });
+                ),
+            );
         }
     };
     let rendered = crate::index::render(&reply.result);
@@ -1129,6 +1122,35 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
             })?;
         }
     }
+    let log = log_line(request, &reply, rendered.outcome, exit, started);
+    emit_to(destination, &request.id, "log", |o| {
+        o.bytes("bytes", &log);
+    })?;
+    emit_to(destination, &request.id, "end", |o| {
+        o.int("exit", exit).str("outcome", rendered.outcome);
+    })
+}
+/// Answers a writer command the writer cannot take, with `message` saying
+/// what to do when the writer failed rather than was gone.
+fn unavailable(destination: &Destination, id: &str, message: Option<&str>) -> io::Result<()> {
+    emit_to(destination, id, "begin", |o| {
+        o.null("generation");
+    })?;
+    emit_to(destination, id, "end", |o| {
+        o.int("exit", 3).str("error", "WriterUnavailable");
+        if let Some(message) = message {
+            o.str("message", message);
+        }
+    })
+}
+/// The query-log line for writer command `request`, which `reply` answered.
+fn log_line(
+    request: &Request,
+    reply: &CommandReply,
+    outcome: &str,
+    exit: u8,
+    started: Instant,
+) -> Vec<u8> {
     let mut log = Vec::new();
     let mut object = crate::log::line(
         &mut log,
@@ -1140,17 +1162,12 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
         SystemTime::now(),
     );
     object
-        .str("outcome", rendered.outcome)
+        .str("outcome", outcome)
         .int("exit", exit)
         .int("total_us", started.elapsed().as_micros() as i128);
     crate::index::log_result(&mut object, &reply.result);
     object.end();
-    emit_to(destination, &request.id, "log", |o| {
-        o.bytes("bytes", &log);
-    })?;
-    emit_to(destination, &request.id, "end", |o| {
-        o.int("exit", exit).str("outcome", rendered.outcome);
-    })
+    log
 }
 pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
     let s = lock(&host.writer_status);
