@@ -1139,23 +1139,27 @@ impl Catalog {
         let names = self.name_reader();
         let mut kinds = self.kinds();
         self.children(dir)
-            .map(move |id| Self::typed_entry(id, names.get(id), &mut kinds))
+            .map(move |id| Self::typed_entry(id, names.child_edge(id), &mut kinds))
     }
 
     /// One typed name row. Needs Names and Links for a visible non-directory.
     pub fn entry(&self, id: NameId) -> Entry<'_> {
-        Self::typed_entry(id, self.name(id), &mut self.kinds())
+        Self::typed_entry(id, self.name_reader().child_edge(id), &mut self.kinds())
     }
 
-    fn typed_entry<'a>(id: NameId, name: Name<'a>, kinds: &mut Kinds<'_>) -> Entry<'a> {
-        let target = name.target();
+    fn typed_entry<'a>(
+        id: NameId,
+        (child, bytes): (InoId, &'a [u8]),
+        kinds: &mut Kinds<'_>,
+    ) -> Entry<'a> {
+        let target = Target::from_child(child);
         let kind = match target {
             Target::Inode(inode) => kinds.kind(inode),
             Target::Ignored(kind) => kind,
         };
         Entry {
             name: id,
-            bytes: name.bytes,
+            bytes,
             kind,
             target,
         }

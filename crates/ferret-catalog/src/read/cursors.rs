@@ -46,6 +46,20 @@ impl<'c> NameReader<'c> {
         self.base_edge(id)
     }
 
+    /// A name's child and bytes, without its directory: what a listing
+    /// reads for each entry.
+    pub fn child_edge(&self, id: NameId) -> (InoId, &'c [u8]) {
+        if self.overlay.is_some() {
+            let n = self.get(id);
+            return (n.child, n.bytes);
+        }
+        let child = InoId(self.children.get(id.0 as usize) as u32);
+        match self.resident {
+            Some(names) => (child, names.name(id)),
+            None => (child, self.heap_bytes(id)),
+        }
+    }
+
     /// A checkpoint name's directory and bytes.
     fn base_edge(&self, id: NameId) -> (InoId, &'c [u8]) {
         let i = id.0 as usize;
@@ -239,18 +253,11 @@ impl Kinds<'_> {
         let n = links.len() / PAIR_ROW;
         let key = |i: usize| u32_at(links, i * PAIR_ROW);
         let below = |i: usize| key(i) < id.0;
-        if self.at > 0 && !below(self.at - 1) {
-            self.at = partition_point(self.at, below);
-        } else {
-            // Gallop: `lo` is at or before the answer, `hi` past it or `n`.
-            let (mut lo, mut hi, mut step) = (self.at, self.at, 1);
-            while hi < n && below(hi) {
-                lo = hi + 1;
-                hi = (hi + step).min(n);
-                step *= 2;
-            }
-            self.at = lo + partition_point(hi - lo, |i| below(lo + i));
-        }
+        let at = self.at;
+        self.at = match at > 0 && !below(at - 1) {
+            true => partition_point(at, below),
+            false => at + gallop(n - at, |i| below(at + i)),
+        };
         match self.at < n && key(self.at) == id.0 {
             true => Kind::Symlink,
             false => Kind::File,
