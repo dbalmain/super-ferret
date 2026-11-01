@@ -55,6 +55,18 @@ fn basic_midpattern_anchors_are_literals_but_extended_anchors_assert() {
     assert_eq!(regex.try_is_match(b"./a^b$c"), Ok(false));
 }
 
+// GNU find 4.11.0 agrees: `$` anchors where a basic branch ends.
+#[test]
+fn basic_dollar_anchors_at_a_branch_end() {
+    for dialect in [Dialect::Emacs, Dialect::Basic, Dialect::Grep] {
+        for pattern in [&br"\./a$"[..], br"\./\(a$\)", br"\./a$\|\./b"] {
+            let regex = FindRegex::new(pattern, dialect, false).unwrap();
+            assert_eq!(regex.try_is_match(b"./a"), Ok(true));
+            assert_eq!(regex.try_is_match(b"./a$"), Ok(false));
+        }
+    }
+}
+
 #[test]
 fn backreferences_backtrack_into_groups_and_fold_only_ascii() {
     for (dialect, pattern) in [

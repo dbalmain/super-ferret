@@ -47,6 +47,50 @@ impl Dialect {
             _ => return None,
         })
     }
+
+    /// Basic syntax: groups, intervals and alternation are escaped.
+    fn basic(self) -> bool {
+        matches!(
+            self,
+            Self::Emacs | Self::Basic | Self::Grep | Self::MinimalBasic
+        )
+    }
+
+    /// Whether `byte`, escaped or not, is an operator here. `branch_start`
+    /// says it opens a branch; `rest` is the pattern after it.
+    fn operator(self, byte: u8, escaped: bool, branch_start: bool, rest: &[u8]) -> bool {
+        let basic = self.basic();
+        match byte {
+            b'\n' => matches!(self, Self::Grep | Self::Egrep),
+            b'(' | b')' => escaped == basic,
+            b'|' => {
+                if basic {
+                    escaped && self != Self::MinimalBasic
+                } else {
+                    !escaped
+                }
+            }
+            b'+' | b'?' => {
+                if self == Self::Emacs || !basic {
+                    !escaped
+                } else {
+                    escaped && self != Self::MinimalBasic
+                }
+            }
+            b'{' | b'}' => self != Self::Awk && escaped == basic,
+            b'*' | b'.' => !escaped,
+            b'^' => !escaped && (!basic || branch_start),
+            // In basic syntax `$` anchors only where a branch ends.
+            b'$' => {
+                !escaped
+                    && (!basic
+                        || rest.is_empty()
+                        || rest.starts_with(b"\\)")
+                        || rest.starts_with(b"\\|"))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A whole-path, byte-oriented GNU dialect regex.
@@ -100,10 +144,6 @@ fn literal(out: &mut String, byte: u8) {
 }
 
 fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<(String, bool), RegexError> {
-    let basic = matches!(
-        dialect,
-        Dialect::Emacs | Dialect::Basic | Dialect::Grep | Dialect::MinimalBasic
-    );
     let mut out = String::from(match (fold, dialect == Dialect::Emacs) {
         (true, true) => "(?i-u)\\A(?:",
         (false, true) => "(?-u)\\A(?:",
@@ -137,35 +177,7 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<(String, bo
         } else {
             byte
         };
-        let operator = match byte {
-            b'\n' => matches!(dialect, Dialect::Grep | Dialect::Egrep),
-            b'(' | b')' => escaped == basic,
-            b'|' => {
-                if basic {
-                    escaped && dialect != Dialect::MinimalBasic
-                } else {
-                    !escaped
-                }
-            }
-            b'+' | b'?' => {
-                if dialect == Dialect::Emacs || !basic {
-                    !escaped
-                } else {
-                    escaped && dialect != Dialect::MinimalBasic
-                }
-            }
-            b'{' | b'}' => dialect != Dialect::Awk && escaped == basic,
-            b'*' | b'.' => !escaped,
-            b'^' => !escaped && (!basic || branch_start),
-            b'$' => {
-                !escaped
-                    && (!basic
-                        || at + 1 == pattern.len()
-                        || pattern[at + 1..].starts_with(b"\\)")
-                        || pattern[at + 1..].starts_with(b"\\|"))
-            }
-            _ => false,
-        };
+        let operator = dialect.operator(byte, escaped, branch_start, &pattern[at + 1..]);
         if escaped && matches!(byte, b'1'..=b'9') && dialect != Dialect::Awk {
             if !closed[usize::from(byte - b'1')] {
                 return Err(RegexError("invalid backreference".into()));
@@ -191,7 +203,7 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<(String, bo
                 repeated = false;
             } else {
                 let repetition = if byte == b'{' {
-                    interval(pattern, at, basic, dialect)?
+                    interval(pattern, at, dialect)?
                 } else {
                     Some((String::from(byte as char), at + 1))
                 };
@@ -298,9 +310,9 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<(String, bo
 fn interval(
     pattern: &[u8],
     at: usize,
-    basic: bool,
     dialect: Dialect,
 ) -> Result<Option<(String, usize)>, RegexError> {
+    let basic = dialect.basic();
     let close: &[u8] = if basic { b"\\}" } else { b"}" };
     let tail = &pattern[at + 1..];
     let strict = basic || dialect == Dialect::Extended;
