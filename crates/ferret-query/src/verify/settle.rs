@@ -291,25 +291,11 @@ fn stream(
         return Outcome::Stopped(Matched::default());
     }
     // Sized before the read, in case the host never calls `each`.
-    let mut answers = vec![None; regexes.len()];
-    // Which atoms' answers are final: matched, or searched to the end.
-    let mut done = vec![false; regexes.len()];
-    let mut regex = Duration::ZERO;
-    let mut size = 0;
+    let mut progress = Progress::new(regexes.len());
     // Set when `stopped` ends the read.
     let mut halted = false;
     let mut each = |source: &mut dyn Read, len: u64| {
-        size = len;
-        regex = Duration::ZERO;
-        answers.clear();
-        answers.resize(regexes.len(), None);
-        done.clear();
-        done.resize(regexes.len(), false);
-        let mut open = regexes.len();
-        let mut halt = || {
-            halted = true;
-            Err(io::Error::other("stopped"))
-        };
+        progress.restart(len);
         crate::scan::runs(
             source,
             len,
@@ -317,60 +303,121 @@ fn stream(
             stopped,
             None,
             |run, base, terminated| {
-                let engine = Instant::now();
-                for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
-                    let (false, Some(search)) = (*done, search) else {
-                        continue;
-                    };
-                    if stopped() {
-                        regex += engine.elapsed();
-                        return halt();
-                    }
-                    if let Some(found) = search.find(run) {
-                        *answer = Some(base + found);
-                        open -= 1;
-                    }
-                    *done = answer.is_some() || !terminated;
-                }
-                regex += engine.elapsed();
-                if (open == 0 || !terminated) && stopped() {
-                    return halt();
-                }
-                Ok(if open == 0 {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                })
+                progress
+                    .search(regexes, run, base, terminated, stopped)
+                    .ok_or_else(|| {
+                        halted = true;
+                        io::Error::other("stopped")
+                    })
             },
         )
     };
     let version = read(name, ReadRequest::Stream(&mut each, stopped));
-    // The atoms that finished, matched or not: every one after a full read.
-    let finished = || {
-        let settled = || answers.iter().zip(&done).filter(|(_, done)| **done);
-        let counted = settled().count() as u64;
-        let mut work = Matched {
-            regex,
-            ..Matched::default()
-        };
-        work.matching.regex_documents = counted;
-        work.matching.regex_bytes = counted * size;
-        work.matching.regex_rejected = settled().filter(|(a, _)| a.is_none()).count() as u64;
-        work.time = start.elapsed();
-        work
-    };
     // A stop after `each` returned, in the host's own checks, is a stop
     // too: the host may have succeeded or given up because of it.
     if halted || stopped() {
-        return Outcome::Stopped(finished());
+        return Outcome::Stopped(progress.finished(start));
     }
     match version {
         None => Outcome::Unread(start.elapsed()),
         Some(version) => Outcome::Read {
             version,
-            work: finished(),
-            answers,
+            work: progress.finished(start),
+            answers: progress.answers,
         },
+    }
+}
+
+/// One read's search, run by run: each atom's first match.
+struct Progress {
+    answers: Vec<Option<usize>>,
+    /// Which atoms' answers are final: matched, or searched to the end.
+    done: Vec<bool>,
+    /// Atoms not yet matched.
+    open: usize,
+    regex: Duration,
+    size: u64,
+}
+
+impl Progress {
+    fn new(atoms: usize) -> Self {
+        Self {
+            answers: vec![None; atoms],
+            done: vec![false; atoms],
+            open: atoms,
+            regex: Duration::ZERO,
+            size: 0,
+        }
+    }
+
+    /// Starts over for a read of `len` bytes.
+    fn restart(&mut self, len: u64) {
+        let atoms = self.answers.len();
+        self.size = len;
+        self.regex = Duration::ZERO;
+        self.answers.clear();
+        self.answers.resize(atoms, None);
+        self.done.clear();
+        self.done.resize(atoms, false);
+        self.open = atoms;
+    }
+
+    /// Searches `run`, at `base`, for every atom still open; `Break` once
+    /// none is. `None` when `stopped` ends the read.
+    fn search(
+        &mut self,
+        regexes: &[Option<Search<'_>>],
+        run: &[u8],
+        base: usize,
+        terminated: bool,
+        stopped: &dyn Fn() -> bool,
+    ) -> Option<ControlFlow<()>> {
+        let engine = Instant::now();
+        let atoms = regexes.iter().zip(&mut self.answers).zip(&mut self.done);
+        for ((search, answer), done) in atoms {
+            let (false, Some(search)) = (*done, search) else {
+                continue;
+            };
+            if stopped() {
+                self.regex += engine.elapsed();
+                return None;
+            }
+            if let Some(found) = search.find(run) {
+                *answer = Some(base + found);
+                self.open -= 1;
+            }
+            *done = answer.is_some() || !terminated;
+        }
+        self.regex += engine.elapsed();
+        if (self.open == 0 || !terminated) && stopped() {
+            return None;
+        }
+        Some(if self.open == 0 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// The work of the atoms that finished, matched or not: every one after
+    /// a full read.
+    fn finished(&self, start: Instant) -> Matched {
+        let settled = || {
+            self.answers
+                .iter()
+                .zip(&self.done)
+                .filter(|(_, done)| **done)
+        };
+        let counted = settled().count() as u64;
+        let mut work = Matched {
+            regex: self.regex,
+            ..Matched::default()
+        };
+        work.matching.regex_documents = counted;
+        work.matching.regex_bytes = counted * self.size;
+        work.matching.regex_rejected = settled().filter(|(a, _)| a.is_none()).count() as u64;
+        work.time = start.elapsed();
+        work
     }
 }
 
