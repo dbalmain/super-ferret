@@ -203,6 +203,40 @@ pub(crate) struct WorkTreeEntry {
     pub(crate) common_id: (u64, u64),
 }
 
+/// Whether `old`'s row `id`, named by `edge`, proves the observed `file`
+/// unchanged: the same non-directory inode, kind, content state and hash,
+/// link target and `!` flag.
+fn unchanged(
+    old: &Catalog,
+    id: NameId,
+    edge: crate::Name<'_>,
+    file: &PendingFile,
+    target: Option<&[u8]>,
+) -> bool {
+    let crate::Target::Inode(child) = edge.target() else {
+        return false;
+    };
+    if old.is_directory(child) {
+        return false;
+    }
+    let inode = old.inode(child);
+    let kind = old.kind(child);
+    inode.stat == file.stat
+        && kind == Kind::from_mode(file.stat.mode)
+        && inode.state == file.content.state()
+        && match file.content {
+            Content::Hashed(hash) => inode.doc.and_then(|doc| old.doc_hash(doc)) == Some(hash),
+            _ => true,
+        }
+        && if kind == Kind::Symlink {
+            old.link_target(child) == target
+        } else {
+            target.is_none()
+        }
+        // A changed `!` rule changes only the flag (D127).
+        && old.is_revealed(id) == file.revealed
+}
+
 struct PendingFile {
     parent: DirToken,
     name: Span,
@@ -705,32 +739,7 @@ impl Batch {
                         .filter(|(_, edge)| edge.bytes == name)
                 };
                 let reusable = !duplicate
-                    && matched.is_some_and(|(_, edge)| {
-                        let crate::Target::Inode(child) = edge.target() else {
-                            return false;
-                        };
-                        if old.is_directory(child) {
-                            return false;
-                        }
-                        let inode = old.inode(child);
-                        let kind = old.kind(child);
-                        inode.stat == file.stat
-                            && kind == Kind::from_mode(file.stat.mode)
-                            && inode.state == file.content.state()
-                            && match file.content {
-                                Content::Hashed(hash) => {
-                                    inode.doc.and_then(|doc| old.doc_hash(doc)) == Some(hash)
-                                }
-                                _ => true,
-                            }
-                            && if kind == Kind::Symlink {
-                                old.link_target(child) == target
-                            } else {
-                                target.is_none()
-                            }
-                    })
-                    // A changed `!` rule changes only the flag (D127).
-                    && matched.is_some_and(|(id, _)| old.is_revealed(id) == file.revealed);
+                    && matched.is_some_and(|(id, edge)| unchanged(&old, id, edge, file, target));
                 if reusable {
                     if let Some((id, edge)) = matched {
                         self.reused.insert(file.parent, id, Some(edge.child));
