@@ -32,6 +32,18 @@ struct PatternByte {
     escaped: bool,
 }
 
+impl PatternByte {
+    /// Whether this is `value` with no backslash before it.
+    fn is(self, value: u8) -> bool {
+        !self.escaped && self.value == value
+    }
+}
+
+/// Whether `part[at]` is an unescaped `value`.
+fn bare(part: &[PatternByte], at: usize, value: u8) -> bool {
+    part.get(at).is_some_and(|byte| byte.is(value))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Component {
     Globstar { allow_zero: bool },
@@ -815,7 +827,7 @@ fn split_components(pattern: &[u8]) -> Result<SplitPattern, String> {
 }
 
 fn compile_component(part: &[PatternByte], anchored: bool, syntax: Syntax) -> Component {
-    if anchored && part.len() >= 2 && part.iter().all(|byte| !byte.escaped && byte.value == b'*') {
+    if anchored && part.len() >= 2 && part.iter().all(|byte| byte.is(b'*')) {
         return Component::Globstar { allow_zero: true };
     }
     if part.is_empty() {
@@ -881,74 +893,51 @@ fn compile_class(
     let mut at = start + 1;
     let negated = part
         .get(at)
-        .is_some_and(|byte| !byte.escaped && matches!(byte.value, b'!' | b'^'));
+        .is_some_and(|byte| byte.is(b'!') || byte.is(b'^'));
     if negated {
         at += 1;
     }
 
     let mut members = Vec::new();
-    if part
-        .get(at)
-        .is_some_and(|byte| !byte.escaped && byte.value == b']')
-    {
+    if bare(part, at, b']') {
         members.push(ClassMember::Byte(part[at]));
         at += 1;
     }
     let end = loop {
         let byte = *part.get(at)?;
-        if !byte.escaped && byte.value == b']' {
+        if byte.is(b']') {
             break at + 1;
         }
-        if syntax == Syntax::Ignore
-            && !byte.escaped
-            && byte.value == b'['
-            && part
-                .get(at + 1)
-                .is_some_and(|colon| !colon.escaped && colon.value == b':')
-        {
+        if syntax == Syntax::Ignore && byte.is(b'[') && bare(part, at + 1, b':') {
             let name_start = at + 2;
             let mut name_end = name_start;
-            while !(part
-                .get(name_end)
-                .is_some_and(|colon| !colon.escaped && colon.value == b':')
-                && part
-                    .get(name_end + 1)
-                    .is_some_and(|close| !close.escaped && close.value == b']'))
-            {
+            while !(bare(part, name_end, b':') && bare(part, name_end + 1, b']')) {
                 name_end += 1;
                 part.get(name_end)?;
             }
             if part[name_start..name_end].iter().any(|item| item.escaped) {
                 return None;
             }
-            if members.last().is_some_and(|member| {
-                matches!(
-                    member,
-                    ClassMember::Byte(PatternByte {
-                        value: b'-',
-                        escaped: false
-                    })
-                )
-            }) {
+            if let Some(ClassMember::Byte(hyphen)) = members.last()
+                && hyphen.is(b'-')
+            {
                 // In Git, a POSIX-looking token after a range hyphen is raw
                 // bracket syntax. The first close bracket ends the class;
                 // the final close bracket is then an ordinary pattern byte.
                 members.pop();
-                let prior = members.pop()?;
-                members.push(prior);
-                let class_end = name_end + 2;
-                let mut terms = Vec::new();
-                for member in members {
-                    if let ClassMember::Byte(byte) = member {
-                        terms.push(ClassTerm::Byte(byte.value));
-                    }
+                if members.is_empty() {
+                    return None;
                 }
+                let terms = members.iter().filter_map(|member| match member {
+                    ClassMember::Byte(byte) => Some(ClassTerm::Byte(byte.value)),
+                    ClassMember::Posix(_) => None,
+                });
                 return Some((
                     CharacterClass {
                         negated,
-                        terms: terms.into_boxed_slice(),
+                        terms: terms.collect(),
                     },
-                    class_end,
+                    name_end + 2,
                 ));
             }
             let name: Vec<u8> = part[name_start..name_end]
@@ -965,20 +954,28 @@ fn compile_class(
     if members.is_empty() {
         return None;
     }
+    Some((
+        CharacterClass {
+            negated,
+            terms: class_terms(&members, syntax)?,
+        },
+        end,
+    ))
+}
 
+/// A class's members as terms, joining `a-z` into a range. None when an
+/// override pattern reverses a range, which Git ignore files tolerate.
+fn class_terms(members: &[ClassMember], syntax: Syntax) -> Option<Box<[ClassTerm]>> {
     let mut terms = Vec::new();
-    let mut member_at = 0;
-    while member_at < members.len() {
-        if let (
-            Some(ClassMember::Byte(first)),
-            Some(ClassMember::Byte(hyphen)),
-            Some(ClassMember::Byte(last)),
-        ) = (
-            members.get(member_at),
-            members.get(member_at + 1),
-            members.get(member_at + 2),
-        ) && !hyphen.escaped
-            && hyphen.value == b'-'
+    let mut at = 0;
+    while at < members.len() {
+        if let [
+            ClassMember::Byte(first),
+            ClassMember::Byte(hyphen),
+            ClassMember::Byte(last),
+            ..,
+        ] = members[at..]
+            && hyphen.is(b'-')
         {
             if first.value <= last.value {
                 terms.push(ClassTerm::Range(first.value, last.value));
@@ -989,22 +986,16 @@ fn compile_class(
                 // Git keeps only the first endpoint of a reversed range.
                 terms.push(ClassTerm::Byte(first.value));
             }
-            member_at += 3;
+            at += 3;
             continue;
         }
-        terms.push(match members[member_at] {
+        terms.push(match members[at] {
             ClassMember::Byte(byte) => ClassTerm::Byte(byte.value),
             ClassMember::Posix(class) => ClassTerm::Posix(class),
         });
-        member_at += 1;
+        at += 1;
     }
-    Some((
-        CharacterClass {
-            negated,
-            terms: terms.into_boxed_slice(),
-        },
-        end,
-    ))
+    Some(terms.into_boxed_slice())
 }
 
 fn trim_trailing_spaces(mut line: &str) -> &str {
