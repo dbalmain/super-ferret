@@ -101,19 +101,7 @@ pub(in super::super) fn observe_streaming(
         None
     };
     if output.streamed {
-        let error = if let Some(error) = spool_failure {
-            Some(error.to_string())
-        } else if changed_after_publication {
-            Some("changed during read after output began; output is partial (not retried)".into())
-        } else {
-            match outcome {
-                ReadOutcome::Failed(error) => Some(error.to_string()),
-                ReadOutcome::Vanished => {
-                    Some("vanished after output began; output is partial".into())
-                }
-                _ => None,
-            }
-        };
+        let error = partial_cause(spool_failure.as_ref(), changed_after_publication, &outcome);
         return Ok(Observed::Streamed(result, error, output.held));
     }
     if let Some(error) = spool_failure {
@@ -131,6 +119,27 @@ pub(in super::super) fn observe_streaming(
         ReadOutcome::RetryChanged => Observed::Failed(ReadFault::Unstable),
         ReadOutcome::Cancelled | ReadOutcome::Vanished => Observed::Skipped,
     })
+}
+
+/// Why output that has already begun streaming is partial, if it is: a
+/// spool failure, a change after publication, or a read that failed or
+/// vanished.
+fn partial_cause(
+    spool: Option<&io::Error>,
+    changed: bool,
+    outcome: &ReadOutcome,
+) -> Option<String> {
+    if let Some(error) = spool {
+        Some(error.to_string())
+    } else if changed {
+        Some("changed during read after output began; output is partial (not retried)".into())
+    } else {
+        match outcome {
+            ReadOutcome::Failed(error) => Some(error.to_string()),
+            ReadOutcome::Vanished => Some("vanished after output began; output is partial".into()),
+            _ => None,
+        }
+    }
 }
 
 /// A job's display path, kept inline when it is short. The producer makes
