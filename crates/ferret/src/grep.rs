@@ -465,11 +465,7 @@ impl<'a> Execution<'a> {
     /// documents' names and reader, and the directories a pruned walk lists.
     fn prepare(&self, inputs: &[Input]) -> Result<Prepared<'a>, Exit> {
         let Self {
-            plan,
-            selection,
-            pin,
-            runtime,
-            ..
+            plan, pin, runtime, ..
         } = *self;
         let stopped = || runtime.cancelled.load(Ordering::Acquire);
         let mut candidates = if !plan.invert {
@@ -515,25 +511,42 @@ impl<'a> Execution<'a> {
         {
             return Err(runtime.failure(&error.to_string()));
         }
-        // Past one candidate a document, every directory may hold one,
-        // unless the globs and types admit files by name.
-        let holders = match candidates.as_ref().zip(pin).filter(|(candidates, pin)| {
-            prune
-                && (candidates.bound() < u64::from(pin.catalog().doc_count())
-                    || selection.whitelists_names())
-        }) {
-            Some((candidates, pin)) => {
-                holders::Holders::new(pin.catalog(), candidates, selection, plan.text, &stopped)
-                    .map_err(|error| runtime.failure(&error.to_string()))?
-            }
-            None => None,
-        };
+        let holders = self.holders(candidates.as_ref(), prune, &stopped)?;
         Ok(Prepared {
             candidates,
             names,
             documents,
             holders,
         })
+    }
+
+    /// The directories a pruned walk lists. Past one candidate a document,
+    /// every directory may hold one, unless the globs and types admit files
+    /// by name.
+    fn holders(
+        &self,
+        candidates: Option<&engine::GrepCandidates<'a>>,
+        prune: bool,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Option<holders::Holders>, Exit> {
+        let Self {
+            plan,
+            selection,
+            pin,
+            runtime,
+            ..
+        } = *self;
+        match candidates.zip(pin).filter(|(candidates, pin)| {
+            prune
+                && (candidates.bound() < u64::from(pin.catalog().doc_count())
+                    || selection.whitelists_names())
+        }) {
+            Some((candidates, pin)) => {
+                holders::Holders::new(pin.catalog(), candidates, selection, plan.text, stopped)
+                    .map_err(|error| runtime.failure(&error.to_string()))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Refuses before any output when a live operand's anchors fail to
