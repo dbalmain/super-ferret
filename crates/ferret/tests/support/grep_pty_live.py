@@ -12,14 +12,15 @@ assert os.isatty(slave)
 child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE,
                          stdout=slave, stderr=subprocess.DEVNULL)
 os.close(slave)
-fed = threading.Event()
 
 
 def feed():
     line = b"hit " + b"x" * 59 + b"\n"
-    child.stdin.write(line * ((5 << 20) // len(line)) + b"hit MARKER\n")
-    child.stdin.flush()
-    fed.set()
+    try:
+        child.stdin.write(line * ((5 << 20) // len(line)) + b"hit MARKER\n")
+        child.stdin.flush()
+    except BrokenPipeError:
+        pass
 
 
 threading.Thread(target=feed, daemon=True).start()
@@ -39,9 +40,18 @@ while time.monotonic() < deadline:
         break
     tail = (tail + chunk)[-64:]
     if b"MARKER" in tail:
-        seen = fed.is_set()
+        # stdin stays open until this loop ends, so any marker seen here
+        # arrived first.
+        seen = True
         break
-child.stdin.close()
+if not seen:
+    # The feeder may still be blocked writing; killing the child frees it,
+    # so closing stdin cannot wait on its lock.
+    child.kill()
+try:
+    child.stdin.close()
+except BrokenPipeError:
+    pass
 while True:
     try:
         if not os.read(master, 65536):
