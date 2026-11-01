@@ -40,6 +40,7 @@ const FORMAT: u64 = ferret_catalog::FORMAT_VERSION as u64;
 const QUERIES: usize = 4;
 const CLIENTS: usize = 32;
 
+#[derive(Default)]
 struct Lifecycle {
     draining: bool,
     queries: usize,
@@ -187,12 +188,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
         engine_ready: Condvar::new(),
-        lifecycle: Mutex::new(Lifecycle {
-            draining: false,
-            queries: 0,
-            connections: std::collections::BTreeMap::new(),
-            next_connection: 0,
-        }),
+        lifecycle: Mutex::new(Lifecycle::default()),
         lifecycle_changed: Condvar::new(),
         clients: AtomicUsize::new(0),
         index,
@@ -222,16 +218,8 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     if let Loaded::Ready(engine) = &*lock(&host.engine) {
         engine.close_writer();
     }
-    // The lifetime-held endpoint lock excludes starters through cleanup. Never
-    // unlink a replacement created by somebody else after our socket vanished.
-    let removed = if let Ok(current) = fs::symlink_metadata(endpoint.socket())
-        && current.dev() == own_socket.dev()
-        && current.ino() == own_socket.ino()
-    {
-        endpoint.remove_socket()
-    } else {
-        Ok(())
-    };
+    // The lifetime-held endpoint lock excludes starters through cleanup.
+    let removed = remove_own_socket(&endpoint, &own_socket);
     drop(cleanup);
     drop(endpoint_lock);
     // The accept error is why this host left. A removal failure still runs
@@ -241,6 +229,18 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     }
     removed?;
     Ok(())
+}
+/// Removes the endpoint's socket if it is still `own`. Never unlink a
+/// replacement created by somebody else after our socket vanished.
+fn remove_own_socket(endpoint: &Endpoint, own: &fs::Metadata) -> io::Result<()> {
+    if let Ok(current) = fs::symlink_metadata(endpoint.socket())
+        && current.dev() == own.dev()
+        && current.ino() == own.ino()
+    {
+        endpoint.remove_socket()
+    } else {
+        Ok(())
+    }
 }
 /// The index directory and idle timeout, from the environment and then
 /// `--index` and `--idle-ms`.

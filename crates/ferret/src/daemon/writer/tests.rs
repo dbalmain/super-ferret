@@ -116,12 +116,7 @@ fn deferred_writer(reason: Blocked) {
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
         engine_ready: Condvar::new(),
-        lifecycle: Mutex::new(Lifecycle {
-            draining: false,
-            queries: 0,
-            connections: std::collections::BTreeMap::new(),
-            next_connection: 0,
-        }),
+        lifecycle: Mutex::new(Lifecycle::default()),
         lifecycle_changed: Condvar::new(),
         clients: AtomicUsize::new(0),
         index: tree.0.join("index"),
