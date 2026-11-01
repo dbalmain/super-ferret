@@ -54,7 +54,7 @@ impl Task {
             return false;
         }
         let effects = std::cell::RefCell::new(effects);
-        let quit = self.quit.clone();
+        let quit = &*self.quit;
         let item = {
             let mut before_directory = || {
                 self.control
