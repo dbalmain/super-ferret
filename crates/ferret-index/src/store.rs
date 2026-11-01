@@ -1381,49 +1381,60 @@ type OpenPair = (Arc<Segment<File>>, Arc<Segment<File>>);
 type WrittenPair = (SegmentEntry, Arc<Segment<File>>, Arc<Segment<File>>);
 type PairedSegments = (Vec<Arc<Segment<File>>>, Vec<Arc<Segment<File>>>);
 
+/// Opens `entry`'s term segment, or its trigram segment when `tri`, checking
+/// it is the one `manifest` describes.
+fn open_segment(
+    dir: &Path,
+    manifest: &Manifest,
+    entry: &SegmentEntry,
+    tri: bool,
+) -> Result<Arc<Segment<File>>, Error> {
+    let name = if tri {
+        entry.trigram_file_name()
+    } else {
+        entry.file_name()
+    };
+    // A special file under a segment's name is refused, as a
+    // regular file of the wrong shape is, without waiting on it.
+    let file = regular::open(&dir.join(name)).map_err(|e| {
+        if regular::is_not_regular(&e) {
+            Error::Segment(ReadError::NotASegment)
+        } else {
+            Error::Io(e)
+        }
+    })?;
+    let bytes = file.metadata()?.len();
+    let segment = Segment::open(file)?;
+    let matches = if tri {
+        entry.matches_trigrams(
+            &segment.info(),
+            &segment.digest(),
+            bytes,
+            manifest.trigram_version,
+        ) && segment.codec() == crate::segment::DICTIONARY_CODEC
+    } else {
+        entry.matches(
+            &segment.info(),
+            &segment.digest(),
+            bytes,
+            manifest.tokenizer_version,
+        )
+    };
+    if !matches {
+        return Err(ReadError::Head.into());
+    }
+    Ok(Arc::new(segment))
+}
+
 /// Opens every segment pair in manifest order, on at most `threads` threads.
 /// The error is the first in manifest order, as a serial open returns it: a
 /// NotFound there makes [`View::open`] retry from a newer manifest.
 fn open_pairs(dir: &Path, manifest: &Manifest, threads: usize) -> Result<PairedSegments, Error> {
     let one = |entry: &SegmentEntry| -> Result<OpenPair, Error> {
-        let open = |tri: bool| -> Result<_, Error> {
-            let name = if tri {
-                entry.trigram_file_name()
-            } else {
-                entry.file_name()
-            };
-            // A special file under a segment's name is refused, as a
-            // regular file of the wrong shape is, without waiting on it.
-            let file = regular::open(&dir.join(name)).map_err(|e| {
-                if regular::is_not_regular(&e) {
-                    Error::Segment(ReadError::NotASegment)
-                } else {
-                    Error::Io(e)
-                }
-            })?;
-            let bytes = file.metadata()?.len();
-            let segment = Segment::open(file)?;
-            let matches = if tri {
-                entry.matches_trigrams(
-                    &segment.info(),
-                    &segment.digest(),
-                    bytes,
-                    manifest.trigram_version,
-                ) && segment.codec() == crate::segment::DICTIONARY_CODEC
-            } else {
-                entry.matches(
-                    &segment.info(),
-                    &segment.digest(),
-                    bytes,
-                    manifest.tokenizer_version,
-                )
-            };
-            if !matches {
-                return Err(ReadError::Head.into());
-            }
-            Ok(Arc::new(segment))
-        };
-        Ok((open(false)?, open(true)?))
+        Ok((
+            open_segment(dir, manifest, entry, false)?,
+            open_segment(dir, manifest, entry, true)?,
+        ))
     };
     // Parsing each segment's block index is most of opening a view, so
     // segments open in parallel (grep-why P7), on the host's thread count
