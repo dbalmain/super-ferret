@@ -87,6 +87,36 @@ impl Children {
     }
 }
 
+/// Where one directory's children begin on the stack, and how many entries
+/// its listing has read.
+struct Listing {
+    start: usize,
+    names_start: usize,
+    seen: usize,
+}
+
+impl Listing {
+    fn begin(children: &Children) -> Self {
+        Listing {
+            start: children.len(),
+            names_start: children.names_len(),
+            seen: 0,
+        }
+    }
+
+    /// Counts one listed entry and, every `CANCELLATION_INTERVAL` entries,
+    /// asks whether the walk was cancelled.
+    fn cancelled_at(&mut self, cancelled: &mut dyn FnMut() -> bool) -> bool {
+        self.seen += 1;
+        self.seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled()
+    }
+
+    /// Takes this listing's children back off the stack.
+    fn undo(&self, children: &mut Children) {
+        children.truncate(self.start, self.names_start);
+    }
+}
+
 impl std::ops::Index<usize> for Children {
     type Output = Child;
 
@@ -429,17 +459,16 @@ impl LiveWalk {
         let Some(catalog) = &self.catalog else {
             unreachable!("descend found the catalog")
         };
-        let start = self.children.len();
-        let names_start = self.children.names_len();
-        let mut seen = 0usize;
+        let mut listing = Listing::begin(&self.children);
         for child in catalog.entries(dir) {
-            seen += 1;
             #[cfg(test)]
             if let Some(listed) = &self.on_listed {
                 listed();
             }
-            if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                self.children.truncate(start, names_start);
+            if listing.cancelled_at(cancelled) {
+                // `catalog` is still borrowed here, so cancel_listing's
+                // `&mut self` is out of reach.
+                listing.undo(&mut self.children);
                 self.cancelled = true;
                 return Ok(());
             }
@@ -487,15 +516,12 @@ impl LiveWalk {
             .take_while(|(parent, _, _)| *parent == dir);
         let mut added = false;
         for (_, id, name) in roots {
-            seen += 1;
             #[cfg(test)]
             if let Some(listed) = &self.on_listed {
                 listed();
             }
-            if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                self.children.truncate(start, names_start);
-                self.cancelled = true;
-                return Ok(());
+            if listing.cancelled_at(cancelled) {
+                return self.cancel_listing(&listing);
             }
             added = true;
             self.children.push(
@@ -507,12 +533,10 @@ impl LiveWalk {
             );
         }
         if cancelled() {
-            self.children.truncate(start, names_start);
-            self.cancelled = true;
-            return Ok(());
+            return self.cancel_listing(&listing);
         }
         if added {
-            self.children.sort_from(start);
+            self.children.sort_from(listing.start);
         }
         if catalog.has_children(dir) == Some(true) || added {
             before_directory().map_err(|error| entry.error(error))?;
@@ -531,10 +555,10 @@ impl LiveWalk {
             identity: None,
             path_len,
             separator,
-            start,
-            next: start,
+            start: listing.start,
+            next: listing.start,
             end: self.children.len(),
-            names_start,
+            names_start: listing.names_start,
             first: None,
             hidden: Hidden::Unrecorded,
             own,
@@ -553,35 +577,30 @@ impl LiveWalk {
         let path_len = entry.path.len();
         let separator = !entry.path.ends_with(b"/");
         let follow = self.options.follow == Follow::All;
-        let start = self.children.len();
-        let names_start = self.children.names_len();
+        let mut listing = Listing::begin(&self.children);
         let mut first = None;
         let mut hidden = self.options.hidden_names.then(Vec::new);
         if self.buffer.is_empty() {
             self.buffer.resize(LISTING_BUFFER, MaybeUninit::uninit());
         }
         let mut reader = RawDir::new(&*handle, &mut self.buffer);
-        let mut seen = 0usize;
         while let Some(item) = reader.next() {
             let item = match item {
                 Ok(item) => item,
                 Err(error) => {
-                    self.children.truncate(start, names_start);
+                    listing.undo(&mut self.children);
                     return Err(WalkError {
                         path: entry.path().to_owned(),
                         error: error.into(),
                     });
                 }
             };
-            seen += 1;
             #[cfg(test)]
             if let Some(listed) = &self.on_listed {
                 listed();
             }
-            if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
-                self.children.truncate(start, names_start);
-                self.cancelled = true;
-                return Ok(());
+            if listing.cancelled_at(cancelled) {
+                return self.cancel_listing(&listing);
             }
             let name = item.file_name().to_bytes();
             if name == b"." || name == b".." {
@@ -597,7 +616,7 @@ impl LiveWalk {
             // depth limit; regular file metadata remains lazy.
             if target.is_none()
                 && kind == Some(FileKind::Directory)
-                && self.children.len() == start
+                && self.children.len() == listing.start
                 && !self.options.lazy_directories
             {
                 // Observed relative to the handle just opened for this
@@ -614,14 +633,12 @@ impl LiveWalk {
             self.children.push(name, kind, target, None, None);
         }
         if cancelled() {
-            self.children.truncate(start, names_start);
-            self.cancelled = true;
-            return Ok(());
+            return self.cancel_listing(&listing);
         }
-        if self.children.len() > start
+        if self.children.len() > listing.start
             && let Err(error) = before_directory()
         {
-            self.children.truncate(start, names_start);
+            listing.undo(&mut self.children);
             return Err(WalkError {
                 path: entry.path().to_owned(),
                 error,
@@ -631,7 +648,7 @@ impl LiveWalk {
         let (handle, identity) = match retain_listed(&self.options, handle) {
             Ok(kept) => kept,
             Err(error) => {
-                self.children.truncate(start, names_start);
+                listing.undo(&mut self.children);
                 own.restore(entry);
                 return Err(entry.error(error));
             }
@@ -643,10 +660,10 @@ impl LiveWalk {
             identity,
             path_len,
             separator,
-            start,
-            next: start,
+            start: listing.start,
+            next: listing.start,
             end: self.children.len(),
-            names_start,
+            names_start: listing.names_start,
             first,
             hidden: match hidden {
                 None => Hidden::Unrecorded,
@@ -655,6 +672,13 @@ impl LiveWalk {
             },
             own,
         });
+        Ok(())
+    }
+
+    /// Abandons a listing the walk was cancelled during.
+    fn cancel_listing(&mut self, listing: &Listing) -> Result<(), WalkError> {
+        listing.undo(&mut self.children);
+        self.cancelled = true;
         Ok(())
     }
 
