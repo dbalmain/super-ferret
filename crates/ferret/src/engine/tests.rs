@@ -706,7 +706,9 @@ fn refresh_and_direct_verification_proceed_beside_a_held_merge() {
             tree.refresh(&engine);
             refreshed.send(()).unwrap();
         });
-        let completed = finished.recv_timeout(std::time::Duration::from_secs(1));
+        // The merge is released only after this wait, so a refresh that
+        // waits for it fails however long the wait; 1 s flaked under load.
+        let completed = finished.recv_timeout(std::time::Duration::from_secs(10));
         let verified = completed.is_ok().then(|| {
             assert!(
                 engine

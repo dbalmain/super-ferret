@@ -3853,13 +3853,19 @@ fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
     ]);
     ready_within(&tree, HANG);
     let (mut idle, _) = tree.connect();
+    // One rename is one watch event. Twenty separate writes can straddle a
+    // refresh under load, and the hints still pending make the watch due,
+    // which releases the follow before the obstruction is in place.
+    let staged = tree.base.join("staged");
+    fs::create_dir(&staged).unwrap();
     for i in 0..20 {
         fs::write(
-            tree.base.join(format!("src/follow-{i}.txt")),
+            staged.join(format!("follow-{i}.txt")),
             format!("followed{i}\n"),
         )
         .unwrap();
     }
+    fs::rename(&staged, tree.base.join("src/followed")).unwrap();
     let held_by = Instant::now() + HANG;
     while !gate.join("follow.reached").exists() {
         assert!(tree.try_wait(pid).is_none(), "{}", tree.evidence());
