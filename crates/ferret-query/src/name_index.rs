@@ -328,23 +328,7 @@ impl NameIndex {
             .map(|handle| catalog.checked_inode(handle))
             .transpose()?;
         let names = interned(catalog, self.base.owned.as_deref());
-        let mut keys = if terms.is_empty() {
-            (0..names.distinct_count()).collect()
-        } else {
-            let mut candidates: Option<Vec<u32>> = None;
-            let term_index = self.base.terms.get_or_init(|| build_terms(names));
-            for term in terms {
-                let mut keys = Vec::new();
-                if let Ok(list) = term_index.terms.binary_search(term) {
-                    term_index.keys.get(list as u32, &mut keys);
-                }
-                match &mut candidates {
-                    None => candidates = Some(keys),
-                    Some(current) => current.retain(|key| keys.binary_search(key).is_ok()),
-                }
-            }
-            candidates.unwrap_or_default()
-        };
+        let mut keys = self.term_keys(names, terms);
         let mut hits = 0u64;
         keys.retain(|&key| {
             let count = i64::from(names.count(key)) + self.counts.get(&key).copied().unwrap_or(0);
@@ -362,17 +346,7 @@ impl NameIndex {
                 delta.extend_from_slice(rows);
             }
         }
-        // A moved/replaced directory changes the membership of an arbitrarily
-        // large base subtree. Until a subtree count is known, take the safe
-        // effective walk instead of treating the old count as current.
-        let scope_rows = match scope {
-            None => Some(u64::from(catalog.name_count())),
-            Some(dir) if self.unknown_scopes.contains(&dir) => None,
-            Some(dir) => self.base.scopes.get(dir.0 as usize).map(|&count| {
-                (i64::from(count) + self.scope_changes.get(&dir).copied().unwrap_or(0)).max(0)
-                    as u64
-            }),
-        };
+        let scope_rows = self.scope_rows(catalog, scope);
         // Scoped postings pay for ancestry and merging, while a walk reads one
         // row per scope entry. The factor is provisional, exposed by estimates
         // and the production benchmark rather than always choosing postings.
@@ -401,6 +375,43 @@ impl NameIndex {
             scope,
             owned: self.base.owned.clone(),
         })
+    }
+
+    /// The distinct-name keys holding every term; all keys for no terms.
+    fn term_keys(&self, names: &ResidentNames, terms: &[&[u8]]) -> Vec<u32> {
+        if terms.is_empty() {
+            (0..names.distinct_count()).collect()
+        } else {
+            let mut candidates: Option<Vec<u32>> = None;
+            let term_index = self.base.terms.get_or_init(|| build_terms(names));
+            for term in terms {
+                let mut keys = Vec::new();
+                if let Ok(list) = term_index.terms.binary_search(term) {
+                    term_index.keys.get(list as u32, &mut keys);
+                }
+                match &mut candidates {
+                    None => candidates = Some(keys),
+                    Some(current) => current.retain(|key| keys.binary_search(key).is_ok()),
+                }
+            }
+            candidates.unwrap_or_default()
+        }
+    }
+
+    /// How many name rows `scope` holds, or the whole catalog's for none;
+    /// None while a moved directory leaves the count unknown.
+    fn scope_rows(&self, catalog: &Catalog, scope: Option<InoId>) -> Option<u64> {
+        // A moved/replaced directory changes the membership of an arbitrarily
+        // large base subtree. Until a subtree count is known, take the safe
+        // effective walk instead of treating the old count as current.
+        match scope {
+            None => Some(u64::from(catalog.name_count())),
+            Some(dir) if self.unknown_scopes.contains(&dir) => None,
+            Some(dir) => self.base.scopes.get(dir.0 as usize).map(|&count| {
+                (i64::from(count) + self.scope_changes.get(&dir).copied().unwrap_or(0)).max(0)
+                    as u64
+            }),
+        }
     }
 }
 
