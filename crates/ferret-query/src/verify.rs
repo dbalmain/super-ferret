@@ -456,76 +456,14 @@ impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
         stop: &dyn Fn() -> bool,
         paths: &mut Vec<u8>,
     ) -> Item {
-        let (query, catalog) = (self.query, self.catalog);
-        let doc = catalog.doc(row.inode).map(|d| d.0);
-        let probed = doc.and_then(|d| self.docs.binary_search(&d).ok());
-        let indexed = |i: usize| match probed.and_then(|j| self.table[j * self.width + i]) {
-            None => Truth::No,
-            Some(Certainty::Maybe) => Truth::Maybe,
-            Some(Certainty::Yes) => Truth::Yes,
-        };
-        let truth = query.eval_residual(&mut |test| match test {
-            Test::Content(i) => indexed(*i),
-            other => query.test_row(catalog, row, other),
-        });
-        let how = match (truth, doc) {
+        let doc = self.catalog.doc(row.inode).map(|d| d.0);
+        let how = match (self.truth(row, doc), doc) {
             (Truth::No, _) | (Truth::Maybe, None) => return Item::Skip,
             (Truth::Yes, _) => How::Holds,
             (Truth::Maybe, Some(doc)) if self.owns(at, doc) => {
-                let outcome = self.read(row, hand, pool, stop);
-                if pool.is_some() && self.is_repeated(doc) {
-                    let found = match &outcome {
-                        Outcome::Read {
-                            version: ReadVersion::Catalogued,
-                            answers,
-                            ..
-                        } => Some(answers.clone()),
-                        _ => None,
-                    };
-                    lock(self.shard(doc)).insert(doc, found);
-                }
-                let holds = match &outcome {
-                    Outcome::Read { answers, .. } => holds(query, catalog, row, answers),
-                    _ => None,
-                };
-                How::Read {
-                    doc,
-                    outcome,
-                    holds,
-                }
+                self.read_owned(row, doc, hand, pool, stop)
             }
-            // A later name on a worker, whose reader found the catalogued
-            // version: what the calling thread would do on reaching it,
-            // done here. A stat; a read only if the path changed.
-            (Truth::Maybe, Some(doc)) if pool.is_some() => {
-                let found = lock(self.shard(doc)).get(&doc).cloned();
-                match found {
-                    Some(Some(answers)) => match (hand.read)(row.name, ReadRequest::Stat) {
-                        Some(ReadVersion::Catalogued) => How::Cached {
-                            doc,
-                            holds: holds(query, catalog, row, &answers),
-                        },
-                        Some(ReadVersion::Current) => {
-                            let outcome = self.read(row, hand, pool, stop);
-                            let holds = match &outcome {
-                                Outcome::Read { answers, .. } => {
-                                    holds(query, catalog, row, answers)
-                                }
-                                _ => None,
-                            };
-                            How::Again {
-                                doc,
-                                outcome,
-                                holds,
-                            }
-                        }
-                        None => How::Gone(doc),
-                    },
-                    // Not read yet, or not cacheable: left to the calling
-                    // thread.
-                    _ => How::Here(doc),
-                }
-            }
+            (Truth::Maybe, Some(doc)) if pool.is_some() => self.revisit(row, doc, hand, pool, stop),
             (Truth::Maybe, Some(doc)) => How::Here(doc),
         };
         let start = paths.len();
@@ -538,6 +476,93 @@ impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
             doc,
             how,
         })
+    }
+
+    /// `row`'s residual, with content tests answered by the index for its
+    /// document `doc`.
+    fn truth(&self, row: &Row<'_>, doc: Option<u32>) -> Truth {
+        let probed = doc.and_then(|d| self.docs.binary_search(&d).ok());
+        let indexed = |i: usize| match probed.and_then(|j| self.table[j * self.width + i]) {
+            None => Truth::No,
+            Some(Certainty::Maybe) => Truth::Maybe,
+            Some(Certainty::Yes) => Truth::Yes,
+        };
+        self.query.eval_residual(&mut |test| match test {
+            Test::Content(i) => indexed(*i),
+            other => self.query.test_row(self.catalog, row, other),
+        })
+    }
+
+    /// Reads `doc`, this position's to read, sharing a catalogued read's
+    /// answers with the document's later names on a pool.
+    fn read_owned(
+        &self,
+        row: &Row<'_>,
+        doc: u32,
+        hand: &mut Hand<'_, '_>,
+        pool: Option<&Pool>,
+        stop: &dyn Fn() -> bool,
+    ) -> How {
+        let outcome = self.read(row, hand, pool, stop);
+        if pool.is_some() && self.is_repeated(doc) {
+            let found = match &outcome {
+                Outcome::Read {
+                    version: ReadVersion::Catalogued,
+                    answers,
+                    ..
+                } => Some(answers.clone()),
+                _ => None,
+            };
+            lock(self.shard(doc)).insert(doc, found);
+        }
+        let holds = self.read_holds(row, &outcome);
+        How::Read {
+            doc,
+            outcome,
+            holds,
+        }
+    }
+
+    /// A later name on a worker, whose reader found the catalogued version:
+    /// what the calling thread would do on reaching it, done here. A stat; a
+    /// read only if the path changed.
+    fn revisit(
+        &self,
+        row: &Row<'_>,
+        doc: u32,
+        hand: &mut Hand<'_, '_>,
+        pool: Option<&Pool>,
+        stop: &dyn Fn() -> bool,
+    ) -> How {
+        let found = lock(self.shard(doc)).get(&doc).cloned();
+        // Not read yet, or not cacheable: left to the calling thread.
+        let Some(Some(answers)) = found else {
+            return How::Here(doc);
+        };
+        match (hand.read)(row.name, ReadRequest::Stat) {
+            Some(ReadVersion::Catalogued) => How::Cached {
+                doc,
+                holds: holds(self.query, self.catalog, row, &answers),
+            },
+            Some(ReadVersion::Current) => {
+                let outcome = self.read(row, hand, pool, stop);
+                let holds = self.read_holds(row, &outcome);
+                How::Again {
+                    doc,
+                    outcome,
+                    holds,
+                }
+            }
+            None => How::Gone(doc),
+        }
+    }
+
+    /// Whether a read's answers make `row` hold, and its offset if so.
+    fn read_holds(&self, row: &Row<'_>, outcome: &Outcome) -> Option<Option<usize>> {
+        match outcome {
+            Outcome::Read { answers, .. } => holds(self.query, self.catalog, row, answers),
+            _ => None,
+        }
     }
 
     /// Reads and matches `row`'s document on this thread.
