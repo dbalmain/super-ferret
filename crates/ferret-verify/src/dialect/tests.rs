@@ -67,6 +67,44 @@ fn basic_dollar_anchors_at_a_branch_end() {
     }
 }
 
+/// A grep pattern newline is alternation, so it ends a branch for `$` as
+/// `\|` does (checked against GNU find 4.11).
+#[test]
+fn grep_dollar_anchors_before_a_pattern_newline() {
+    let regex = FindRegex::new(b"\\./a$\nzzz", Dialect::Grep, false).unwrap();
+    assert_eq!(regex.try_is_match(b"./a"), Ok(true));
+    assert_eq!(regex.try_is_match(b"./a$"), Ok(false));
+}
+
+/// GNU's buffer anchors, backslash-backtick and backslash-quote, anchor
+/// everywhere but awk and POSIX awk, which read them as the bytes; a `*` after
+/// one follows the rule for `*` after `^` (checked against GNU find 4.11).
+#[test]
+fn buffer_anchors_anchor_outside_awk() {
+    for dialect in [
+        Dialect::Emacs,
+        Dialect::Basic,
+        Dialect::Extended,
+        Dialect::GnuAwk,
+    ] {
+        let end = FindRegex::new(br".*/a\'", dialect, false).unwrap();
+        assert_eq!(end.try_is_match(b"./a"), Ok(true), "{dialect:?}");
+        assert_eq!(end.try_is_match(b"./a'"), Ok(false), "{dialect:?}");
+        let start = FindRegex::new(br"\`\./a", dialect, false).unwrap();
+        assert_eq!(start.try_is_match(b"./a"), Ok(true), "{dialect:?}");
+    }
+    for dialect in [Dialect::Awk, Dialect::PosixAwk] {
+        let end = FindRegex::new(br".*/a\'", dialect, false).unwrap();
+        assert_eq!(end.try_is_match(b"./a"), Ok(false), "{dialect:?}");
+        assert_eq!(end.try_is_match(b"./a'"), Ok(true), "{dialect:?}");
+    }
+    let starred = FindRegex::new(br".*/a\'*", Dialect::Egrep, false).unwrap();
+    assert_eq!(starred.try_is_match(b"./a"), Ok(true));
+    let starred = FindRegex::new(br".*/a\'*", Dialect::Basic, false).unwrap();
+    assert_eq!(starred.try_is_match(b"./a"), Ok(false));
+    assert!(FindRegex::new(br".*/a\'*", Dialect::Extended, false).is_err());
+}
+
 #[test]
 fn backreferences_backtrack_into_groups_and_fold_only_ascii() {
     for (dialect, pattern) in [

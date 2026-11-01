@@ -80,14 +80,18 @@ impl Dialect {
             b'{' | b'}' => self != Self::Awk && escaped == basic,
             b'*' | b'.' => !escaped,
             b'^' => !escaped && (!basic || branch_start),
-            // In basic syntax `$` anchors only where a branch ends.
+            // In basic syntax `$` anchors only where a branch ends, which in
+            // grep's dialect includes a pattern newline.
             b'$' => {
                 !escaped
                     && (!basic
                         || rest.is_empty()
                         || rest.starts_with(b"\\)")
-                        || rest.starts_with(b"\\|"))
+                        || rest.starts_with(b"\\|")
+                        || (self == Self::Grep && rest.starts_with(b"\n")))
             }
+            // GNU's buffer anchors; awk reads them as the bytes themselves.
+            b'`' | b'\'' => escaped && !matches!(self, Self::Awk | Self::PosixAwk),
             _ => false,
         }
     }
@@ -261,17 +265,19 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<(String, bo
                     }
                     can_repeat = false;
                 }
-                b'^' | b'$' => can_repeat = false,
+                b'^' | b'$' | b'`' | b'\'' => can_repeat = false,
                 _ => {
                     atom_start = out.len();
                     can_repeat = true;
                 }
             }
             repeated = false;
-            if byte == b'}' {
-                literal(&mut out, byte);
-            } else {
-                out.push(if byte == b'\n' { '|' } else { byte as char });
+            match byte {
+                b'}' => literal(&mut out, byte),
+                b'\n' => out.push('|'),
+                b'`' => out.push_str("\\A"),
+                b'\'' => out.push_str("\\z"),
+                _ => out.push(byte as char),
             }
         } else if escaped
             && matches!(byte, b'w' | b'W' | b'b' | b'B')
