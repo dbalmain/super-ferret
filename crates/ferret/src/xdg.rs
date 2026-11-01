@@ -86,18 +86,19 @@ pub fn index_dir(
     explicit: Option<&Path>,
     data: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    index_path(explicit, std::env::var_os("FERRET_INDEX"), data)
+    index_path(explicit, || std::env::var_os("FERRET_INDEX"), data)
 }
 
-/// Index precedence: `explicit`, then a nonempty `env`, then `data`.
+/// Index precedence: `explicit`, then a nonempty `env`, then `data`. Each
+/// later source is read only when the earlier ones gave nothing.
 fn index_path(
     explicit: Option<&Path>,
-    env: Option<OsString>,
+    env: impl FnOnce() -> Option<OsString>,
     data: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     explicit
         .map(Path::to_owned)
-        .or_else(|| env.filter(|value| !value.is_empty()).map(PathBuf::from))
+        .or_else(|| env().filter(|value| !value.is_empty()).map(PathBuf::from))
         .or_else(data)
 }
 
@@ -209,7 +210,7 @@ mod tests {
             assert_eq!(
                 index_path(
                     given(explicit).map(Path::new),
-                    given(env).map(OsString::from),
+                    || given(env).map(OsString::from),
                     || given(data).map(PathBuf::from),
                 ),
                 given(expected).map(PathBuf::from),
