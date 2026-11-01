@@ -45,6 +45,8 @@ use crate::{
 mod cursors;
 mod documents;
 mod inodes;
+#[cfg(test)]
+mod tests;
 
 pub use cursors::{Kinds, NameReader, NameRuns};
 
@@ -1254,9 +1256,11 @@ impl Catalog {
         let parents = self.blocked(Column::NameParent);
         let dir = u64::from(dir.0);
         let start = partition_point(self.layout.names, |i| parents.get(i) < dir);
+        // Most directories are small: find the end from the start rather
+        // than across every name.
         (
             start,
-            start + partition_point(self.layout.names - start, |i| parents.get(start + i) <= dir),
+            start + gallop(self.layout.names - start, |i| parents.get(start + i) <= dir),
         )
     }
 
@@ -1456,6 +1460,18 @@ fn partition_point(n: usize, pred: impl Fn(usize) -> bool) -> usize {
         }
     }
     lo
+}
+
+/// As [`partition_point`], for a boundary near the start: probes 1, 2, 4…
+/// rows ahead, then searches the last span.
+fn gallop(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut step) = (0, 1);
+    while lo + step <= n && pred(lo + step - 1) {
+        lo += step;
+        step *= 2;
+    }
+    let hi = (lo + step).min(n);
+    lo + partition_point(hi - lo, |i| pred(lo + i))
 }
 
 fn special_kind(rows: &[u8], id: InoId) -> Option<Kind> {
