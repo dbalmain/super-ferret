@@ -477,11 +477,9 @@ impl Plan {
     ) -> LiveWalk {
         let Some((paths, known)) = self
             .indexed_pattern()
+            .zip(index.filter(|index| index.can_accelerate_find()))
             .filter(|_| !self.touches_nested_root(&catalog))
-            .and_then(|pattern| {
-                let index = index.filter(|index| index.can_accelerate_find())?;
-                self.indexed_entries(&catalog, index, pattern)
-            })
+            .and_then(|(pattern, index)| self.indexed_entries(&catalog, index, pattern))
         else {
             return self.parallel_catalog_source(catalog);
         };

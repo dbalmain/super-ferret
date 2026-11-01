@@ -1470,7 +1470,8 @@ fn gallop(n: usize, pred: impl Fn(usize) -> bool) -> usize {
         lo += step;
         step *= 2;
     }
-    let hi = (lo + step).min(n);
+    // `pred(lo + step - 1)` failed or lies past the end.
+    let hi = (lo + step - 1).min(n);
     lo + partition_point(hi - lo, |i| pred(lo + i))
 }
 

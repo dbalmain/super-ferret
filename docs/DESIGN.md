@@ -833,13 +833,14 @@ complete read allowances at low descriptor limits (two at NOFILE=64). A stalled
 request cannot consume another admitted request's share. Each request retains
 its own capture budget and streaming owner.
 
-Search, default find and covered directory grep connect to the daemon,
-spawning it on first use. `status` and `stats` (text or `--json`) connect
-without spawning, else answer locally. Unavailable background operation or
-`FERRET_NO_DAEMON` uses the same engine in process. Such an answer from a
-catalog whose `current` was renamed into place over 60 s ago prints one stderr
-warning that it may miss later changes; `FERRET_STALE_NOTICE=0` silences it
-(D117 B).
+Search, default find and covered directory grep connect to the daemon, spawning
+it on first use. `status` and `stats` (text or `--json`) connect without
+spawning, else answer locally. Unavailable background operation or
+`FERRET_NO_DAEMON` answers in process: search and grep with the same engine,
+find by walking the checked catalog without building the name planner. Such an
+answer from a catalog whose `current` was renamed into place over 60 s ago
+prints one stderr warning that it may miss later changes;
+`FERRET_STALE_NOTICE=0` silences it (D117 B).
 D56 A keeps effectful find in the local client; live/information-only find
 and batch remain local too. M5a retains one WriterSession and its lock;
 explicit index/root commands are ordering barriers in one writer queue. Each
