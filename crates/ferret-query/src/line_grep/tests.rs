@@ -300,6 +300,10 @@ fn run_search_and_per_line_search_emit_identical_records_and_results() {
         &["-A2"],
         &["-B2", "-m2"],
         &["-c", "-C1"],
+        // Inversion keeps the next hit per run; one carried into the next
+        // run would select or hide the wrong lines.
+        &["-v"],
+        &["-v", "-C1"],
     ] {
         let mut args: Vec<_> = profile.iter().map(OsString::from).collect();
         args.push("red".into());
