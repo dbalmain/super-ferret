@@ -335,4 +335,39 @@ mod tests {
             "readers ran {furthest} documents ahead"
         );
     }
+
+    /// Readers that finish out of claim order, one document failing, still
+    /// reach `consume` in order with the fault at its own document.
+    #[test]
+    fn extractions_finishing_out_of_order_are_consumed_in_order() {
+        const DOCS: u32 = 40;
+        const FAILS: u32 = 7;
+        let finished = Mutex::new(Vec::new());
+        let read = |doc: u32, bytes: &mut Vec<u8>| {
+            if doc.is_multiple_of(2) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            finished.lock().unwrap().push(doc);
+            if doc == FAILS {
+                return Err(Fault::Unreadable);
+            }
+            bytes.extend_from_slice(b"the quick brown fox");
+            Ok(())
+        };
+        let (mut first, mut second) = (read, read);
+        let mut readers: [&mut Reader<'_>; 2] = [&mut first, &mut second];
+        let mut consumed = Vec::new();
+        holding(0..DOCS, &mut readers, HELD, |doc, extracted| {
+            assert_eq!(extracted.is_err(), doc == FAILS, "document {doc}");
+            consumed.push(doc);
+            Ok::<_, ()>(true)
+        })
+        .unwrap();
+        assert_eq!(consumed, (0..DOCS).collect::<Vec<_>>());
+        let finished = finished.into_inner().unwrap();
+        assert!(
+            !finished.is_sorted(),
+            "the readers finished in claim order, so nothing was reordered"
+        );
+    }
 }
