@@ -465,9 +465,10 @@ fn scan_records(
     // rules those out. Context and inversion still need every intervening line.
     let fast = !plan.invert && plan.before == 0 && plan.after == 0 && plan.grep.is_line_local();
     // Context still needs the lines around each selection, but not a search
-    // of each one: the same proof finds the next selected line, and only the
-    // trailing window and the last `-B` lines before it are visited.
-    let skip = !fast && !plan.invert && plan.grep.is_line_local();
+    // of each one: the same proof finds the next matching line, and only the
+    // trailing window and the last `-B` lines before it are visited. Under
+    // inversion the lines before it are the selected ones, so none is jumped.
+    let skip = !fast && plan.grep.is_line_local();
     #[cfg(test)]
     let (fast, skip) = (fast && !plan.force_per_line, skip && !plan.force_per_line);
     // Counting every LF costs about 15% of a dense scan; skip it unless
@@ -567,7 +568,7 @@ fn scan_records(
                         // Jump over whole unselected lines that are neither
                         // trailing context nor among the last `-B` lines
                         // before the next selected line or the run's end.
-                        let jump = if number < trailing || hit == start {
+                        let jump = if plan.invert || number < trailing || hit == start {
                             start
                         } else {
                             hit_boundary.unwrap_or(start)
@@ -628,7 +629,7 @@ fn scan_records(
                 let selected = if fast {
                     true
                 } else if skip {
-                    hit_line == Some(line_start)
+                    (hit_line == Some(line_start)) != plan.invert
                 } else {
                     search.find(line).is_some() != plan.invert
                 };
