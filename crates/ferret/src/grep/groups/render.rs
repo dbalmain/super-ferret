@@ -9,6 +9,10 @@ pub(in super::super) struct Render<'a> {
     pub prefix: Option<&'a [u8]>,
     pub stopped: &'a dyn Fn() -> bool,
     pub capture: Option<&'a Arc<capture::Budget>>,
+    /// Whether plain lines may wait in the cursor for a chunk: only where the
+    /// destination holds output until a chunk or the group's end anyway. A
+    /// direct stream to a terminal must see each line as it is found.
+    pub batched: bool,
 }
 
 #[derive(Clone)]
@@ -257,7 +261,7 @@ impl Render<'_> {
             }
             batch.extend_from_slice(text);
             batch.push(b'\n');
-            if batch.len() >= CHUNK {
+            if !self.batched || batch.len() >= CHUNK {
                 return cursor.flush(&mut output);
             }
             return Ok(());

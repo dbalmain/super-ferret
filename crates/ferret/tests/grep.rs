@@ -3007,6 +3007,28 @@ impl Fixture {
 }
 
 #[test]
+fn a_streamed_stdin_line_reaches_the_terminal_before_stdin_closes() {
+    // p59: past the capture limit, a line from stdin reaches a terminal as
+    // soon as it is found, not when a chunk of lines fills.
+    let fixture = Fixture::new("pty-live-stdin");
+    let python = std::env::var_os("FERRET_PYTHON")
+        .unwrap_or_else(|| panic!("nix develop supplies Python for real-pty comparisons"));
+    let mut command = fixture.command(&python);
+    command
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/grep_pty_live.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_ferret"))
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "--color=never", "hit", "-"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "pty driver failed: {output:?}");
+    assert_eq!(output.stdout, b"seen\n");
+}
+
+#[test]
 fn m5_real_terminal_matrix() {
     let fixture = Fixture::new("tty-matrix");
     let profiles: &[&[&str]] = &[

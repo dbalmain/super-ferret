@@ -366,6 +366,7 @@ fn small_captures_charge_allocations_instead_of_the_chunk_limit() {
         prefix: None,
         stopped: &|| false,
         capture: Some(&budget),
+        batched: true,
     };
     let mut sink = io::sink();
     let mut output = OutputCapture::new(&mut sink).pooled(&render);

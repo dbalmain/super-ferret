@@ -499,6 +499,7 @@ fn late_spill_failure_remains_a_capture_fault() {
         prefix: None,
         stopped: &|| false,
         capture: None,
+        batched: true,
     };
     let mut bytes = vec![b'x'; GROUP_BYTES];
     bytes.extend_from_slice(b"\nred\n");
@@ -868,6 +869,7 @@ fn cancellation_reaches_the_real_scanner_before_its_next_read() {
         prefix: None,
         stopped: &stopped,
         capture: None,
+        batched: true,
     };
     let bytes = [b"red".to_vec(), vec![b'x'; 200_000]].concat();
     let mut input = &bytes[..];
@@ -1376,6 +1378,7 @@ fn a_line_past_one_chunk_renders_as_a_short_one_does() {
             prefix: Some(b"f"),
             stopped: &|| false,
             capture: None,
+            batched: true,
         };
         let mut replay = Vec::new();
         {

@@ -1114,6 +1114,8 @@ impl<W: Write> Host<'_, W> {
             prefix: (self.filename || self.plan.json)
                 .then_some(label(path, self.plan.paths.is_empty())),
             stopped: &stopped,
+            // Stdin may be slow and stdout a terminal.
+            batched: false,
         };
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut stream = DirectStream {

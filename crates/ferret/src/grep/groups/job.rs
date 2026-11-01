@@ -388,6 +388,8 @@ fn search_job(
         prefix: (filename || plan.json).then(|| label(job.path(), plan.paths.is_empty())),
         stopped,
         capture,
+        // Groups reach the output through a buffer or a chunked relay.
+        batched: true,
     };
     let observed = match job {
         Job::Checked(_, name, doc) => {
