@@ -137,54 +137,8 @@ fn handle(
             Some(&request.id),
             "writer commands require the daemon socket",
         ),
-        Op::Status => {
-            let mut line = Vec::new();
-            let mut object = Object::new(&mut line);
-            object.str("id", &request.id).str("event", "status");
-            if let Some(engine) = engine {
-                let session = engine.pin();
-                generation(&mut object, Some(session.generation()));
-                object
-                    .int("bytes", session.resident_bytes())
-                    .int("engine_opens", Engine::open_count());
-            } else {
-                object
-                    .null("generation")
-                    .int("bytes", 0)
-                    .int("engine_opens", Engine::open_count());
-            }
-            object.end();
-            send(&line)
-        }
-        Op::Reload => {
-            let next = std::env::var_os("FERRET_INDEX")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| dirs.map(|dirs| dirs.data.clone()));
-            // The manifest generation is enough to see that the resident
-            // engine is stale. The snapshot and change log open only when
-            // Engine::open actually reloads.
-            if let Some(path) = next.as_deref()
-                && let Ok(Some(peek)) = ferret_catalog::Catalog::published_generation(path)
-                && engine
-                    .as_ref()
-                    .is_none_or(|current| current.generation() != peek)
-                && let Ok(Some(reloaded)) = Engine::open(path)
-            {
-                *engine = Some(reloaded);
-            }
-            if let (Some(path), Some(current)) = (next.as_deref(), engine.as_ref()) {
-                current.open_content(path).map_err(io::Error::other)?;
-            }
-            event(request, "reload", |o| {
-                if let Some(engine) = engine {
-                    generation(o, Some(engine.generation()));
-                } else {
-                    o.null("generation");
-                }
-                o.int("engine_opens", Engine::open_count());
-            })
-        }
+        Op::Status => status(request, engine.as_ref()),
+        Op::Reload => reload(request, engine, dirs),
         Op::Search => search_request(
             request,
             engine.as_ref().map(Engine::pin),
@@ -208,6 +162,58 @@ fn handle(
             ferret_crawl::default_workers(),
         ),
     }
+}
+
+/// Reports the resident engine's generation and size.
+fn status(request: &Request, engine: Option<&Engine>) -> io::Result<()> {
+    let mut line = Vec::new();
+    let mut object = Object::new(&mut line);
+    object.str("id", &request.id).str("event", "status");
+    if let Some(engine) = engine {
+        let session = engine.pin();
+        generation(&mut object, Some(session.generation()));
+        object
+            .int("bytes", session.resident_bytes())
+            .int("engine_opens", Engine::open_count());
+    } else {
+        object
+            .null("generation")
+            .int("bytes", 0)
+            .int("engine_opens", Engine::open_count());
+    }
+    object.end();
+    send(&line)
+}
+
+/// Reopens the engine when the published generation moved, then reports it.
+fn reload(request: &Request, engine: &mut Option<Engine>, dirs: Option<&Dirs>) -> io::Result<()> {
+    let next = std::env::var_os("FERRET_INDEX")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs.map(|dirs| dirs.data.clone()));
+    // The manifest generation is enough to see that the resident
+    // engine is stale. The snapshot and change log open only when
+    // Engine::open actually reloads.
+    if let Some(path) = next.as_deref()
+        && let Ok(Some(peek)) = ferret_catalog::Catalog::published_generation(path)
+        && engine
+            .as_ref()
+            .is_none_or(|current| current.generation() != peek)
+        && let Ok(Some(reloaded)) = Engine::open(path)
+    {
+        *engine = Some(reloaded);
+    }
+    if let (Some(path), Some(current)) = (next.as_deref(), engine.as_ref()) {
+        current.open_content(path).map_err(io::Error::other)?;
+    }
+    event(request, "reload", |o| {
+        if let Some(engine) = engine {
+            generation(o, Some(engine.generation()));
+        } else {
+            o.null("generation");
+        }
+        o.int("engine_opens", Engine::open_count());
+    })
 }
 
 pub(crate) fn search_request(
@@ -325,6 +331,33 @@ impl Outcome {
             ..Self::new(status)
         }
     }
+
+    /// Records how a search with `result` ended: its stats and status, or
+    /// the error to report.
+    fn settle(
+        &mut self,
+        result: Result<ferret_query::Stats, ferret_query::RunError>,
+        session: &QuerySession,
+        query: &Query,
+    ) {
+        match result {
+            Ok(result) => {
+                self.stats = Some(result);
+                self.status = if self.rows == 0 { 1 } else { 0 };
+            }
+            Err(error @ ferret_query::RunError::ScanRequired { .. }) => {
+                self.refused = session.explain_content(query).ok();
+                self.error = Some(error.to_string());
+            }
+            Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
+                self.error = Some(crate::search::incomplete_message(uncovered, live));
+            }
+            Err(error) => {
+                self.read_error = true;
+                self.error = Some(error.to_string());
+            }
+        }
+    }
 }
 
 /// Runs a parsed query against an open session, sending each row as it
@@ -396,23 +429,7 @@ fn search_session(
     if let Some(error) = output_error {
         return Err(error);
     }
-    match result {
-        Ok(result) => {
-            outcome.stats = Some(result);
-            outcome.status = if outcome.rows == 0 { 1 } else { 0 };
-        }
-        Err(error @ ferret_query::RunError::ScanRequired { .. }) => {
-            outcome.refused = session.explain_content(query).ok();
-            outcome.error = Some(error.to_string());
-        }
-        Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
-            outcome.error = Some(crate::search::incomplete_message(uncovered, live));
-        }
-        Err(error) => {
-            outcome.read_error = true;
-            outcome.error = Some(error.to_string());
-        }
-    }
+    outcome.settle(result, session, query);
     Ok(outcome)
 }
 
