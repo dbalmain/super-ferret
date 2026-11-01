@@ -5,6 +5,7 @@ use super::super::holders::Holders;
 use super::super::visibility::{Visibility, Visit};
 use super::job::{Job, JobPath};
 use super::*;
+use std::ops::ControlFlow;
 use std::sync::Mutex;
 
 /// Index candidates: the documents that may hold a match.
@@ -312,51 +313,9 @@ impl<'a> Source<'a> {
             if stopped() {
                 return None;
             }
-            if let Some(source) = &mut self.source {
-                loop {
-                    if stopped() {
-                        return None;
-                    }
-                    let mut cancelled = || {
-                        #[cfg(test)]
-                        if let Some(hook) = &mut self.on_listing_poll {
-                            hook();
-                        }
-                        stopped()
-                    };
-                    let entry =
-                        source.next_with_cancel(self.descend, &mut || Ok(()), &mut cancelled);
-                    if stopped() {
-                        return None;
-                    }
-                    let Some(entry) = entry else {
-                        break;
-                    };
-                    self.descend = true;
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            return Some((0, Job::Failed(error.path, error.error.to_string())));
-                        }
-                    };
-                    #[cfg(test)]
-                    if let Some(hook) = &mut self.on_entry {
-                        hook(entry.path());
-                    }
-                    let job = self.filter.entry(
-                        entry,
-                        &mut self.descend,
-                        self.policy.as_mut(),
-                        &mut self.searched,
-                        None,
-                        stopped,
-                    );
-                    if self.until_searched && self.searched {
-                        return None;
-                    }
-                    if job.is_some() {
-                        return job;
-                    }
+            if self.source.is_some() {
+                if let ControlFlow::Break(job) = self.walked(stopped) {
+                    return job;
                 }
                 self.source = None;
             }
@@ -368,36 +327,100 @@ impl<'a> Source<'a> {
                     return Some((0, Job::Failed(path, error.to_string())));
                 }
                 Input::Directory(path) => {
-                    self.policy = match self
-                        .live
-                        .filter(|anchors| anchors.walks(&path))
-                        .map(|anchors| anchors.start(&path, stopped))
-                        .transpose()
-                    {
-                        Ok(policy) => policy,
-                        Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
-                    };
-                    match sources::Directory::new(
-                        &path,
-                        self.filter.catalog,
-                        &self.filter.cwd,
-                        self.filter.traversal.unrestricted,
-                        self.policy.is_some(),
-                    ) {
-                        Ok(source) => {
-                            self.source = Some(
-                                source
-                                    .following_links(self.filter.traversal.follow)
-                                    .retaining_parents(),
-                            )
-                        }
-                        Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
+                    if let Some(failed) = self.open(path, stopped) {
+                        return Some(failed);
                     }
-                    self.descend = true;
                 }
                 // The parent splits operands at stdin barriers before scheduling.
                 Input::Stream(_) => return None,
             }
         }
+    }
+
+    /// The next job from the directory being walked: `Break` with it, or
+    /// with `None` once stopped, and `Continue` when the walk is done.
+    fn walked(&mut self, stopped: &dyn Fn() -> bool) -> ControlFlow<Option<(u64, Job)>> {
+        let Some(source) = &mut self.source else {
+            return ControlFlow::Continue(());
+        };
+        loop {
+            if stopped() {
+                return ControlFlow::Break(None);
+            }
+            let mut cancelled = || {
+                #[cfg(test)]
+                if let Some(hook) = &mut self.on_listing_poll {
+                    hook();
+                }
+                stopped()
+            };
+            let entry = source.next_with_cancel(self.descend, &mut || Ok(()), &mut cancelled);
+            if stopped() {
+                return ControlFlow::Break(None);
+            }
+            let Some(entry) = entry else {
+                return ControlFlow::Continue(());
+            };
+            self.descend = true;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return ControlFlow::Break(Some((
+                        0,
+                        Job::Failed(error.path, error.error.to_string()),
+                    )));
+                }
+            };
+            #[cfg(test)]
+            if let Some(hook) = &mut self.on_entry {
+                hook(entry.path());
+            }
+            let job = self.filter.entry(
+                entry,
+                &mut self.descend,
+                self.policy.as_mut(),
+                &mut self.searched,
+                None,
+                stopped,
+            );
+            if self.until_searched && self.searched {
+                return ControlFlow::Break(None);
+            }
+            if job.is_some() {
+                return ControlFlow::Break(job);
+            }
+        }
+    }
+
+    /// Starts walking directory operand `path`; a failure to start is its
+    /// job.
+    fn open(&mut self, path: PathBuf, stopped: &dyn Fn() -> bool) -> Option<(u64, Job)> {
+        self.policy = match self
+            .live
+            .filter(|anchors| anchors.walks(&path))
+            .map(|anchors| anchors.start(&path, stopped))
+            .transpose()
+        {
+            Ok(policy) => policy,
+            Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
+        };
+        match sources::Directory::new(
+            &path,
+            self.filter.catalog,
+            &self.filter.cwd,
+            self.filter.traversal.unrestricted,
+            self.policy.is_some(),
+        ) {
+            Ok(source) => {
+                self.source = Some(
+                    source
+                        .following_links(self.filter.traversal.follow)
+                        .retaining_parents(),
+                )
+            }
+            Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
+        }
+        self.descend = true;
+        None
     }
 }
