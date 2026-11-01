@@ -7719,3 +7719,32 @@ publisher single-threaded, and takes most of the measured tail. The fact
 that would change it: if large first builds mostly run through the daemon
 and its pass-end publication is what users wait on, C, because only C
 moves merge work under the reading.
+
+## D138 — Whether stdin output waits for the capture limit
+
+**Question:** Should `ferret grep` print lines from stdin and other stream
+operands as it finds them, rather than capturing up to 4 MiB of output first?
+
+Stdin and stream operands use the same 4 MiB capture threshold as files
+(GREP.md, "Stdin and cached-record rendering use the same threshold"). A
+file's capture serves its version check, which stdin cannot have. So `tail -f
+log | ferret grep error` on a terminal prints nothing until 4 MiB of matching
+output or end of input. rg 15.2.0 printed the first line at once (p59 review,
+2026-11-01: `echo "hit EARLY"; sleep 3` showed it at 1.5 s; ferret showed it
+at EOF).
+
+What the capture buys on stdin is binary suppression: a NUL anywhere in the
+first 4 MiB of output hides every captured line. rg suppresses at its read
+buffer instead: `printf 'hit a\nhit b\n\0hit c\n' | rg hit` prints only the
+binary notice, because the NUL is in the first buffer; a later NUL leaves the
+lines already printed.
+
+| Option | Costs | Buys |
+| ------ | ----- | ---- |
+| A. Keep: capture stdin up to 4 MiB | Slow pipelines show nothing on a terminal until 4 MiB or EOF; not a drop-in for `tail -f \| rg`. | No change; binary suppression covers the first 4 MiB. |
+| B. Stream stdin from the first line when stdout is a terminal | A tty check on the stream path, and two binary rules for stdin, by destination. | Interactive pipelines behave like rg; piped output is unchanged. |
+| C. Stream stdin and stream operands from the first line always | Binary suppression on stdin shrinks to one read run (64 KiB) everywhere, as rg's does to its buffer. The grep-compat fixtures feed rg through stdin, so any whose NUL falls past the first run would show the difference. | One rule, no tty check; first output as soon as a line matches; less memory for large piped stdin. |
+
+**Recommendation:** C. It is the simpler rule and the closest to rg. The fact
+that would change it: if grep-compat has stdin cases whose NUL lies past 64
+KiB and rg hides earlier lines there, B, which keeps piped output unchanged.
