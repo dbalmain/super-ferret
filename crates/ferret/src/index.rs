@@ -305,18 +305,7 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
     let total = started.elapsed();
 
     let rendered = render(&result);
-    note(&rendered.diagnostics);
-    let exit = if let Err(error) = content {
-        crate::cli::error(&format!("content index: {error}"));
-        Exit::Error
-    } else if matches!(rendered.exit, Exit::Ok | Exit::Partial) {
-        match print("the report", rendered.stdout.as_bytes()) {
-            Exit::Ok => rendered.exit,
-            failed => failed,
-        }
-    } else {
-        rendered.exit
-    };
+    let exit = report(&rendered, content);
     let outcome = rendered.outcome;
 
     let mut line = Vec::new();
@@ -330,6 +319,23 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
     object.end();
     context.log(&line);
     exit
+}
+
+/// Prints a rendered run, whose content index ended as `content`, and
+/// returns its exit status.
+fn report(rendered: &Rendered, content: Result<(), String>) -> Exit {
+    note(&rendered.diagnostics);
+    if let Err(error) = content {
+        crate::cli::error(&format!("content index: {error}"));
+        Exit::Error
+    } else if matches!(rendered.exit, Exit::Ok | Exit::Partial) {
+        match print("the report", rendered.stdout.as_bytes()) {
+            Exit::Ok => rendered.exit,
+            failed => failed,
+        }
+    } else {
+        rendered.exit
+    }
 }
 
 pub(crate) struct Rendered {
