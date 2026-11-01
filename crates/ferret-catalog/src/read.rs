@@ -844,8 +844,11 @@ impl Catalog {
     /// Reads and checks the base sections but `skip` on a few threads,
     /// ignoring failures: [`Catalog::load_all`] then finds them loaded, and
     /// loads any that failed again in order, so it reports what a serial
-    /// load would. Sections with nothing to wait for go first, then those
-    /// needing only them; the rest are a few bytes and load serially.
+    /// load would. Each section with nothing to wait for heads a chain, and
+    /// a section needing only such sections follows its largest need in
+    /// that need's chain, so it starts as soon as the need is checked rather
+    /// than when every need is. Longest chains go first; the rest are a few
+    /// bytes and load serially.
     fn prefetch(&self, skip: &[Section]) {
         const WORKERS: usize = 4;
         if !matches!(self.source.as_ref(), Source::File { .. }) {
@@ -853,20 +856,30 @@ impl Catalog {
         }
         let size = |section: Section| {
             let (start, end) = self.layout.range(section);
-            std::cmp::Reverse(end - start)
+            end - start
         };
         let sections = SECTIONS.into_iter().filter(|s| !skip.contains(s));
-        let mut first: Vec<_> = sections.clone().filter(|s| s.needs().is_empty()).collect();
-        let mut second: Vec<_> = sections
-            .filter(|s| !s.needs().is_empty() && s.needs().iter().all(|n| n.needs().is_empty()))
+        let mut chains: Vec<Vec<_>> = sections
+            .clone()
+            .filter(|s| s.needs().is_empty())
+            .map(|s| vec![s])
             .collect();
-        first.sort_by_key(|&s| size(s));
-        second.sort_by_key(|&s| size(s));
-        for wave in [first, second] {
-            fan_out(wave, WORKERS, |section| {
-                let _ = self.load_one(section);
-            });
+        for section in sections
+            .filter(|s| !s.needs().is_empty() && s.needs().iter().all(|n| n.needs().is_empty()))
+        {
+            let lead = section.needs().iter().copied().max_by_key(|&n| size(n));
+            match chains.iter_mut().find(|chain| Some(chain[0]) == lead) {
+                Some(chain) => chain.push(section),
+                None => chains.push(vec![section]),
+            }
         }
+        chains
+            .sort_by_key(|chain| std::cmp::Reverse(chain.iter().map(|&s| size(s)).sum::<usize>()));
+        fan_out(chains, WORKERS, |chain| {
+            for section in chain {
+                let _ = self.load_one(section);
+            }
+        });
     }
 
     fn load_one(&self, section: Section) -> Result<(), OpenError> {
