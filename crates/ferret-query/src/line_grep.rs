@@ -350,8 +350,10 @@ pub struct Line<'a> {
     pub source_lines: Option<(u64, u64)>,
     /// Whether the original line had LF, which JSON restores to `bytes`.
     pub terminated: bool,
-    /// One-based line number. The line-local fast path counts lines only
-    /// when the plan prints numbers or JSON, so it is unspecified otherwise.
+    /// One-based line number. The line-local paths count lines only when the
+    /// plan prints numbers or JSON. Otherwise it is only ordered: it rises by
+    /// one between adjacent lines and by more across skipped ones, which is
+    /// all context separators read.
     pub number: u64,
     pub bytes: &'a [u8],
     pub kind: LineKind,
@@ -472,8 +474,9 @@ fn scan_records(
     #[cfg(test)]
     let (fast, skip) = (fast && !plan.force_per_line, skip && !plan.force_per_line);
     // Counting every LF costs about 15% of a dense scan; skip it unless
-    // something reads the number.
-    let count_lines = !fast || plan.line_number || plan.json;
+    // something reads the number. A jump then adds one, which still leaves
+    // a gap for context separators to see.
+    let count_lines = plan.line_number || plan.json;
     if !result.searched {
         return Ok(());
     }
@@ -579,7 +582,11 @@ fn scan_records(
                             if stopped() {
                                 return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                             }
-                            number += count_lf(&text[start..jump]);
+                            number += if count_lines {
+                                count_lf(&text[start..jump])
+                            } else {
+                                1
+                            };
                             offset += (jump - start) as u64;
                             result.bytes_searched = offset;
                             next = Some(jump);

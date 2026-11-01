@@ -111,17 +111,23 @@ fn compare_scanners(plan: &Plan, bytes: &[u8]) {
         result.elapsed = std::time::Duration::ZERO;
         (output, result)
     };
-    // The fast path counts lines only when something prints them, so an
-    // unnumbered plan compares everything else; a numbered copy compares
-    // the numbers too.
+    // The line-local paths count lines only when something prints them, so
+    // an unnumbered plan compares everything else; a numbered copy compares
+    // the numbers too. Context separators still read whether a line follows
+    // the previous one, so that much is compared under context.
     let mut numbered = plan.clone();
     numbered.line_number = true;
+    let context = plan.before > 0 || plan.after > 0;
     for (plan, masked) in [(plan, !plan.line_number && !plan.json), (&numbered, false)] {
         let mask = |(mut output, result): (Vec<_>, _)| {
             if masked {
-                output
-                    .iter_mut()
-                    .for_each(|line: &mut (_, _, _, u64, _, _, _, _)| line.3 = 0);
+                let mut previous = None;
+                for line in &mut output {
+                    let line: &mut (_, _, _, u64, _, _, _, _) = line;
+                    let gap = previous.is_some_and(|previous: u64| line.3 > previous + 1);
+                    previous = Some(line.3);
+                    line.3 = u64::from(context && gap);
+                }
             }
             (output, result)
         };
