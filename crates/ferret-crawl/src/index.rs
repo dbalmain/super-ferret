@@ -50,9 +50,12 @@ pub(crate) use hasher::Hasher;
 use hasher::Output;
 #[cfg(test)]
 pub(crate) use hasher::{DRAIN_MIN, Deferred, PROBES, Probe};
+#[cfg(test)]
+pub(crate) use report::content_faults;
 pub use report::{
     Counts, CoverageContext, CoverageFault, FailedRoot, IndexError, Published, Report,
 };
+use report::{finish_report, reporting_ids, undurable, unpublished, update_error, withdrawn};
 
 /// Which configured roots to walk this run. The rest stay in the effective
 /// view where keeping them is valid.
@@ -1019,181 +1022,6 @@ fn withdraw(
     failed
 }
 
-/// Records withdrawn roots in a report that will publish.
-fn withdrawn(report: &mut Report, plan: &Plan, failed: Vec<FailedRoot>) {
-    report.refreshed.clone_from(&plan.refresh);
-    report.failed_roots.extend(failed);
-    report.failed_roots.sort_by(|a, b| a.root.cmp(&b.root));
-}
-
-/// The atomic refusal when withdrawing roots cannot leave a publishable run:
-/// every fault is reported, the withdrawn roots' included.
-fn unpublished(mut report: Report, failed: Vec<FailedRoot>) -> IndexError {
-    let mut faults = std::mem::take(&mut report.coverage_faults);
-    let earlier = std::mem::take(&mut report.failed_roots);
-    for root in earlier.into_iter().chain(failed) {
-        faults.extend(root.faults);
-    }
-    IndexError::Coverage {
-        faults,
-        report: Box::new(report),
-    }
-}
-
-// Changes contain epoch-scoped ids. A checkpoint remaps them; reporting must
-// scan the resulting catalog before looking up any numeric id from the diff.
-fn reporting_ids(
-    session: &WriterSession,
-    previous: ferret_catalog::Generation,
-    changes: &ferret_catalog::log::ChangeSet,
-) -> (Option<Vec<InoId>>, Option<Vec<NameId>>) {
-    if session.view().generation().checkpoint != previous.checkpoint {
-        return (None, None);
-    }
-    let faulted = faulted_inodes(changes);
-    let aliases = faulted
-        .iter()
-        .flat_map(|&id| session.names_for(id))
-        .collect();
-    (Some(faulted), Some(aliases))
-}
-
-fn faulted_inodes(changes: &ferret_catalog::log::ChangeSet) -> Vec<InoId> {
-    changes
-        .records
-        .iter()
-        .filter_map(|r| match r {
-            ferret_catalog::log::Record::InodePut {
-                id,
-                state: ContentState::Fault,
-                ..
-            } => Some(InoId(*id)),
-            _ => None,
-        })
-        .collect()
-}
-
-fn finish_report(
-    report: &mut Report,
-    catalog: &Catalog,
-    plan: &Plan,
-    changed: bool,
-    faulted: Option<&[InoId]>,
-    aliases: Option<&[NameId]>,
-) {
-    let started = Instant::now();
-    report
-        .coverage_faults
-        .retain(|f| !crate::coverage::directory_denied(f));
-    let seen = std::mem::take(&mut report.content_faults)
-        .into_iter()
-        .filter(|(path, _)| published_content_fault(catalog, path))
-        .collect();
-    report.content_faults = content_faults_with(catalog, &plan.refresh, seen, faulted, aliases);
-    report.counts.content_faults = report.content_faults.len() as u64;
-    report.fault_time = started.elapsed();
-    report.published = changed.then(|| Published::of(catalog));
-}
-
-// Fault reports describe the effective indexed row, including retained data.
-// Resolve's live-fallback boundary is deliberately crossed through checked
-// child keys here; this is reporting, not permission to use a stale listing.
-fn published_content_fault(catalog: &Catalog, path: &Path) -> bool {
-    let Some(resolved) = catalog.resolve(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    let mut target = resolved.target;
-    for component in resolved
-        .remainder
-        .split(|&b| b == b'/')
-        .filter(|part| !part.is_empty())
-    {
-        let ferret_catalog::Target::Inode(parent) = target else {
-            return false;
-        };
-        if !catalog.is_directory(parent) {
-            return false;
-        }
-        let Some(name) = catalog.lookup(parent, component) else {
-            return false;
-        };
-        target = catalog.name(name).target();
-    }
-    matches!(target, ferret_catalog::Target::Inode(id) if catalog.state(id) == ContentState::Fault)
-}
-
-/// Every name under a refreshed root whose inode the catalog published as
-/// Fault, merged with the faults the workers saw. The build is the
-/// authority: it faults an inode when its names' observations disagree
-/// (D31), which no single worker can see, so each such name is listed as
-/// [`ContentFault::Alias`] unless a worker recorded its own error. Kept
-/// roots are skipped: their faults are last run's, already reported.
-///
-/// Paths come from the catalog, so the walk holds none; the scan over the
-/// names runs only when some inode is Fault.
-#[cfg(test)]
-pub(crate) fn content_faults(
-    catalog: &Catalog,
-    refresh: &[PathBuf],
-    seen: Vec<(PathBuf, ContentFault)>,
-) -> Vec<(PathBuf, ContentFault)> {
-    content_faults_with(catalog, refresh, seen, None, None)
-}
-
-fn content_faults_with(
-    catalog: &Catalog,
-    refresh: &[PathBuf],
-    seen: Vec<(PathBuf, ContentFault)>,
-    faulted: Option<&[InoId]>,
-    aliases: Option<&[NameId]>,
-) -> Vec<(PathBuf, ContentFault)> {
-    let fault = |id: InoId| catalog.state(id) == ContentState::Fault;
-    let mut listed: BTreeMap<PathBuf, ContentFault> = seen.into_iter().collect();
-    let any = faulted.map_or_else(
-        || {
-            catalog
-                .inode_ids()
-                .filter(|&id| !catalog.is_directory(id))
-                .any(fault)
-        },
-        |ids| ids.iter().copied().any(fault),
-    );
-    if !any {
-        return listed.into_iter().collect();
-    }
-    let refreshed: Vec<InoId> = catalog
-        .roots()
-        .filter(|(_, path)| refresh.iter().any(|r| r.as_os_str().as_bytes() == *path))
-        .map(|(id, _)| id)
-        .collect();
-    let root_of = |mut dir: InoId| {
-        while let Some(name) = catalog.dir_name(dir) {
-            dir = catalog.name(name).parent;
-        }
-        dir
-    };
-    let mut buf = Vec::new();
-    let report_alias = |id| {
-        let name = catalog.name(id);
-        if matches!(name.target(), ferret_catalog::Target::Ignored(_))
-            || !fault(name.child)
-            || !refreshed.contains(&root_of(name.parent))
-        {
-            return;
-        }
-        buf.clear();
-        catalog.path(id, &mut buf);
-        let path = PathBuf::from(OsStr::from_bytes(&buf));
-        listed.entry(path).or_insert(ContentFault::Alias);
-    };
-    if let Some(aliases) = aliases {
-        aliases.iter().copied().for_each(report_alias);
-    } else {
-        catalog.names().map(|(id, _)| id).for_each(report_alias);
-    }
-    listed.into_iter().collect()
-}
-
 /// Which roots a run walks, keeps and drops.
 struct Plan {
     /// Every configured root, normalised and sorted.
@@ -1363,30 +1191,4 @@ fn full_rewalk(
     report.input_fallback = true;
     finish_report(&mut report, &catalog, &plan, true, None, None);
     Ok(report)
-}
-
-/// A publication error that left the new generation visible takes the run's
-/// report with it ([`IndexError::Undurable`]), so the roots D119 withdrew
-/// from that generation are still reported. Any other error is returned as
-/// it is: nothing was published, and the report would describe nothing.
-fn undurable(error: IndexError, report: &mut Report) -> IndexError {
-    let published = match &error {
-        IndexError::Commit(e) => e.published(),
-        IndexError::Update(e) => e.published(),
-        _ => false,
-    };
-    if !published {
-        return error;
-    }
-    IndexError::Undurable {
-        error: Box::new(error),
-        report: Box::new(std::mem::take(report)),
-    }
-}
-
-fn update_error(error: ferret_catalog::log::Error) -> IndexError {
-    match error {
-        ferret_catalog::log::Error::Deferred(reason) => IndexError::DeferredBulk(reason),
-        error => IndexError::Update(error),
-    }
 }
