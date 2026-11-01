@@ -317,185 +317,7 @@ pub(super) fn decode(
         }
         let b = &rest[..len];
         let id = u32_at(b, 8);
-        let exact = |n| if len == n { Ok(()) } else { Err(bad()) };
-        let deleted = || -> Result<(), DecodeError> {
-            exact(16)?;
-            if b[12..16] != [0; 4] {
-                return Err(bad());
-            }
-            Ok(())
-        };
-        let record = match b[0] {
-            1 => {
-                exact(24)?;
-                if b[14..16] != [0; 2]
-                    || b[20..24] != [0; 4]
-                    || b[13] != 0
-                    || u32_at(b, 16) > counters[1]
-                    || (u32_at(b, 16) == 0 && kind(b[12])? != Kind::Dir)
-                {
-                    return Err(bad());
-                }
-                Record::LifePut {
-                    id,
-                    kind: kind(b[12])?,
-                    flags: b[13],
-                    names: u32_at(b, 16),
-                }
-            }
-            2 => {
-                deleted()?;
-                Record::InodeDelete { id }
-            }
-            3 => {
-                if len < 32 {
-                    return Err(bad());
-                }
-                let parent = u32_at(b, 12);
-                let child = u32_at(b, 16);
-                let name = text(b, 20, 24)?;
-                if parent >= counters[0]
-                    || (child >= counters[0] && Kind::from_ignored_child(child).is_none())
-                    || name.contains(&b'/')
-                    || name == b"."
-                    || name == b".."
-                {
-                    return Err(bad());
-                }
-                Record::NamePut {
-                    id,
-                    parent,
-                    child,
-                    name,
-                    revealed: b[1] == 1,
-                }
-            }
-            4 => {
-                deleted()?;
-                Record::NameDelete { id }
-            }
-            5 => {
-                exact(32)?;
-                let name = u32_at(b, 12);
-                let flags = u32_at(b, 20);
-                let retained = u64_at(b, 24);
-                if (name != NONE && name >= counters[1])
-                    || flags & !15 != 0
-                    || (retained != u64::MAX && retained > sequence)
-                    || ((flags & 8 != 0) != (retained != u64::MAX))
-                {
-                    return Err(bad());
-                }
-                Record::DirPut {
-                    id,
-                    name: (name != NONE).then_some(name),
-                    entries: (u32_at(b, 16) != NONE).then_some(u32_at(b, 16)),
-                    flags,
-                    retained_at: (retained != u64::MAX).then_some(retained),
-                }
-            }
-            6 => {
-                let path = text(b, 12, 16)?;
-                if !path.starts_with(b"/") {
-                    return Err(bad());
-                }
-                Record::RootPut { id, path }
-            }
-            7 => {
-                deleted()?;
-                Record::RootDelete { id }
-            }
-            8 => {
-                exact(24)?;
-                let mut hash = [0; 16];
-                hash.copy_from_slice(&b[8..24]);
-                Record::PolicyPut { hash }
-            }
-            9 => {
-                exact(88)?;
-                let k = kind(b[12])?;
-                let state = b[13];
-                let doc = u32_at(b, 16);
-                let stat = Stat {
-                    dev: u64_at(b, 20),
-                    ino: u64_at(b, 28),
-                    size: u64_at(b, 36),
-                    mtime_sec: u64_at(b, 44) as i64,
-                    mtime_nsec: u32_at(b, 52),
-                    ctime_sec: u64_at(b, 56) as i64,
-                    ctime_nsec: u32_at(b, 64),
-                    mode: u32_at(b, 68),
-                    uid: u32_at(b, 72),
-                    gid: u32_at(b, 76),
-                    nlink: u64_at(b, 80),
-                };
-                if b[14..16] != [0; 2]
-                    || state > 3
-                    || (state == 2) != (doc != NONE)
-                    || (doc != NONE && doc >= counters[2])
-                    || stat.mtime_nsec >= 1_000_000_000
-                    || stat.ctime_nsec >= 1_000_000_000
-                    || Kind::from_mode(stat.mode) != k
-                    || (k != Kind::File && state != 0)
-                {
-                    return Err(bad());
-                }
-                Record::InodePut {
-                    id,
-                    kind: k,
-                    state: ContentState::from_bits(state),
-                    doc: (doc != NONE).then_some(doc),
-                    stat,
-                }
-            }
-            10 => Record::LinkPut {
-                id,
-                target: text(b, 12, 16)?,
-            },
-            11 => {
-                deleted()?;
-                Record::LinkDelete { id }
-            }
-            12 => {
-                if len < 40 || b[13..16] != [0; 3] {
-                    return Err(bad());
-                }
-                let k = WorkTreeKind::from_byte(b[12]).ok_or_else(bad)?;
-                let path = text(b, 32, 36)?;
-                if !path.starts_with(b"/") {
-                    return Err(bad());
-                }
-                Record::WorkTreePut {
-                    id,
-                    kind: k,
-                    common_id: (u64_at(b, 16), u64_at(b, 24)),
-                    path,
-                }
-            }
-            13 => {
-                deleted()?;
-                Record::WorkTreeDelete { id }
-            }
-            14 => {
-                exact(32)?;
-                let references = u32_at(b, 12);
-                if references == 0 || references > counters[0] {
-                    return Err(bad());
-                }
-                let mut hash = [0; 16];
-                hash.copy_from_slice(&b[16..32]);
-                Record::DocPut {
-                    id,
-                    references,
-                    hash,
-                }
-            }
-            15 => {
-                deleted()?;
-                Record::DocDelete { id }
-            }
-            _ => return Err(bad()),
-        };
+        let record = record(b, counters, sequence)?;
         if record.family() != family {
             return Err(bad());
         }
@@ -518,4 +340,190 @@ pub(super) fn decode(
         return Err(bad());
     }
     Ok(records)
+}
+
+/// One record from its framed bytes `b`, whose length the caller checked:
+/// its fields, and their bounds against the segment's counters.
+fn record(b: &[u8], counters: [u32; 3], sequence: u64) -> Result<Record, DecodeError> {
+    let len = b.len();
+    let id = u32_at(b, 8);
+    let exact = |n| if len == n { Ok(()) } else { Err(bad()) };
+    let deleted = || -> Result<(), DecodeError> {
+        exact(16)?;
+        if b[12..16] != [0; 4] {
+            return Err(bad());
+        }
+        Ok(())
+    };
+    Ok(match b[0] {
+        1 => {
+            exact(24)?;
+            if b[14..16] != [0; 2]
+                || b[20..24] != [0; 4]
+                || b[13] != 0
+                || u32_at(b, 16) > counters[1]
+                || (u32_at(b, 16) == 0 && kind(b[12])? != Kind::Dir)
+            {
+                return Err(bad());
+            }
+            Record::LifePut {
+                id,
+                kind: kind(b[12])?,
+                flags: b[13],
+                names: u32_at(b, 16),
+            }
+        }
+        2 => {
+            deleted()?;
+            Record::InodeDelete { id }
+        }
+        3 => {
+            if len < 32 {
+                return Err(bad());
+            }
+            let parent = u32_at(b, 12);
+            let child = u32_at(b, 16);
+            let name = text(b, 20, 24)?;
+            if parent >= counters[0]
+                || (child >= counters[0] && Kind::from_ignored_child(child).is_none())
+                || name.contains(&b'/')
+                || name == b"."
+                || name == b".."
+            {
+                return Err(bad());
+            }
+            Record::NamePut {
+                id,
+                parent,
+                child,
+                name,
+                revealed: b[1] == 1,
+            }
+        }
+        4 => {
+            deleted()?;
+            Record::NameDelete { id }
+        }
+        5 => {
+            exact(32)?;
+            let name = u32_at(b, 12);
+            let flags = u32_at(b, 20);
+            let retained = u64_at(b, 24);
+            if (name != NONE && name >= counters[1])
+                || flags & !15 != 0
+                || (retained != u64::MAX && retained > sequence)
+                || ((flags & 8 != 0) != (retained != u64::MAX))
+            {
+                return Err(bad());
+            }
+            Record::DirPut {
+                id,
+                name: (name != NONE).then_some(name),
+                entries: (u32_at(b, 16) != NONE).then_some(u32_at(b, 16)),
+                flags,
+                retained_at: (retained != u64::MAX).then_some(retained),
+            }
+        }
+        6 => {
+            let path = text(b, 12, 16)?;
+            if !path.starts_with(b"/") {
+                return Err(bad());
+            }
+            Record::RootPut { id, path }
+        }
+        7 => {
+            deleted()?;
+            Record::RootDelete { id }
+        }
+        8 => {
+            exact(24)?;
+            let mut hash = [0; 16];
+            hash.copy_from_slice(&b[8..24]);
+            Record::PolicyPut { hash }
+        }
+        9 => {
+            exact(88)?;
+            let k = kind(b[12])?;
+            let state = b[13];
+            let doc = u32_at(b, 16);
+            let stat = Stat {
+                dev: u64_at(b, 20),
+                ino: u64_at(b, 28),
+                size: u64_at(b, 36),
+                mtime_sec: u64_at(b, 44) as i64,
+                mtime_nsec: u32_at(b, 52),
+                ctime_sec: u64_at(b, 56) as i64,
+                ctime_nsec: u32_at(b, 64),
+                mode: u32_at(b, 68),
+                uid: u32_at(b, 72),
+                gid: u32_at(b, 76),
+                nlink: u64_at(b, 80),
+            };
+            if b[14..16] != [0; 2]
+                || state > 3
+                || (state == 2) != (doc != NONE)
+                || (doc != NONE && doc >= counters[2])
+                || stat.mtime_nsec >= 1_000_000_000
+                || stat.ctime_nsec >= 1_000_000_000
+                || Kind::from_mode(stat.mode) != k
+                || (k != Kind::File && state != 0)
+            {
+                return Err(bad());
+            }
+            Record::InodePut {
+                id,
+                kind: k,
+                state: ContentState::from_bits(state),
+                doc: (doc != NONE).then_some(doc),
+                stat,
+            }
+        }
+        10 => Record::LinkPut {
+            id,
+            target: text(b, 12, 16)?,
+        },
+        11 => {
+            deleted()?;
+            Record::LinkDelete { id }
+        }
+        12 => {
+            if len < 40 || b[13..16] != [0; 3] {
+                return Err(bad());
+            }
+            let k = WorkTreeKind::from_byte(b[12]).ok_or_else(bad)?;
+            let path = text(b, 32, 36)?;
+            if !path.starts_with(b"/") {
+                return Err(bad());
+            }
+            Record::WorkTreePut {
+                id,
+                kind: k,
+                common_id: (u64_at(b, 16), u64_at(b, 24)),
+                path,
+            }
+        }
+        13 => {
+            deleted()?;
+            Record::WorkTreeDelete { id }
+        }
+        14 => {
+            exact(32)?;
+            let references = u32_at(b, 12);
+            if references == 0 || references > counters[0] {
+                return Err(bad());
+            }
+            let mut hash = [0; 16];
+            hash.copy_from_slice(&b[16..32]);
+            Record::DocPut {
+                id,
+                references,
+                hash,
+            }
+        }
+        15 => {
+            deleted()?;
+            Record::DocDelete { id }
+        }
+        _ => return Err(bad()),
+    })
 }
