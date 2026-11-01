@@ -3,7 +3,6 @@
 
 use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
-use std::io::BufRead;
 
 /// Reads an explicit operand by `path`, following symlinks, or, given the
 /// `listed` directory a walk found it in, a walked file by its name beneath
@@ -79,31 +78,50 @@ fn read_content(
     // D13 --live retains the indexing sniffer instead.
     let rg = rg || plan.traversal.unrestricted;
     let probe = if rg { CHUNK } else { ferret_policy::SNIFF_LEN };
-    let mut buffered = io::BufReader::with_capacity(probe, input);
-    let head = buffered.fill_buf()?;
-    let binary = if rg {
-        line_grep::binary_window(head)
-    } else {
-        ferret_policy::sniff(head) == ferret_policy::Content::Binary
-    };
-    if binary {
-        Ok(())
-    } else {
-        each(&mut Probed(buffered), size)
+    // A buffer reused across files, taken rather than borrowed so the
+    // consumer runs outside it: a fresh one per file was a 64 KiB allocation
+    // and free on every walked file.
+    let mut buffer = PROBE.take();
+    if buffer.len() < probe {
+        buffer.resize(probe, 0);
     }
+    let read = input.read(&mut buffer[..probe]);
+    let outcome = read.and_then(|filled| {
+        let head = &buffer[..filled];
+        let binary = if rg {
+            line_grep::binary_window(head)
+        } else {
+            ferret_policy::sniff(head) == ferret_policy::Content::Binary
+        };
+        if binary {
+            Ok(())
+        } else {
+            each(&mut Probed { head, rest: input }, size)
+        }
+    });
+    PROBE.set(buffer);
+    outcome
 }
 
-/// The probed head, then the rest straight from the file. A consumer's reads
-/// are a little under the probe's capacity (its buffer less a carried partial
-/// line), so through `BufReader` every byte would be copied twice.
-struct Probed<R>(io::BufReader<R>);
+thread_local! {
+    static PROBE: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
 
-impl<R: Read> Read for Probed<R> {
+/// The probed head, then the rest straight from the file.
+struct Probed<'a> {
+    head: &'a [u8],
+    rest: &'a mut dyn Read,
+}
+
+impl Read for Probed<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.0.buffer().is_empty() {
-            true => self.0.get_mut().read(buf),
-            false => self.0.read(buf),
+        if self.head.is_empty() {
+            return self.rest.read(buf);
         }
+        let n = self.head.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.head[..n]);
+        self.head = &self.head[n..];
+        Ok(n)
     }
 }
 
