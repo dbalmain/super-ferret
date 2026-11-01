@@ -94,11 +94,14 @@ pub(super) struct Batch {
     bytes: usize,
 }
 
+/// Batches every task of a run shares, keyed by action.
+pub(super) type Shared = Arc<Mutex<BTreeMap<usize, Batch>>>;
+
 #[derive(Default)]
 pub(super) struct State {
     batches: BTreeMap<usize, Batch>,
     staged: BTreeMap<usize, Batch>,
-    pub shared: Arc<Mutex<BTreeMap<usize, Batch>>>,
+    pub shared: Shared,
     buffer: Vec<u8>,
     limit: Option<Budget>,
     files: Vec<SharedFile>,
@@ -123,6 +126,20 @@ fn flush_files(files: &[SharedFile]) -> io::Result<()> {
 }
 
 impl State {
+    pub(super) fn new(gate: Arc<Mutex<()>>, quit: Arc<AtomicBool>, shared: Shared) -> Self {
+        Self {
+            batches: BTreeMap::new(),
+            staged: BTreeMap::new(),
+            shared,
+            buffer: Vec::new(),
+            limit: None,
+            files: Vec::new(),
+            errors: 0,
+            gate,
+            quit,
+        }
+    }
+
     pub(super) fn flush_files(&self) -> io::Result<()> {
         flush_files(&self.files)
     }

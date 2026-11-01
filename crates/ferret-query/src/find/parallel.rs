@@ -10,7 +10,7 @@ use super::schedule::{self, Schedule, Share, Split, Step, Visitor};
 
 use super::{
     Control, Effects, EntrySource, EvaluationError, Expression, LiveWalk, Outcome, Plan,
-    Unsupported, WalkError, evaluate,
+    Unsupported, WalkError, action, evaluate,
 };
 
 struct Task {
@@ -23,16 +23,31 @@ struct Task {
 }
 
 impl Task {
+    /// A run's first task: its own entry gate and shared batches, and no
+    /// cancellation until it lends work.
     fn new(quit: &Arc<AtomicBool>) -> Self {
-        let gate = Arc::new(Mutex::new(()));
-        let mut control = Control {
-            cancelled: Some(quit.clone()),
-            ..Control::default()
-        };
-        control.actions.gate = gate.clone();
-        control.actions.quit = quit.clone();
+        Self::with(quit, Arc::default(), Arc::default(), None)
+    }
+
+    /// A task lent from `parent`, sharing its entry gate and batches.
+    fn lent(parent: &Self, quit: &Arc<AtomicBool>) -> Self {
+        let shared = parent.control.actions.shared.clone();
+        Self::with(quit, parent.gate.clone(), shared, Some(quit.clone()))
+    }
+
+    fn with(
+        quit: &Arc<AtomicBool>,
+        gate: Arc<Mutex<()>>,
+        shared: action::Shared,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self {
-            control,
+            control: Control {
+                cancelled,
+                prune: false,
+                quit: false,
+                actions: action::State::new(gate.clone(), quit.clone(), shared),
+            },
             descend: true,
             errors: 0,
             record: super::output::Record::default(),
@@ -176,7 +191,6 @@ pub(super) fn run(
     };
     let quit = Arc::new(AtomicBool::new(false));
     let mut task = Task::new(&quit);
-    task.control.cancelled = None;
     let policy = super::output::policy(&expression);
     let shared = task.control.actions.shared.clone();
     let gate = task.gate.clone();
@@ -285,11 +299,7 @@ impl<E: Effects> Visitor<LiveWalk, Task> for Worker<'_, E> {
             parent.errors += 1;
             self.quit.store(true, Ordering::Release);
         }
-        let mut task = Task::new(self.quit);
-        task.gate = parent.gate.clone();
-        task.control.actions.gate = parent.gate.clone();
-        task.control.actions.shared = parent.control.actions.shared.clone();
-        task
+        Task::lent(parent, self.quit)
     }
     fn resume(&mut self, task: &mut Task) {
         std::mem::swap(&mut self.record, &mut task.record);
@@ -336,8 +346,7 @@ impl Plan {
         let shallow_catalog =
             source.catalog().is_some() && self.options.max_depth.is_some_and(|depth| depth <= 2);
         let quit = Arc::new(AtomicBool::new(false));
-        let mut task = Task::new(&quit);
-        task.control.cancelled = None;
+        let task = Task::new(&quit);
         let sequential = super::sequential_starts(&expression);
         let shared = task.control.actions.shared.clone();
         let gate = task.gate.clone();
