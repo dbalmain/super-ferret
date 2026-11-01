@@ -501,7 +501,9 @@ fn scan_records(
             } else {
                 run
             };
-            let binary = (!plan.text).then(|| memchr::memchr(0, run)).flatten();
+            // `runs` ends a run just after the sentinel, and every byte before
+            // it was searched for one, so a NUL can only be the last byte.
+            let binary = (!plan.text && run.last() == Some(&0)).then(|| run.len() - 1);
             // M4 R1: a selected-line limit cannot hide a sentinel already
             // received, even when it follows a complete selected line.
             result.binary = binary.is_some();
