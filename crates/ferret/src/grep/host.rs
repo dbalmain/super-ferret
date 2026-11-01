@@ -112,7 +112,7 @@ impl<W: Write> Host<'_, W> {
         self.runtime
             .map_or_else(stdout_is_terminal, |runtime| runtime.tty)
     }
-    pub(super) fn diagnostic(&self, message: &str) -> io::Result<()> {
+    fn diagnostic(&self, message: &str) -> io::Result<()> {
         if let Some(runtime) = self.runtime {
             (runtime.stderr)(message)
         } else {
@@ -183,7 +183,7 @@ impl<W: Write> Host<'_, W> {
         })
     }
 
-    pub(super) fn transaction(
+    fn transaction(
         &mut self,
         path: &Path,
         read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
