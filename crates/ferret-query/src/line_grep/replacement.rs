@@ -72,6 +72,8 @@ pub(super) fn region(
         region.range.end > region.range.start && region.source[region.range.end - 1] == b'\n';
     let mut at = region.range.start;
     let mut expanded = false;
+    let regex = plan.grep.regex();
+    let mut captures = replacement.uses_groups().then(|| regex.captures());
     for span in spans {
         cancelled(stopped)?;
         if span.start < region.range.start
@@ -80,9 +82,13 @@ pub(super) fn region(
         {
             continue;
         }
-        let Some(captures) = plan.grep.regex().captures_at(region.source, span.start) else {
+        // Group zero is the span itself, so a template naming no other
+        // group skips the capture search.
+        if let Some(captures) = &mut captures
+            && !regex.captures_at(captures, region.source, span.start)
+        {
             continue;
-        };
+        }
         if !only {
             output.push(&region.source[at..span.start], false, stopped, emit)?;
         } else if whole {
@@ -90,7 +96,14 @@ pub(super) fn region(
         }
         output.merge = whole;
         expanded = true;
-        replacement.expand(&captures, |piece| output.push(piece, true, stopped, emit))?;
+        let whole_match = &region.source[span.clone()];
+        replacement.expand(
+            &|index| match &captures {
+                Some(captures) => captures.get(region.source, index),
+                None => (index == 0).then_some(whole_match),
+            },
+            |piece| output.push(piece, true, stopped, emit),
+        )?;
         if only {
             // D79 D: `-o` prints a non-empty expansion, never an empty record.
             output.flush(false, stopped, emit)?;

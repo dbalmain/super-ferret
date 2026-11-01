@@ -79,9 +79,17 @@ impl Regex {
         }
     }
 
-    /// Capture spans retain the supplied haystack's assertion context.
-    pub fn captures_at<'t>(&self, bytes: &'t [u8], at: usize) -> Option<Captures<'t>> {
-        self.0.captures_at(bytes, at).map(Captures)
+    /// A capture buffer for this pattern, reused across matches.
+    pub fn captures(&self) -> Captures {
+        Captures(self.0.capture_locations())
+    }
+
+    /// Fill `captures` from the first match at or after `at`; false when
+    /// there is none. Spans retain the supplied haystack's assertion context.
+    pub fn captures_at(&self, captures: &mut Captures, bytes: &[u8], at: usize) -> bool {
+        self.0
+            .captures_read_at(&mut captures.0, bytes, at)
+            .is_some()
     }
 
     /// Resolve replacement references against this compiled pattern.
@@ -108,18 +116,20 @@ impl Matcher for Regex {
     }
 }
 
-/// Captures from one match; engine types stay inside the verifier.
-pub struct Captures<'t>(regex::bytes::Captures<'t>);
+/// Group offsets from the last match `Regex::captures_at` filled in; engine
+/// types stay inside the verifier.
+pub struct Captures(regex::bytes::CaptureLocations);
 
-impl Captures<'_> {
+impl Captures {
     /// A participating group's byte offsets in the original supplied haystack.
     pub fn span(&self, index: usize) -> Option<std::ops::Range<usize>> {
-        self.0.get(index).map(|capture| capture.range())
+        self.0.get(index).map(|(start, end)| start..end)
     }
 
-    /// A participating group's bytes; group zero is the complete match.
-    pub fn get(&self, index: usize) -> Option<&[u8]> {
-        self.0.get(index).map(|capture| capture.as_bytes())
+    /// A participating group's bytes in `bytes`, the haystack the match was
+    /// found in; group zero is the complete match.
+    pub fn get<'t>(&self, bytes: &'t [u8], index: usize) -> Option<&'t [u8]> {
+        self.span(index).map(|span| &bytes[span])
     }
 }
 
@@ -188,18 +198,27 @@ impl Replacement {
         Self { parts }
     }
 
+    /// Whether expansion reads a group other than the whole match. When it
+    /// does not, a caller can expand from the match span without captures.
+    pub fn uses_groups(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|part| matches!(part, ReplacementPart::Capture(index) if *index != 0))
+    }
+
     /// Emit literal/captured byte pieces without accumulating expanded output.
+    /// `group` returns a participating group's bytes; zero is the whole match.
     /// The caller controls allocation, cancellation and output-fault handling.
-    pub fn expand<E>(
+    pub fn expand<'t, E>(
         &self,
-        captures: &Captures<'_>,
+        group: &dyn Fn(usize) -> Option<&'t [u8]>,
         mut emit: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<(), E> {
         for part in &self.parts {
             match part {
                 ReplacementPart::Literal(bytes) => emit(bytes)?,
                 ReplacementPart::Capture(index) => {
-                    if let Some(bytes) = captures.get(*index) {
+                    if let Some(bytes) = group(*index) {
                         emit(bytes)?;
                     }
                 }
@@ -255,7 +274,9 @@ mod tests {
     #[test]
     fn capture_spans_keep_original_offsets_empty_and_absent_groups() {
         let regex = Regex::new(r"(?P<word>r(ed))()|(blue)", false).unwrap();
-        let captures = regex.captures_at(b"xx red blue", 1).unwrap();
+        let mut captures = regex.captures();
+        let haystack = b"xx red blue";
+        assert!(regex.captures_at(&mut captures, haystack, 1));
         assert_eq!(captures.span(0), Some(3..6));
         assert_eq!(captures.span(1), Some(3..6));
         assert_eq!(captures.span(2), Some(4..6));
@@ -264,16 +285,20 @@ mod tests {
         let replacement = regex.replacement("${word}X/$wordX/$2/$$/$4/${word!}");
         let mut expanded = Vec::new();
         replacement
-            .expand(&captures, |bytes| {
+            .expand(&|index| captures.get(haystack, index), |bytes| {
                 expanded.extend_from_slice(bytes);
                 Ok::<_, std::convert::Infallible>(())
             })
             .unwrap();
         assert_eq!(expanded, b"redX//ed/$//${word!}");
+        assert!(replacement.uses_groups());
+        assert!(!regex.replacement("<$0>${0}$$1").uses_groups());
         let regex = Regex::new(r"(?-u:(\xFF))", false).unwrap();
-        let captures = regex.captures_at(b"x\xff", 0).unwrap();
+        let mut captures = regex.captures();
+        assert!(regex.captures_at(&mut captures, b"x\xff", 0));
         assert_eq!(captures.span(1), Some(1..2));
-        assert_eq!(captures.get(1), Some(b"\xff".as_slice()));
+        assert_eq!(captures.get(b"x\xff", 1), Some(b"\xff".as_slice()));
+        assert!(!regex.captures_at(&mut captures, b"x\xff", 2));
     }
 
     // M2: scalar-consuming matches and byte-wise empty advancement coexist.
