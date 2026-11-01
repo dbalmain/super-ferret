@@ -253,11 +253,7 @@ impl Kinds<'_> {
         let n = links.len() / PAIR_ROW;
         let key = |i: usize| u32_at(links, i * PAIR_ROW);
         let below = |i: usize| key(i) < id.0;
-        let at = self.at;
-        self.at = match at > 0 && !below(at - 1) {
-            true => partition_point(at, below),
-            false => at + gallop(n - at, |i| below(at + i)),
-        };
+        self.at = seek(self.at, n, below);
         match self.at < n && key(self.at) == id.0 {
             true => Kind::Symlink,
             false => Kind::File,

@@ -34,6 +34,7 @@ mod publication;
 pub mod read;
 mod regular;
 mod resident_names;
+mod seek;
 mod session;
 pub mod transaction;
 

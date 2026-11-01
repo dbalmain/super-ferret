@@ -120,6 +120,7 @@ use std::sync::OnceLock;
 
 use crate::generation::{Generation, checksum};
 use crate::packed::{self, Blocked, Packed, RUN};
+use crate::seek::{partition_point, seek};
 
 mod check;
 use check::CHECK_ORDER;
@@ -895,23 +896,26 @@ impl<'a> View<'a> {
     /// Finds a live sequence id, including sparse historical DocIds. The
     /// zero-width representation permits subtraction instead of searching.
     pub(crate) fn sequence_row(self, id: u64, count: usize) -> Option<usize> {
+        self.find_sequence(id, count, |below| partition_point(count, below))
+    }
+
+    /// As [`View::sequence_row`], searching from row `near`, the answer to a
+    /// nearby earlier lookup ([`seek`]).
+    pub(crate) fn sequence_row_near(self, id: u64, count: usize, near: usize) -> Option<usize> {
+        self.find_sequence(id, count, |below| seek(near.min(count), count, below))
+    }
+
+    fn find_sequence(
+        self,
+        id: u64,
+        count: usize,
+        search: impl FnOnce(&dyn Fn(usize) -> bool) -> usize,
+    ) -> Option<usize> {
         let at = match self.dense() {
             Some(first) => id
                 .checked_sub(first)
                 .map_or(count, |row| row.min(count as u64) as usize),
-            None => {
-                let mut low = 0;
-                let mut high = count;
-                while low < high {
-                    let mid = low + (high - low) / 2;
-                    if self.sequence(mid) < id {
-                        low = mid + 1;
-                    } else {
-                        high = mid;
-                    }
-                }
-                low
-            }
+            None => search(&|row| self.sequence(row) < id),
         };
         (at < count && self.sequence(at) == id).then_some(at)
     }

@@ -38,6 +38,7 @@ use crate::log::{Family, Record};
 use crate::overlay::{self, Overlay};
 use crate::packed::{self, Blocked};
 use crate::regular::{self, Access};
+use crate::seek::{gallop, partition_point, seek};
 use crate::{
     ContentState, DecodeError, DocId, Generation, Handle, Hash, InoId, NameId, RetryFromCurrent,
 };
@@ -45,8 +46,6 @@ use crate::{
 mod cursors;
 mod documents;
 mod inodes;
-#[cfg(test)]
-mod tests;
 
 pub use cursors::{Kinds, NameReader, NameRuns};
 
@@ -1449,34 +1448,6 @@ fn push_component(out: &mut Vec<u8>, name: &[u8]) {
         out.push(b'/');
     }
     out.extend_from_slice(name);
-}
-
-/// The first index in `0..n` for which `pred` is false, given that `pred` is
-/// true then false over the range.
-fn partition_point(n: usize, pred: impl Fn(usize) -> bool) -> usize {
-    let (mut lo, mut hi) = (0, n);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if pred(mid) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
-/// As [`partition_point`], for a boundary near the start: probes 1, 2, 4…
-/// rows ahead, then searches the last span.
-fn gallop(n: usize, pred: impl Fn(usize) -> bool) -> usize {
-    let (mut lo, mut step) = (0, 1);
-    while lo + step <= n && pred(lo + step - 1) {
-        lo += step;
-        step *= 2;
-    }
-    // `pred(lo + step - 1)` failed or lies past the end.
-    let hi = (lo + step - 1).min(n);
-    lo + partition_point(hi - lo, |i| pred(lo + i))
 }
 
 fn special_kind(rows: &[u8], id: InoId) -> Option<Kind> {

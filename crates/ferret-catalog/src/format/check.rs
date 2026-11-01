@@ -270,12 +270,15 @@ pub(crate) fn document_references(
     let ids = l.view(Column::DocId, docs);
     let bindings = l.blocked(Column::Doc, bindings);
     let mut counts = vec![0u32; l.docs];
+    // Bindings mostly ascend with the inode, so each search starts at the
+    // last one's row.
+    let mut at = 0;
     for row in 0..l.inodes {
         let Some(id) = bindings.nullable(row) else {
             continue;
         };
-        let at = ids
-            .sequence_row(id, l.docs)
+        at = ids
+            .sequence_row_near(id, l.docs, at)
             .ok_or(DecodeError::Corrupt("document references"))?;
         counts[at] = counts[at]
             .checked_add(1)
