@@ -236,6 +236,7 @@ impl Cached {
         for record in &self.records {
             render.line(&mut output, record.line(), &mut cursor)?;
         }
+        render.finish(&mut output, &mut cursor)?;
         output.flush()?;
         if output.streamed {
             return Ok(Observed::Streamed(self.result, None, output.held));

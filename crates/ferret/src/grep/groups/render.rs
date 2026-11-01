@@ -86,9 +86,23 @@ pub(super) struct Cursor {
     line: Option<u64>,
     printed: bool,
     gap: bool,
-    /// A plain or JSON line, assembled so that it reaches the output in one
-    /// write.
+    /// A JSON line, assembled so that it reaches the output in one write.
     scratch: Vec<u8>,
+    /// Plain lines not yet written: they reach the output a chunk at a time,
+    /// and before anything else does.
+    batch: Vec<u8>,
+}
+
+impl Cursor {
+    /// Writes the batched plain lines.
+    fn flush(&mut self, output: &mut dyn Write) -> io::Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let written = output.write_all(&self.batch);
+        self.batch.clear();
+        written
+    }
 }
 
 /// Rendered captures never spill. Above the threshold they claim the single
@@ -204,6 +218,7 @@ impl Render<'_> {
             })?;
         }
         if (self.plan.before > 0 || self.plan.after > 0) && cursor.printed && cursor.gap {
+            cursor.flush(&mut output)?;
             output.write_all(b"--\n")?;
         }
         cursor.printed = true;
@@ -218,32 +233,34 @@ impl Render<'_> {
             let prefix = self
                 .prefix
                 .filter(|_| self.plan.presentation.heading != Some(true));
-            let scratch = &mut cursor.scratch;
-            scratch.clear();
+            let batch = &mut cursor.batch;
             if let Some(prefix) = prefix {
-                scratch.extend_from_slice(prefix);
-                scratch.extend_from_slice(if self.plan.presentation.null {
+                batch.extend_from_slice(prefix);
+                batch.extend_from_slice(if self.plan.presentation.null {
                     b"\0"
                 } else {
                     delimiter
                 });
             }
             if self.plan.line_number {
-                scratch.extend_from_slice(presentation::decimal(line.number, &mut [0; 20]));
-                scratch.extend_from_slice(delimiter);
+                batch.extend_from_slice(presentation::decimal(line.number, &mut [0; 20]));
+                batch.extend_from_slice(delimiter);
             }
             let text = omitted.as_deref().unwrap_or(line.bytes);
             // A line past one write's chunk keeps its own bounded writes:
             // copying it whole would allocate and copy before cancellation
             // or the capture budget could act.
             if text.len() > CHUNK {
-                output.write_all(scratch)?;
+                cursor.flush(&mut output)?;
                 output.write_all(text)?;
                 return output.write_all(b"\n");
             }
-            scratch.extend_from_slice(text);
-            scratch.push(b'\n');
-            return output.write_all(scratch);
+            batch.extend_from_slice(text);
+            batch.push(b'\n');
+            if batch.len() >= CHUNK {
+                return cursor.flush(&mut output);
+            }
+            return Ok(());
         }
         if self.plan.presentation.heading != Some(true)
             && let Some(prefix) = self.prefix
@@ -290,6 +307,14 @@ impl Render<'_> {
         })
     }
 
+    /// Writes the plain lines `cursor` still holds.
+    pub(super) fn finish(&self, output: &mut dyn Write, cursor: &mut Cursor) -> io::Result<()> {
+        cursor.flush(&mut Cancellable {
+            inner: output,
+            stopped: self.stopped,
+        })
+    }
+
     pub(super) fn scan(
         &self,
         input: &mut dyn Read,
@@ -317,8 +342,8 @@ impl Render<'_> {
         let partial = match &result {
             Ok(result) | Err((result, _)) => *result,
         };
-        output
-            .flush()
+        self.finish(output, &mut cursor)
+            .and_then(|()| output.flush())
             .map_err(|error| (partial, ScanError::Output(error)))?;
         result
     }
