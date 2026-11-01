@@ -407,74 +407,76 @@ impl Overlay {
     pub(crate) fn check_aux(&self) -> Result<(), OpenError> {
         self.base.load(&[Section::Links])?;
         if self.aux_checked.get().is_none() {
-            // A checked predecessor proves the inherited rows; validate only
-            // current changes. Disk replay has no predecessor proof.
-            let rows: Vec<_> = if self
-                .parent
-                .as_ref()
-                .is_some_and(|p| p.checked.get().is_some())
-            {
-                self.delta.iter().map(Arc::as_ref).collect()
-            } else {
+            let rows = self.unproven(|| {
                 self.projection(Family::Namespace)
                     .records(LIFE)
                     .chain(self.projection(Family::Aux).records(LINK))
                     .chain(self.projection(Family::Aux).records(WORKTREE))
-                    .collect()
-            };
-            for r in rows {
-                match r {
-                    Record::LifePut { id, kind, .. }
-                        if *id < self.base.base_inode_count()
-                            && self.base.kind(InoId(*id)) != *kind =>
-                    {
-                        return Err(bad("base inode lifetime type changed"));
-                    }
-                    Record::LinkPut { id, .. }
-                        if self.live_inode(*id)
-                            && self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id)))
-                                != Kind::Symlink =>
-                    {
-                        return Err(bad("link target on non-symlink"));
-                    }
-                    Record::WorkTreePut { id, .. }
-                        if self.live_inode(*id)
-                            && !self
-                                .kind(*id)
-                                .map_or(*id < self.base.base_dir_count(), |kind| {
-                                    kind == Kind::Dir
-                                }) =>
-                    {
-                        return Err(bad("work tree on non-directory inode"));
-                    }
-                    _ => {}
-                }
-            }
+            });
+            rows.into_iter()
+                .try_for_each(|r| self.check_aux_record(r))?;
             let _ = self.aux_checked.set(());
         }
         if self.kinds_checked.get().is_none()
             && let Some(fields) = self.families[Family::Inodes as usize].get()
         {
-            let rows: Vec<_> = if self
-                .parent
-                .as_ref()
-                .is_some_and(|p| p.checked.get().is_some())
-            {
-                self.delta.iter().map(Arc::as_ref).collect()
-            } else {
-                fields.records(INODE).collect()
-            };
-            for r in rows {
-                if let Record::InodePut { id, kind, .. } = r
-                    && self.live_inode(*id)
-                {
-                    let actual = self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id)));
-                    if *kind != actual {
-                        return Err(bad("inode/life kind mismatch"));
-                    }
-                }
-            }
+            let rows = self.unproven(|| fields.records(INODE));
+            rows.into_iter()
+                .try_for_each(|r| self.check_inode_kind(r))?;
             let _ = self.kinds_checked.set(());
+        }
+        Ok(())
+    }
+    /// The rows still to validate. A checked predecessor proves the inherited
+    /// rows, so only current changes; disk replay has no predecessor proof,
+    /// so every row `all` yields.
+    fn unproven<'a, I: Iterator<Item = &'a Record>>(
+        &'a self,
+        all: impl FnOnce() -> I,
+    ) -> Vec<&'a Record> {
+        if self
+            .parent
+            .as_ref()
+            .is_some_and(|p| p.checked.get().is_some())
+        {
+            self.delta.iter().map(Arc::as_ref).collect()
+        } else {
+            all().collect()
+        }
+    }
+    fn check_aux_record(&self, r: &Record) -> Result<(), OpenError> {
+        match r {
+            Record::LifePut { id, kind, .. }
+                if *id < self.base.base_inode_count() && self.base.kind(InoId(*id)) != *kind =>
+            {
+                Err(bad("base inode lifetime type changed"))
+            }
+            Record::LinkPut { id, .. }
+                if self.live_inode(*id)
+                    && self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id)))
+                        != Kind::Symlink =>
+            {
+                Err(bad("link target on non-symlink"))
+            }
+            Record::WorkTreePut { id, .. }
+                if self.live_inode(*id)
+                    && !self
+                        .kind(*id)
+                        .map_or(*id < self.base.base_dir_count(), |kind| kind == Kind::Dir) =>
+            {
+                Err(bad("work tree on non-directory inode"))
+            }
+            _ => Ok(()),
+        }
+    }
+    fn check_inode_kind(&self, r: &Record) -> Result<(), OpenError> {
+        if let Record::InodePut { id, kind, .. } = r
+            && self.live_inode(*id)
+        {
+            let actual = self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id)));
+            if *kind != actual {
+                return Err(bad("inode/life kind mismatch"));
+            }
         }
         Ok(())
     }
@@ -1221,6 +1223,13 @@ fn validate_graph(
     changed: &[Arc<Record>],
     old_dirs: BTreeSet<u32>,
 ) -> Result<(), OpenError> {
+    check_roots(base, rows)?;
+    touched_dirs(base, rows, changed, old_dirs)
+        .into_iter()
+        .try_for_each(|dir| reaches_root(base, rows, dir))
+}
+/// Every root is a live directory with no incoming edge, at a distinct path.
+fn check_roots(base: &Catalog, rows: &Projection) -> Result<(), OpenError> {
     let mut paths = BTreeSet::new();
     let roots = base
         .roots()
@@ -1238,6 +1247,17 @@ fn validate_graph(
             return Err(bad("root liveness/incoming edge/duplicate path"));
         }
     }
+    Ok(())
+}
+/// The live directories whose path to a root `changed` may have altered:
+/// `old_dirs`, the parents and directory children of changed names, and
+/// directories whose life, record or root changed.
+fn touched_dirs(
+    base: &Catalog,
+    rows: &Projection,
+    changed: &[Arc<Record>],
+    old_dirs: BTreeSet<u32>,
+) -> BTreeSet<u32> {
     let mut dirs: BTreeSet<_> = old_dirs
         .into_iter()
         .filter(|&id| live(base, rows, id))
@@ -1250,46 +1270,44 @@ fn validate_graph(
             }
         }
     }
-    {
-        for r in changed.iter().map(Arc::as_ref) {
-            match r {
-                Record::LifePut {
-                    id,
-                    kind: Kind::Dir,
-                    ..
-                }
-                | Record::DirPut { id, .. }
-                | Record::RootPut { id, .. }
-                | Record::RootDelete { id }
-                    if live(base, rows, *id) =>
-                {
-                    dirs.insert(*id);
-                }
-                _ => {}
+    for r in changed.iter().map(Arc::as_ref) {
+        match r {
+            Record::LifePut {
+                id,
+                kind: Kind::Dir,
+                ..
             }
-        }
-    }
-    for mut at in dirs {
-        let mut seen = BTreeSet::new();
-        loop {
-            if !live(base, rows, at) || kind(base, rows, at) != Some(Kind::Dir) || !seen.insert(at)
+            | Record::DirPut { id, .. }
+            | Record::RootPut { id, .. }
+            | Record::RootDelete { id }
+                if live(base, rows, *id) =>
             {
-                return Err(bad("directory cycle/dead parent"));
+                dirs.insert(*id);
             }
-            if let Some(edge) = own(base, rows, at) {
-                let n =
-                    name(base, rows, edge).ok_or_else(|| bad("missing directory incoming edge"))?;
-                if n.target() != Target::Inode(InoId(at)) || root(base, rows, at) {
-                    return Err(bad("directory incoming edge/root"));
-                }
-                at = n.parent.0;
-            } else {
-                if !root(base, rows, at) {
-                    return Err(bad("directory has no root"));
-                }
-                break;
-            }
+            _ => {}
         }
     }
-    Ok(())
+    dirs
+}
+/// `dir`'s incoming edges lead, through live directories and without a
+/// cycle, to a root.
+fn reaches_root(base: &Catalog, rows: &Projection, mut at: u32) -> Result<(), OpenError> {
+    let mut seen = BTreeSet::new();
+    loop {
+        if !live(base, rows, at) || kind(base, rows, at) != Some(Kind::Dir) || !seen.insert(at) {
+            return Err(bad("directory cycle/dead parent"));
+        }
+        let Some(edge) = own(base, rows, at) else {
+            return if root(base, rows, at) {
+                Ok(())
+            } else {
+                Err(bad("directory has no root"))
+            };
+        };
+        let n = name(base, rows, edge).ok_or_else(|| bad("missing directory incoming edge"))?;
+        if n.target() != Target::Inode(InoId(at)) || root(base, rows, at) {
+            return Err(bad("directory incoming edge/root"));
+        }
+        at = n.parent.0;
+    }
 }
