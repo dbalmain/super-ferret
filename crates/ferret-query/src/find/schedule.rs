@@ -265,26 +265,7 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
         let _panic = PanicStop(self);
         let quit = self.schedule.quit;
         let mut errors = 0;
-        loop {
-            let mut queue = self.lock();
-            let mut lent = loop {
-                if quit.load(Ordering::Acquire) {
-                    return errors;
-                }
-                if let Some(index) = queue.tasks.iter().rposition(|lent| !lent.walk.waiting()) {
-                    queue.active += 1;
-                    self.active.store(queue.active, Ordering::Relaxed);
-                    break queue.tasks.swap_remove(index);
-                }
-                if queue.active == 0 {
-                    return errors;
-                }
-                queue = self
-                    .changed
-                    .wait(queue)
-                    .unwrap_or_else(PoisonError::into_inner);
-            };
-            drop(queue);
+        while let Some(mut lent) = self.take() {
             visitor.resume(&mut lent.task);
             let mut steps = 0usize;
             // After an offer to idle workers finds nothing to lend, the next
@@ -303,43 +284,13 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                     }
                 }
                 let cadence = steps.is_multiple_of(STEPS_PER_LOAN);
-                let workers = self.schedule.workers;
                 // A visitor about to hold its worker on one long step offers
                 // whatever the backoff, so an idle worker is not left asleep
                 // through it.
-                let offer = self.active.load(Ordering::Relaxed) < workers
+                let offer = self.active.load(Ordering::Relaxed) < self.schedule.workers
                     && (steps >= next_offer || visitor.holding(&lent.task));
                 if cadence || offer {
-                    let mut queue = self.lock();
-                    // Workers with no task, less those a runnable queued task
-                    // will occupy.
-                    let idle = workers.saturating_sub(
-                        queue.active
-                            + queue
-                                .tasks
-                                .iter()
-                                .filter(|queued| !queued.walk.waiting())
-                                .count(),
-                    );
-                    let share = if idle > 0 && visitor.holding(&lent.task) {
-                        Share::Idle(idle)
-                    } else {
-                        Share::Half
-                    };
-                    let room = queue.tasks.len() + queue.active < workers * QUEUED_PER_WORKER;
-                    if (idle > 0 || (cadence && room))
-                        && let Some((walk, completion)) =
-                            lent.walk.split(self.schedule.starts, share)
-                    {
-                        // Under the queue lock, as the borrower must not run
-                        // before the lender has published.
-                        let task = visitor.lend(&mut lent.task);
-                        queue.tasks.push(Lent {
-                            walk,
-                            task,
-                            completion,
-                        });
-                        self.changed.notify_all();
+                    if self.loan(visitor, &mut lent, cadence) {
                         backoff = 0;
                     } else if offer {
                         backoff = (backoff * 2 + 1).min(STEPS_PER_LOAN);
@@ -359,14 +310,86 @@ impl<S: Split, T: Send> Pool<'_, '_, S, T> {
                 errors += lent.end(visitor);
                 None
             };
-            let mut queue = self.lock();
-            queue.active -= 1;
-            self.active.store(queue.active, Ordering::Relaxed);
-            if let Some(lent) = suspended {
-                queue.tasks.push(lent);
-            }
-            self.changed.notify_all();
+            self.retire(suspended);
         }
+        errors
+    }
+
+    /// The next runnable task, waiting for one while any worker is active.
+    /// `None` once the walk is over or quitting.
+    fn take(&self) -> Option<Lent<S, T>> {
+        let mut queue = self.lock();
+        loop {
+            if self.schedule.quit.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(index) = queue.tasks.iter().rposition(|lent| !lent.walk.waiting()) {
+                queue.active += 1;
+                self.active.store(queue.active, Ordering::Relaxed);
+                return Some(queue.tasks.swap_remove(index));
+            }
+            if queue.active == 0 {
+                return None;
+            }
+            queue = self
+                .changed
+                .wait(queue)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Splits off part of `lent`'s walk for the queue when a worker is idle,
+    /// or at the `cadence` while the queue has room. Whether it lent.
+    fn loan<V: Visitor<S, T>>(
+        &self,
+        visitor: &mut V,
+        lent: &mut Lent<S, T>,
+        cadence: bool,
+    ) -> bool {
+        let workers = self.schedule.workers;
+        let mut queue = self.lock();
+        // Workers with no task, less those a runnable queued task will occupy.
+        let idle = workers.saturating_sub(
+            queue.active
+                + queue
+                    .tasks
+                    .iter()
+                    .filter(|queued| !queued.walk.waiting())
+                    .count(),
+        );
+        let share = if idle > 0 && visitor.holding(&lent.task) {
+            Share::Idle(idle)
+        } else {
+            Share::Half
+        };
+        let room = queue.tasks.len() + queue.active < workers * QUEUED_PER_WORKER;
+        if !(idle > 0 || (cadence && room)) {
+            return false;
+        }
+        let Some((walk, completion)) = lent.walk.split(self.schedule.starts, share) else {
+            return false;
+        };
+        // Under the queue lock, as the borrower must not run before the
+        // lender has published.
+        let task = visitor.lend(&mut lent.task);
+        queue.tasks.push(Lent {
+            walk,
+            task,
+            completion,
+        });
+        self.changed.notify_all();
+        true
+    }
+
+    /// A task leaves its worker, queued again if `suspended`.
+    fn retire(&self, suspended: Option<Lent<S, T>>) {
+        let mut queue = self.lock();
+        queue.active -= 1;
+        self.active.store(queue.active, Ordering::Relaxed);
+        if let Some(lent) = suspended {
+            queue.tasks.push(lent);
+        }
+        self.changed.notify_all();
     }
 }
 
