@@ -523,6 +523,21 @@ pub(crate) fn plan(
         docs: Vec::new(),
         revealed: Vec::new(),
     };
+    number_roots(&mut plan, roots)?;
+
+    let file_pos = number_names(&mut plan, batches, &visible)?;
+
+    take_entry_counts(&mut plan, batches, &tokens)?;
+
+    number_files(&mut plan, batches, file_pos)?;
+    assign_docs(&mut plan, batches, known.docs)?;
+    push_links(&mut plan, batches)?;
+    push_work_trees(&mut plan, batches, &tokens)?;
+    Ok(plan)
+}
+
+/// Numbers the sorted `roots` first, in path order, storing their paths.
+fn number_roots(plan: &mut Plan, roots: Roots<'_>) -> Result<(), BuildError> {
     for &(path, global) in &roots {
         if path.is_empty() || path.contains(&0) {
             return Err(BuildError::BadPath(path.to_vec()));
@@ -532,21 +547,21 @@ pub(crate) fn plan(
         plan.roots.push((id, push_string(&mut plan.strings, path)?));
         plan.order.push(global as u32);
     }
-    drop(roots);
+    Ok(())
+}
 
-    let file_pos = number_names(&mut plan, batches, &visible)?;
-
+/// Moves each batch's directory entry counts into the plan.
+fn take_entry_counts(
+    plan: &mut Plan,
+    batches: &mut [Batch],
+    tokens: &Tokens,
+) -> Result<(), BuildError> {
     for batch in batches.iter_mut() {
         for (dir, count) in std::mem::take(&mut batch.entry_counts) {
             plan.entry_count[tokens.resolve(dir)?] = count;
         }
     }
-
-    number_files(&mut plan, batches, file_pos)?;
-    assign_docs(&mut plan, batches, known.docs)?;
-    push_links(&mut plan, batches)?;
-    push_work_trees(&mut plan, batches, &tokens)?;
-    Ok(plan)
+    Ok(())
 }
 
 /// Each batch's first directory number and its directory count, by batch
