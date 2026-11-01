@@ -1456,6 +1456,7 @@ fn name_index_once(dir: &Path) -> Result<()> {
     let projection = projection_started.elapsed();
     let index_started = Instant::now();
     let index = ferret_query::NameIndex::new(&catalog);
+    index.warm(&catalog).map_err(|_| "stale query index")?;
     let index_time = index_started.elapsed();
     let full = started.elapsed();
     let (rss, peak) = memory()?;
@@ -1641,6 +1642,7 @@ fn name_index_update(dir: &Path, count: &str) -> Result<()> {
     let writer_setup = setup.elapsed();
     let setup = Instant::now();
     let index = ferret_query::NameIndex::new(&previous);
+    index.warm(&previous).map_err(|_| "stale query index")?;
     let query_setup = setup.elapsed();
     if count > previous.base_name_count()
         || count > previous.base_inode_count() - previous.base_dir_count()
@@ -1690,6 +1692,7 @@ fn name_index_update(dir: &Path, count: &str) -> Result<()> {
     let publication = started.elapsed();
     let started = Instant::now();
     let next = ferret_query::NameIndex::adopt(&current, Some(&index));
+    next.warm(&current).map_err(|_| "stale query index")?;
     let cache = started.elapsed();
     let (rss, peak) = memory()?;
     println!(
@@ -1716,12 +1719,14 @@ fn name_index_compact(dir: &Path) -> Result<()> {
     let previous = session.view();
     let old_epoch = previous.generation().checkpoint;
     let index = ferret_query::NameIndex::new(&previous);
+    index.warm(&previous).map_err(|_| "stale query index")?;
     let setup_ms = duration_ms(setup.elapsed());
     let started = Instant::now();
     let current = session.compact()?;
     let writer_pause = started.elapsed();
     let started = Instant::now();
     let next = ferret_query::NameIndex::adopt(&current, Some(&index));
+    next.warm(&current).map_err(|_| "stale query index")?;
     let query_cache = started.elapsed();
     let names = current.resident_names().ok_or("resident compaction view")?;
     let (before_drop_rss, peak) = memory()?;

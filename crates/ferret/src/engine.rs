@@ -116,7 +116,9 @@ impl Derived {
 /// publication so that no query waits for them.
 fn resident_index(catalog: &Catalog, previous: Option<&NameIndex>) -> NameIndex {
     let index = NameIndex::adopt(catalog, previous);
-    index.warm(catalog);
+    let Ok(()) = index.warm(catalog) else {
+        unreachable!("adopted from this catalog");
+    };
     index
 }
 

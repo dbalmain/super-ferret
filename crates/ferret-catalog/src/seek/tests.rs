@@ -25,6 +25,20 @@ fn seek_finds_every_boundary_from_every_start() {
             for at in 0..=n {
                 assert_eq!(seek(at, n, pred), boundary, "{n} rows from {at}");
             }
+            // From at or just before the boundary, a seek probes a
+            // few, where a search of the whole range would probe log n.
+            for at in boundary.saturating_sub(1)..=boundary {
+                let probes = std::cell::Cell::new(0);
+                seek(at, n, |i| {
+                    probes.set(probes.get() + 1);
+                    pred(i)
+                });
+                assert!(
+                    probes.get() <= 4,
+                    "{n} rows from {at}: {} probes",
+                    probes.get()
+                );
+            }
         }
     }
 }

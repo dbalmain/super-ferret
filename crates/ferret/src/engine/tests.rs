@@ -805,6 +805,11 @@ fn a_removed_checkpoint_directory_publishes_and_reopens() {
 fn new_and_removed_directories_keep_scope_counts_known() {
     let tree = Tree::with_files(300);
     let engine = tree.compacted_engine();
+    let warmed = engine.pin().name_index().scope_build_time();
+    assert!(
+        warmed.is_some(),
+        "a resident engine builds scope counts as it opens"
+    );
     let checkpoint = engine.pin().generation().checkpoint;
     fs::create_dir_all(tree.0.join("root/fresh/deeper")).unwrap();
     fs::write(tree.0.join("root/fresh/deeper/needle.txt"), b"alpha").unwrap();
@@ -815,6 +820,7 @@ fn new_and_removed_directories_keep_scope_counts_known() {
     let (plan, estimated, counted) = root_scope(&tree, &after);
     assert_eq!(plan, ferret_query::NamePlan::Postings);
     assert_eq!(estimated, Some(counted));
+    assert_eq!(reopened_root_scope(&tree), (plan, estimated, counted));
 }
 
 /// A directory created over the overlay and then moved under a directory
@@ -835,8 +841,24 @@ fn a_new_directory_moved_under_a_newer_one_keeps_its_rows_counted() {
     tree.refresh(&engine);
     let after = engine.pin();
     assert_eq!(after.generation().checkpoint, checkpoint, "compacted");
-    let (_, estimated, counted) = root_scope(&tree, &after);
+    let (plan, estimated, counted) = root_scope(&tree, &after);
     assert_eq!(estimated, Some(counted));
+    assert_eq!(reopened_root_scope(&tree), (plan, estimated, counted));
+}
+
+/// [`root_scope`] from an engine opened on the index as it stands, overlay
+/// and all, which builds its scope counts at that first scoped selection,
+/// where the writer's engine built them before the overlay existed.
+fn reopened_root_scope(tree: &Tree) -> (ferret_query::NamePlan, Option<u64>, u64) {
+    let reopened = Engine::open(&tree.0.join("index")).unwrap().unwrap().pin();
+    assert!(
+        reopened.catalog().overlay_run_count() > 0,
+        "the reopened view has the overlay"
+    );
+    assert_eq!(reopened.name_index().scope_build_time(), None, "lazy");
+    let scope = root_scope(tree, &reopened);
+    assert!(reopened.name_index().scope_build_time().is_some(), "built");
+    scope
 }
 
 /// The plan and estimated scope of a `needle.txt` name search under

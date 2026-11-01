@@ -76,6 +76,13 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
         crate::cli::error(&error.to_string());
         return Exit::Error;
     }
+    // A daemon builds its scope counts when it opens; report what it holds.
+    if let Some(engine) = &engine {
+        let session = engine.pin();
+        let Ok(()) = session.name_index().warm(session.catalog()) else {
+            unreachable!("one pinned view");
+        };
+    }
     if census && engine.is_none() {
         crate::cli::error(&format!(
             "no index in {}: run `ferret index DIR` first",

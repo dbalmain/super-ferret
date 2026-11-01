@@ -37,7 +37,8 @@ pub(crate) fn gallop(n: usize, pred: impl Fn(usize) -> bool) -> usize {
 /// for a search over the whole range only when it moves back.
 pub(crate) fn seek(at: usize, n: usize, pred: impl Fn(usize) -> bool) -> usize {
     match at > 0 && !pred(at - 1) {
-        true => partition_point(at, pred),
+        // `pred(at - 1)` is already known false.
+        true => partition_point(at - 1, pred),
         false => at + gallop(n - at, |i| pred(at + i)),
     }
 }

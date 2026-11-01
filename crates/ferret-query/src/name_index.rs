@@ -304,18 +304,8 @@ impl NameIndex {
 
     /// Includes the interned names it built for a raw catalog.
     pub fn bytes(&self) -> usize {
-        self.base.owned.as_ref().map_or(0, |names| names.bytes())
-            + self
-                .base
-                .terms
-                .get()
-                .map_or(0, |terms| terms.terms.bytes() + terms.keys.bytes())
-            + self.scope_bytes()
-            + self
-                .delta
-                .iter()
-                .map(|(name, rows)| name.len() + rows.len() * 4)
-                .sum::<usize>()
+        let (terms, scopes, delta) = self.byte_counts();
+        self.base.owned.as_ref().map_or(0, |names| names.bytes()) + terms + scopes + delta
     }
 
     fn scope_bytes(&self) -> usize {
@@ -326,8 +316,11 @@ impl NameIndex {
 
     /// Builds the base scope counts now rather than at the first scoped
     /// selection: for a resident host, whose queries should not pay for them.
-    pub fn warm(&self, catalog: &Catalog) {
+    /// `catalog` must be of this index's generation, as for a selection.
+    pub fn warm(&self, catalog: &Catalog) -> Result<(), RetryFromCurrent> {
+        catalog.generation().check(self.generation)?;
         self.base.scopes(catalog);
+        Ok(())
     }
 
     /// Time spent building base scope cardinalities, excluding overlay edits,
