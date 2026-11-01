@@ -48,6 +48,23 @@ pub(super) fn turn(
             .join()
             .map_err(|_| io::Error::other("content merge panicked"))??;
     }
+    if let Some(wait) = follow(host, engine, scheduler)? {
+        return Ok(wait);
+    }
+    if state.merge.is_some() {
+        return Ok(Duration::from_millis(100));
+    }
+    start_merge(host, engine, scheduler, state)
+}
+
+/// Follows the catalog into the content index for one bounded slice. Returns
+/// how long to wait before the next turn, or None once it is caught up and a
+/// merge may start.
+fn follow(
+    host: &Arc<Host>,
+    engine: &Arc<Engine>,
+    scheduler: &Arc<crate::scheduler::Scheduler>,
+) -> io::Result<Option<Duration>> {
     let started = Instant::now();
     let should_interrupt = || {
         urgent(host, scheduler)
@@ -68,7 +85,7 @@ pub(super) fn turn(
         should_interrupt() || started.elapsed() >= Duration::from_millis(100)
     };
     if cancelled() {
-        return Ok(Duration::from_secs(1));
+        return Ok(Some(Duration::from_secs(1)));
     }
     let limiter = scheduler.limiter();
     let pace = |bytes: usize| {
@@ -90,14 +107,22 @@ pub(super) fn turn(
         .map_err(io::Error::other)?;
     drop(operation);
     let Some(followed) = followed else {
-        return Ok(Duration::from_millis(100));
+        return Ok(Some(Duration::from_millis(100)));
     };
     if cancelled() || followed.remaining > 0 {
-        return Ok(Duration::ZERO);
+        return Ok(Some(Duration::ZERO));
     }
-    if state.merge.is_some() {
-        return Ok(Duration::from_millis(100));
-    }
+    Ok(None)
+}
+
+/// Starts a background merge when the scheduler admits one, returning how long
+/// to wait before the next turn.
+fn start_merge(
+    host: &Arc<Host>,
+    engine: &Arc<Engine>,
+    scheduler: &Arc<crate::scheduler::Scheduler>,
+    state: &mut State,
+) -> io::Result<Duration> {
     let pin = engine.pin();
     let Some((memory, disk)) = pin.content().and_then(|v| v.merge_resources(pin.live())) else {
         return Ok(Duration::from_secs(3600));
