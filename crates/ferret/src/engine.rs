@@ -128,7 +128,8 @@ impl Engine {
     /// every section is loaded and checked as before, but the catalog keeps
     /// its raw name heap instead of interning it, and the name planner is
     /// built only if a query needs it. A content-only query such as grep
-    /// never does, so it skips both builds.
+    /// never does, and find asks only for a name test postings could answer,
+    /// so both skip both builds.
     pub fn open_one_shot(index: &Path) -> Result<Option<Self>, OpenError> {
         let Some(catalog) = Catalog::open(index)? else {
             return Ok(None);
@@ -803,7 +804,7 @@ impl QuerySession {
         let source = if plan.no_ignore() || plan.is_information() {
             plan.live_source()
         } else {
-            plan.indexed_catalog_source(self.catalog.clone(), self.name_index())
+            plan.indexed_catalog_source(self.catalog.clone(), || self.name_index())
         };
         plan.run_parallel(source, effects, workers)
     }

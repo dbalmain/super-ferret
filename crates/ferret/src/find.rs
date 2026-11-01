@@ -117,7 +117,7 @@ fn open_catalog(plan: &Plan, index: &Path) -> Result<FindSource, String> {
         catalog.load(&plan.catalog_sections()).map_err(failed)?;
         return Ok(FindSource::Sections(Box::new(catalog)));
     }
-    match Engine::open(index) {
+    match Engine::open_one_shot(index) {
         Ok(Some(engine)) => Ok(FindSource::Pinned(Box::new(engine.pin()))),
         Ok(None) => Err(missing()),
         Err(error) => Err(format!(

@@ -468,15 +468,20 @@ impl Plan {
     /// Counted postings are safe only for a name test followed by printing,
     /// without traversal controls, effects, symlink following or live scopes.
     /// Candidates still use the ordinary entry evaluator and output commit.
-    pub fn indexed_catalog_source(
+    /// `index` is asked for only when the expression could use postings, so
+    /// a one-shot host builds no name index for any other find.
+    pub fn indexed_catalog_source<'a>(
         &self,
         catalog: ferret_catalog::Catalog,
-        index: &crate::NameIndex,
+        index: impl FnOnce() -> &'a crate::NameIndex,
     ) -> LiveWalk {
         let Some((paths, known)) = self
-            .indexed_pattern(index)
+            .indexed_pattern()
             .filter(|_| !self.touches_nested_root(&catalog))
-            .and_then(|pattern| self.indexed_entries(&catalog, index, pattern))
+            .and_then(|pattern| {
+                let index = Some(index()).filter(|index| index.can_accelerate_find())?;
+                self.indexed_entries(&catalog, index, pattern)
+            })
         else {
             return self.parallel_catalog_source(catalog);
         };
@@ -486,7 +491,7 @@ impl Plan {
     }
 
     /// The name pattern of a `-name P -print` find that postings can answer.
-    fn indexed_pattern(&self, index: &crate::NameIndex) -> Option<&glob::Pattern> {
+    fn indexed_pattern(&self) -> Option<&glob::Pattern> {
         let Expression::And(left, right) = &self.expression else {
             return None;
         };
@@ -494,7 +499,6 @@ impl Plan {
             return None;
         };
         let plain = !self.no_ignore
-            && index.can_accelerate_find()
             && self.options.max_depth.is_none()
             && self.options.min_depth == 0
             && !self.options.depth_first
