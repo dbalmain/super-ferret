@@ -545,11 +545,7 @@ fn emit(
         |error| {
             cancelled.store(true, Ordering::Release);
             // D94: a closed pipe stops the listing quietly, as in rg.
-            if error.kind() == io::ErrorKind::BrokenPipe {
-                Ok(true)
-            } else {
-                Err(format!("writing stdout: {error}"))
-            }
+            stdout_error(&error).map_or(Ok(true), Err)
         },
         |()| Ok(false),
     )
@@ -558,13 +554,9 @@ fn emit(
 fn flush_output(writer: &mut impl Write, cancelled: &AtomicBool) -> Result<Option<Exit>, String> {
     match writer.flush() {
         Ok(()) => Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-            cancelled.store(true, Ordering::Release);
-            Ok(Some(Exit::Ok))
-        }
         Err(error) => {
             cancelled.store(true, Ordering::Release);
-            Err(format!("writing stdout: {error}"))
+            stdout_error(&error).map_or(Ok(Some(Exit::Ok)), Err)
         }
     }
 }

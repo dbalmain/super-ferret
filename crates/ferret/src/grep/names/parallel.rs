@@ -156,10 +156,10 @@ impl Walk<'_> {
                 match result {
                     Ok(()) => {}
                     // D94: a closed pipe stops the listing quietly.
-                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                        written.closed = true;
-                    }
-                    Err(error) => written.failed = Some(format!("writing stdout: {error}")),
+                    Err(error) => match stdout_error(&error) {
+                        None => written.closed = true,
+                        message => written.failed = message,
+                    },
                 }
             }
             Found::Diagnostic(message) => {

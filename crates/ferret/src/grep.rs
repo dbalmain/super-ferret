@@ -316,11 +316,7 @@ impl Runtime<'_> {
         Exit::Usage
     }
     fn output_failure(&self, error: &io::Error) -> Exit {
-        if error.kind() == io::ErrorKind::BrokenPipe {
-            Exit::Ok
-        } else {
-            self.failure(&format!("writing stdout: {error}"))
-        }
+        stdout_fault(error, |message| self.failure(message))
     }
 }
 
@@ -814,14 +810,20 @@ fn print(bytes: &[u8]) -> Exit {
     }
 }
 
-/// D94: a reader that closes the pipe ends grep quietly with success. File
-/// staging faults have already been diagnosed by the per-file transaction.
 fn output_failure(error: &io::Error) -> Exit {
-    if error.kind() == io::ErrorKind::BrokenPipe {
-        Exit::Ok
-    } else {
-        failure(&format!("writing stdout: {error}"))
-    }
+    stdout_fault(error, failure)
+}
+
+/// File staging faults have already been diagnosed by the per-file
+/// transaction; any other fault is reported through `failure`.
+fn stdout_fault(error: &io::Error, failure: impl FnOnce(&str) -> Exit) -> Exit {
+    stdout_error(error).map_or(Exit::Ok, |message| failure(&message))
+}
+
+/// D94: a reader that closes the pipe ends grep quietly with success, so a
+/// closed pipe has no message; any other write fault does.
+fn stdout_error(error: &io::Error) -> Option<String> {
+    (error.kind() != io::ErrorKind::BrokenPipe).then(|| format!("writing stdout: {error}"))
 }
 
 fn failure(message: &str) -> Exit {
