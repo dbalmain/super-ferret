@@ -1118,6 +1118,15 @@ impl Burst {
     /// Resolves parent/name locators in the current checked generation. Missing
     /// ancestry or changed root boundaries widen observation conservatively.
     pub fn request(&self, view: &Catalog) -> RefreshRequest {
+        let expected_generation = view.generation();
+        if self.marker.is_some() {
+            return RefreshRequest {
+                expected_generation,
+                scopes: Vec::new(),
+                rename_hints: Vec::new(),
+                reason: self.reason(),
+            };
+        }
         let mut scopes = Vec::new();
         let mut roots = self.roots.clone();
         let mut moves: BTreeMap<u32, MovePair> = BTreeMap::new();
@@ -1144,64 +1153,55 @@ impl Burst {
                 }
             }
         }
-        if self.marker.is_some() {
-            return RefreshRequest {
-                expected_generation: view.generation(),
-                scopes: Vec::new(),
-                rename_hints: Vec::new(),
-                reason: self.reason(),
-            };
-        }
         let changed_boundary = roots
             .iter()
             .any(|root| !view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
         if changed_boundary {
-            scopes.clear();
-        } else {
-            scopes.retain(|scope| match scope {
-                RefreshScope::Entry { parent, .. } => {
-                    let mut path = Vec::new();
-                    view.dir_path(*parent, &mut path);
-                    !roots
-                        .iter()
-                        .any(|root| Path::new(OsStr::from_bytes(&path)).starts_with(root))
-                }
-                _ => true,
-            });
-            scopes.extend(roots.into_iter().map(RefreshScope::Root));
+            return RefreshRequest {
+                expected_generation,
+                scopes: Vec::new(),
+                rename_hints: Vec::new(),
+                reason: RefreshReason::Backstop,
+            };
         }
-        let rename_hints = if self.marker.is_some() || changed_boundary {
-            Vec::new()
-        } else {
-            moves
-                .into_values()
-                .filter_map(|MovePair { mut old, mut new }| {
-                    if old.len() != 1 || new.len() != 1 {
-                        return None;
-                    }
-                    let (old_parent, old_name) = old.pop()?;
-                    let (new_parent, new_name) = new.pop()?;
-                    Some(RenameHint {
-                        old_parent,
-                        old_name,
-                        new_parent,
-                        new_name,
-                    })
-                })
-                .collect()
-        };
+        scopes.retain(|scope| match scope {
+            RefreshScope::Entry { parent, .. } => {
+                let mut path = Vec::new();
+                view.dir_path(*parent, &mut path);
+                !roots
+                    .iter()
+                    .any(|root| Path::new(OsStr::from_bytes(&path)).starts_with(root))
+            }
+            _ => true,
+        });
+        scopes.extend(roots.into_iter().map(RefreshScope::Root));
         RefreshRequest {
-            expected_generation: view.generation(),
+            expected_generation,
             scopes,
-            rename_hints,
-            reason: if changed_boundary {
-                RefreshReason::Backstop
-            } else {
-                self.reason()
-            },
+            rename_hints: rename_hints(moves),
+            reason: self.reason(),
         }
     }
 }
 
+/// A hint for each move cookie seen exactly once on each side.
+fn rename_hints(moves: BTreeMap<u32, MovePair>) -> Vec<RenameHint> {
+    moves
+        .into_values()
+        .filter_map(|MovePair { mut old, mut new }| {
+            if old.len() != 1 || new.len() != 1 {
+                return None;
+            }
+            let (old_parent, old_name) = old.pop()?;
+            let (new_parent, new_name) = new.pop()?;
+            Some(RenameHint {
+                old_parent,
+                old_name,
+                new_parent,
+                new_name,
+            })
+        })
+        .collect()
+}
 #[cfg(test)]
 mod tests;
