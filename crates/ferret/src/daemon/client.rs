@@ -402,18 +402,10 @@ impl Handshake<'_> {
         while writer && field_text(&hello, "state") == Some("loading") {
             hello = event(&mut reader, &mut line)?;
         }
-        if field_text(&hello, "event") != Some("hello")
-            || field_number(&hello, "major") != Some(MAJOR)
-            || field_text(&hello, "index") != Some(&self.endpoint.identity)
-            || field_text(&hello, "context") != Some(&self.context)
-        {
+        if !self.same_context(&hello) {
             return Err(io::Error::other("incompatible daemon context or protocol"));
         }
-        if field_text(&hello, "build") != Some(BUILD)
-            || field_number(&hello, "format") != Some(FORMAT)
-            || !supports_queries(&hello)
-            || writer && !has_capability(&hello, "writer")
-        {
+        if !self.can_serve(&hello) {
             if !self.can_spawn {
                 return Err(io::Error::other(
                     "incompatible writer owner; use ferret status --json",
@@ -446,6 +438,22 @@ impl Handshake<'_> {
             }
             _ => Err(io::Error::other("daemon could not open the catalog")),
         }
+    }
+    /// Whether `hello` is a hello from a daemon for this index and context,
+    /// speaking this protocol's major version.
+    fn same_context(&self, hello: &Value) -> bool {
+        field_text(hello, "event") == Some("hello")
+            && field_number(hello, "major") == Some(MAJOR)
+            && field_text(hello, "index") == Some(&self.endpoint.identity)
+            && field_text(hello, "context") == Some(&self.context)
+    }
+    /// Whether the daemon behind `hello` is this build, on this format, and
+    /// can answer this client's queries and, for a writer, its commands.
+    fn can_serve(&self, hello: &Value) -> bool {
+        field_text(hello, "build") == Some(BUILD)
+            && field_number(hello, "format") == Some(FORMAT)
+            && supports_queries(hello)
+            && (!self.writer || has_capability(hello, "writer"))
     }
 }
 fn has_capability(hello: &Value, capability: &str) -> bool {
