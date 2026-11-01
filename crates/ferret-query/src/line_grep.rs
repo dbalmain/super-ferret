@@ -522,6 +522,9 @@ fn scan_records(
             let mut hit_line = None;
             let mut hit_boundary = None;
             let mut line_start = 0;
+            // How often hits fall on their search's first line: a
+            // saturating counter, trusted from 2 of 3.
+            let mut dense = 3u8;
             loop {
                 let line = if fast {
                     let Some(start) = next.take() else { break };
@@ -545,9 +548,29 @@ fn scan_records(
                         }
                         break;
                     };
-                    let first = memchr::memrchr(b'\n', &remaining[..hit]).map_or(0, |at| at + 1);
-                    let end = memchr::memchr(b'\n', &remaining[hit..])
-                        .map_or(remaining.len(), |at| hit + at);
+                    // While hits keep landing on the first remaining line,
+                    // that line's end bounds the hit in one search.
+                    let first_end = (dense >= 2)
+                        .then(|| memchr::memchr(b'\n', remaining).unwrap_or(remaining.len()))
+                        .filter(|&first_end| hit <= first_end);
+                    let (first, end) = match first_end {
+                        Some(first_end) => {
+                            dense = 3;
+                            (0, first_end)
+                        }
+                        None => {
+                            let first =
+                                memchr::memrchr(b'\n', &remaining[..hit]).map_or(0, |at| at + 1);
+                            dense = if first == 0 {
+                                (dense + 1).min(3)
+                            } else {
+                                dense.saturating_sub(1)
+                            };
+                            let end = memchr::memchr(b'\n', &remaining[hit..])
+                                .map_or(remaining.len(), |at| hit + at);
+                            (first, end)
+                        }
+                    };
                     if count_lines {
                         number += count_lf(&remaining[..first]);
                     }
