@@ -528,9 +528,9 @@ pub(crate) fn json_fields(o: &mut crate::json::Object<'_>, session: &crate::engi
             .int("postings_plans", postings_plans)
             .int("scope_walk_plans", scope_walks)
             .int("estimated_candidates", candidates)
-            .int(
+            .opt_int(
                 "scope_build_us",
-                names.scope_build_time().as_micros() as i128,
+                names.scope_build_time().map(|d| d.as_micros() as i128),
             )
             .opt_int(
                 "term_build_us",

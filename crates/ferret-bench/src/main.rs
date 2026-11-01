@@ -1521,8 +1521,8 @@ fn name_index_once(dir: &Path) -> Result<()> {
         }
     }
     println!(
-        "name-index-build scope_ms={:.3} term_ms={:?}",
-        duration_ms(index.scope_build_time()),
+        "name-index-build scope_ms={:?} term_ms={:?}",
+        index.scope_build_time().map(duration_ms),
         index.term_build_time().map(duration_ms)
     );
     println!("raw_scan_bytes={}", names.raw_scan_bytes());

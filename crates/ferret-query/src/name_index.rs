@@ -31,16 +31,15 @@ struct Base {
     /// base; `None` when the catalog holds them ([`Catalog::into_resident`]).
     owned: Option<Arc<ResidentNames>>,
     terms: OnceLock<TermIndex>,
-    scopes: Vec<u32>,
+    /// Built by the first scoped selection: an unscoped one-shot search
+    /// never reads them (2.9 of its 21 ms on 227k names).
+    scopes: OnceLock<Scopes>,
     live_scopes: Vec<InoId>,
-    scope_build_time: std::time::Duration,
 }
 
 impl Base {
     /// The base of `checkpoint`, with its own interned names when `raw`.
     fn build(checkpoint: &Catalog, raw: bool) -> Self {
-        let scope_started = std::time::Instant::now();
-        let scopes = scope_counts(checkpoint);
         let live_scopes = checkpoint
             .dir_ids()
             .filter(|&dir| {
@@ -50,11 +49,26 @@ impl Base {
         Base {
             owned: raw.then(|| Arc::new(checkpoint.build_resident_names())),
             terms: OnceLock::new(),
-            scopes,
+            scopes: OnceLock::new(),
             live_scopes,
-            scope_build_time: scope_started.elapsed(),
         }
     }
+
+    fn scopes(&self, catalog: &Catalog) -> &Scopes {
+        self.scopes.get_or_init(|| {
+            let started = std::time::Instant::now();
+            let counts = scope_counts(&catalog.checkpoint_base());
+            Scopes {
+                counts,
+                build_time: started.elapsed(),
+            }
+        })
+    }
+}
+
+struct Scopes {
+    counts: Vec<u32>,
+    build_time: std::time::Duration,
 }
 
 /// Each checkpoint directory's subtree name count: its own rows, which the
@@ -283,7 +297,7 @@ impl NameIndex {
                 .terms
                 .get()
                 .map_or(0, |t| t.terms.bytes() + t.keys.bytes()),
-            self.base.scopes.capacity() * std::mem::size_of::<u32>(),
+            self.scope_bytes(),
             self.delta.iter().map(|(n, r)| n.len() + r.len() * 4).sum(),
         )
     }
@@ -296,7 +310,7 @@ impl NameIndex {
                 .terms
                 .get()
                 .map_or(0, |terms| terms.terms.bytes() + terms.keys.bytes())
-            + self.base.scopes.capacity() * std::mem::size_of::<u32>()
+            + self.scope_bytes()
             + self
                 .delta
                 .iter()
@@ -304,9 +318,22 @@ impl NameIndex {
                 .sum::<usize>()
     }
 
-    /// Time spent building base scope cardinalities, excluding overlay edits.
-    pub fn scope_build_time(&self) -> std::time::Duration {
-        self.base.scope_build_time
+    fn scope_bytes(&self) -> usize {
+        self.base.scopes.get().map_or(0, |scopes| {
+            scopes.counts.capacity() * std::mem::size_of::<u32>()
+        })
+    }
+
+    /// Builds the base scope counts now rather than at the first scoped
+    /// selection: for a resident host, whose queries should not pay for them.
+    pub fn warm(&self, catalog: &Catalog) {
+        self.base.scopes(catalog);
+    }
+
+    /// Time spent building base scope cardinalities, excluding overlay edits,
+    /// if they are built.
+    pub fn scope_build_time(&self) -> Option<std::time::Duration> {
+        self.base.scopes.get().map(|scopes| scopes.build_time)
     }
 
     /// Time spent constructing the shared lazy term table, if first used.
@@ -407,10 +434,15 @@ impl NameIndex {
         match scope {
             None => Some(u64::from(catalog.name_count())),
             Some(dir) if self.unknown_scopes.contains(&dir) => None,
-            Some(dir) => self.base.scopes.get(dir.0 as usize).map(|&count| {
-                (i64::from(count) + self.scope_changes.get(&dir).copied().unwrap_or(0)).max(0)
-                    as u64
-            }),
+            Some(dir) => self
+                .base
+                .scopes(catalog)
+                .counts
+                .get(dir.0 as usize)
+                .map(|&count| {
+                    (i64::from(count) + self.scope_changes.get(&dir).copied().unwrap_or(0)).max(0)
+                        as u64
+                }),
         }
     }
 }

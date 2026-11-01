@@ -112,6 +112,14 @@ impl Derived {
     }
 }
 
+/// A writer-backed engine's name planner, its scope counts built at
+/// publication so that no query waits for them.
+fn resident_index(catalog: &Catalog, previous: Option<&NameIndex>) -> NameIndex {
+    let index = NameIndex::adopt(catalog, previous);
+    index.warm(catalog);
+    index
+}
+
 impl Engine {
     /// Opens and validates every catalog section once. No checkpoint returns
     /// `None`, as in the catalog reader API.
@@ -165,7 +173,7 @@ impl Engine {
         let threads = Threads::new(writer.dir());
         Self {
             current: RwLock::new(QuerySession {
-                names: Arc::new(OnceLock::from(NameIndex::new(&catalog))),
+                names: Arc::new(OnceLock::from(resident_index(&catalog, None))),
                 catalog,
                 content: None,
                 derived: Arc::default(),
@@ -490,7 +498,7 @@ impl Engine {
 
     fn select(&self, view: Catalog) {
         let previous = self.pin();
-        let names = Arc::new(OnceLock::from(NameIndex::adopt(
+        let names = Arc::new(OnceLock::from(resident_index(
             &view,
             Some(previous.name_index()),
         )));
