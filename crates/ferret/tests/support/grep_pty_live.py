@@ -53,16 +53,16 @@ try:
 except BrokenPipeError:
     pass
 # A child that hangs after stdin closes would hold the pty open forever:
-# drain against a deadline, then kill it.
+# drain against a deadline, then kill it and say so.
+drained = False
 deadline = time.monotonic() + 10
-while time.monotonic() < deadline:
+while not drained and time.monotonic() < deadline:
     if not select.select([master], [], [], 0.1)[0]:
         continue
     try:
-        if not os.read(master, 65536):
-            break
+        drained = not os.read(master, 65536)
     except OSError:
-        break
+        drained = True
 child.kill()
 child.wait(timeout=10)
-print("seen" if seen else "withheld")
+print("hung" if not drained else "seen" if seen else "withheld")
