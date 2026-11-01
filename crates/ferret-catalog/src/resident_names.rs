@@ -3,6 +3,7 @@
 //! The v4 encoder still obtains ordinary name bytes through those accessors.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
 use intpack::{bits, pfor128};
@@ -151,6 +152,45 @@ struct Part<'c> {
     lists: ListsBuilder,
 }
 
+/// The intern table's hasher: the rustc mixing step, eight bytes at a time,
+/// as `ferret-policy`'s matcher maps use, which this crate may not depend on.
+/// Names come from the indexed tree, so SipHash's collision resistance buys
+/// nothing a colliding name could take beyond extra comparisons, and it was
+/// a tenth of a one-shot `ferret search`.
+#[derive(Default)]
+struct NameHasher(u64);
+
+impl NameHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for NameHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let mut word = [0; 8];
+            word.copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// The most a part's intern table reserves before it sees its names.
 const RESERVE: usize = 1 << 16;
 
@@ -163,7 +203,8 @@ impl<'c> Part<'c> {
         // RESERVE: names repeat. On a 10M-row catalog with 133k distinct
         // names, reserving half of every part's rows cost 55 MB of peak RSS
         // and 25 ms of build.
-        let mut lookup = HashMap::with_capacity((rows.len() / 2).min(RESERVE));
+        let mut lookup: HashMap<_, _, BuildHasherDefault<NameHasher>> =
+            HashMap::with_capacity_and_hasher((rows.len() / 2).min(RESERVE), Default::default());
         let mut keys = Vec::with_capacity(rows.len());
         for &row in rows.iter() {
             let next = lookup.len() as u32;
