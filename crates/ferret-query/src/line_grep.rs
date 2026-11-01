@@ -142,8 +142,9 @@ pub struct Plan {
 
 /// Name and count switches override one another in argv order; quiet is
 /// independent and overrides every rendering mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Output {
+    #[default]
     Lines,
     Names,
     Count,

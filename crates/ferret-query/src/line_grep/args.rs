@@ -111,333 +111,101 @@ fn parse_marked(
     rg: &mut Vec<usize>,
 ) -> Result<Command, ParseError> {
     let total = args.len();
-    let mut positionals = Vec::new();
-    let mut sources = Vec::new();
-    let mut filters = Vec::new();
-    let (mut line_number, mut quiet, mut done) = (false, false, false);
-    let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
-    let mut smart_case = false;
-    let mut replacement = None;
-    let mut json = false;
-    let (mut word, mut line) = (false, false);
-    // `--hidden` and its relatives; otherwise the mode decides (D128).
-    let mut hidden = None;
-    let mut text_mode = false;
-    let (mut multiline, mut dotall) = (false, false);
-    let mut unrestricted_count = 0;
-    let mut traversal = Traversal::default();
-    let mut files = false;
-    let mut include_zero = false;
-    let mut max_count = None;
-    let mut max_columns = None;
-    // The spelling of a sort ferret lacks is kept for its refusal.
-    let mut sort: Option<Result<Sort, String>> = None;
-    let (mut before, mut after, mut around) = (None, None, 0);
-    let mut presentation = Presentation::default();
-    let mut output = Output::Lines;
-    let (mut help, mut version) = (false, false);
+    let mut options = Options::default();
+    let mut done = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let bytes = arg.as_bytes();
-        if !done && bytes == b"--" {
+        if done || !bytes.starts_with(b"-") || bytes.len() == 1 {
+            options.positionals.push(arg.clone());
+        } else if bytes == b"--" {
             done = true;
-            continue;
-        }
-        if !done && (bytes == b"--file" || bytes.starts_with(b"--file=")) {
-            let path = if bytes == b"--file" {
-                args.next().map(|arg| PathBuf::from(arg.as_os_str()))
-            } else {
-                Some(PathBuf::from(OsStr::from_bytes(&bytes[7..])))
-            }
-            .ok_or_else(|| ParseError::Value("--file".to_owned()))?;
-            sources.push(PatternSource::File(path));
-            continue;
-        }
-        if !done && (bytes == b"--replace" || bytes.starts_with(b"--replace=")) {
-            let value = if bytes == b"--replace" {
-                args.next().map(|arg| arg.as_bytes())
-            } else {
-                Some(&bytes[10..])
-            }
-            .ok_or_else(|| ParseError::Value("--replace".to_owned()))?;
-            replacement = Some(
-                std::str::from_utf8(value)
-                    .map_err(|_| ParseError::Utf8("replacement"))?
-                    .to_owned(),
-            );
-            continue;
-        }
-        if !done && bytes.starts_with(b"--") {
-            let text = arg.to_str().ok_or(ParseError::Utf8("option"))?;
-            let (flag, value) = text
-                .split_once('=')
-                .map_or((text, None), |(f, v)| (f, Some(v)));
-            match flag {
-                "--help" if value.is_none() => help = true,
-                "--version" if value.is_none() => version = true,
-                "--line-number" if value.is_none() => {
-                    line_number = true;
-                    presentation.numbers = Some(true);
-                }
-                "--no-line-number" if value.is_none() => {
-                    line_number = false;
-                    presentation.numbers = Some(false);
-                }
-                "--with-filename" if value.is_none() => presentation.filename = Some(true),
-                "--no-filename" if value.is_none() => presentation.filename = Some(false),
-                "--heading" if value.is_none() => presentation.heading = Some(true),
-                "--no-heading" if value.is_none() => presentation.heading = Some(false),
-                "--null" if value.is_none() => presentation.null = true,
-                "--pretty" if value.is_none() => {
-                    presentation.pretty();
-                    line_number = true;
-                }
-                "--quiet" if value.is_none() => quiet = true,
-                "--json" if value.is_none() => json = true,
-                "--no-json" if value.is_none() => json = false,
-                "--live" if value.is_none() => traversal.live = true,
-                "--rg" if value.is_none() => {
-                    traversal.rg = true;
+        } else if bytes.starts_with(b"--") {
+            let (flag, value) = match bytes.iter().position(|&byte| byte == b'=') {
+                Some(at) => (&bytes[..at], Some(OsStr::from_bytes(&bytes[at + 1..]))),
+                None => (bytes, None),
+            };
+            // Only a path or a replacement may carry non-UTF-8 bytes.
+            let text = arg.to_str();
+            let flag = match std::str::from_utf8(flag) {
+                Ok(flag @ ("--file" | "--replace")) => flag,
+                Ok(flag) if text.is_some() => flag,
+                _ => return Err(ParseError::Utf8("option")),
+            };
+            if VALUED.contains(&flag) {
+                let value = match value {
+                    Some(value) => value,
+                    None => args
+                        .next()
+                        .ok_or_else(|| ParseError::Value(flag.to_owned()))?,
+                };
+                options.set(flag, flag, value)?;
+            } else if value.is_none() && options.switch(flag)? {
+                if flag == "--rg" {
                     rg.push(total - args.len() - 1);
                 }
-                "--follow" if value.is_none() => traversal.follow = true,
-                "--no-follow" if value.is_none() => traversal.follow = false,
-                "--no-ignore" if value.is_none() => traversal.unrestricted = true,
-                "--ignore" if value.is_none() => traversal.unrestricted = false,
-                "--unrestricted" if value.is_none() => {
-                    unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?
-                }
-                "--multiline" if value.is_none() => multiline = true,
-                "--no-multiline" if value.is_none() => multiline = false,
-                "--multiline-dotall" if value.is_none() => dotall = true,
-                "--no-multiline-dotall" if value.is_none() => dotall = false,
-                "--text" if value.is_none() => text_mode = true,
-                "--no-text" if value.is_none() => text_mode = false,
-                "--hidden" if value.is_none() => hidden = Some(true),
-                "--no-hidden" if value.is_none() => hidden = Some(false),
-                "--ignore-case" if value.is_none() => {
-                    fold = true;
-                    smart_case = false;
-                }
-                "--case-sensitive" if value.is_none() => {
-                    fold = false;
-                    smart_case = false;
-                }
-                "--smart-case" if value.is_none() => {
-                    fold = false;
-                    smart_case = true;
-                }
-                "--word-regexp" if value.is_none() => {
-                    word = true;
-                    line = false;
-                }
-                "--line-regexp" if value.is_none() => {
-                    line = true;
-                    word = false;
-                }
-                "--fixed-strings" if value.is_none() => fixed = true,
-                "--no-fixed-strings" if value.is_none() => fixed = false,
-                "--invert-match" if value.is_none() => invert = true,
-                "--no-invert-match" if value.is_none() => invert = false,
-                "--only-matching" if value.is_none() => only_matching = true,
-                "--files" if value.is_none() => files = true,
-                "--include-zero" if value.is_none() => include_zero = true,
-                "--no-include-zero" if value.is_none() => include_zero = false,
-                "--count-matches" if value.is_none() => {
-                    output = Output::CountMatches;
-                    files = false;
-                }
-                "--files-without-match" if value.is_none() => {
-                    output = Output::WithoutMatch;
-                    files = false;
-                }
-                "--files-with-matches" if value.is_none() => {
-                    output = Output::Names;
-                    files = false;
-                }
-                "--count" if value.is_none() => {
-                    output = Output::Count;
-                    files = false;
-                }
-                "--scan" | "--scan-uncovered" if value.is_none() => {}
-                "--glob" | "--type" | "--type-not" | "--color" | "--regexp" | "--max-count"
-                | "--before-context" | "--after-context" | "--context" | "--max-depth"
-                | "--max-columns" | "--sort" | "--sortr" => {
-                    let value = value
-                        .map(str::to_owned)
-                        .or_else(|| args.next().and_then(|s| s.to_str()).map(str::to_owned))
-                        .ok_or_else(|| ParseError::Value(flag.to_owned()))?;
-                    match flag {
-                        "--before-context" | "--after-context" | "--context" => {
-                            let number = value.parse().map_err(|_| ParseError::Context(value))?;
-                            match flag {
-                                "--before-context" => before = Some(number),
-                                "--after-context" => after = Some(number),
-                                _ => around = number,
-                            }
-                        }
-                        "--max-depth" => {
-                            traversal.max_depth =
-                                Some(value.parse().map_err(|_| ParseError::Depth(value))?)
-                        }
-                        "--max-count" => {
-                            max_count = Some(value.parse().map_err(|_| ParseError::Number(value))?)
-                        }
-                        "--max-columns" => max_columns = columns(&value)?,
-                        "--glob" => filters.push(Filter::Glob(value)),
-                        "--type" | "--type-not" => filters.push(Filter::Type {
-                            name: value,
-                            include: flag == "--type",
-                        }),
-                        "--regexp" => sources.push(PatternSource::Argument(value)),
-                        "--sort" | "--sortr" => {
-                            sort = match value.as_str() {
-                                "none" => None,
-                                "modified" if flag == "--sort" => Some(Ok(Sort::Oldest)),
-                                "modified" => Some(Ok(Sort::Newest)),
-                                "path" | "accessed" | "created" => {
-                                    Some(Err(format!("{flag}={value}")))
-                                }
-                                _ => return Err(ParseError::Choice(flag.to_owned(), value)),
-                            }
-                        }
-                        _ => {
-                            presentation.color = match value.as_str() {
-                                "auto" => Color::Auto,
-                                "never" => Color::Never,
-                                "always" => Color::Always,
-                                "ansi" => Color::Ansi,
-                                _ => return Err(ParseError::Choice(flag.to_owned(), value)),
-                            }
-                        }
-                    }
-                }
-                _ => return Err(unsupported(text)),
-            }
-        } else if !done && bytes.starts_with(b"-") && bytes.len() > 1 {
-            for (at, &flag) in bytes.iter().enumerate().skip(1) {
-                match flag {
-                    b'n' => {
-                        line_number = true;
-                        presentation.numbers = Some(true);
-                    }
-                    b'N' => {
-                        line_number = false;
-                        presentation.numbers = Some(false);
-                    }
-                    b'H' => presentation.filename = Some(true),
-                    b'I' => presentation.filename = Some(false),
-                    b'0' => presentation.null = true,
-                    b'p' => {
-                        presentation.pretty();
-                        line_number = true;
-                    }
-                    b'L' => traversal.follow = true,
-                    b'q' => quiet = true,
-                    b'u' => unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?,
-                    b'a' => text_mode = true,
-                    b'U' => multiline = true,
-                    b'.' => hidden = Some(true),
-                    b'i' => {
-                        fold = true;
-                        smart_case = false;
-                    }
-                    b's' => {
-                        fold = false;
-                        smart_case = false;
-                    }
-                    b'S' => {
-                        fold = false;
-                        smart_case = true;
-                    }
-                    b'w' => {
-                        word = true;
-                        line = false;
-                    }
-                    b'x' => {
-                        line = true;
-                        word = false;
-                    }
-                    b'F' => fixed = true,
-                    b'v' => invert = true,
-                    b'o' => only_matching = true,
-                    b'l' => {
-                        output = Output::Names;
-                        files = false;
-                    }
-                    b'c' => {
-                        output = Output::Count;
-                        files = false;
-                    }
-                    b'h' => help = true,
-                    b'V' => version = true,
-                    b'r' => {
-                        let value = if at + 1 < bytes.len() {
-                            Some(&bytes[at + 1..])
-                        } else {
-                            args.next().map(|arg| arg.as_bytes())
-                        }
-                        .ok_or_else(|| ParseError::Value("-r".to_owned()))?;
-                        replacement = Some(
-                            std::str::from_utf8(value)
-                                .map_err(|_| ParseError::Utf8("replacement"))?
-                                .to_owned(),
-                        );
-                        break;
-                    }
-                    b'f' => {
-                        let path = if at + 1 < bytes.len() {
-                            Some(PathBuf::from(OsStr::from_bytes(&bytes[at + 1..])))
-                        } else {
-                            args.next().map(|arg| PathBuf::from(arg.as_os_str()))
-                        }
-                        .ok_or_else(|| ParseError::Value("-f".to_owned()))?;
-                        sources.push(PatternSource::File(path));
-                        break;
-                    }
-                    b'g' | b't' | b'T' | b'e' | b'm' | b'M' | b'A' | b'B' | b'C' => {
-                        let value = if at + 1 < bytes.len() {
-                            std::str::from_utf8(&bytes[at + 1..]).ok()
-                        } else {
-                            args.next().and_then(|s| s.to_str())
-                        }
-                        .ok_or_else(|| ParseError::Value(format!("-{}", char::from(flag))))?;
-                        if matches!(flag, b'A' | b'B' | b'C') {
-                            let number = value
-                                .parse()
-                                .map_err(|_| ParseError::Context(value.to_owned()))?;
-                            match flag {
-                                b'A' => after = Some(number),
-                                b'B' => before = Some(number),
-                                _ => around = number,
-                            }
-                        } else if flag == b'm' {
-                            max_count = Some(
-                                value
-                                    .parse()
-                                    .map_err(|_| ParseError::Number(value.to_owned()))?,
-                            );
-                        } else if flag == b'M' {
-                            max_columns = columns(value)?;
-                        } else if flag == b'g' {
-                            filters.push(Filter::Glob(value.to_owned()));
-                        } else if matches!(flag, b't' | b'T') {
-                            filters.push(Filter::Type {
-                                name: value.to_owned(),
-                                include: flag == b't',
-                            });
-                        } else {
-                            sources.push(PatternSource::Argument(value.to_owned()));
-                        }
-                        break;
-                    }
-                    _ => return Err(unsupported(&format!("-{}", char::from(flag)))),
-                }
+            } else {
+                let Some(text) = text else { unreachable!() };
+                return Err(unsupported(text));
             }
         } else {
-            positionals.push(arg.clone());
+            for (at, &letter) in bytes.iter().enumerate().skip(1) {
+                let spelling = || format!("-{}", char::from(letter));
+                let Some(flag) = long_name(letter) else {
+                    return Err(unsupported(&spelling()));
+                };
+                if !VALUED.contains(&flag) {
+                    let true = options.switch(flag)? else {
+                        unreachable!("{flag} is a switch")
+                    };
+                    continue;
+                }
+                // A value flag takes the rest of its cluster, or the next
+                // argument.
+                let value = if at + 1 < bytes.len() {
+                    OsStr::from_bytes(&bytes[at + 1..])
+                } else {
+                    args.next().ok_or_else(|| ParseError::Value(spelling()))?
+                };
+                options.set(flag, &spelling(), value)?;
+                break;
+            }
         }
     }
+    let Options {
+        mut positionals,
+        mut sources,
+        filters,
+        line_number,
+        quiet,
+        fold,
+        fixed,
+        invert,
+        mut only_matching,
+        smart_case,
+        mut replacement,
+        json,
+        word,
+        line,
+        hidden,
+        text_mode,
+        multiline,
+        dotall,
+        unrestricted_count: _,
+        traversal,
+        files,
+        include_zero,
+        max_count,
+        max_columns,
+        sort,
+        before,
+        after,
+        around,
+        presentation,
+        output,
+        help,
+        version,
+    } = options;
     if help {
         return Ok(Command::Help);
     }
@@ -571,6 +339,246 @@ fn parse_marked(
         json,
         spill_dir: None,
     })))
+}
+
+/// Long options that take a value, attached with `=` or as the next argument.
+const VALUED: [&str; 15] = [
+    "--file",
+    "--replace",
+    "--glob",
+    "--type",
+    "--type-not",
+    "--color",
+    "--regexp",
+    "--max-count",
+    "--before-context",
+    "--after-context",
+    "--context",
+    "--max-depth",
+    "--max-columns",
+    "--sort",
+    "--sortr",
+];
+
+/// The long option a short letter spells; a cluster applies each in turn.
+fn long_name(letter: u8) -> Option<&'static str> {
+    Some(match letter {
+        b'n' => "--line-number",
+        b'N' => "--no-line-number",
+        b'H' => "--with-filename",
+        b'I' => "--no-filename",
+        b'0' => "--null",
+        b'p' => "--pretty",
+        b'L' => "--follow",
+        b'q' => "--quiet",
+        b'u' => "--unrestricted",
+        b'a' => "--text",
+        b'U' => "--multiline",
+        b'.' => "--hidden",
+        b'i' => "--ignore-case",
+        b's' => "--case-sensitive",
+        b'S' => "--smart-case",
+        b'w' => "--word-regexp",
+        b'x' => "--line-regexp",
+        b'F' => "--fixed-strings",
+        b'v' => "--invert-match",
+        b'o' => "--only-matching",
+        b'l' => "--files-with-matches",
+        b'c' => "--count",
+        b'h' => "--help",
+        b'V' => "--version",
+        b'r' => "--replace",
+        b'f' => "--file",
+        b'e' => "--regexp",
+        b'g' => "--glob",
+        b't' => "--type",
+        b'T' => "--type-not",
+        b'm' => "--max-count",
+        b'M' => "--max-columns",
+        b'A' => "--after-context",
+        b'B' => "--before-context",
+        b'C' => "--context",
+        _ => return None,
+    })
+}
+
+/// Everything argv sets, before the finished command is checked. Later
+/// flags override earlier ones, in argv order.
+#[derive(Default)]
+struct Options {
+    positionals: Vec<OsString>,
+    sources: Vec<PatternSource>,
+    filters: Vec<Filter>,
+    line_number: bool,
+    quiet: bool,
+    fold: bool,
+    fixed: bool,
+    invert: bool,
+    only_matching: bool,
+    smart_case: bool,
+    replacement: Option<String>,
+    json: bool,
+    word: bool,
+    line: bool,
+    // `--hidden` and its relatives; otherwise the mode decides (D128).
+    hidden: Option<bool>,
+    text_mode: bool,
+    multiline: bool,
+    dotall: bool,
+    unrestricted_count: u8,
+    traversal: Traversal,
+    files: bool,
+    include_zero: bool,
+    max_count: Option<u64>,
+    max_columns: Option<u64>,
+    // The spelling of a sort ferret lacks is kept for its refusal.
+    sort: Option<Result<Sort, String>>,
+    before: Option<u64>,
+    after: Option<u64>,
+    around: u64,
+    presentation: Presentation,
+    output: Output,
+    help: bool,
+    version: bool,
+}
+
+impl Options {
+    /// Apply a flag that takes no value; false when `flag` is not one.
+    fn switch(&mut self, flag: &str) -> Result<bool, ParseError> {
+        match flag {
+            "--help" => self.help = true,
+            "--version" => self.version = true,
+            "--line-number" => {
+                self.line_number = true;
+                self.presentation.numbers = Some(true);
+            }
+            "--no-line-number" => {
+                self.line_number = false;
+                self.presentation.numbers = Some(false);
+            }
+            "--with-filename" => self.presentation.filename = Some(true),
+            "--no-filename" => self.presentation.filename = Some(false),
+            "--heading" => self.presentation.heading = Some(true),
+            "--no-heading" => self.presentation.heading = Some(false),
+            "--null" => self.presentation.null = true,
+            "--pretty" => {
+                self.presentation.pretty();
+                self.line_number = true;
+            }
+            "--quiet" => self.quiet = true,
+            "--json" => self.json = true,
+            "--no-json" => self.json = false,
+            "--live" => self.traversal.live = true,
+            "--rg" => self.traversal.rg = true,
+            "--follow" => self.traversal.follow = true,
+            "--no-follow" => self.traversal.follow = false,
+            "--no-ignore" => self.traversal.unrestricted = true,
+            "--ignore" => self.traversal.unrestricted = false,
+            "--unrestricted" => unrestricted(
+                &mut self.unrestricted_count,
+                &mut self.traversal,
+                &mut self.hidden,
+            )?,
+            "--multiline" => self.multiline = true,
+            "--no-multiline" => self.multiline = false,
+            "--multiline-dotall" => self.dotall = true,
+            "--no-multiline-dotall" => self.dotall = false,
+            "--text" => self.text_mode = true,
+            "--no-text" => self.text_mode = false,
+            "--hidden" => self.hidden = Some(true),
+            "--no-hidden" => self.hidden = Some(false),
+            "--ignore-case" => (self.fold, self.smart_case) = (true, false),
+            "--case-sensitive" => (self.fold, self.smart_case) = (false, false),
+            "--smart-case" => (self.fold, self.smart_case) = (false, true),
+            "--word-regexp" => (self.word, self.line) = (true, false),
+            "--line-regexp" => (self.word, self.line) = (false, true),
+            "--fixed-strings" => self.fixed = true,
+            "--no-fixed-strings" => self.fixed = false,
+            "--invert-match" => self.invert = true,
+            "--no-invert-match" => self.invert = false,
+            "--only-matching" => self.only_matching = true,
+            "--files" => self.files = true,
+            "--include-zero" => self.include_zero = true,
+            "--no-include-zero" => self.include_zero = false,
+            "--count-matches" => self.produce(Output::CountMatches),
+            "--files-without-match" => self.produce(Output::WithoutMatch),
+            "--files-with-matches" => self.produce(Output::Names),
+            "--count" => self.produce(Output::Count),
+            "--scan" | "--scan-uncovered" => {}
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// A names or count mode replaces `--files` and any earlier mode.
+    fn produce(&mut self, output: Output) {
+        self.output = output;
+        self.files = false;
+    }
+
+    /// Apply a `VALUED` flag; `spelling` is how argv wrote it, for errors.
+    fn set(&mut self, flag: &str, spelling: &str, value: &OsStr) -> Result<(), ParseError> {
+        match flag {
+            "--file" => {
+                self.sources.push(PatternSource::File(PathBuf::from(value)));
+                return Ok(());
+            }
+            "--replace" => {
+                let value = value.to_str().ok_or(ParseError::Utf8("replacement"))?;
+                self.replacement = Some(value.to_owned());
+                return Ok(());
+            }
+            _ => {}
+        }
+        let value = value
+            .to_str()
+            .ok_or_else(|| ParseError::Value(spelling.to_owned()))?
+            .to_owned();
+        match flag {
+            "--before-context" | "--after-context" | "--context" => {
+                let number = value.parse().map_err(|_| ParseError::Context(value))?;
+                match flag {
+                    "--before-context" => self.before = Some(number),
+                    "--after-context" => self.after = Some(number),
+                    _ => self.around = number,
+                }
+            }
+            "--max-depth" => {
+                self.traversal.max_depth =
+                    Some(value.parse().map_err(|_| ParseError::Depth(value))?)
+            }
+            "--max-count" => {
+                self.max_count = Some(value.parse().map_err(|_| ParseError::Number(value))?)
+            }
+            "--max-columns" => self.max_columns = columns(&value)?,
+            "--glob" => self.filters.push(Filter::Glob(value)),
+            "--type" | "--type-not" => self.filters.push(Filter::Type {
+                name: value,
+                include: flag == "--type",
+            }),
+            "--regexp" => self.sources.push(PatternSource::Argument(value)),
+            "--sort" | "--sortr" => {
+                self.sort = match value.as_str() {
+                    "none" => None,
+                    "modified" if flag == "--sort" => Some(Ok(Sort::Oldest)),
+                    "modified" => Some(Ok(Sort::Newest)),
+                    "path" | "accessed" | "created" => Some(Err(format!("{flag}={value}"))),
+                    _ => return Err(ParseError::Choice(flag.to_owned(), value)),
+                }
+            }
+            "--color" => {
+                self.presentation.color = match value.as_str() {
+                    "auto" => Color::Auto,
+                    "never" => Color::Never,
+                    "always" => Color::Always,
+                    "ansi" => Color::Ansi,
+                    _ => return Err(ParseError::Choice(flag.to_owned(), value)),
+                }
+            }
+            _ => unreachable!("{flag} is not in VALUED"),
+        }
+        Ok(())
+    }
 }
 
 // Each -u occurrence applies its next widening step at that argv position.
