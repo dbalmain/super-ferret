@@ -7748,3 +7748,30 @@ lines already printed.
 **Recommendation:** C. It is the simpler rule and the closest to rg. The fact
 that would change it: if grep-compat has stdin cases whose NUL lies past 64
 KiB and rg hides earlier lines there, B, which keeps piped output unchanged.
+
+## D139 — Whether `ferret find` reads and prints times in local time
+
+**Question:** Should `ferret find` use the local time zone, as GNU find does,
+for `-daystart`, date arguments (`-newermt`, `-newerXt`) and the times that
+`-printf` and `-ls` print?
+
+Today all of them are UTC. FIND.md lists the UTC formatting of `-printf` and
+`-ls` as a divergence, but `-daystart` and date arguments are UTC too, and on
+a host east or west of UTC they select different files from GNU. Measured on
+msa2 (`/etc/localtime` is Australia/Sydney, `TZ` unset), against GNU find
+4.11.0, with a file modified at 2024-01-01 05:00 UTC:
+`find . -newermt '2024-01-01 10:00'` lists it under GNU (10:00 Sydney is
+23:00 UTC the day before) and not under ferret. The p62 review found the same
+for `-daystart -mtime 1` at +11:00. The differential tests set `TZ=UTC`, so
+they never see it.
+
+| Option | Costs | Buys |
+| ------ | ----- | ---- |
+| A. Keep UTC; document `-daystart` and date arguments as UTC beside `-printf` and `-ls` | Pasted commands with dates or `-daystart` select different files from GNU on any host not on UTC, Dave's included, by up to a day at the boundaries. | No time-zone code; output is the same on every host. |
+| B. Local time throughout: a safe-Rust TZif reader (`TZ` as `:path` or `Area/City`, else `/etc/localtime`; the POSIX rule string for times past the table) used for parsing, `-daystart` and printing | About 300 lines plus tests run against GNU under several zones; a malformed or missing zone file falls back to UTC, as glibc does. | GNU's answers and output on every host; `-printf %Z` can print the zone's abbreviation rather than `UTC`. |
+| C. Local time for inputs only (`-daystart`, date arguments); keep printing UTC | Most of B's reader; output times still differ from GNU, and inputs and outputs disagree about the zone. | GNU's selections, with the smaller change to printing. |
+
+**Recommendation:** B. `ferret find` is meant to be a drop-in for pasted GNU
+commands, and the selection difference in A is silent. The fact that would
+change it: if find is used mostly in scripts that already set `TZ=UTC`, A,
+with the documentation fix.
