@@ -303,12 +303,51 @@ pub(crate) const RUN: usize = 64;
 /// Rows `0..count` of a column in order, `decode`d [`RUN`] at a time: a pass
 /// over the whole column, for a validation or a scan.
 pub(crate) fn runs(count: usize, decode: impl Fn(usize, &mut [u64])) -> impl Iterator<Item = u64> {
-    (0..count).step_by(RUN).flat_map(move |first| {
-        let mut run = [0; RUN];
-        let n = RUN.min(count - first);
-        decode(first, &mut run[..n]);
-        run.into_iter().take(n)
-    })
+    Runs {
+        decode,
+        count,
+        next: 0,
+        at: 0,
+        len: 0,
+        run: [0; RUN],
+    }
+}
+
+/// The pass [`runs`] returns: the run decoded last, and where the next
+/// starts.
+struct Runs<F> {
+    decode: F,
+    count: usize,
+    /// The first row of the run after this one.
+    next: usize,
+    /// The next value's index in `run`, and how many it holds.
+    at: usize,
+    len: usize,
+    run: [u64; RUN],
+}
+
+impl<F: Fn(usize, &mut [u64])> Iterator for Runs<F> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        if self.at == self.len {
+            if self.next == self.count {
+                return None;
+            }
+            self.len = RUN.min(self.count - self.next);
+            (self.decode)(self.next, &mut self.run[..self.len]);
+            self.next += self.len;
+            self.at = 0;
+        }
+        let value = self.run[self.at];
+        self.at += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.count - self.next + self.len - self.at;
+        (left, Some(left))
+    }
 }
 
 /// Finds a blocked column's values length and widest block from its values
@@ -488,6 +527,25 @@ mod tests {
                 v & mask(width)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_pass_yields_every_row_once_in_order_around_run_edges() {
+        for count in [0, 1, RUN - 1, RUN, RUN + 1, 2 * RUN, 2 * RUN + 3] {
+            let mut pass = runs(count, |first, out| {
+                for (row, value) in (first..).zip(out.iter_mut()) {
+                    *value = row as u64;
+                }
+            });
+            assert_eq!(pass.size_hint(), (count, Some(count)));
+            let first: Vec<u64> = pass.by_ref().take(count / 2).collect();
+            assert_eq!(
+                pass.size_hint(),
+                (count - count / 2, Some(count - count / 2))
+            );
+            let all: Vec<u64> = first.into_iter().chain(pass).collect();
+            assert_eq!(all, (0..count as u64).collect::<Vec<_>>(), "{count}");
+        }
     }
 
     #[test]
