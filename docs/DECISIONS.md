@@ -7778,9 +7778,10 @@ with the documentation fix.
 
 ## D140 — Whether a local find checks catalog sections its plan does not read
 
-**Question:** When `ferret find` answers in process (no daemon, or
-`FERRET_NO_DAEMON`), should it check only the catalog sections its plan reads,
-or every section, as search and the daemon do?
+**Question:** When `ferret find` answers a plain listing in process (no daemon,
+or `FERRET_NO_DAEMON`), should it check only the catalog sections its plan
+reads, or every section, as search and the daemon do? An action plan loads
+only its own sections either way.
 
 A local find now walks the catalog without building the name planner. bb8d16a
 loaded and checked only the sections the plan reads; the p64 review pointed
@@ -7793,7 +7794,7 @@ a 227k-entry tree, `find -name '*.rs'` takes 22.6 ms with the full check and
 | Option | Costs | Buys |
 | ------ | ----- | ---- |
 | A. Check only the sections the plan reads | A damaged index answers `find` and fails `search`; corruption a find never touches goes unreported until another command trips on it. Diverges from D46. | About 3.5 ms (15%) per local find on 227k entries, growing with the index. |
-| B. Check every section (built, 44c2c67) | 3.5 ms per local find. | One rule for every command: any damaged section fails the query and says so (D46). |
+| B. Check every section (built, 44c2c67) | 3.5 ms per local find. | One rule for search and every plain listing: any damaged section fails the query and says so (D46). An action plan still loads only the sections it reads, as before. |
 
 **Recommendation:** B. The saving is small against the time of the walk, and
 a find that succeeds on a damaged index hides the damage from the command
