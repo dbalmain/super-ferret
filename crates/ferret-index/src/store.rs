@@ -188,6 +188,21 @@ pub struct Followed {
     pub remaining: u64,
 }
 
+/// What merging a run of segments reads and keeps, decided before any
+/// input is opened.
+struct RunPlan {
+    /// The manifest to publish, with dead unreadable documents dropped.
+    manifest: Manifest,
+    /// Input segment bytes.
+    read: u64,
+    first: u32,
+    last: u32,
+    /// Live documents that survive the merge.
+    docs: u32,
+    purged: u64,
+    input_records: u64,
+}
+
 /// What a merge did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Merged {
@@ -814,6 +829,48 @@ impl IndexWriter {
         if (budget.cancelled)() {
             return Err(Error::Cancelled);
         }
+        let Some(mut plan) = self.plan_run(catalog, budget, run.clone()) else {
+            return Ok(None);
+        };
+        if plan.docs == 0 {
+            // Nothing survives: drop the inputs without writing. Their
+            // range stays below the frontier, so it is not re-covered.
+            let retired = self.replace_run(plan.manifest, run, None)?;
+            return Ok(Some(Merged {
+                inputs: retired.len(),
+                read: plan.read,
+                written: 0,
+                purged: plan.purged,
+                records_added: 0,
+                records_removed: plan.input_records,
+                segment: None,
+            }));
+        }
+        let (written, changes) = self.write_run(&mut plan, catalog, budget, run.clone())?;
+        let entry = written.0;
+        if (budget.cancelled)() {
+            return Err(Error::Cancelled);
+        }
+        let retired = self.replace_run(plan.manifest, run, Some(written))?;
+        Ok(Some(Merged {
+            inputs: retired.len(),
+            read: plan.read,
+            written: entry.total_bytes(),
+            purged: plan.purged,
+            records_added: changes.0,
+            records_removed: changes.1,
+            segment: Some(entry),
+        }))
+    }
+
+    /// What merging the segments at `run` reads and keeps, or `None` when
+    /// their bytes exceed the budget.
+    fn plan_run(
+        &self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        run: std::ops::Range<usize>,
+    ) -> Option<RunPlan> {
         let mut manifest = self.current.manifest.clone();
         manifest.last_merge = Some(timestamp());
         manifest
@@ -822,35 +879,38 @@ impl IndexWriter {
         let entries = &self.current.manifest.segments[run.clone()];
         let read: u64 = entries.iter().map(SegmentEntry::total_bytes).sum();
         if read > budget.bytes {
-            return Ok(None);
+            return None;
         }
-        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-            return Ok(None);
-        };
-        let (first, last) = (first.first, last.last);
+        let (first, last) = (entries.first()?.first, entries.last()?.last);
         let docs: u32 = entries
             .iter()
             .map(|s| alive(s, catalog.live, &manifest.unreadable))
             .sum();
         let purged = entries.iter().map(|s| u64::from(s.docs)).sum::<u64>() - u64::from(docs);
-        let input_records: u64 = self.current.segments[run.clone()]
+        let input_records = self.current.segments[run]
             .iter()
             .map(|s| s.fingerprint_records())
             .sum();
-        if docs == 0 {
-            // Nothing survives: drop the inputs without writing. Their
-            // range stays below the frontier, so it is not re-covered.
-            let retired = self.replace_run(manifest, run, None)?;
-            return Ok(Some(Merged {
-                inputs: retired.len(),
-                read,
-                written: 0,
-                purged,
-                records_added: 0,
-                records_removed: input_records,
-                segment: None,
-            }));
-        }
+        Some(RunPlan {
+            manifest,
+            read,
+            first,
+            last,
+            docs,
+            purged,
+            input_records,
+        })
+    }
+
+    /// Writes the merged segment pair for `run` under the plan's next
+    /// number, returning it with the records it added and removed.
+    fn write_run(
+        &self,
+        plan: &mut RunPlan,
+        catalog: &CatalogView,
+        budget: &Budget,
+        run: std::ops::Range<usize>,
+    ) -> Result<(WrittenPair, (u64, u64)), Error> {
         let merge_pace = |bytes| {
             if (budget.cancelled)() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, Error::Cancelled));
@@ -861,12 +921,13 @@ impl IndexWriter {
             .iter()
             .map(|segment| PacedInput::open(segment.source(), &merge_pace))
             .collect::<Result<Vec<_>, _>>()?;
-        let trigram_inputs = self.current.trigrams[run.clone()]
+        let trigram_inputs = self.current.trigrams[run]
             .iter()
             .map(|segment| PacedInput::open(segment.source(), &merge_pace))
             .collect::<Result<Vec<_>, _>>()?;
-        let number = manifest.next_number;
-        manifest.next_number += 1;
+        let number = plan.manifest.next_number;
+        plan.manifest.next_number += 1;
+        let (first, last) = (plan.first, plan.last);
         let codec = self.codec;
         let dir = &self.dir;
         // Each output spills its postings to its own scratch file.
@@ -884,10 +945,10 @@ impl IndexWriter {
             result
         };
         let mut changes = (0, 0);
-        let result = Self::write_pair(
+        let written = Self::write_pair(
             &self.dir,
             number,
-            docs,
+            plan.docs,
             first,
             last,
             budget.cancelled,
@@ -899,23 +960,8 @@ impl IndexWriter {
                 },
                 move |file| fill(&trigram_inputs, file, true),
             ),
-        );
-        let written = result?;
-        let entry = written.0;
-
-        if (budget.cancelled)() {
-            return Err(Error::Cancelled);
-        }
-        let retired = self.replace_run(manifest, run, Some(written))?;
-        Ok(Some(Merged {
-            inputs: retired.len(),
-            read,
-            written: entry.total_bytes(),
-            purged,
-            records_added: changes.0,
-            records_removed: changes.1,
-            segment: Some(entry),
-        }))
+        )?;
+        Ok((written, changes))
     }
 
     /// Publishes `manifest` with the segments at `run` replaced by `merged`,
