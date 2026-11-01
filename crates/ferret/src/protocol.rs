@@ -297,14 +297,10 @@ pub(crate) fn recover_id(line: &[u8]) -> Option<String> {
     }
 }
 
-fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, RequestErrorKind> {
-    let op = match find_field(fields, "op") {
-        Some(Value::Str(s)) => Op::from_name(s).ok_or(RequestErrorKind::UnknownOp)?,
-        Some(_) => return Err(RequestErrorKind::InvalidField("op")),
-        None => return Err(RequestErrorKind::MissingField("op")),
-    };
-
-    let args = match find_field(fields, "args") {
+/// A request's byte-string arguments, which every op but a control request
+/// must give.
+fn request_args(fields: &[(String, Value)], op: &Op) -> Result<Vec<Vec<u8>>, RequestErrorKind> {
+    match find_field(fields, "args") {
         Some(Value::Arr(items)) => {
             if items.len() > MAX_ARGV_ELEMENTS {
                 return Err(RequestErrorKind::InvalidField("args"));
@@ -313,13 +309,38 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
             for item in items {
                 out.push(byte_value(item).ok_or(RequestErrorKind::InvalidField("args"))?);
             }
-            out
+            Ok(out)
         }
-        Some(_) => return Err(RequestErrorKind::InvalidField("args")),
+        Some(_) => Err(RequestErrorKind::InvalidField("args")),
         // Control requests take no arguments; queries must say theirs.
-        None if matches!(op, Op::Status | Op::Reload) => Vec::new(),
-        None => return Err(RequestErrorKind::MissingField("args")),
+        None if matches!(op, Op::Status | Op::Reload) => Ok(Vec::new()),
+        None => Err(RequestErrorKind::MissingField("args")),
+    }
+}
+
+/// Optional unsigned field `name`; a JSON `null` is the same as absent.
+fn optional_u64(
+    fields: &[(String, Value)],
+    name: &'static str,
+) -> Result<Option<u64>, RequestErrorKind> {
+    match find_field(fields, name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Num(n)) => n
+            .as_u64()
+            .map(Some)
+            .ok_or(RequestErrorKind::InvalidField(name)),
+        Some(_) => Err(RequestErrorKind::InvalidField(name)),
+    }
+}
+
+fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, RequestErrorKind> {
+    let op = match find_field(fields, "op") {
+        Some(Value::Str(s)) => Op::from_name(s).ok_or(RequestErrorKind::UnknownOp)?,
+        Some(_) => return Err(RequestErrorKind::InvalidField("op")),
+        None => return Err(RequestErrorKind::MissingField("op")),
     };
+
+    let args = request_args(fields, &op)?;
 
     // An explicit JSON `null` is the same as the field being absent — that
     // is what `json.rs`'s `opt_bytes`/`opt_int` write for `None`, and the
@@ -329,11 +350,7 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
         Some(v) => Some(byte_value(v).ok_or(RequestErrorKind::InvalidField("cwd"))?),
     };
 
-    let limit = match find_field(fields, "limit") {
-        Some(Value::Null) | None => None,
-        Some(Value::Num(n)) => Some(n.as_u64().ok_or(RequestErrorKind::InvalidField("limit"))?),
-        Some(_) => return Err(RequestErrorKind::InvalidField("limit")),
-    };
+    let limit = optional_u64(fields, "limit")?;
 
     let capabilities = match find_field(fields, "capabilities") {
         None | Some(Value::Null) => Vec::new(),
@@ -367,14 +384,7 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
         limit,
         capabilities,
         child_stdin,
-        start_unix_ns: match find_field(fields, "start_unix_ns") {
-            None | Some(Value::Null) => None,
-            Some(Value::Num(n)) => Some(
-                n.as_u64()
-                    .ok_or(RequestErrorKind::InvalidField("start_unix_ns"))?,
-            ),
-            _ => return Err(RequestErrorKind::InvalidField("start_unix_ns")),
-        },
+        start_unix_ns: optional_u64(fields, "start_unix_ns")?,
     })
 }
 
