@@ -685,6 +685,18 @@ enum How {
     Here(u32),
 }
 
+/// How a consumed position settled.
+enum Verdict {
+    /// Whether the row holds, and its offset if so.
+    Holds(Option<Option<usize>>),
+    /// The row holds by the run's cached answers for this document.
+    Cached(u32),
+    /// Nothing to emit; the run goes on.
+    Skip,
+    /// The run stops at this position.
+    Stop,
+}
+
 // ── the calling thread's side ──
 
 /// Consumes positions in order: counts them, settles later names of a
@@ -752,6 +764,74 @@ impl<'s, 'q, 'c, 'p, 'r, 'a, E: FnMut(&Row<'_>) -> ControlFlow<()>>
         }
     }
 
+    /// Settles how a worker left `row`, whose document is `doc`, counting the
+    /// document.
+    fn verdict(&mut self, how: How, doc: Option<u32>, row: &Row<'_>) -> Verdict {
+        let scan = self.scan;
+        let known = |verifier: &Verifier<'_, '_, '_>, doc: u32| verifier.exact.contains_key(&doc);
+        match how {
+            How::Holds => {
+                self.consumed(doc, false);
+                Verdict::Holds(Some(None))
+            }
+            // A worker took the cache's state for granted: a first read
+            // found no answers cached, a later name found them. Both hold
+            // whenever the run is as the sequential order saw it; when not,
+            // this thread settles the row as that order would.
+            How::Read {
+                doc: read,
+                outcome,
+                holds,
+            } if !known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                let keep = scan.is_repeated(read);
+                match self.verifier.settle(read, outcome, keep) {
+                    Settled::Unread => Verdict::Skip,
+                    Settled::Stopped => Verdict::Stop,
+                    Settled::Cached | Settled::Fresh(_) => Verdict::Holds(holds),
+                }
+            }
+            How::Cached { doc: read, holds } if known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                Verdict::Holds(holds)
+            }
+            How::Gone(read) if known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                self.verifier.tally.changed += 1;
+                Verdict::Skip
+            }
+            How::Again {
+                doc: read,
+                outcome,
+                holds,
+            } if known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                match self.verifier.settle(read, outcome, true) {
+                    Settled::Unread => Verdict::Skip,
+                    Settled::Stopped => Verdict::Stop,
+                    Settled::Cached => Verdict::Cached(read),
+                    Settled::Fresh(_) => Verdict::Holds(holds),
+                }
+            }
+            How::Read { doc: read, .. }
+            | How::Cached { doc: read, .. }
+            | How::Gone(read)
+            | How::Again { doc: read, .. }
+            | How::Here(read) => {
+                self.consumed(doc, true);
+                let stopped = || scan.stopped();
+                match self.verifier.here(read, row.name, &stopped) {
+                    Settled::Unread => Verdict::Skip,
+                    Settled::Stopped => Verdict::Stop,
+                    Settled::Cached => Verdict::Cached(read),
+                    Settled::Fresh(answers) => {
+                        Verdict::Holds(holds(scan.query, scan.catalog, row, &answers))
+                    }
+                }
+            }
+        }
+    }
+
     /// Consumes one position; `Break` stops the run there.
     fn consume(&mut self, item: Item, paths: &[u8]) -> Result<ControlFlow<()>, RunError> {
         let pending = match item {
@@ -768,71 +848,13 @@ impl<'s, 'q, 'c, 'p, 'r, 'a, E: FnMut(&Row<'_>) -> ControlFlow<()>>
             offset: None,
         };
         let scan = self.scan;
-        let doc = pending.doc;
-        let known = |verifier: &Verifier<'_, '_, '_>, doc: u32| verifier.exact.contains_key(&doc);
-        let settled = match pending.how {
-            How::Holds => {
-                self.consumed(doc, false);
-                Ok(Some(None))
+        let offset = match self.verdict(pending.how, pending.doc, &row) {
+            Verdict::Holds(holds) => holds,
+            Verdict::Cached(read) => {
+                holds(scan.query, scan.catalog, &row, &self.verifier.exact[&read])
             }
-            // A worker took the cache's state for granted: a first read
-            // found no answers cached, a later name found them. Both hold
-            // whenever the run is as the sequential order saw it; when not,
-            // this thread settles the row as that order would.
-            How::Read {
-                doc: read,
-                outcome,
-                holds,
-            } if !known(&self.verifier, read) => {
-                self.consumed(doc, true);
-                let keep = scan.is_repeated(read);
-                match self.verifier.settle(read, outcome, keep) {
-                    Settled::Unread => return Ok(ControlFlow::Continue(())),
-                    Settled::Stopped => return Ok(ControlFlow::Break(())),
-                    Settled::Cached | Settled::Fresh(_) => Ok(holds),
-                }
-            }
-            How::Cached { doc: read, holds } if known(&self.verifier, read) => {
-                self.consumed(doc, true);
-                Ok(holds)
-            }
-            How::Gone(read) if known(&self.verifier, read) => {
-                self.consumed(doc, true);
-                self.verifier.tally.changed += 1;
-                return Ok(ControlFlow::Continue(()));
-            }
-            How::Again {
-                doc: read,
-                outcome,
-                holds,
-            } if known(&self.verifier, read) => {
-                self.consumed(doc, true);
-                match self.verifier.settle(read, outcome, true) {
-                    Settled::Unread => return Ok(ControlFlow::Continue(())),
-                    Settled::Stopped => return Ok(ControlFlow::Break(())),
-                    Settled::Cached => Err(read),
-                    Settled::Fresh(_) => Ok(holds),
-                }
-            }
-            How::Read { doc: read, .. }
-            | How::Cached { doc: read, .. }
-            | How::Gone(read)
-            | How::Again { doc: read, .. }
-            | How::Here(read) => {
-                self.consumed(doc, true);
-                let stopped = || scan.stopped();
-                match self.verifier.here(read, pending.name, &stopped) {
-                    Settled::Unread => return Ok(ControlFlow::Continue(())),
-                    Settled::Stopped => return Ok(ControlFlow::Break(())),
-                    Settled::Cached => Err(read),
-                    Settled::Fresh(answers) => Ok(holds(scan.query, scan.catalog, &row, &answers)),
-                }
-            }
-        };
-        // `Err`: the row holds by the run's cached answers for the document.
-        let offset = match settled {
-            Ok(holds) => holds,
-            Err(read) => holds(scan.query, scan.catalog, &row, &self.verifier.exact[&read]),
+            Verdict::Skip => return Ok(ControlFlow::Continue(())),
+            Verdict::Stop => return Ok(ControlFlow::Break(())),
         };
         let Some(offset) = offset else {
             return Ok(ControlFlow::Continue(()));
