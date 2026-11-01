@@ -943,68 +943,79 @@ impl<'a> Final<'a> {
             let Some(id) = d.id else {
                 continue;
             };
-            let name = if d.observation.parent.is_some() {
-                own_names.get(&id).copied().or_else(|| {
-                    self.old
-                        .is_live_inode(InoId(id))
-                        .then(|| self.old.dir_name(InoId(id)))
-                        .flatten()
-                        .map(|n| n.0)
-                })
-            } else {
-                None
-            };
             let stale = protection.markers.contains(&id);
-            let retained_at = stale.then(|| self.retained_sequence(InoId(id))).flatten();
-            let entries = if stale || d.opaque { None } else { d.entries };
-            let flags = if retained_at.is_some() {
-                8
-            } else if stale || d.opaque {
-                0
-            } else {
-                4
-            } | if d.observation.traversed { 3 } else { 0 };
             if stale {
                 marked.insert(id);
             }
-            if !self.old.is_live_inode(InoId(id))
-                || self.old.dir_name(InoId(id)).map(|n| n.0) != name
-                || self.old.entry_count(InoId(id)) != entries
-                || self.old.is_traversed(InoId(id)) != d.observation.traversed
-                || self.old.retained_at(InoId(id)) != retained_at
-            {
-                push(
-                    &self.budget,
-                    &mut self.changes.records,
-                    Record::DirPut {
-                        id,
-                        name,
-                        entries,
-                        flags,
-                        retained_at,
-                    },
-                )?;
+            if let Some(record) = self.directory_record(id, d, &own_names, stale) {
+                push(&self.budget, &mut self.changes.records, record)?;
             }
         }
         for &id in protection.markers.difference(&marked) {
-            let dir = InoId(id);
-            let retained = self.retained_sequence(dir);
-            if self.old.entry_count(dir).is_some() || self.old.retained_at(dir) != retained {
-                push(
-                    &self.budget,
-                    &mut self.changes.records,
-                    Record::DirPut {
-                        id,
-                        name: self.old.dir_name(dir).map(|n| n.0),
-                        entries: None,
-                        flags: if retained.is_some() { 8 } else { 0 }
-                            | if self.old.is_traversed(dir) { 3 } else { 0 },
-                        retained_at: retained,
-                    },
-                )?;
+            if let Some(record) = self.cleared_marker(InoId(id)) {
+                push(&self.budget, &mut self.changes.records, record)?;
             }
         }
         Ok(())
+    }
+
+    /// The row for placed directory `d`, or None when the old catalog already
+    /// has it. A `stale` marker drops its entry count.
+    fn directory_record(
+        &self,
+        id: u32,
+        d: &Directory<'_>,
+        own_names: &BTreeMap<u32, u32>,
+        stale: bool,
+    ) -> Option<Record> {
+        let name = if d.observation.parent.is_some() {
+            own_names.get(&id).copied().or_else(|| {
+                self.old
+                    .is_live_inode(InoId(id))
+                    .then(|| self.old.dir_name(InoId(id)))
+                    .flatten()
+                    .map(|n| n.0)
+            })
+        } else {
+            None
+        };
+        let retained_at = stale.then(|| self.retained_sequence(InoId(id))).flatten();
+        let entries = if stale || d.opaque { None } else { d.entries };
+        let flags = if retained_at.is_some() {
+            8
+        } else if stale || d.opaque {
+            0
+        } else {
+            4
+        } | if d.observation.traversed { 3 } else { 0 };
+        let unchanged = self.old.is_live_inode(InoId(id))
+            && self.old.dir_name(InoId(id)).map(|n| n.0) == name
+            && self.old.entry_count(InoId(id)) == entries
+            && self.old.is_traversed(InoId(id)) == d.observation.traversed
+            && self.old.retained_at(InoId(id)) == retained_at;
+        (!unchanged).then_some(Record::DirPut {
+            id,
+            name,
+            entries,
+            flags,
+            retained_at,
+        })
+    }
+
+    /// The row clearing the entry count of `dir`, a stale marker this run
+    /// did not place, or None when the old catalog already has it.
+    fn cleared_marker(&self, dir: InoId) -> Option<Record> {
+        let retained = self.retained_sequence(dir);
+        (self.old.entry_count(dir).is_some() || self.old.retained_at(dir) != retained).then(|| {
+            Record::DirPut {
+                id: dir.0,
+                name: self.old.dir_name(dir).map(|n| n.0),
+                entries: None,
+                flags: if retained.is_some() { 8 } else { 0 }
+                    | if self.old.is_traversed(dir) { 3 } else { 0 },
+                retained_at: retained,
+            }
+        })
     }
 
     fn work_trees(&mut self, tree: &Tree<'_>, batches: &[Batch]) -> Result<(), Error> {
