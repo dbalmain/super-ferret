@@ -105,17 +105,25 @@ pub fn stream<R: ReadAt>(
     pace: &dyn Fn(usize) -> std::io::Result<()>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Sizes, Error> {
+    merge_terms(inputs, live, &mut writer, pace, cancelled)?;
+    let (carried, removed) = merge_records(inputs, live, &mut writer, pace, cancelled)?;
+    let mut sizes = writer.finish_spilled(pace)?;
+    sizes.records_added = sizes.records.saturating_sub(carried);
+    sizes.records_removed = removed;
+    Ok(sizes)
+}
+
+/// Writes each term of `inputs` once, with its live documents from every
+/// input that holds it, in input order.
+fn merge_terms<R: ReadAt>(
+    inputs: &[Segment<R>],
+    live: &DocSet,
+    writer: &mut Writer,
+    pace: &dyn Fn(usize) -> std::io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), Error> {
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();
-    // An input whose whole range is live keeps every document, so its lists
-    // skip the filter: a first build's merges purge nothing.
-    let whole: Vec<bool> = inputs
-        .iter()
-        .map(|input| {
-            let Info { first, last, .. } = input.info();
-            u64::from(live.count(first, last.saturating_add(1)))
-                == u64::from(last) - u64::from(first) + 1
-        })
-        .collect();
+    let whole = wholly_live(inputs, live);
     // Each input's current term and entry, `None` once it is exhausted. The
     // buffers are reused, so stepping a cursor allocates nothing.
     let mut terms: Vec<Vec<u8>> = vec![Vec::new(); inputs.len()];
@@ -164,6 +172,32 @@ pub fn stream<R: ReadAt>(
             }
         }
     }
+    Ok(())
+}
+
+/// Whether each input's whole range is live. Such an input keeps every
+/// document, so its lists skip the filter: a first build's merges purge
+/// nothing.
+fn wholly_live<R: ReadAt>(inputs: &[Segment<R>], live: &DocSet) -> Vec<bool> {
+    inputs
+        .iter()
+        .map(|input| {
+            let Info { first, last, .. } = input.info();
+            u64::from(live.count(first, last.saturating_add(1)))
+                == u64::from(last) - u64::from(first) + 1
+        })
+        .collect()
+}
+
+/// Writes the fingerprint records of `inputs` in order, once each, for live
+/// documents. How many it carried, and how many it dropped as dead.
+fn merge_records<R: ReadAt>(
+    inputs: &[Segment<R>],
+    live: &DocSet,
+    writer: &mut Writer,
+    pace: &dyn Fn(usize) -> std::io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(u64, u64), Error> {
     let mut records: Vec<_> = inputs.iter().map(Segment::records).collect();
     let mut heap = BinaryHeap::new();
     for (i, cursor) in records.iter_mut().enumerate() {
@@ -190,10 +224,7 @@ pub fn stream<R: ReadAt>(
             heap.push(Reverse((record, i)));
         }
     }
-    let mut sizes = writer.finish_spilled(pace)?;
-    sizes.records_added = sizes.records.saturating_sub(carried);
-    sizes.records_removed = removed;
-    Ok(sizes)
+    Ok((carried, removed))
 }
 
 /// Steps `cursor`, copying its term into `term`; `None` once it is done.
