@@ -73,35 +73,10 @@ impl Holders {
                 held.push(name.parent);
             }
         }
-        // A nested root has no name row in the outer root (D34): the walk
-        // reaches it from the directory holding its path. One whose contents
-        // are not catalogued is held itself, as a directory's would be.
-        for (root, path) in catalog.roots() {
-            if catalog.contents(Target::Inode(root)) != Some(Contents::Catalogued) {
-                held.push(root);
-            }
-            let parent = std::path::Path::new(std::ffi::OsStr::from_bytes(path)).parent();
-            if let Some(ferret_catalog::Resolved {
-                target: Target::Inode(parent),
-                remainder: b"",
-                ..
-            }) = parent.and_then(|parent| catalog.resolve(parent.as_os_str().as_bytes()))
-                && let Some(slot) = parents.get_mut(root.0 as usize)
-            {
-                *slot = parent.0;
-            }
-        }
-        let mut directories = vec![false; inodes];
-        for mut directory in held {
-            // Stops at the first directory already held: its ancestors are.
-            while let Some(slot) = directories.get_mut(directory.0 as usize)
-                && !*slot
-            {
-                *slot = true;
-                directory = InoId(parents[directory.0 as usize]);
-            }
-        }
-        Ok(Some(Self { directories }))
+        hold_roots(catalog, &mut parents, &mut held);
+        Ok(Some(Self {
+            directories: mark_ancestors(held, &parents),
+        }))
     }
 
     /// Whether the walk must list `directory`.
@@ -111,4 +86,40 @@ impl Holders {
             .copied()
             .unwrap_or(true)
     }
+}
+
+/// Holds each nested root whose contents are not catalogued, and records
+/// each root's parent directory. A nested root has no name row in the outer
+/// root (D34): the walk reaches it from the directory holding its path.
+fn hold_roots(catalog: &Catalog, parents: &mut [u32], held: &mut Vec<InoId>) {
+    for (root, path) in catalog.roots() {
+        if catalog.contents(Target::Inode(root)) != Some(Contents::Catalogued) {
+            held.push(root);
+        }
+        let parent = std::path::Path::new(std::ffi::OsStr::from_bytes(path)).parent();
+        if let Some(ferret_catalog::Resolved {
+            target: Target::Inode(parent),
+            remainder: b"",
+            ..
+        }) = parent.and_then(|parent| catalog.resolve(parent.as_os_str().as_bytes()))
+            && let Some(slot) = parents.get_mut(root.0 as usize)
+        {
+            *slot = parent.0;
+        }
+    }
+}
+
+/// Marks each `held` directory and its ancestors, by `parents`.
+fn mark_ancestors(held: Vec<InoId>, parents: &[u32]) -> Vec<bool> {
+    let mut directories = vec![false; parents.len()];
+    for mut directory in held {
+        // Stops at the first directory already held: its ancestors are.
+        while let Some(slot) = directories.get_mut(directory.0 as usize)
+            && !*slot
+        {
+            *slot = true;
+            directory = InoId(parents[directory.0 as usize]);
+        }
+    }
+    directories
 }
