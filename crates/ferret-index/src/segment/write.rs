@@ -387,20 +387,7 @@ impl Writer {
     /// record instead, and the entry's size is 0. Terms may not follow
     /// [`Writer::push_record`].
     pub fn push(&mut self, term: &[u8], docs: &[u32]) -> Result<u64, WriteError> {
-        if self.pushed > 0 && term <= self.last_term.as_slice() {
-            return Err(WriteError::TermOrder);
-        }
-        let (Some(&low), Some(&high)) = (docs.first(), docs.last()) else {
-            return Err(WriteError::NoDocuments);
-        };
-        if docs.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(WriteError::DocOrder);
-        }
-        for doc in [low, high] {
-            if !(self.first..=self.last).contains(&doc) {
-                return Err(WriteError::DocRange(doc));
-            }
-        }
+        self.check_term(term, docs)?;
         if let Some(singles) = self.singles.as_mut() {
             if singles.sealed {
                 return Err(WriteError::RecordOrder);
@@ -408,23 +395,13 @@ impl Writer {
             if let [doc] = docs {
                 singles.pending.push((fingerprint(term), doc - self.first));
                 self.sizes.singletons += 1;
-                self.last_term.clear();
-                self.last_term.extend_from_slice(term);
-                self.pushed += 1;
+                self.remember(term);
                 return Ok(0);
             }
         }
 
         if self.sizes.terms == 0 || self.in_block == BLOCK {
-            let (blocks, postings) = self.lengths();
-            put(term.len() as u64, &mut self.index);
-            self.index.extend_from_slice(term);
-            put(blocks - self.block_start, &mut self.index);
-            put(postings - self.postings_base, &mut self.index);
-            self.block_start = blocks;
-            self.postings_base = postings;
-            self.in_block = 0;
-            self.sizes.term_bytes += term.len() as u64;
+            self.open_block(term);
         }
 
         let entry = self.blocks.len();
@@ -455,13 +432,52 @@ impl Writer {
 
         self.previous.clear();
         self.previous.extend_from_slice(term);
-        self.last_term.clear();
-        self.last_term.extend_from_slice(term);
-        self.pushed += 1;
+        self.remember(term);
         self.in_block += 1;
         self.sizes.terms += 1;
         self.sizes.pairs += docs.len() as u64;
         Ok((self.blocks.len() - entry) as u64)
+    }
+
+    /// `term` sorts after the previous term, and `docs` are strictly
+    /// increasing, not empty, and inside `[first, last]`.
+    fn check_term(&self, term: &[u8], docs: &[u32]) -> Result<(), WriteError> {
+        if self.pushed > 0 && term <= self.last_term.as_slice() {
+            return Err(WriteError::TermOrder);
+        }
+        let (Some(&low), Some(&high)) = (docs.first(), docs.last()) else {
+            return Err(WriteError::NoDocuments);
+        };
+        if docs.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(WriteError::DocOrder);
+        }
+        for doc in [low, high] {
+            if !(self.first..=self.last).contains(&doc) {
+                return Err(WriteError::DocRange(doc));
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts a block at `term`: its index entry holds the term in full and
+    /// where the block's entries and postings start.
+    fn open_block(&mut self, term: &[u8]) {
+        let (blocks, postings) = self.lengths();
+        put(term.len() as u64, &mut self.index);
+        self.index.extend_from_slice(term);
+        put(blocks - self.block_start, &mut self.index);
+        put(postings - self.postings_base, &mut self.index);
+        self.block_start = blocks;
+        self.postings_base = postings;
+        self.in_block = 0;
+        self.sizes.term_bytes += term.len() as u64;
+    }
+
+    /// `term` was pushed: the next must sort after it.
+    fn remember(&mut self, term: &[u8]) {
+        self.last_term.clear();
+        self.last_term.extend_from_slice(term);
+        self.pushed += 1;
     }
 
     /// Adds a fingerprint record a merge carries from an input: document
