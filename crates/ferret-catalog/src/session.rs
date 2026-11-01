@@ -348,6 +348,14 @@ impl WriterSession {
             self.rebuild();
             return Ok(view);
         }
+        self.cache_names(&previous, changes);
+        self.cache_identities(&previous, &view, changes);
+        Ok(view)
+    }
+
+    /// Records the names each inode gained or lost in `changes`, starting
+    /// from its names before them.
+    fn cache_names(&mut self, previous: &Catalog, changes: &ChangeSet) {
         let mut names: BTreeMap<InoId, BTreeSet<NameId>> = BTreeMap::new();
         for record in &changes.records {
             let name = match record {
@@ -373,6 +381,10 @@ impl WriterSession {
             }
         }
         self.name_changes.extend(names);
+    }
+
+    /// Records the identities and documents `changes` added or removed.
+    fn cache_identities(&mut self, previous: &Catalog, view: &Catalog, changes: &ChangeSet) {
         for record in &changes.records {
             match record {
                 Record::InodePut { id, kind, stat, .. } if *kind != crate::Kind::Dir => {
@@ -385,7 +397,7 @@ impl WriterSession {
                     stat,
                     ..
                 } => {
-                    let root = root_of(&view, InoId(*id));
+                    let root = root_of(view, InoId(*id));
                     let ids = self
                         .directory_changes
                         .entry((root.0, stat.dev, stat.ino))
@@ -409,7 +421,6 @@ impl WriterSession {
                 _ => {}
             }
         }
-        Ok(view)
     }
 }
 
