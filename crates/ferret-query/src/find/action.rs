@@ -399,61 +399,55 @@ fn register_file(state: &mut State, target: &Target) {
     }
 }
 
+/// Where an `-exec` runs and the path it names: the entry's own directory
+/// and basename under `-execdir`, else the command directory and full path.
+struct Site {
+    directory: Option<PathBuf>,
+    path: OsString,
+    handle: Option<DirectoryHandle>,
+}
+
+impl Site {
+    fn of(exec: &Exec, entry: &Entry) -> io::Result<Self> {
+        let (directory, path) = if exec.directory {
+            let (directory, path) = exec_path(entry.path());
+            (Some(directory), path)
+        } else {
+            (
+                entry.cwd().map(Path::to_owned),
+                entry.path().as_os_str().to_owned(),
+            )
+        };
+        let handle = if exec.directory {
+            Some(
+                entry
+                    .directory_handle()
+                    .ok_or_else(|| io::Error::other("missing execution directory handle"))?,
+            )
+        } else {
+            entry.command_cwd()
+        };
+        Ok(Self {
+            directory,
+            path,
+            handle,
+        })
+    }
+}
+
 fn execute(
     exec: &Exec,
     entry: &Entry,
     effects: &mut impl Effects,
     state: &mut State,
 ) -> io::Result<bool> {
-    let (directory, path) = if exec.directory {
-        let (directory, path) = exec_path(entry.path());
-        (Some(directory), path)
-    } else {
-        (
-            entry.cwd().map(Path::to_owned),
-            entry.path().as_os_str().to_owned(),
-        )
-    };
-    let handle = if exec.directory {
-        Some(
-            entry
-                .directory_handle()
-                .ok_or_else(|| io::Error::other("missing execution directory handle"))?,
-        )
-    } else {
-        entry.command_cwd()
-    };
+    let site = Site::of(exec, entry)?;
     if exec.batch {
-        let limit = *state.limit.get_or_insert_with(batch_limit);
-        if !exec.directory {
-            let batch = state
-                .staged
-                .entry(exec.id)
-                .or_insert_with(|| Batch::new(exec, directory.clone(), handle.clone()));
-            batch.bytes += path.as_bytes().len() + 1;
-            batch.paths.push(path);
-            // Bound worker staging by count and bytes. A single oversized path
-            // is immediately collected; only the shared batch partitions argv.
-            if batch.paths.len() >= 32 || batch.bytes - command_bytes(&exec.args) >= 4096 {
-                flush_files(&state.files)?;
-                state.errors +=
-                    batch.collect(&state.shared, limit, effects, &state.gate, &state.quit)?;
-            }
-            return Ok(true);
+        if exec.directory {
+            batch_in_directory(exec, site, effects, state)?;
+        } else {
+            stage(exec, site, effects, state)?;
         }
-        let batch = state
-            .batches
-            .entry(exec.id)
-            .or_insert_with(|| Batch::new(exec, directory.clone(), handle.clone()));
-        let bytes = path.as_bytes().len() + 1;
-        if batch.directory != directory || batch.full(bytes, limit) {
-            flush_files(&state.files)?;
-            state.errors += u64::from(!batch.run(effects, &state.gate, &state.quit)?);
-        }
-        batch.directory = directory;
-        batch.handle = handle;
-        batch.paths.push(path);
-        batch.bytes += bytes;
         return Ok(true);
     }
     state.flush_files()?;
@@ -463,15 +457,59 @@ fn execute(
     let args = exec
         .args
         .iter()
-        .map(|arg| substitute(arg, &path))
+        .map(|arg| substitute(arg, &site.path))
         .collect::<Vec<_>>();
     spawn(
         &args,
-        directory.as_deref(),
-        handle.as_deref(),
+        site.directory.as_deref(),
+        site.handle.as_deref(),
         exec.prompt,
         effects,
     )
+}
+
+/// Stages an `-exec … {} +` path in this worker's batch, collecting it into
+/// the shared batch once it is large enough.
+fn stage(exec: &Exec, site: Site, effects: &mut impl Effects, state: &mut State) -> io::Result<()> {
+    let limit = *state.limit.get_or_insert_with(batch_limit);
+    let batch = state
+        .staged
+        .entry(exec.id)
+        .or_insert_with(|| Batch::new(exec, site.directory.clone(), site.handle.clone()));
+    batch.bytes += site.path.as_bytes().len() + 1;
+    batch.paths.push(site.path);
+    // Bound worker staging by count and bytes. A single oversized path
+    // is immediately collected; only the shared batch partitions argv.
+    if batch.paths.len() >= 32 || batch.bytes - command_bytes(&exec.args) >= 4096 {
+        flush_files(&state.files)?;
+        state.errors += batch.collect(&state.shared, limit, effects, &state.gate, &state.quit)?;
+    }
+    Ok(())
+}
+
+/// Adds an `-execdir … {} +` path to its directory's batch, first running
+/// the batch when the directory changes or the path would overfill it.
+fn batch_in_directory(
+    exec: &Exec,
+    site: Site,
+    effects: &mut impl Effects,
+    state: &mut State,
+) -> io::Result<()> {
+    let limit = *state.limit.get_or_insert_with(batch_limit);
+    let batch = state
+        .batches
+        .entry(exec.id)
+        .or_insert_with(|| Batch::new(exec, site.directory.clone(), site.handle.clone()));
+    let bytes = site.path.as_bytes().len() + 1;
+    if batch.directory != site.directory || batch.full(bytes, limit) {
+        flush_files(&state.files)?;
+        state.errors += u64::from(!batch.run(effects, &state.gate, &state.quit)?);
+    }
+    batch.directory = site.directory;
+    batch.handle = site.handle;
+    batch.paths.push(site.path);
+    batch.bytes += bytes;
+    Ok(())
 }
 
 fn substitute(arg: &OsStr, path: &OsStr) -> OsString {
