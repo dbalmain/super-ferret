@@ -344,8 +344,14 @@ mod tests {
         const FAILS: u32 = 7;
         let finished = Mutex::new(Vec::new());
         let read = |doc: u32, bytes: &mut Vec<u8>| {
-            if doc.is_multiple_of(2) {
-                std::thread::sleep(Duration::from_millis(2));
+            // The first document finishes after the second, which the other
+            // reader claims meanwhile.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while doc == 0
+                && !finished.lock().unwrap().contains(&1)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
             }
             finished.lock().unwrap().push(doc);
             if doc == FAILS {
@@ -365,9 +371,10 @@ mod tests {
         .unwrap();
         assert_eq!(consumed, (0..DOCS).collect::<Vec<_>>());
         let finished = finished.into_inner().unwrap();
+        let at = |doc| finished.iter().position(|&d| d == doc);
         assert!(
-            !finished.is_sorted(),
-            "the readers finished in claim order, so nothing was reordered"
+            at(1) < at(0),
+            "the second document must finish first for the order to be restored"
         );
     }
 }
