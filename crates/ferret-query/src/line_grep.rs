@@ -360,19 +360,26 @@ pub struct Line<'a> {
     pub highlights: Option<&'a [std::ops::Range<usize>]>,
 }
 
-/// The LFs in `bytes`. Counted 255 bytes at a time into a byte, which
-/// the compiler vectorises; `memchr_iter` pays per hit on dense text.
+/// The LFs in `bytes`, counted into 64 byte-wide lanes the compiler
+/// vectorises, one 64-byte block at a time. A lane sees one byte a block, so
+/// 255 blocks fill it; a run ends with its lanes summed and its last partial
+/// block counted bytewise. `memchr_iter` pays per hit on dense text.
 fn count_lf(bytes: &[u8]) -> u64 {
-    bytes
-        .chunks(255)
-        .map(|chunk| {
-            u64::from(
-                chunk
-                    .iter()
-                    .fold(0u8, |count, &byte| count + u8::from(byte == b'\n')),
-            )
-        })
-        .sum()
+    const LANES: usize = 64;
+    let mut total = 0;
+    for run in bytes.chunks(255 * LANES) {
+        let mut lanes = [0u8; LANES];
+        let blocks = run.chunks_exact(LANES);
+        let tail = blocks.remainder();
+        for block in blocks {
+            for (lane, &byte) in lanes.iter_mut().zip(block) {
+                *lane += u8::from(byte == b'\n');
+            }
+        }
+        total += lanes.iter().map(|&lane| u64::from(lane)).sum::<u64>();
+        total += tail.iter().filter(|&&byte| byte == b'\n').count() as u64;
+    }
+    total
 }
 
 /// Rg's binary test for a recursive file's first window: any NUL byte.
