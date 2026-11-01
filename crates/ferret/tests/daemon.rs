@@ -3849,8 +3849,6 @@ fn a_writer_that_fails_after_ready_stops_the_host_and_frees_the_catalog() {
         ("FERRET_DAEMON_IDLE_MS", "0"),
         ("FERRET_BACKSTOP_MS", "3600000"),
         ("FERRET_POLL_MS", "300000"),
-        // On battery the follow would never hold at its gate.
-        ("FERRET_BATTERY_PAUSE", "0"),
         ("FERRET_CONTENT_TEST_GATE", gate.to_str().unwrap()),
     ]);
     ready_within(&tree, HANG);

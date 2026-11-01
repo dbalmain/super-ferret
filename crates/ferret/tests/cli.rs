@@ -2288,7 +2288,7 @@ fn catalog_find_candidate_guards_preserve_earlier_effects_and_followed_directory
 }
 
 #[test]
-fn resident_search_checks_every_section_before_emitting_rows() {
+fn search_and_find_check_every_section_before_emitting_rows() {
     // D46's common engine warms and checks every section, including fields
     // a name-only query will not use. Corruption fails before any output.
     let env = Env::new("lazy-checksum-query");
@@ -2319,6 +2319,21 @@ fn resident_search_checks_every_section_before_emitting_rows() {
     let metadata = env.run(&[os("search"), os("checked"), os("size:>0")]);
     assert_eq!(code(&metadata), 3, "{}", stderr(&metadata));
     assert!(stderr(&metadata).contains("corrupt: size"));
+    // A local find walks the catalog without the engine, but a plain
+    // listing checks every section first all the same. An action plan
+    // loads only the sections it reads, and sizes are not among them.
+    let find = |expression: &[&str]| {
+        let mut args = vec![os("find"), os(".")];
+        args.extend(expression.iter().map(os));
+        env.command(&args).current_dir(env.tree()).output().unwrap()
+    };
+    let listing = find(&["-name", "checked.txt"]);
+    assert_eq!(code(&listing), 1, "{}", stderr(&listing));
+    assert!(listing.stdout.is_empty());
+    assert!(stderr(&listing).contains("corrupt: size"));
+    let action = find(&["-name", "checked.txt", "-exec", "true", ";", "-print"]);
+    assert_eq!(code(&action), 0, "{}", stderr(&action));
+    assert!(String::from_utf8_lossy(&action.stdout).contains("checked.txt"));
 }
 
 #[test]

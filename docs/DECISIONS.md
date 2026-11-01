@@ -7768,7 +7768,7 @@ they never see it.
 | Option | Costs | Buys |
 | ------ | ----- | ---- |
 | A. Keep UTC; document `-daystart` and date arguments as UTC beside `-printf` and `-ls` | Pasted commands with dates or `-daystart` select different files from GNU on any host not on UTC, Dave's included, by up to a day at the boundaries. | No time-zone code; output is the same on every host. |
-| B. Local time throughout: a safe-Rust TZif reader (`TZ` as `:path` or `Area/City`, else `/etc/localtime`; the POSIX rule string for times past the table) used for parsing, `-daystart` and printing | About 300 lines plus tests run against GNU under several zones; a malformed or missing zone file falls back to UTC, as glibc does. | GNU's answers and output on every host; it would also let `-printf %Z`, unimplemented today, print the zone's abbreviation. |
+| B. Local time throughout: a safe-Rust TZif reader (`TZ` as `:path` or `Area/City`, else `/etc/localtime`; the POSIX rule string for times past the table) used for parsing, `-daystart` and printing | About 300 lines plus tests run against GNU under several zones; a malformed or missing zone file falls back to UTC, as glibc does. | GNU's answers and output on every host; `-printf %TZ` (and `%AZ`, `%CZ`) would print the local zone's abbreviation rather than `UTC`. |
 | C. Local time for inputs only (`-daystart`, date arguments); keep printing UTC | Most of B's reader; output times still differ from GNU, and inputs and outputs disagree about the zone. | GNU's selections, with the smaller change to printing. |
 
 **Recommendation:** B. `ferret find` is meant to be a drop-in for pasted GNU

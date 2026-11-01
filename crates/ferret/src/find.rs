@@ -24,10 +24,10 @@ pub(crate) const PERMISSION_WARNING: &str =
     "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form";
 
 /// The source a prepared find walks, and the catalog view a JSON `begin`
-/// names. A plain listing pins the full engine, whose name index serves
-/// `-name`; an action plan, which never reads that index, walks the bare
-/// catalog with only the sections it reads (D56 A still runs actions here;
-/// D78's resident open is skipped for them); `Live` walks the unrestricted
+/// names. A local find walks the bare catalog: a plain listing after
+/// checking every section, an action plan with only the sections it reads
+/// (D56 A still runs actions here). `Pinned` is the daemon batch's resident
+/// engine, whose name index serves `-name`. `Live` walks the unrestricted
 /// tree and selects no view.
 pub(crate) enum FindSource {
     Pinned(Box<QuerySession>),
@@ -113,14 +113,20 @@ fn open_catalog(plan: &Plan, index: &Path) -> Result<FindSource, String> {
     };
     // Postings need a resident name index, which only the daemon holds;
     // building one for a single find costs more than the walk, so a local
-    // find loads just the sections its plan reads.
+    // find walks the catalog. A plain listing still checks every section
+    // before any output, as an engine open does (D46); an action plan loads
+    // only the sections it reads.
     let failed = |error| format!("{}: {error}; re-index or use -I", index.display());
     let catalog = Catalog::open(index).map_err(failed)?.ok_or_else(missing)?;
-    catalog.load(&plan.catalog_sections()).map_err(failed)?;
+    if plan.has_side_effects() {
+        catalog.load(&plan.catalog_sections()).map_err(failed)?;
+    } else {
+        catalog.load_all().map_err(failed)?;
+    }
     Ok(FindSource::Sections(Box::new(catalog)))
 }
 
-// Routing must precede engine open. Effects stay local; so do live routes.
+// Routing must precede catalog open. Effects stay local; so do live routes.
 fn remote(
     args: &[OsString],
     route: &Route,
