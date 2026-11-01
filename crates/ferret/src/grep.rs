@@ -588,6 +588,25 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 
+    /// The source that lists `segment`'s inputs and their candidates.
+    fn source<'s>(&self, segment: Vec<Input>, prepared: &'s Prepared<'a>) -> groups::Source<'s> {
+        let plan = self.plan;
+        groups::Source::new(
+            segment,
+            self.pin.map(|p| p.catalog()),
+            prepared
+                .candidates
+                .as_ref()
+                .map(|candidates| candidates as &dyn groups::Candidates),
+            self.selection,
+            self.cwd.to_owned(),
+        )
+        .with_traversal(plan.traversal, plan.text)
+        .with_live(self.live)
+        .with_holders(prepared.holders.as_ref())
+        .with_absence(plan.universe() == line_grep::Universe::Searchable)
+    }
+
     /// Searches one segment of operands, on several workers when it walks
     /// live.
     fn segment<W: Write>(
@@ -598,10 +617,7 @@ impl<'a> Execution<'a> {
         searched: &mut bool,
     ) -> Result<(), Exit> {
         let Self {
-            plan,
-            selection,
             pin,
-            live,
             cwd,
             threads,
             runtime,
@@ -620,20 +636,7 @@ impl<'a> Execution<'a> {
         } else {
             threads.min(segment.len())
         };
-        let mut source = groups::Source::new(
-            segment,
-            pin.map(|p| p.catalog()),
-            prepared
-                .candidates
-                .as_ref()
-                .map(|candidates| candidates as &dyn groups::Candidates),
-            selection,
-            cwd.to_owned(),
-        )
-        .with_traversal(plan.traversal, plan.text)
-        .with_live(live)
-        .with_holders(prepared.holders.as_ref())
-        .with_absence(plan.universe() == line_grep::Universe::Searchable);
+        let mut source = self.source(segment, prepared);
         let walked = (threads > 1 && source.walks_live())
             .then(|| groups::walk(host, &mut source, threads, cancelled, searched));
         let serial = match walked {
