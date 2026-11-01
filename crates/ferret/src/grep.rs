@@ -1218,37 +1218,14 @@ impl<W: Write> Host<'_, W> {
     ) -> io::Result<()> {
         self.matched |= result.matched;
         if self.plan.json {
-            let mut printed = 0;
-            if !self.plan.quiet && !output.is_empty() {
-                let path = label(path, self.plan.paths.is_empty());
-                let mut begin = Vec::new();
-                json::begin(&mut begin, path)?;
-                printed = begin.len() as u64 + output.len();
-                self.writer.write_all(&begin)?;
-                let flag = self.cancelled;
-                groups::emit(&mut output, &mut self.writer, &|| {
-                    flag.is_some_and(|flag| flag.load(Ordering::Acquire))
-                })?;
-                json::end(&mut self.writer, path, result, printed)?;
-            }
-            self.json_stats.add(result, printed);
-            return Ok(());
+            return self.publish_json(path, result, output);
         }
         if self.plan.quiet {
             return Ok(());
         }
         if matches!(self.plan.output, Output::Names | Output::WithoutMatch) {
             if result.matched {
-                presentation::path(
-                    &self.plan.presentation,
-                    &mut self.writer,
-                    label(path, self.plan.paths.is_empty()),
-                )?;
-                self.writer.write_all(if self.plan.presentation.null {
-                    b"\0"
-                } else {
-                    b"\n"
-                })?;
+                self.path_label(path, b"\n")?;
             }
             return Ok(());
         }
@@ -1256,16 +1233,7 @@ impl<W: Write> Host<'_, W> {
         if matches!(self.plan.output, Output::Count | Output::CountMatches) {
             if result.count > 0 || (self.plan.include_zero && result.searched) {
                 if self.filename {
-                    presentation::path(
-                        &self.plan.presentation,
-                        &mut self.writer,
-                        label(path, self.plan.paths.is_empty()),
-                    )?;
-                    self.writer.write_all(if self.plan.presentation.null {
-                        b"\0"
-                    } else {
-                        b":"
-                    })?;
+                    self.path_label(path, b":")?;
                 }
                 writeln!(self.writer, "{}", result.count)?;
             }
@@ -1274,20 +1242,63 @@ impl<W: Write> Host<'_, W> {
                 self.binary_warning(path)?;
             }
         } else {
-            if self.emitted_group && !output.is_empty() {
-                if self.plan.presentation.heading == Some(true) {
-                    self.writer.write_all(b"\n")?;
-                } else if self.plan.before > 0 || self.plan.after > 0 {
-                    self.writer.write_all(b"--\n")?;
-                }
-            }
-            self.emitted_group |= !output.is_empty();
+            self.publish_group(&mut output)?;
+        }
+        Ok(())
+    }
+
+    /// Writes one file's JSON events and counts its stats.
+    fn publish_json(
+        &mut self,
+        path: &Path,
+        result: InputResult,
+        mut output: OutputBuffer,
+    ) -> io::Result<()> {
+        let mut printed = 0;
+        if !self.plan.quiet && !output.is_empty() {
+            let path = label(path, self.plan.paths.is_empty());
+            let mut begin = Vec::new();
+            json::begin(&mut begin, path)?;
+            printed = begin.len() as u64 + output.len();
+            self.writer.write_all(&begin)?;
             let flag = self.cancelled;
             groups::emit(&mut output, &mut self.writer, &|| {
                 flag.is_some_and(|flag| flag.load(Ordering::Acquire))
             })?;
+            json::end(&mut self.writer, path, result, printed)?;
         }
+        self.json_stats.add(result, printed);
         Ok(())
+    }
+
+    /// Writes `path`'s label and then `separator`, or NUL under `--null`.
+    fn path_label(&mut self, path: &Path, separator: &[u8]) -> io::Result<()> {
+        presentation::path(
+            &self.plan.presentation,
+            &mut self.writer,
+            label(path, self.plan.paths.is_empty()),
+        )?;
+        self.writer.write_all(if self.plan.presentation.null {
+            b"\0"
+        } else {
+            separator
+        })
+    }
+
+    /// Writes one file's match groups, separated from the previous file's.
+    fn publish_group(&mut self, output: &mut OutputBuffer) -> io::Result<()> {
+        if self.emitted_group && !output.is_empty() {
+            if self.plan.presentation.heading == Some(true) {
+                self.writer.write_all(b"\n")?;
+            } else if self.plan.before > 0 || self.plan.after > 0 {
+                self.writer.write_all(b"--\n")?;
+            }
+        }
+        self.emitted_group |= !output.is_empty();
+        let flag = self.cancelled;
+        groups::emit(output, &mut self.writer, &|| {
+            flag.is_some_and(|flag| flag.load(Ordering::Acquire))
+        })
     }
 }
 
