@@ -177,57 +177,76 @@ fn holding<'a, E>(
         for read in readers.iter_mut() {
             let sender = sender.clone();
             let (claims, moved) = (&claims, &moved);
-            scope.spawn(move || {
-                // Ends every claim when this reader finishes, or unwinds:
-                // the writer then sees the channel close, and the scope
-                // re-raises a panic.
-                let _stop = Stop(claims, moved);
-                let mut extractor = Extractor::new();
-                while let Some((seq, doc)) = Claims::claim(claims, moved) {
-                    let mut extracted = Extracted::default();
-                    let result = extractor
-                        .extract(*read, doc, &mut extracted)
-                        .map(|()| extracted);
-                    // A reader that asks to stop reads no further; the
-                    // writer stops when it reaches this document.
-                    let stop = matches!(result, Err(Fault::Stop));
-                    if let Ok(extracted) = &result {
-                        claims.lock().unwrap_or_else(|e| e.into_inner()).held += extracted.bytes();
-                    }
-                    if sender.send((seq, doc, result)).is_err() || stop {
-                        break;
-                    }
-                }
-            });
+            scope.spawn(move || read_claims(read, claims, moved, &sender));
         }
         drop(sender);
-        let mut ready = BTreeMap::new();
-        let mut next = 0;
-        loop {
-            let Some((doc, result)) = ready.remove(&next) else {
-                match receiver.recv() {
-                    Ok((seq, doc, result)) => {
-                        ready.insert(seq, (doc, result));
-                        continue;
-                    }
-                    // Every reader has stopped: the documents ran out.
-                    Err(_) => break Ok(()),
-                }
-            };
-            next += 1;
-            {
-                let mut claims = claims.lock().unwrap_or_else(|e| e.into_inner());
-                claims.consumed = next;
-                claims.held -= result.as_ref().map_or(0, Extracted::bytes);
-                moved.notify_all();
-            }
-            match consume(doc, result.as_ref().map_err(|&fault| fault)) {
-                Ok(true) => {}
-                Ok(false) => break Ok(()),
-                Err(error) => break Err(error),
-            }
-        }
+        consume_in_order(&receiver, &claims, &moved, consume)
     })
+}
+
+/// One extraction, sent with its claim's sequence number.
+type Sent = (usize, u32, Result<Extracted, Fault>);
+
+/// A reader thread: extracts each document it claims and sends it on.
+fn read_claims<I: Iterator<Item = u32>>(
+    read: &mut Reader<'_>,
+    claims: &Mutex<Claims<I>>,
+    moved: &Condvar,
+    sender: &mpsc::Sender<Sent>,
+) {
+    // Ends every claim when this reader finishes, or unwinds: the writer
+    // then sees the channel close, and the scope re-raises a panic.
+    let _stop = Stop(claims, moved);
+    let mut extractor = Extractor::new();
+    while let Some((seq, doc)) = Claims::claim(claims, moved) {
+        let mut extracted = Extracted::default();
+        let result = extractor
+            .extract(read, doc, &mut extracted)
+            .map(|()| extracted);
+        // A reader that asks to stop reads no further; the writer stops
+        // when it reaches this document.
+        let stop = matches!(result, Err(Fault::Stop));
+        if let Ok(extracted) = &result {
+            claims.lock().unwrap_or_else(|e| e.into_inner()).held += extracted.bytes();
+        }
+        if sender.send((seq, doc, result)).is_err() || stop {
+            break;
+        }
+    }
+}
+
+/// The writer: passes extractions to `consume` in claim order, releasing
+/// each one's bytes and window slot as it goes.
+fn consume_in_order<I, E>(
+    receiver: &mpsc::Receiver<Sent>,
+    claims: &Mutex<Claims<I>>,
+    moved: &Condvar,
+    mut consume: impl FnMut(u32, Result<&Extracted, Fault>) -> Result<bool, E>,
+) -> Result<(), E> {
+    let mut ready = BTreeMap::new();
+    let mut next = 0;
+    loop {
+        let Some((doc, result)) = ready.remove(&next) else {
+            match receiver.recv() {
+                Ok((seq, doc, result)) => {
+                    ready.insert(seq, (doc, result));
+                    continue;
+                }
+                // Every reader has stopped: the documents ran out.
+                Err(_) => return Ok(()),
+            }
+        };
+        next += 1;
+        {
+            let mut claims = claims.lock().unwrap_or_else(|e| e.into_inner());
+            claims.consumed = next;
+            claims.held -= result.as_ref().map_or(0, Extracted::bytes);
+            moved.notify_all();
+        }
+        if !consume(doc, result.as_ref().map_err(|&fault| fault))? {
+            return Ok(());
+        }
+    }
 }
 
 /// Stops all claims when dropped.
