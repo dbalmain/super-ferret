@@ -187,7 +187,9 @@ impl<'a> Parser<'a> {
                 b"-D" => {
                     self.at += 1;
                     let value = self.argument(OsStr::new("-D"))?;
-                    if value.is_empty() {
+                    // GNU skips empty flags, but not a value that is only
+                    // empty flags.
+                    if value.as_bytes().split(|&b| b == b',').all(<[u8]>::is_empty) {
                         return Err(invalid(OsStr::new("-D"), value));
                     }
                     self.debug(value.as_bytes());
@@ -211,7 +213,7 @@ impl<'a> Parser<'a> {
     /// `-D`'s comma-separated flags. Only `exec` and `stat` are accepted
     /// quietly, as GNU does; `help` lists the rest and quiets them too.
     fn debug(&mut self, value: &[u8]) {
-        let flags = || value.split(|&b| b == b',');
+        let flags = || value.split(|&b| b == b',').filter(|flag| !flag.is_empty());
         let help = flags().any(|flag| flag == b"help");
         if help {
             self.message =

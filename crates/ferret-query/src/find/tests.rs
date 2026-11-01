@@ -650,6 +650,8 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
         &["-O"],
         &["-D"],
         &["-newerXY", "ref"],
+        &["-D", ","],
+        &["-D", ",,"],
     ];
     for args in invalid {
         assert!(
@@ -661,6 +663,11 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
     for args in cases {
         let plan = Plan::parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
         assert!(plan.unsupported().is_some(), "{args:?}");
+    }
+    // GNU skips an empty -D flag without a warning.
+    for value in ["exec,", ",stat", "exec,,stat"] {
+        let plan = Plan::parse(&["-D", value, "."].map(OsString::from)).unwrap();
+        assert!(plan.warnings.is_empty(), "{value} {:?}", plan.warnings);
     }
     let plan = Plan::parse(&["-L", "-I", "-O3", "-P", "a", "b", "-type", "f"].map(OsString::from))
         .unwrap();
@@ -1056,8 +1063,8 @@ fn newer_spellings_compare_their_own_time_fields() {
     let reference = tree.0.join("reference");
     let late = tree.0.join("late");
     for (path, accessed, modified) in [
-        (&reference, 1_700_000_000, 1_700_000_000),
-        (&late, 1_900_000_000, 1_500_000_000),
+        (&reference, 2_000_000_000, 1_700_000_000),
+        (&late, 1_750_000_000, 1_720_000_000),
     ] {
         fs::write(path, b"").unwrap();
         fs::File::options()
@@ -1071,14 +1078,16 @@ fn newer_spellings_compare_their_own_time_fields() {
             )
             .unwrap();
     }
-    // Both files changed status just now, after the reference's mtime;
-    // only `late` was read after it, and neither was modified after it.
+    // The reference's times are distinct: mtime, then ctime (now, before
+    // 2033), then atime. Each of `late`'s falls between the reference's mtime
+    // and its ctime, so comparing against the wrong reference field changes
+    // a row.
     let reference = reference.to_str().unwrap();
     for (test, value, expected) in [
-        ("-newer", reference, ""),
-        ("-anewer", reference, "late"),
+        ("-newer", reference, "late"),
+        ("-anewer", reference, "late reference"),
         ("-cnewer", reference, "late reference"),
-        ("-newerat", "2030-01-01", "late"),
+        ("-newerat", "2030-01-01", "reference"),
         ("-newermt", "2030-01-01", ""),
     ] {
         let (_, output) = tree.run(&[
