@@ -26,9 +26,9 @@ pub(crate) const PERMISSION_WARNING: &str =
 /// The source a prepared find walks, and the catalog view a JSON `begin`
 /// names. A local find walks the bare catalog: a plain listing after
 /// checking every section, an action plan with only the sections it reads
-/// (D56 A still runs actions here). `Pinned` is the daemon batch's resident
-/// engine, whose name index serves `-name`. `Live` walks the unrestricted
-/// tree and selects no view.
+/// (D56 A still runs actions here). `Pinned` is the resident engine of a
+/// batch or socket find, whose name index serves `-name`. `Live` walks the
+/// unrestricted tree and selects no view.
 pub(crate) enum FindSource {
     Pinned(Box<QuerySession>),
     Sections(Box<Catalog>),

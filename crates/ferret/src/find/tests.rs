@@ -16,8 +16,9 @@ fn a_closed_pipe_ends_only_its_own_invocation() {
     assert!(!Output::stdout().closed());
 }
 
-/// A local plan, with actions or without, opens only the sections it reads,
-/// never the resident names a name index is built from.
+/// A local plan never builds the resident names a name index is built from.
+/// A plain listing checks every section, as search does (D46); an action
+/// plan opens only the sections it reads.
 #[test]
 fn local_plans_open_the_catalog_without_resident_names() {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -43,11 +44,19 @@ fn local_plans_open_the_catalog_without_resident_names() {
         Plan::parse(&argv).unwrap()
     };
 
-    for args in [&["-exec", "true", "{}", "+"][..], &["-name", "one"]] {
-        match open_catalog(&plan(args), &index) {
-            Ok(FindSource::Sections(catalog)) => assert!(catalog.resident_names().is_none()),
-            _ => panic!("{args:?} opened the engine"),
-        }
+    for (args, every) in [
+        (&["-exec", "true", "{}", "+"][..], false),
+        (&["-name", "one"], true),
+    ] {
+        let Ok(FindSource::Sections(catalog)) = open_catalog(&plan(args), &index) else {
+            panic!("{args:?} opened the engine");
+        };
+        assert!(catalog.resident_names().is_none());
+        assert_eq!(
+            catalog.is_loaded(ferret_catalog::Section::Size),
+            every,
+            "{args:?}"
+        );
     }
     let _ = std::fs::remove_dir_all(directory);
 }
