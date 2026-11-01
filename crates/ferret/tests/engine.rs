@@ -1066,6 +1066,7 @@ fn an_independent_catalog_incarnation_cannot_reuse_another_name_term_base() {
             .select(current.catalog(), None, &[], |_| true)
             .is_err()
     );
+    assert!(old.name_index().warm(current.catalog()).is_err());
     let query = Query::parse("name-term:receipt", SystemTime::now()).unwrap();
     let mut rows = Vec::new();
     query

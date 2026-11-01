@@ -533,6 +533,7 @@ mod tests {
     fn a_pass_yields_every_row_once_in_order_around_run_edges() {
         for count in [0, 1, RUN - 1, RUN, RUN + 1, 2 * RUN, 2 * RUN + 3] {
             let mut pass = runs(count, |first, out| {
+                assert!(first + out.len() <= count, "decoded past row {count}");
                 for (row, value) in (first..).zip(out.iter_mut()) {
                     *value = row as u64;
                 }

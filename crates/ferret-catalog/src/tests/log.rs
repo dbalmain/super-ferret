@@ -110,6 +110,28 @@ fn framing_open_is_header_only_and_families_load_once() {
     );
 }
 
+/// Loaders racing for a section and its needs wait for the first to read
+/// each rather than read it again, so the bytes read count it once.
+#[test]
+fn racing_loads_read_each_section_once() {
+    let s = fixture("log-race");
+    let serial = Catalog::open(&s.path).unwrap().unwrap();
+    serial.load(&[Section::DocRefs]).unwrap();
+    for round in 0..20 {
+        let catalog = Catalog::open(&s.path).unwrap().unwrap();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    catalog.load(&[Section::DocRefs]).unwrap();
+                });
+            }
+        });
+        assert_eq!(catalog.bytes_read(), serial.bytes_read(), "round {round}");
+    }
+}
+
 #[test]
 fn every_published_append_truncation_is_refused_and_every_unpublished_suffix_is_discarded() {
     let s = fixture("log-truncations");

@@ -1305,6 +1305,8 @@ import json, sys
 docs = [json.loads(line) for line in sys.stdin]
 local, s = docs
 assert local['host_running'] is False
+assert local['planner_bytes'] > 0, local
+assert type(s['d54']['scope_build_us']) is int, s['d54']
 assert isinstance(local['generation'], dict)
 assert local['last_successful_refresh'] is None
 assert local['last_complete_backstop'] is None

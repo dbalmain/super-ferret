@@ -25,7 +25,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::batch::{Stat, WorkTreeKind};
 use crate::fan_out::fan_out;
@@ -41,6 +41,7 @@ use crate::regular::{self, Access};
 use crate::seek::{gallop, partition_point, seek};
 use crate::{
     ContentState, DecodeError, DocId, Generation, Handle, Hash, InoId, NameId, RetryFromCurrent,
+    lock,
 };
 
 mod cursors;
@@ -265,6 +266,9 @@ enum Source {
     File {
         file: File,
         sections: Box<[OnceLock<Arc<[u8]>>; SECTIONS.len()]>,
+        /// Held while a section is read and checked, so that a second
+        /// loader waits for it rather than reading it again.
+        loading: Box<[Mutex<()>; SECTIONS.len()]>,
         /// Bytes read from the file so far, header and table included.
         read: AtomicU64,
         /// What the checks of loaded sections found, for later checks.
@@ -345,6 +349,7 @@ impl Catalog {
             source: Arc::new(Source::File {
                 file,
                 sections: Default::default(),
+                loading: Default::default(),
                 read: AtomicU64::new(head.len() as u64),
                 facts: Facts::default(),
             }),
@@ -886,6 +891,7 @@ impl Catalog {
         let Source::File {
             file,
             sections,
+            loading,
             read,
             facts,
         } = self.source.as_ref()
@@ -898,6 +904,11 @@ impl Catalog {
         }
         for &need in section.needs() {
             self.load_one(need)?;
+        }
+        // Needs are loaded before this is taken, so no thread holds two.
+        let _loading = lock(&loading[section as usize]);
+        if slot.get().is_some() {
+            return Ok(());
         }
         let (start, end) = self.layout.range(section);
         let mut bytes = vec![0; end - start].into_boxed_slice();
@@ -912,8 +923,9 @@ impl Catalog {
             }
         })
         .map_err(OpenError::Decode)?;
-        // A racing loader may have set it first; its bytes are the same.
-        let _ = slot.set(bytes.into());
+        let Ok(()) = slot.set(bytes.into()) else {
+            unreachable!("set only under its load lock");
+        };
         Ok(())
     }
 
