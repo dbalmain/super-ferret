@@ -468,18 +468,18 @@ impl Plan {
     /// Counted postings are safe only for a name test followed by printing,
     /// without traversal controls, effects, symlink following or live scopes.
     /// Candidates still use the ordinary entry evaluator and output commit.
-    /// `index` is asked for only when the expression could use postings, so
-    /// a one-shot host builds no name index for any other find.
-    pub fn indexed_catalog_source<'a>(
+    /// Without a built `index` this is the catalog walk: building one to
+    /// answer a single find costs more than the walk it would save.
+    pub fn indexed_catalog_source(
         &self,
         catalog: ferret_catalog::Catalog,
-        index: impl FnOnce() -> &'a crate::NameIndex,
+        index: Option<&crate::NameIndex>,
     ) -> LiveWalk {
         let Some((paths, known)) = self
             .indexed_pattern()
             .filter(|_| !self.touches_nested_root(&catalog))
             .and_then(|pattern| {
-                let index = Some(index()).filter(|index| index.can_accelerate_find())?;
+                let index = index.filter(|index| index.can_accelerate_find())?;
                 self.indexed_entries(&catalog, index, pattern)
             })
         else {
