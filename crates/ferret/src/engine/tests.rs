@@ -689,8 +689,10 @@ fn refresh_and_direct_verification_proceed_beside_a_held_merge() {
             let pace = |_| {
                 if let Some(resume) = resume.lock().unwrap().take() {
                     reached.send(()).unwrap();
+                    // Longer than the refresh wait below, so the merge is
+                    // still held when that wait ends.
                     resume
-                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .recv_timeout(std::time::Duration::from_secs(30))
                         .unwrap();
                 }
                 Ok(())

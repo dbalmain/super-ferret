@@ -231,8 +231,8 @@ Beyond the order rules:
   an error for that entry, with exit 1, rather than an unbounded search.
 - **Dates and names:** `-printf` and `-ls` format times in UTC, in the C
   locale, and `-daystart` and date arguments (`-newermt`) are read in UTC,
-  whatever `TZ` says; GNU uses local time for all of these (D139). User and group names come from `/etc/passwd` and
-  `/etc/group` only.
+  whatever `TZ` says; GNU uses local time for all of these (D139). User and
+  group names come from `/etc/passwd` and `/etc/group` only.
 
 ## Resource and expression limits
 

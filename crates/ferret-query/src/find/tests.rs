@@ -1062,9 +1062,11 @@ fn newer_spellings_compare_their_own_time_fields() {
     let at = |seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
     let reference = tree.0.join("reference");
     let late = tree.0.join("late");
+    let stale = tree.0.join("stale");
     for (path, accessed, modified) in [
         (&reference, 2_000_000_000, 1_700_000_000),
         (&late, 1_750_000_000, 1_720_000_000),
+        (&stale, 1_600_000_000, 1_600_000_000),
     ] {
         fs::write(path, b"").unwrap();
         fs::File::options()
@@ -1079,14 +1081,15 @@ fn newer_spellings_compare_their_own_time_fields() {
             .unwrap();
     }
     // The reference's times are distinct: mtime, then ctime (now, before
-    // 2033), then atime. Each of `late`'s falls between the reference's mtime
-    // and its ctime, so comparing against the wrong reference field changes
-    // a row.
+    // 2033), then atime. `late`'s atime and mtime fall between the
+    // reference's mtime and ctime, so comparing against the wrong reference
+    // field changes a row. `stale`'s fall before them all while its ctime is
+    // now, so comparing the wrong field of the file itself does too.
     let reference = reference.to_str().unwrap();
     for (test, value, expected) in [
         ("-newer", reference, "late"),
         ("-anewer", reference, "late reference"),
-        ("-cnewer", reference, "late reference"),
+        ("-cnewer", reference, "late reference stale"),
         ("-newerat", "2030-01-01", "reference"),
         ("-newermt", "2030-01-01", ""),
     ] {
@@ -1097,6 +1100,9 @@ fn newer_spellings_compare_their_own_time_fields() {
             "-o",
             "-name",
             "late",
+            "-o",
+            "-name",
+            "stale",
             ")",
             test,
             value,

@@ -2940,37 +2940,40 @@ fn buffered_stdout_broken_pipe_mid_group_and_late_full_disk() {
     }
 }
 
-// A names listing from the parallel walk spans many chunks, so a full disk
-// fails a write mid-listing rather than only at the final flush; a closed
-// pipe there is still quiet (D94).
+// A names listing spans many chunks, so a full disk fails a write
+// mid-listing rather than only at the final flush, on the serial walk and the
+// parallel one alike; a closed pipe there is still quiet (D94).
 #[test]
-fn parallel_names_listing_fails_on_a_full_disk_mid_listing() {
-    let fixture = Fixture::new("parallel-names-full-disk");
+fn names_listing_fails_on_a_full_disk_mid_listing() {
+    let fixture = Fixture::new("names-full-disk");
     let long = "n".repeat(200);
     for at in 0..3000 {
         fixture.write(&format!("many/{long}-{at}"), b"");
     }
-    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
-    command
-        .args(["grep", "--files", "many"])
-        .env("FERRET_SEARCH_THREADS", "8")
-        .stdout(
-            fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/full")
-                .unwrap(),
+    for threads in ["1", "8"] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .args(["grep", "--files", "many"])
+            .env("FERRET_SEARCH_THREADS", threads)
+            .stdout(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap(),
+            );
+        let output = command.output().unwrap();
+        assert_eq!(
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            (
+                Some(2),
+                "ferret: grep: writing stdout: No space left on device (os error 28)\n".into()
+            ),
+            "{threads} threads"
         );
-    let output = command.output().unwrap();
-    assert_eq!(
-        (
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        (
-            Some(2),
-            "ferret: grep: writing stdout: No space left on device (os error 28)\n".into()
-        )
-    );
+    }
 }
 
 // M5: these comparisons attach each child to a real pty. The helper captures
