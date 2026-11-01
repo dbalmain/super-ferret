@@ -70,94 +70,9 @@ pub(super) fn parse(
     cwd: Option<Arc<PathBuf>>,
     now: std::time::SystemTime,
 ) -> Result<Plan, ParseError> {
-    let mut parser = Parser {
-        args,
-        at: 0,
-        options: Options {
-            cwd,
-            ..Options::default()
-        },
-        action: false,
-        unsupported: None,
-        warnings: Vec::new(),
-        message: None,
-        dialect: Dialect::Emacs,
-        streams: HashMap::new(),
-        exec_id: 0,
-        delete: false,
-        prune: false,
-        explicit_depth: false,
-        daystart: false,
-        now,
-        permission_warning: false,
-        combinators: 0,
-        nesting: 0,
-    };
-    let mut no_ignore = false;
-    while let Some(arg) = parser.peek() {
-        match arg {
-            b"-I" | b"--no-ignore" => no_ignore = true,
-            b"-P" => parser.options.follow = Follow::Physical,
-            b"-H" => parser.options.follow = Follow::Roots,
-            b"-L" => parser.options.follow = Follow::All,
-            b"--" => {}
-            b"-D" => {
-                parser.at += 1;
-                let value = parser.argument(OsStr::new("-D"))?.to_owned();
-                if value.is_empty() {
-                    return Err(invalid(OsStr::new("-D"), &value));
-                }
-                for flag in value.as_bytes().split(|&b| b == b',') {
-                    if flag == b"help" {
-                        parser.message = Some(
-                            "Debug options: exec opt rates search stat time tree all help\n".into(),
-                        );
-                    } else if flag != b"exec"
-                        && flag != b"stat"
-                        && (!value
-                            .as_bytes()
-                            .split(|&b| b == b',')
-                            .any(|part| part == b"help")
-                            || ![
-                                b"opt".as_slice(),
-                                b"rates",
-                                b"search",
-                                b"time",
-                                b"tree",
-                                b"all",
-                            ]
-                            .contains(&flag))
-                    {
-                        parser
-                            .warnings
-                            .push(format!("debug flag {}", String::from_utf8_lossy(flag)));
-                    }
-                }
-                continue;
-            }
-            bytes if bytes.starts_with(b"-O") => {
-                if decimal(&bytes[2..]).is_none() {
-                    return Err(ParseError::Invalid {
-                        primary: "-O".into(),
-                        value: args[parser.at].clone(),
-                    });
-                }
-            }
-            _ => break,
-        }
-        parser.at += 1;
-    }
-    let mut paths = Vec::new();
-    while let Some(bytes) = parser.peek() {
-        if bytes.starts_with(b"-") || bytes == b"(" || bytes == b"!" {
-            break;
-        }
-        paths.push(PathBuf::from(&args[parser.at]));
-        parser.at += 1;
-    }
-    if paths.is_empty() {
-        paths.push(PathBuf::from("."));
-    }
+    let mut parser = Parser::new(args, cwd, now);
+    let no_ignore = parser.leading_options()?;
+    let paths = parser.paths();
     let mut expression = if parser.at == args.len() || parser.message.is_some() {
         parser.at = args.len();
         Expression::Constant(true)
@@ -233,6 +148,104 @@ const MAX_COMBINATORS: usize = 2000;
 const MAX_NESTING: usize = 128;
 
 impl<'a> Parser<'a> {
+    fn new(args: &'a [OsString], cwd: Option<Arc<PathBuf>>, now: std::time::SystemTime) -> Self {
+        Self {
+            args,
+            at: 0,
+            options: Options {
+                cwd,
+                ..Options::default()
+            },
+            action: false,
+            unsupported: None,
+            warnings: Vec::new(),
+            message: None,
+            dialect: Dialect::Emacs,
+            streams: HashMap::new(),
+            exec_id: 0,
+            delete: false,
+            prune: false,
+            explicit_depth: false,
+            daystart: false,
+            now,
+            permission_warning: false,
+            combinators: 0,
+            nesting: 0,
+        }
+    }
+
+    /// The options before the paths; true when one asks for no ignore rules.
+    fn leading_options(&mut self) -> Result<bool, ParseError> {
+        let mut no_ignore = false;
+        while let Some(arg) = self.peek() {
+            match arg {
+                b"-I" | b"--no-ignore" => no_ignore = true,
+                b"-P" => self.options.follow = Follow::Physical,
+                b"-H" => self.options.follow = Follow::Roots,
+                b"-L" => self.options.follow = Follow::All,
+                b"--" => {}
+                b"-D" => {
+                    self.at += 1;
+                    let value = self.argument(OsStr::new("-D"))?;
+                    if value.is_empty() {
+                        return Err(invalid(OsStr::new("-D"), value));
+                    }
+                    self.debug(value.as_bytes());
+                    continue;
+                }
+                bytes if bytes.starts_with(b"-O") => {
+                    if decimal(&bytes[2..]).is_none() {
+                        return Err(ParseError::Invalid {
+                            primary: "-O".into(),
+                            value: self.args[self.at].clone(),
+                        });
+                    }
+                }
+                _ => break,
+            }
+            self.at += 1;
+        }
+        Ok(no_ignore)
+    }
+
+    /// `-D`'s comma-separated flags. Only `exec` and `stat` are accepted
+    /// quietly, as GNU does; `help` lists the rest and quiets them too.
+    fn debug(&mut self, value: &[u8]) {
+        let flags = || value.split(|&b| b == b',');
+        let help = flags().any(|flag| flag == b"help");
+        if help {
+            self.message =
+                Some("Debug options: exec opt rates search stat time tree all help\n".into());
+        }
+        let listed: [&[u8]; 6] = [b"opt", b"rates", b"search", b"time", b"tree", b"all"];
+        for flag in flags() {
+            if flag != b"help"
+                && flag != b"exec"
+                && flag != b"stat"
+                && !(help && listed.contains(&flag))
+            {
+                self.warnings
+                    .push(format!("debug flag {}", String::from_utf8_lossy(flag)));
+            }
+        }
+    }
+
+    /// The start paths, `.` when none are given.
+    fn paths(&mut self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        while let Some(bytes) = self.peek() {
+            if bytes.starts_with(b"-") || bytes == b"(" || bytes == b"!" {
+                break;
+            }
+            paths.push(PathBuf::from(&self.args[self.at]));
+            self.at += 1;
+        }
+        if paths.is_empty() {
+            paths.push(PathBuf::from("."));
+        }
+        paths
+    }
+
     fn nest(&mut self) -> Result<(), ParseError> {
         self.nesting += 1;
         if self.nesting > MAX_NESTING {
