@@ -7775,3 +7775,28 @@ they never see it.
 commands, and the selection difference in A is silent. The fact that would
 change it: if find is used mostly in scripts that already set `TZ=UTC`, A,
 with the documentation fix.
+
+## D140 — Whether a local find checks catalog sections its plan does not read
+
+**Question:** When `ferret find` answers in process (no daemon, or
+`FERRET_NO_DAEMON`), should it check only the catalog sections its plan reads,
+or every section, as search and the daemon do?
+
+A local find now walks the catalog without building the name planner. bb8d16a
+loaded and checked only the sections the plan reads; the p64 review pointed
+out that a damaged section the plan skips (sizes, say, for `-name '*.rs'`)
+then failed `ferret search` but not `ferret find`, which D46 does not allow.
+44c2c67 restored the full check for plain listings. Measured on msa2 against
+a 227k-entry tree, `find -name '*.rs'` takes 22.6 ms with the full check and
+19.1 ms without; it was 31.6 ms before this stretch.
+
+| Option | Costs | Buys |
+| ------ | ----- | ---- |
+| A. Check only the sections the plan reads | A damaged index answers `find` and fails `search`; corruption a find never touches goes unreported until another command trips on it. Diverges from D46. | About 3.5 ms (15%) per local find on 227k entries, growing with the index. |
+| B. Check every section (built, 44c2c67) | 3.5 ms per local find. | One rule for every command: any damaged section fails the query and says so (D46). |
+
+**Recommendation:** B. The saving is small against the time of the walk, and
+a find that succeeds on a damaged index hides the damage from the command
+people run most. The fact that would change it: if nobody relies on `find` to
+surface index damage, because the daemon's open or `ferret status` checks it
+anyway, A.
