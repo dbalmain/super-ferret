@@ -65,6 +65,12 @@ pub(super) fn region(
         },
         whole,
     );
+    // Most expansions keep about the line's length: reserve it once rather
+    // than growing from empty, bounded for a multiline region.
+    output
+        .bytes
+        .try_reserve(region.range.len().min(crate::scan::BUFFER) + 64)
+        .map_err(io::Error::other)?;
     // Every ordinary span in the range expands (D83 A). An empty span at the
     // range's end belongs to it unless that end follows an LF, where it starts
     // the next line.
