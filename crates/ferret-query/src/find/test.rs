@@ -54,10 +54,7 @@ pub(super) enum Test {
         daystart: bool,
         minutes: bool,
     },
-    Used {
-        age: Number,
-        now: SystemTime,
-    },
+    Used(Number),
     Links(Number),
     Inum(Number),
     Uid(Number),
@@ -123,7 +120,7 @@ impl Test {
             Self::Perm { .. } => vec![Mode],
             Self::Size { .. } | Self::Empty => vec![Size],
             Self::Time { field, .. } | Self::Newer { field, .. } => time(*field),
-            Self::Used { .. } => vec![Ctime, CtimeNs],
+            Self::Used(_) => vec![Ctime, CtimeNs],
             Self::Links(_) => vec![Nlink],
             Self::Inum(_) => vec![Dev, Ino],
             Self::Uid(_)
@@ -195,7 +192,7 @@ impl Test {
         };
         let age = parse_number(value, true)?;
         Some(if primary == b"-used" {
-            Self::Used { age, now }
+            Self::Used(age)
         } else {
             Self::Time {
                 field,
@@ -356,41 +353,12 @@ impl Test {
                 minutes,
             } => {
                 let delta = age_nanos(entry_stamp(entry, *field)?, *now, *daystart);
-                let unit_nanos = if *minutes {
-                    60_000_000_000i128
-                } else {
-                    86_400_000_000_000i128
-                };
-                let unit = unit_nanos as f64;
-                if age.value.fract() != 0.0 {
-                    let raw = delta as f64 / unit;
-                    match age.order {
-                        Order::Equal if *minutes => raw > age.value - 1.0 && raw <= age.value,
-                        Order::Equal => raw >= age.value && raw < age.value + 1.0,
-                        // GNU: `-mtime +0.5` is older than 1.5 days, the
-                        // fractional analogue of `+N` meaning "N+1 or more".
-                        Order::Greater if !*minutes => raw > age.value + 1.0,
-                        Order::Greater => raw > age.value,
-                        Order::Less => raw < age.value,
-                    }
-                } else if *minutes && age.order == Order::Less {
-                    // GNU compares the unrounded age here: a 359 s file is
-                    // `-mmin -6` although its whole-minute bucket is 6.
-                    delta < age.value as i128 * unit_nanos
-                } else {
-                    let value = if *minutes {
-                        (delta + unit_nanos - 1).div_euclid(unit_nanos)
-                    } else {
-                        delta.div_euclid(unit_nanos)
-                    };
-                    compare_float(value as f64, age.value, age.order)
-                }
+                age_matches(delta, *age, *minutes)
             }
-            Self::Used { age, now } => {
+            Self::Used(age) => {
                 let access = entry_stamp(entry, TimeField::Access)?;
                 let changed = entry_stamp(entry, TimeField::Change)?;
                 let days = (access - changed) as f64 / 86_400_000_000_000.0;
-                let _ = now;
                 if days < 0.0 {
                     false
                 } else {
@@ -478,6 +446,40 @@ fn compare(actual: u64, expected: u64, order: Order) -> bool {
         Order::Less => actual < expected,
     }
 }
+/// Whether an age of `delta` nanoseconds is `age` days, or minutes, in
+/// GNU's rounding for each.
+fn age_matches(delta: i128, age: Number, minutes: bool) -> bool {
+    let unit_nanos = if minutes {
+        60_000_000_000i128
+    } else {
+        86_400_000_000_000i128
+    };
+    let unit = unit_nanos as f64;
+    if age.value.fract() != 0.0 {
+        let raw = delta as f64 / unit;
+        match age.order {
+            Order::Equal if minutes => raw > age.value - 1.0 && raw <= age.value,
+            Order::Equal => raw >= age.value && raw < age.value + 1.0,
+            // GNU: `-mtime +0.5` is older than 1.5 days, the fractional
+            // analogue of `+N` meaning "N+1 or more".
+            Order::Greater if !minutes => raw > age.value + 1.0,
+            Order::Greater => raw > age.value,
+            Order::Less => raw < age.value,
+        }
+    } else if minutes && age.order == Order::Less {
+        // GNU compares the unrounded age here: a 359 s file is `-mmin -6`
+        // although its whole-minute bucket is 6.
+        delta < age.value as i128 * unit_nanos
+    } else {
+        let value = if minutes {
+            (delta + unit_nanos - 1).div_euclid(unit_nanos)
+        } else {
+            delta.div_euclid(unit_nanos)
+        };
+        compare_float(value as f64, age.value, age.order)
+    }
+}
+
 fn compare_float(actual: f64, expected: f64, order: Order) -> bool {
     match order {
         Order::Equal => actual == expected,
