@@ -16,11 +16,10 @@ fn a_closed_pipe_ends_only_its_own_invocation() {
     assert!(!Output::stdout().closed());
 }
 
-/// An action plan opens only the sections it reads, never the resident
-/// names a `-name` listing's index is built from; a plain listing still
-/// gets the engine.
+/// A local plan, with actions or without, opens only the sections it reads,
+/// never the resident names a name index is built from.
 #[test]
-fn action_plans_open_the_catalog_without_resident_names() {
+fn local_plans_open_the_catalog_without_resident_names() {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let directory = std::env::temp_dir().join(format!(
         "ferret-find-light-open-{}-{}",
@@ -44,14 +43,12 @@ fn action_plans_open_the_catalog_without_resident_names() {
         Plan::parse(&argv).unwrap()
     };
 
-    match open_catalog(&plan(&["-exec", "true", "{}", "+"]), &index) {
-        Ok(FindSource::Sections(catalog)) => assert!(catalog.resident_names().is_none()),
-        _ => panic!("an action plan opened the engine"),
+    for args in [&["-exec", "true", "{}", "+"][..], &["-name", "one"]] {
+        match open_catalog(&plan(args), &index) {
+            Ok(FindSource::Sections(catalog)) => assert!(catalog.resident_names().is_none()),
+            _ => panic!("{args:?} opened the engine"),
+        }
     }
-    assert!(matches!(
-        open_catalog(&plan(&["-name", "one"]), &index),
-        Ok(FindSource::Pinned(_))
-    ));
     let _ = std::fs::remove_dir_all(directory);
 }
 

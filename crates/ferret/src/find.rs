@@ -15,7 +15,7 @@ use ferret_query::find::{Effects, Outcome, OutputBuffer, Plan, Unsupported, Walk
 
 use crate::cli::{self, Exit};
 use crate::config_file::Contents;
-use crate::engine::{Engine, QuerySession};
+use crate::engine::QuerySession;
 use crate::find_json::{self, FrameOutput};
 use crate::protocol::ChildStdin;
 use crate::xdg::Dirs;
@@ -111,20 +111,13 @@ fn open_catalog(plan: &Plan, index: &Path) -> Result<FindSource, String> {
             index.display()
         )
     };
-    if plan.has_side_effects() {
-        let failed = |error| format!("{}: {error}; re-index or use -I", index.display());
-        let catalog = Catalog::open(index).map_err(failed)?.ok_or_else(missing)?;
-        catalog.load(&plan.catalog_sections()).map_err(failed)?;
-        return Ok(FindSource::Sections(Box::new(catalog)));
-    }
-    match Engine::open_one_shot(index) {
-        Ok(Some(engine)) => Ok(FindSource::Pinned(Box::new(engine.pin()))),
-        Ok(None) => Err(missing()),
-        Err(error) => Err(format!(
-            "cannot open index in {}: {error}; re-index or use -I",
-            index.display()
-        )),
-    }
+    // Postings need a resident name index, which only the daemon holds;
+    // building one for a single find costs more than the walk, so a local
+    // find loads just the sections its plan reads.
+    let failed = |error| format!("{}: {error}; re-index or use -I", index.display());
+    let catalog = Catalog::open(index).map_err(failed)?.ok_or_else(missing)?;
+    catalog.load(&plan.catalog_sections()).map_err(failed)?;
+    Ok(FindSource::Sections(Box::new(catalog)))
 }
 
 // Routing must precede engine open. Effects stay local; so do live routes.

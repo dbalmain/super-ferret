@@ -128,8 +128,7 @@ impl Engine {
     /// every section is loaded and checked as before, but the catalog keeps
     /// its raw name heap instead of interning it, and the name planner is
     /// built only if a query needs it. A content-only query such as grep
-    /// never does, and find walks rather than build an index for one query,
-    /// so both skip both builds.
+    /// never does, so it skips both builds.
     pub fn open_one_shot(index: &Path) -> Result<Option<Self>, OpenError> {
         let Some(catalog) = Catalog::open(index)? else {
             return Ok(None);
