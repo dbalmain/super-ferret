@@ -280,7 +280,8 @@ impl Split {
                 let mut counts = vec![0; parts];
                 let from = NameId((c * chunk) as u32);
                 for ((_, name), slot) in names.runs_from(from).zip(out.iter_mut()) {
-                    let p = splitters.partition_point(|&s| s <= prefix(name.bytes));
+                    let key = prefix(name.bytes);
+                    let p = splitters.partition_point(|&s| s <= key);
                     *slot = p as u8;
                     counts[p] += 1;
                 }
