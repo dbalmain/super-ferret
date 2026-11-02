@@ -250,15 +250,15 @@ impl Entry {
     /// Trailing slashes are omitted, except for an all-slash root operand.
     pub fn name(&self) -> &[u8] {
         let bytes = self.path.as_slice();
-        let end = bytes
-            .iter()
-            .rposition(|&b| b != b'/')
-            .map_or(bytes.len(), |i| i + 1);
-        let trimmed = &bytes[..end];
-        if trimmed.iter().all(|&b| b == b'/') {
+        let Some(last) = bytes.iter().rposition(|&b| b != b'/') else {
             return b"/";
-        }
-        trimmed.rsplit(|&b| b == b'/').next().unwrap_or(trimmed)
+        };
+        let trimmed = &bytes[..=last];
+        let start = trimmed
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map_or(0, |i| i + 1);
+        &trimmed[start..]
     }
     /// lstat, at most once for this entry (including failures). A start operand
     /// has the metadata that established its existence already cached.
@@ -773,6 +773,26 @@ impl Drop for Charge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_is_the_last_component_without_trailing_slashes() {
+        for (path, name) in [
+            ("/", "/"),
+            ("///", "/"),
+            ("", "/"),
+            ("a", "a"),
+            ("a/", "a"),
+            ("a//", "a"),
+            ("./a/bc", "bc"),
+            ("/a/bc//", "bc"),
+            ("//bc", "bc"),
+            (".", "."),
+            ("../..", ".."),
+        ] {
+            let entry = Entry::new(PathBuf::from(path), 0, FileKind::File);
+            assert_eq!(entry.name(), name.as_bytes(), "{path:?}");
+        }
+    }
 
     #[test]
     fn access_tests_leave_the_metadata_cache_unobserved() {
