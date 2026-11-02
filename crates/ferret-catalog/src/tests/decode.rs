@@ -81,36 +81,67 @@ fn descriptor(column: Column) -> usize {
     TABLE_END - 16 - (COLUMNS.len() - column as usize) * 16
 }
 
-/// Overwrites row `row` of `column` with the packed value `raw`, leaving
-/// everything else as it was. In a blocked column, `raw` is above the row's
-/// block's base, at its block's width.
-fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
+/// Where row `row` of `column` is packed: the start of its values, their
+/// width, the row's index among them, and in a blocked column the byte
+/// where its block's base is stored.
+fn packed_row(bytes: &[u8], column: Column, row: usize) -> (usize, usize, usize, Option<usize>) {
     let signed = resigned(bytes.to_vec());
     let layout = format::decode_table(&signed, bytes.len() as u64).unwrap();
     let placed = layout.columns[column as usize];
     let start =
         section_start(bytes, column.section()) + placed.start + placed.desc.dict_len as usize * 8;
-    let (values, width, row) = match column.coding() {
+    match column.coding() {
         coding if coding.is_blocked() => {
             let count = layout.count(column.rows()) as u32;
-            let entry = start + row / packed::BLOCK_ROWS * packed::BLOCK_ENTRY as usize + 8;
-            let word = u64::from_le_bytes(bytes[entry..entry + 8].try_into().unwrap());
+            let entry = start + row / packed::BLOCK_ROWS * packed::BLOCK_ENTRY as usize;
+            let word = u64::from_le_bytes(bytes[entry + 8..entry + 16].try_into().unwrap());
             let table = (packed::blocks(count) * packed::BLOCK_ENTRY) as usize;
             let values = start + table + (word >> 8) as usize;
-            (values, (word & 0x7F) as u32, row % packed::BLOCK_ROWS)
+            let width = (word & 0x7F) as usize;
+            (values, width, row % packed::BLOCK_ROWS, Some(entry))
         }
-        _ => (start, placed.desc.width, row),
-    };
+        _ => (start, placed.desc.width as usize, row, None),
+    }
+}
+
+/// Overwrites row `row` of `column` with the packed value `raw`, leaving
+/// everything else as it was. In a blocked column, `raw` is above the row's
+/// block's base, at its block's width.
+fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
+    let (values, width, row, _) = packed_row(bytes, column, row);
     assert!(
-        raw <= packed::mask(width),
+        raw <= packed::mask(width as u32),
         "{raw} does not fit {width} bits"
     );
-    let width = width as usize;
     for bit in 0..width {
         let at = row * width + bit;
         let byte = &mut bytes[values + at / 8];
         *byte = (*byte & !(1 << (at % 8))) | (((raw >> bit) & 1) as u8) << (at % 8);
     }
+}
+
+/// Makes row `row` of the blocked column `column` read `value`: its packed
+/// value when that fits above its block's base, else by moving the base,
+/// which moves the rest of the block with it. False when neither can.
+fn set_value(bytes: &mut [u8], column: Column, row: usize, value: u64) -> bool {
+    let (values, width, at, entry) = packed_row(bytes, column, row);
+    let Some(entry) = entry else {
+        panic!("{column:?} is not blocked")
+    };
+    let base = u64::from_le_bytes(bytes[entry..entry + 8].try_into().unwrap());
+    if value >= base && value - base <= packed::mask(width as u32) {
+        set_raw(bytes, column, row, value - base);
+        return true;
+    }
+    let raw = (0..width).fold(0, |raw, bit| {
+        let bit_at = at * width + bit;
+        raw | u64::from(bytes[values + bit_at / 8] >> (bit_at % 8) & 1) << bit
+    });
+    let Some(base) = value.checked_sub(raw) else {
+        return false;
+    };
+    bytes[entry..entry + 8].copy_from_slice(&base.to_le_bytes());
+    true
 }
 
 /// Overwrites the base of block `block` of the blocked column `column`: every
@@ -1299,32 +1330,54 @@ fn a_small_resident_conversion_starts_no_thread() {
 }
 
 /// A names table checked in row ranges on several threads fails as one pass
-/// does: for corruptions on either side of each range's edge (the rows that
-/// seed a range, and the first rows it checks itself) and at the table's
-/// end, and for two corruptions in different ranges, where the first in row
-/// order, or a wrong NUL count before either, must win.
+/// does. The table is laid out so that each range's edge falls where the
+/// seeding rows matter: a parent change between the two seed rows, then
+/// at the edge itself, then between the seed rows again, with directory
+/// children in every range. Every row near an edge, and the table's ends,
+/// gets each corruption below, and each must be rejected the same way; so
+/// must one NUL too many in each quarter of the heap, which only the NUL
+/// count sees, and pairs of errors in different ranges, where the first in
+/// row order, or a wrong NUL count before either, must win.
 #[test]
 fn a_names_table_checked_in_ranges_fails_as_one_pass_does() {
     use crate::fan_out::seam::Seams;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    const FILES: usize = 40_000;
+    // Under the root, in name order: directories a to d (ids 1 to 4); then
+    // a's files; b's files and directory s (5); c's files and t (6); d's
+    // files and z (7); z's files and yy (8). s, t and yy are empty.
+    let (a, b, c, d, z) = (10_043, 10_048, 10_046, 4_900, 4_955);
+    let files = |count: usize| (0..count).map(|i| format!("f{i:05}").into_bytes());
+    let mut rows: Vec<(u64, Vec<u8>)> = [b"a", b"b", b"c", b"d"]
+        .into_iter()
+        .map(|name| (0, name.to_vec()))
+        .collect();
+    rows.extend(files(a).map(|name| (1, name)));
+    rows.extend(files(b).chain([b"s".to_vec()]).map(|name| (2, name)));
+    rows.extend(files(c).chain([b"t".to_vec()]).map(|name| (3, name)));
+    rows.extend(files(d).chain([b"z".to_vec()]).map(|name| (4, name)));
+    rows.extend(files(z).chain([b"yy".to_vec()]).map(|name| (7, name)));
+    assert_eq!(rows.len(), 40_000);
     let scratch = Scratch::new("decode-names-ranges");
     commit(&scratch.path, |txn| {
         let mut w = txn.batch();
         let root = w.root(b"/r", dir_stat(1));
-        // Under a directory, so a seeded parent is 1, not the 0 a range
-        // starts from.
-        let dir = w.dir(root, b"d", dir_stat(2));
-        for i in 0..FILES {
-            let name = format!("f{i:05}");
-            w.file(
-                dir,
-                name.as_bytes(),
-                file_stat(10 + i as u64),
-                Content::Unindexed,
-            );
+        let mut ino = 10;
+        let mut stat = || {
+            ino += 1;
+            file_stat(ino)
+        };
+        let [a_dir, b_dir, c_dir, d_dir] = [b"a", b"b", b"c", b"d"]
+            .map(|name| w.dir(root, name, dir_stat(2 + u64::from(name[0]))));
+        w.dir(b_dir, b"s", dir_stat(200));
+        w.dir(c_dir, b"t", dir_stat(201));
+        let z_dir = w.dir(d_dir, b"z", dir_stat(202));
+        w.dir(z_dir, b"yy", dir_stat(203));
+        for (dir, count) in [(a_dir, a), (b_dir, b), (c_dir, c), (d_dir, d), (z_dir, z)] {
+            for name in files(count) {
+                w.file(dir, &name, stat(), Content::Unindexed);
+            }
         }
         txn.add(w);
     });
@@ -1342,79 +1395,133 @@ fn a_names_table_checked_in_ranges_fails_as_one_pass_does() {
     };
     assert_eq!(decode(&bytes, 1), (Ok(()), false));
     assert_eq!(decode(&bytes, 4), (Ok(()), true));
-    // Row 0 is `d`; row `r` after it is file `r - 1`, 6 bytes and its NUL.
-    // The heap's 280,002 bytes do not split evenly in four.
+    // The heap is the names in row order, each with its NUL.
     let heap = section_start(&bytes, Section::NameHeap);
-    let at = |row: usize| heap + 2 + 7 * (row - 1);
-    assert_eq!(&bytes[at(12_346)..at(12_347)], b"f12345\0");
-    let mut cases = Vec::new();
-    // Four threads take ranges of 10,048 rows, the 40,001 rounded up to
-    // whole runs; the last ends at the table's end.
-    for row in [10_048, 20_096, 30_144]
-        .into_iter()
-        .flat_map(|edge| edge - 2..edge + 2)
-        .chain([FILES - 1, FILES])
-    {
-        // Out of sibling order after its predecessor, or before its
-        // successor.
-        for first in [b'a', b'~'] {
-            let mut flipped = bytes.clone();
-            flipped[at(row)] = first;
-            cases.push(flipped);
-        }
-        // An empty name: the previous name's NUL moved onto this one's
-        // first byte, keeping the count.
-        let mut emptied = bytes.clone();
-        emptied[at(row) - 1] = b'x';
-        emptied[at(row)] = 0;
-        cases.push(emptied);
-        // One NUL too many, inside a name.
-        let mut extra = bytes.clone();
-        extra[at(row) + 1] = 0;
-        cases.push(extra);
-        // An offset moved back into an earlier name, unless it already
-        // starts its block, which leaves it where it is.
-        for raw in [0, 1] {
-            let mut moved = bytes.clone();
-            set_raw(&mut moved, Column::NameOffset, row, raw);
-            if moved != bytes {
-                cases.push(moved);
-            }
-        }
+    let mut offsets = Vec::new();
+    let mut expected = Vec::new();
+    for (_, name) in &rows {
+        offsets.push(expected.len() as u64);
+        expected.extend_from_slice(name);
+        expected.push(0);
     }
-    // Rows 20,096 to 20,223, one block that starts the third range, back
-    // under the root: a parent that falls across the range's edge.
-    let mut fallen = bytes.clone();
-    set_block_base(
-        &mut fallen,
-        Column::NameParent,
-        20_096 / packed::BLOCK_ROWS,
-        0,
+    let len = expected.len() as u64;
+    // A heap that splits unevenly in four, so no quarter's NUL count may
+    // round its end down.
+    assert_eq!(len % 4, 1);
+    assert_eq!(&bytes[heap..heap + expected.len()], expected);
+    let at = |row: usize| heap + offsets[row] as usize;
+    // Four threads take ranges of 10,048 rows, the 40,000 rounded up to
+    // whole runs. A parent changes between rows 10,046 and 10,047, at
+    // 20,096, and between 30,142 and 30,143.
+    let edges = [10_048, 20_096, 30_144];
+    assert_eq!(
+        edges.map(|edge| (rows[edge - 2].0, rows[edge - 1].0, rows[edge].0)),
+        [(1, 2, 2), (2, 2, 3), (3, 4, 4)]
     );
-    cases.push(fallen);
+    let near = edges
+        .into_iter()
+        .flat_map(|edge| edge - 3..edge + 2)
+        .chain([1, rows.len() - 2, rows.len() - 1]);
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut case = |label: String, change: &dyn Fn(&mut Vec<u8>) -> bool| {
+        let mut corrupt = bytes.clone();
+        if change(&mut corrupt) && corrupt != bytes {
+            cases.push((label, corrupt));
+        }
+    };
+    for row in near {
+        let last = row + 1 == rows.len();
+        let offset = offsets[row];
+        let mut values = vec![
+            offsets[row - 1],
+            offsets[row - 1] + 1,
+            offset - 1,
+            len - 1,
+            len,
+            len + 7,
+            0,
+        ];
+        if !last {
+            values.extend([offset + 1, offsets[row + 1]]);
+        }
+        for value in values {
+            case(format!("row {row} offset {value}"), &|b| {
+                set_value(b, Column::NameOffset, row, value)
+            });
+        }
+        let parent = rows[row].0;
+        for value in [parent.wrapping_sub(1), parent + 1, 9, u64::from(u32::MAX)] {
+            if value == 0 || row + 1 < rows.len() && rows[row + 1].0 > parent {
+                // Moving the last of a directory's names to the next
+                // parent, or the root, can leave the table in order.
+                continue;
+            }
+            case(format!("row {row} parent {value}"), &|b| {
+                set_value(b, Column::NameParent, row, value)
+            });
+        }
+        for byte in [b'a', b'~', 0] {
+            let first = rows[row - 1].0 != rows[row].0;
+            let closing = last || rows[row + 1].0 != rows[row].0;
+            if byte == b'a' && first || byte == b'~' && closing {
+                // The first or last of its directory's names: still in
+                // order.
+                continue;
+            }
+            case(format!("row {row} first byte {byte}"), &|b| {
+                b[at(row)] = byte;
+                true
+            });
+        }
+        case(format!("row {row} previous name unterminated"), &|b| {
+            b[at(row) - 1] = b'x';
+            true
+        });
+    }
+    // One NUL too many in each quarter of the heap, at the end of a name
+    // ending in 0 that is not the first of its directory: "f10050" becomes
+    // "f1005", still between "f10049" and "f10051".
+    for quarter in 0..4 {
+        let from = quarter * len / 4 + 64;
+        let row = (0..rows.len())
+            .find(|&r| {
+                offsets[r] >= from
+                    && rows[r].1.len() == 6
+                    && rows[r].1[5] == b'0'
+                    && rows[r - 1].0 == rows[r].0
+                    && rows[r + 1].0 == rows[r].0
+            })
+            .unwrap();
+        case(format!("row {row} extra NUL"), &|b| {
+            b[at(row) + 5] = 0;
+            true
+        });
+    }
     // A sibling-order error in the first range and an offset error in the
     // second; an offset error in the first and one NUL too many in the last.
     // A one-thread decode runs the same code, so these say what must win.
     let mut two = bytes.clone();
     two[at(5)] = b'a';
-    set_raw(&mut two, Column::NameOffset, 10_100, 0);
+    assert!(set_value(
+        &mut two,
+        Column::NameOffset,
+        10_100,
+        offsets[10_000]
+    ));
     assert_eq!(decode(&two, 4).0, Err(DecodeError::Corrupt("name order")));
-    cases.push(two);
+    cases.push(("two: order, then offset".into(), two));
     let mut two = bytes.clone();
-    set_raw(&mut two, Column::NameOffset, 3, 0);
+    assert!(set_value(&mut two, Column::NameOffset, 3, 0));
     assert_eq!(decode(&two, 4).0, Err(DecodeError::Corrupt("names")));
-    two[at(35_000) + 1] = 0;
+    two[at(35_010) + 5] = 0;
     assert_eq!(decode(&two, 4).0, Err(DecodeError::Corrupt("name order")));
-    cases.push(two);
-    let mut rejected = 0;
-    for case in &cases {
+    cases.push(("two: offset, then NUL count".into(), two));
+    // Every corruption the loops above make changes the file; one that
+    // stopped doing so would drop out here.
+    assert_eq!(cases.len(), 274);
+    for (label, case) in &cases {
         let (serial, _) = decode(case, 1);
-        rejected += usize::from(serial.is_err());
-        assert_eq!(decode(case, 4).0, serial, "case {rejected}");
+        assert!(serial.is_err(), "{label}: accepted");
+        assert_eq!(decode(case, 4).0, serial, "{label}");
     }
-    assert!(
-        rejected + 2 >= cases.len(),
-        "{rejected} of {} rejected",
-        cases.len()
-    );
 }
