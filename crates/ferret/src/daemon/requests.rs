@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::io::BufReader;
 use std::os::unix::ffi::OsStrExt;
 
+use super::permits::admit;
 use super::*;
 use crate::protocol::{Op, Request};
 

@@ -37,9 +37,8 @@ mod plan;
 mod report;
 mod source;
 
-pub(crate) use hasher::Hasher;
 #[cfg(test)]
-pub(crate) use hasher::{DRAIN_MIN, Deferred, PROBES, Probe};
+pub(crate) use hasher::{DRAIN_MIN, Deferred, Hasher, PROBES, Probe};
 use plan::{Plan, configured_roots, normalise, strictly_inside};
 #[cfg(test)]
 pub(crate) use report::content_faults;

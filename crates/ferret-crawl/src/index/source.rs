@@ -4,7 +4,7 @@
 use ferret_catalog::{Content, Stat};
 
 use super::*;
-use crate::index::hasher::Output;
+use crate::index::hasher::{Hasher, Output};
 use crate::observe::Cache;
 use crate::walk::{WalkOptions, walk_parallel};
 

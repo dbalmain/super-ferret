@@ -29,7 +29,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use endpoint::Endpoint;
-use permits::{Permits, admit};
+use permits::Permits;
 use requests::connection;
 
 use crate::engine::{Engine, QuerySession};
