@@ -1,7 +1,14 @@
 //! What a run reports: its counts and publication, the roots it
 //! withdrew, and the errors that publish nothing.
 
+use std::os::unix::ffi::OsStrExt;
+use std::{fmt, io};
+
+use ferret_catalog::{CommitError, ContentState, DirToken, KeepError, NameId};
+
 use super::*;
+use crate::observe::ContentFault;
+use crate::walk::IoOp;
 
 /// Owned walker context retained until all workers have finished.
 #[derive(Clone, Debug)]

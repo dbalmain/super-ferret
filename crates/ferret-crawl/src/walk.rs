@@ -26,18 +26,15 @@
 //! path, which on Linux reads the link the descriptor refers to). The stat
 //! in the event and the stored target cannot disagree.
 
-use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
-use std::thread;
+use std::sync::Mutex;
+use std::{io, thread};
 
-use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
+use ferret_policy::{Config, Decision, DirRules, Entry, PatternError};
 use rustix::fs::{
     AtFlags, FileType, Mode, OFlags, RawDir, fstat, open as open_path, openat, readlinkat, statat,
 };

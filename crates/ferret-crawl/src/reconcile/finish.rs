@@ -1,6 +1,8 @@
 //! Settling a walk's placements: edges, inodes and documents become the
 //! records of the final change set.
 
+use ferret_catalog::DocId;
+
 use super::*;
 
 impl Final<'_> {

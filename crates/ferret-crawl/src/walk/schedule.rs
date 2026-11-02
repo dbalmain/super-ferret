@@ -2,6 +2,10 @@
 //! stack and hands its oldest job to an idle worker, and open directory
 //! descriptors in queued jobs stay within [`MAX_OPEN_JOBS`].
 
+use std::collections::VecDeque;
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use super::*;
 use crate::lock;
 

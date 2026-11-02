@@ -2,7 +2,16 @@
 //! shares its parents with the last one reopens only what differs; and the
 //! process-wide budget that bounds them.
 
+use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, OnceLock, PoisonError, TryLockError, Weak};
+use std::time::Duration;
+
+use ferret_catalog::InoId;
+
 use super::*;
+use crate::lock;
 
 impl Documents {
     /// Keeps each checked directory walk's descriptors for later paths

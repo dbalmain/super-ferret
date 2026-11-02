@@ -18,8 +18,7 @@ use rustix::fs::inotify::{self, ReadFlags, WatchFlags};
 use rustix::fs::{Mode, OFlags, fstat, openat};
 use rustix::io::Errno;
 
-use crate::lock;
-use crate::{RefreshReason, RefreshRequest, RefreshScope, RenameHint};
+use crate::{RefreshReason, lock};
 
 mod aliases;
 mod burst;

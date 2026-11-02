@@ -1,6 +1,7 @@
 //! Watches registered at policy reads. Parent watches also catch atomic saves
 //! and creation of absent inputs; followed symlinks register their target too.
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::ffi::OsStrExt;
 
 use super::*;
 use crate::lock;

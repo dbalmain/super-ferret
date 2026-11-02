@@ -3,6 +3,8 @@
 //! its listing. Every open below the root is `O_NOFOLLOW` and checked
 //! against the inode the walk already reported.
 
+use std::os::fd::AsFd;
+
 use super::*;
 
 impl<V: EventVisitor> Walker<'_, V> {

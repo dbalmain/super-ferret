@@ -2,6 +2,12 @@
 //! starts a work tree and where that tree's `info/exclude` lives; and
 //! [`load_policy`], which reads them for one directory outside a walk.
 
+use std::io::Read;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::ffi::OsStrExt;
+
+use ferret_policy::IgnoreFiles;
+
 use super::*;
 
 /// What `.git` is. The crawl leaves a symlink as [`GitProbe::Present`] and

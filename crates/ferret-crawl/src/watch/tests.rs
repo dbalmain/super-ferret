@@ -3,9 +3,10 @@
 use std::fs;
 use std::sync::RwLockReadGuard;
 
-use super::*;
-use crate::{IndexOptions, Refresh, index};
 use ferret_catalog::WriterSession;
+
+use super::*;
+use crate::{IndexOptions, Refresh, RefreshScope, index};
 
 struct Tree {
     _fds: RwLockReadGuard<'static, ()>,

@@ -2,6 +2,8 @@
 //! inputs, failures and aliases whose root is gone, then each descriptor
 //! whose directories no longer resolve.
 
+use std::os::unix::ffi::OsStrExt;
+
 use super::*;
 
 impl Watch {

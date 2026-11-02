@@ -1,5 +1,7 @@
 //! Sparse physical hard-link proofs. A file with an unindexed link needs
 //! polling because directory events do not cover writes through that name.
+use std::os::unix::ffi::OsStrExt;
+
 use super::*;
 use crate::lock;
 

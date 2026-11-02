@@ -25,23 +25,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::fmt;
-use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ferret_catalog::{
-    BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, NameId,
-    Stat, Transaction, WriterSession,
-};
-use ferret_policy::{Config, Decision, Reason};
+use ferret_catalog::{BeginError, Catalog, Content, InoId, Stat, Transaction, WriterSession};
+use ferret_policy::Config;
 
-use crate::observe::{self, Cache, ContentFault, Lookup, Observation, Opened, Reader};
-use crate::walk::{
-    Boundary, Decided, Event, EventVisitor, FaultContext, IoOp, WalkOptions, WorkTreeKind,
-    walk_parallel,
-};
+use crate::observe::{self, Cache};
+use crate::walk::{Boundary, WalkOptions, walk_parallel};
 
 mod hasher;
 mod report;

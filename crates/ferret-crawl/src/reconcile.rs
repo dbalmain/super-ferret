@@ -15,7 +15,7 @@ mod finish;
 use ferret_catalog::batch::DirectoryObservation;
 use ferret_catalog::log::{ChangeSet, Error, Record};
 use ferret_catalog::{
-    Batch, Catalog, Content, DecodeError, DirToken, DocId, Hash, InoId, Kind, NameId, Stat, Target,
+    Batch, Catalog, Content, DecodeError, DirToken, Hash, InoId, Kind, NameId, Stat, Target,
     WriterSession,
 };
 

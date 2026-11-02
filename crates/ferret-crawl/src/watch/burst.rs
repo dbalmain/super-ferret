@@ -1,7 +1,10 @@
 //! A burst's refresh request: the paths it touched, narrowed to what the
 //! catalog view still names, and the rename hints its paired moves give.
 
+use std::os::unix::ffi::OsStrExt;
+
 use super::*;
+use crate::{RefreshRequest, RefreshScope, RenameHint};
 
 #[derive(Default)]
 struct MovePair {

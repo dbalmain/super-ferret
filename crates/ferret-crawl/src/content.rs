@@ -20,18 +20,15 @@
 
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use ferret_catalog::bulk::Limiter;
-use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
+use ferret_catalog::{Catalog, DocId, NameId, OpenError, Section, Target};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 
 use crate::ContentFault;
-use crate::lock;
 use crate::observe::{BulkRead, Opened, Reader, bracket, bracket_search, catalog_stat};
 
 mod held;
