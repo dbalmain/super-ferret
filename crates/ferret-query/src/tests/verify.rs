@@ -640,21 +640,30 @@ fn the_name_ordering_pass_asks_to_stop() {
         false
     };
     let mut names = [NameId(5), NameId(1)];
-    assert_eq!(crate::plan::order(&starts, &mut names, &count), Some(()));
+    assert_eq!(
+        crate::plan::doc_names::order(&starts, &mut names, &count),
+        Some(())
+    );
     assert_eq!(names, [NameId(1), NameId(5)]);
     assert_eq!(asked.load(Ordering::Relaxed), 4);
     // A stop at the second check leaves the last document as it was.
     let mut names = [NameId(5), NameId(1)];
     let calls = AtomicUsize::new(0);
     let stop_second = || calls.fetch_add(1, Ordering::Relaxed) >= 1;
-    assert_eq!(crate::plan::order(&starts, &mut names, &stop_second), None);
+    assert_eq!(
+        crate::plan::doc_names::order(&starts, &mut names, &stop_second),
+        None
+    );
     assert_eq!(names, [NameId(5), NameId(1)]);
     // One long document, second: asked before its sort.
     let starts = [0, 1, 1 + every as u32];
     let mut names: Vec<_> = (0..=every as u32).rev().map(NameId).collect();
     let calls = AtomicUsize::new(0);
     let stop_second = || calls.fetch_add(1, Ordering::Relaxed) >= 1;
-    assert_eq!(crate::plan::order(&starts, &mut names, &stop_second), None);
+    assert_eq!(
+        crate::plan::doc_names::order(&starts, &mut names, &stop_second),
+        None
+    );
     assert!(!names[1..].is_sorted());
 }
 
