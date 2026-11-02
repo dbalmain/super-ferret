@@ -105,6 +105,9 @@ pub(super) fn scan_records(
             // `usize::MAX` when the rest of the run selects nothing.
             let mut hit_line = None;
             let mut hit_boundary = None;
+            // The first LF at or after a line start, when `next_hit` found
+            // it: `(line start, LF offset in the rest)`.
+            let mut first_lf = None;
             let mut line_start = 0;
             // How often hits fall on their search's first line: a
             // saturating counter, trusted from 2 of 3.
@@ -170,8 +173,9 @@ pub(super) fn scan_records(
                             Some(hit) if hit >= start => hit,
                             _ => {
                                 let open = !terminated && binary.is_none();
-                                let (hit, boundary) =
-                                    next_hit(&search, text, start, open, before_lines);
+                                let (hit, boundary, lf) =
+                                    next_hit(&search, text, start, open, before_lines, plan.invert);
+                                first_lf = lf.map(|lf| (start, lf));
                                 hit_boundary = Some(boundary);
                                 hit_line = Some(hit);
                                 hit
@@ -202,7 +206,11 @@ pub(super) fn scan_records(
                     }
                     line_start = start;
                     let rest = &text[start..];
-                    match memchr::memchr(b'\n', rest) {
+                    let lf = match first_lf {
+                        Some((at, lf)) if at == start => lf,
+                        _ => memchr::memchr(b'\n', rest),
+                    };
+                    match lf {
                         Some(at) => {
                             next = Some(start + at + 1);
                             &rest[..at]
@@ -352,16 +360,28 @@ fn render(
 /// `usize::MAX` when none is, with where the lines worth visiting before it
 /// begin: the last `before` lines, or the run's last line when nothing more is
 /// selected. `open` says a final LF may still be followed by more input.
+/// With a hit and `visit_first`, also the first LF in the rest (`None`
+/// inside when there is none): a hit on the first line then needs no search
+/// back for its start, and the caller, which visits that line (as `-v`
+/// does), splits it without searching again.
 fn next_hit(
     search: &Search<'_>,
     text: &[u8],
     start: usize,
     open: bool,
     before: u64,
-) -> (usize, usize) {
+    visit_first: bool,
+) -> (usize, usize, Option<Option<usize>>) {
     let rest = &text[start..];
+    let mut first_lf = None;
     let hit = search.matching_line(rest).map_or(usize::MAX, |hit| {
-        start + memchr::memrchr(b'\n', &rest[..hit]).map_or(0, |at| at + 1)
+        let lf = visit_first.then(|| memchr::memchr(b'\n', rest));
+        first_lf = lf;
+        if lf.is_some_and(|lf| lf.is_none_or(|lf| hit <= lf)) {
+            start
+        } else {
+            start + memchr::memrchr(b'\n', &rest[..hit]).map_or(0, |at| at + 1)
+        }
     });
     let boundary = if hit == usize::MAX {
         let end = if open && text.ends_with(b"\n") {
@@ -375,7 +395,7 @@ fn next_hit(
     } else {
         start + context::tail_start(&text[start..hit - 1], before)
     };
-    (hit, boundary)
+    (hit, boundary, first_lf)
 }
 
 /// Counts and emits a selected line: its spans under `-o` or a match count,
