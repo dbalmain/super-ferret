@@ -3,8 +3,8 @@
 //! descriptors in queued jobs stay within [`MAX_OPEN_JOBS`].
 
 use std::collections::VecDeque;
-use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use super::*;
 use crate::lock;

@@ -20,7 +20,6 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use ferret_text::trigram_key;
 use regex_syntax::hir::{Class, Hir, HirKind};
 
 use crate::matcher::{Regex, RegexError};

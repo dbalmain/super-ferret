@@ -3,7 +3,6 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -19,6 +18,7 @@ use crate::engine::QuerySession;
 use crate::find_json::{self, FrameOutput};
 use crate::protocol::ChildStdin;
 use crate::xdg::Dirs;
+use std::os::unix::ffi::OsStrExt;
 
 pub(crate) const PERMISSION_WARNING: &str =
     "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form";

@@ -27,11 +27,9 @@
 //! in the event and the stored target cannot disagree.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 use std::{io, thread};
 
 use ferret_policy::{Config, Decision, DirRules, Entry, PatternError};

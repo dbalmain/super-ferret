@@ -14,8 +14,8 @@ use intpack::pfor128skip::{self, SortedCursor};
 use super::fingerprint::{self, Index as FingerprintIndex};
 use super::{
     ALL, BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FORMAT_VERSION, HEAD, HEAD_MAX, MAGIC,
-    POSTINGS_CODEC, ReadError, Section, TABLE_ENTRY, checksum, chunks, head_len, sections, take,
-    u32_at, u64_at,
+    POSTINGS_CODEC, ReadError, Section, TABLE_ENTRY, checksum, chunks, head_len, sections, u32_at,
+    u64_at,
 };
 
 mod block_index;

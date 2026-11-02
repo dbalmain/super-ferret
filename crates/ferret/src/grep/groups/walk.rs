@@ -12,6 +12,7 @@ use super::job::{Job, Observed, Scratch};
 use super::publish::{Handoff, Search, weight};
 use super::source::{Filter, Source};
 use super::*;
+use crate::grep::host::report_shortfall;
 use crate::lock;
 
 /// Searches `source`'s operands with the walk itself spread over `threads`

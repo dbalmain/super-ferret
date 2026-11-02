@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use ferret_catalog::bulk::Limiter;
 use ferret_catalog::{Catalog, DocId, NameId, OpenError, Section, Target};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
 
 use crate::ContentFault;
 use crate::observe::{BulkRead, Opened, Reader, bracket, bracket_search, catalog_stat};

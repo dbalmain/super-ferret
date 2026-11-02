@@ -2,6 +2,7 @@
 //! parsed and checked at open; the places between samples decode on demand.
 
 use super::*;
+use crate::segment::take;
 
 /// One block's place, decoded from the resident index bytes.
 ///

@@ -2,6 +2,7 @@
 //! starts a work tree and where that tree's `info/exclude` lives; and
 //! [`load_policy`], which reads them for one directory outside a walk.
 
+use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;

@@ -1,6 +1,7 @@
 //! D109 regressions through the real scheduler, renderer and publisher.
 
 use std::sync::Condvar;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use ferret_catalog::NameId;

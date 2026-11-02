@@ -32,7 +32,6 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::thread::ScopedJoinHandle;
 
 use ferret_text::{TERM_VERSION, TRIGRAM_VERSION};
 
@@ -46,9 +45,8 @@ use crate::{merge, regular};
 mod follow;
 mod merging;
 mod paced;
-use paced::{Paced, PacedInput};
 #[cfg(test)]
-use paced::{RECENT_PAGES, input_trace};
+use paced::input_trace;
 
 /// Follow flush charge for terms plus 16 bytes per buffered trigram pair.
 /// The fixed trigram allocation is separate from this charge (D70).

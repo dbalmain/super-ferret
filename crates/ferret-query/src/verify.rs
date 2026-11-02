@@ -65,7 +65,7 @@
 //! documents: a path and a few words per position.
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::Read;
 use std::ops::{ControlFlow, Range};
 use std::sync::Mutex;
 #[cfg(test)]

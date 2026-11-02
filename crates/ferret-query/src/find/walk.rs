@@ -16,7 +16,6 @@ use std::fs::{self, File};
 use std::io;
 use std::ops::Deref;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,8 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
 use rustix::fs::{AtFlags, CWD, StatxFlags, readlinkat, statat, statx};
 
-use super::schedule::Share;
-use super::{Follow, Options};
+use super::Options;
 use crate::threads::lock;
 
 mod live;

@@ -2,6 +2,7 @@
 //! evaluator; fractions and width rules differ from plausible Rust defaults.
 
 use std::fs::{File, FileTimes};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 

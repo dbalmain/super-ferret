@@ -13,6 +13,7 @@ use ferret_query::line_grep::{Names, Sort};
 
 use super::visibility::{Visibility, Visit};
 use super::*;
+use crate::grep::host::label;
 
 mod parallel;
 

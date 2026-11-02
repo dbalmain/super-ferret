@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::paced::{PacedInput, RECENT_PAGES};
 use super::*;
 use crate::manifest;
 use crate::segment::{CHUNK, ReadAt, Section};

@@ -3,6 +3,7 @@
 //! checked chunks.
 
 use super::*;
+use crate::segment::take;
 
 /// Entries of one dictionary block, decoded in order.
 pub(super) struct Entries {

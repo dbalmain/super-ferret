@@ -2,7 +2,9 @@
 //! and writing each segment as the buffers fill, and publishing the pass.
 
 use std::io::{BufWriter, Write};
+use std::thread::ScopedJoinHandle;
 
+use super::paced::Paced;
 use super::*;
 use crate::extract::Extracted;
 

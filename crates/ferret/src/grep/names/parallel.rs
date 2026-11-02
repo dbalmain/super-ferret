@@ -10,6 +10,7 @@ use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
 use ferret_query::find::{EntrySource, LiveWalk};
 
 use super::*;
+use crate::grep::host::label;
 
 /// Bytes of names a worker gathers before sending them.
 const CHUNK: usize = 16 << 10;

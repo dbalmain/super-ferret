@@ -1,6 +1,7 @@
 //! A merge step: planning which segments of a run survive, writing their
 //! merged pair, and publishing the manifest that replaces the run.
 
+use super::paced::PacedInput;
 use super::*;
 
 impl IndexWriter {

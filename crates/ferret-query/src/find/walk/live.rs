@@ -3,11 +3,14 @@
 
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 
 use ferret_catalog::Contents;
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open, openat};
 
 use super::*;
+use crate::find::Follow;
+use crate::find::schedule::Share;
 use crate::threads::lock;
 
 /// getdents64 buffer. One call reads a typical directory whole; 8 KiB took

@@ -13,6 +13,7 @@ use ferret_query::{CheckedReader, ReadFault, ReadOutcome, ReadRequest, ReadVersi
 use super::read::{read_catalogued, read_file, read_file_policy};
 use super::render::{Cursor, OutputCapture, Record, Recording, Render, record_size};
 use super::*;
+use crate::grep::host::label;
 use crate::lock;
 
 pub(in super::super) struct Group {

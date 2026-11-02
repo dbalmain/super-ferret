@@ -32,7 +32,7 @@ mod routing;
 mod sources;
 mod visibility;
 
-use host::{Host, block_stdout, buffered_path_output, label, report_shortfall};
+use host::{Host, block_stdout, buffered_path_output};
 
 const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -n, --line-number   print 1-based line numbers\n\

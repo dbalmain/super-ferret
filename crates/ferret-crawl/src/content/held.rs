@@ -9,6 +9,7 @@ use std::sync::{Condvar, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::Duration;
 
 use ferret_catalog::InoId;
+use rustix::fs::open;
 
 use super::*;
 use crate::lock;

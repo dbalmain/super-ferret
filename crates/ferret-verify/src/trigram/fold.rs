@@ -1,6 +1,8 @@
 //! The fold: Cox's five facts over folded byte strings, derived node by
 //! node from the HIR and simplified under [`Limits`].
 
+use ferret_text::trigram_key;
+
 use super::*;
 
 // ── limits ──

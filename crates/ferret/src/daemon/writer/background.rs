@@ -1,6 +1,7 @@
 //! The writer loop's background schedule: timers, refreshes and their log.
 
 use std::collections::BTreeSet;
+use std::os::unix::ffi::OsStrExt;
 
 use super::*;
 

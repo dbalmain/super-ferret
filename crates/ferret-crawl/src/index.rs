@@ -38,7 +38,6 @@ mod report;
 mod source;
 
 pub(crate) use hasher::Hasher;
-use hasher::Output;
 #[cfg(test)]
 pub(crate) use hasher::{DRAIN_MIN, Deferred, PROBES, Probe};
 use plan::{Plan, configured_roots, normalise, strictly_inside};

@@ -9,11 +9,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
+use ferret_catalog::batch::DirectoryObservation;
+use ferret_catalog::log::{ChangeSet, Error, Record};
+
 mod files;
 mod finish;
 
-use ferret_catalog::batch::DirectoryObservation;
-use ferret_catalog::log::{ChangeSet, Error, Record};
 use ferret_catalog::{
     Batch, Catalog, Content, DecodeError, DirToken, Hash, InoId, Kind, NameId, Stat, Target,
     WriterSession,

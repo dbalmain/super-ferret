@@ -1,7 +1,7 @@
 mod capture;
 use std::cell::Cell;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use ferret_catalog::NameId;
