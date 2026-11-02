@@ -10,6 +10,8 @@ use std::os::unix::ffi::OsStrExt;
 use ferret_policy::IgnoreFiles;
 
 use super::*;
+use rustix::fs::openat;
+use std::ffi::OsString;
 
 /// What `.git` is. The crawl leaves a symlink as [`GitProbe::Present`] and
 /// opens nothing through it. Grep follows one: a resolved directory is

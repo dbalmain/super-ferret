@@ -6,6 +6,7 @@
 use std::os::fd::AsFd;
 
 use super::*;
+use rustix::fs::openat;
 
 impl<V: EventVisitor> Walker<'_, V> {
     // ── reopening ──
