@@ -47,7 +47,7 @@ pub(crate) use report::content_faults;
 pub use report::{
     Counts, CoverageContext, CoverageFault, FailedRoot, IndexError, Published, Report,
 };
-use report::{finish_report, reporting_ids, undurable, unpublished, update_error, withdrawn};
+use report::{finish_report, reporting_ids, undurable, unpublished, update_error};
 use source::{Observed, Source, observe};
 
 /// Which configured roots to walk this run. The rest stay in the effective

@@ -220,12 +220,12 @@ fn replay_entries(
 }
 
 struct Resolver<'a> {
-    pub(super) session: &'a WriterSession,
-    pub(super) old: Catalog,
-    pub(super) dirs: BTreeMap<DirToken, DirectoryObservation<'a>>,
-    pub(super) resolved: BTreeMap<DirToken, Option<InoId>>,
-    pub(super) active: BTreeSet<DirToken>,
-    pub(super) out: Protection,
+    session: &'a WriterSession,
+    old: Catalog,
+    dirs: BTreeMap<DirToken, DirectoryObservation<'a>>,
+    resolved: BTreeMap<DirToken, Option<InoId>>,
+    active: BTreeSet<DirToken>,
+    out: Protection,
 }
 impl Resolver<'_> {
     fn directory(&mut self, token: DirToken) -> Option<InoId> {

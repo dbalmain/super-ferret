@@ -3,6 +3,7 @@
 //! root that cannot be anchored.
 
 use super::plan::strictly_inside;
+use super::report::withdrawn;
 use super::*;
 
 /// Resolves a bounded observation's faults to protection. When some fault has

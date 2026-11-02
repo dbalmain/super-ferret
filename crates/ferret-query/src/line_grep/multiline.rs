@@ -178,21 +178,7 @@ pub(super) fn scan_progress(
     }
 
     let windows = windows(plan, &groups, lines.len(), stopped)?;
-    let mut render = Render {
-        plan,
-        regex,
-        bytes,
-        lines: &lines,
-        spans: &spans,
-        groups: &groups,
-        searched_end,
-        // JSON events and replacement cover a whole selected group; plain
-        // and `-o` output render one source line at a time.
-        split: whole && !plan.invert,
-        stopped,
-        highlights: Vec::new(),
-        local: Vec::new(),
-    };
+    let mut render = Render::new(plan, bytes, &lines, &spans, &groups, searched_end, stopped);
     let (mut group_at, mut span_at) = (0, 0);
     for window in windows {
         let mut index = window.start;

@@ -6,17 +6,17 @@ use super::*;
 /// Renders the windows' lines from the scan's spans, reusing its highlight
 /// buffers across lines.
 pub(super) struct Render<'a> {
-    pub(super) plan: &'a Plan,
-    pub(super) regex: &'a ferret_verify::Regex,
-    pub(super) bytes: &'a [u8],
-    pub(super) lines: &'a [Range<usize>],
-    pub(super) spans: &'a [Range<usize>],
-    pub(super) groups: &'a [Range<usize>],
-    pub(super) searched_end: usize,
-    pub(super) split: bool,
-    pub(super) stopped: &'a dyn Fn() -> bool,
-    pub(super) highlights: Vec<Range<usize>>,
-    pub(super) local: Vec<Range<usize>>,
+    plan: &'a Plan,
+    regex: &'a ferret_verify::Regex,
+    bytes: &'a [u8],
+    lines: &'a [Range<usize>],
+    spans: &'a [Range<usize>],
+    groups: &'a [Range<usize>],
+    searched_end: usize,
+    split: bool,
+    stopped: &'a dyn Fn() -> bool,
+    highlights: Vec<Range<usize>>,
+    local: Vec<Range<usize>>,
 }
 
 /// The source line being rendered.
@@ -36,6 +36,34 @@ struct At {
     inverted_context: bool,
     /// The first span that may touch the line.
     span_at: usize,
+}
+
+impl<'a> Render<'a> {
+    pub(super) fn new(
+        plan: &'a Plan,
+        bytes: &'a [u8],
+        lines: &'a [Range<usize>],
+        spans: &'a [Range<usize>],
+        groups: &'a [Range<usize>],
+        searched_end: usize,
+        stopped: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Self {
+            plan,
+            regex: plan.grep.regex(),
+            bytes,
+            lines,
+            spans,
+            groups,
+            searched_end,
+            // JSON events and replacement cover a whole selected group; plain
+            // and `-o` output render one source line at a time.
+            split: !plan.grep.excludes_lf() && !plan.invert,
+            stopped,
+            highlights: Vec::new(),
+            local: Vec::new(),
+        }
+    }
 }
 
 impl Render<'_> {
