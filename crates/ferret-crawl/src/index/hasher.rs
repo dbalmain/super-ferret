@@ -5,11 +5,11 @@
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 
-use ferret_catalog::DirToken;
+use ferret_catalog::{Content, DirToken, Stat};
 use ferret_policy::{Decision, Reason};
 
 use super::*;
-use crate::observe::{ContentFault, Lookup, Observation, Opened, Reader};
+use crate::observe::{self, Cache, ContentFault, Lookup, Observation, Opened, Reader};
 use crate::walk::{Decided, Event, EventVisitor, FaultContext, IoOp, WorkTreeKind};
 
 /// A name of a multiply-linked inode that was in flight on another worker

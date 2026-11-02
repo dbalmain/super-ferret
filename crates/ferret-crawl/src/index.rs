@@ -26,28 +26,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ferret_catalog::{BeginError, Catalog, Content, InoId, Stat, Transaction, WriterSession};
+use ferret_catalog::{BeginError, Catalog, InoId, Transaction, WriterSession};
 use ferret_policy::Config;
 
-use crate::observe::{self, Cache};
-use crate::walk::{Boundary, WalkOptions, walk_parallel};
-
 mod hasher;
+mod plan;
 mod report;
+mod source;
 
 pub(crate) use hasher::Hasher;
 use hasher::Output;
 #[cfg(test)]
 pub(crate) use hasher::{DRAIN_MIN, Deferred, PROBES, Probe};
+use plan::{Plan, configured_roots, normalise, strictly_inside};
 #[cfg(test)]
 pub(crate) use report::content_faults;
 pub use report::{
     Counts, CoverageContext, CoverageFault, FailedRoot, IndexError, Published, Report,
 };
 use report::{finish_report, reporting_ids, undurable, unpublished, update_error, withdrawn};
+use source::{Observed, Source, observe};
 
 /// Which configured roots to walk this run. The rest stay in the effective
 /// view where keeping them is valid.
@@ -202,13 +203,7 @@ fn changed_roots(
     previous: Option<&Catalog>,
     change: RootChange<'_>,
 ) -> Result<Vec<PathBuf>, IndexError> {
-    let mut roots: Vec<PathBuf> = previous
-        .map(|p| {
-            p.roots()
-                .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut roots = configured_roots(previous);
     for gone in change.remove {
         let gone = normalise(gone)?;
         let before = roots.len();
@@ -716,185 +711,6 @@ fn fingerprint(options: &IndexOptions) -> ferret_catalog::Hash {
     fingerprint
 }
 
-#[derive(Clone, Copy)]
-enum Source<'a> {
-    Checkpoint(&'a Transaction),
-    Bounded(
-        &'a WriterSession,
-        u32,
-        &'a std::sync::Arc<ferret_catalog::InputBudget>,
-    ),
-    Rebuild(&'a WriterSession, u32, usize),
-}
-impl Source<'_> {
-    fn batch(self) -> ferret_catalog::Batch {
-        match self {
-            Self::Checkpoint(txn) => txn.batch(),
-            Self::Bounded(session, _, budget) => {
-                session.batch().with_input_budget((*budget).clone())
-            }
-            Self::Rebuild(session, _, hint) => session.checkpoint_batch(hint),
-        }
-    }
-    fn budget(self) -> Option<std::sync::Arc<ferret_catalog::InputBudget>> {
-        match self {
-            Self::Bounded(_, _, budget) => Some(budget.clone()),
-            _ => None,
-        }
-    }
-    fn carry(self, stat: &Stat) -> Option<Content> {
-        match self {
-            Self::Checkpoint(txn) => txn.carry(stat),
-            Self::Bounded(session, sniffer, _) | Self::Rebuild(session, sniffer, _) => {
-                session.carry(stat, sniffer)
-            }
-        }
-    }
-}
-
-/// One observation of a plan's refreshed roots: the batches, and the root each
-/// batch came from.
-struct Observed {
-    batches: Vec<ferret_catalog::Batch>,
-    owners: Vec<PathBuf>,
-}
-
-fn observe(
-    source: Source<'_>,
-    plan: &Plan,
-    options: &IndexOptions,
-) -> Result<(Observed, Report), IndexError> {
-    let mut report = Report {
-        refreshed: plan.refresh.clone(),
-        kept: plan.keep.clone(),
-        dropped: plan.dropped.clone(),
-        ..Report::default()
-    };
-    let started = Instant::now();
-    let cache = Cache::new();
-    let mut faults = Vec::new();
-    let mut batches = Vec::new();
-    let mut owners = Vec::new();
-    for root in &plan.refresh {
-        let bulk_read = matches!(source, Source::Rebuild(..))
-            || plan.selections.get(root).is_none_or(|s| s.whole_root());
-        if bulk_read {
-            admit_bulk(source, options)?;
-        }
-        if !plan.selections.contains_key(root)
-            && let Some(watch) = &options.watch
-        {
-            watch.begin_policy_root(root);
-        }
-        let mut visitors = walk_root(source, &cache, root, plan, options, bulk_read);
-        if let Some(error) = visitors.iter_mut().find_map(|v| v.priority_error.take()) {
-            return Err(IndexError::Priority(error));
-        }
-        within_budget(source)?;
-        let outputs: Vec<Output> = visitors
-            .into_iter()
-            .map(|v| v.finish(&mut faults))
-            .collect();
-        let mut observation_rows = 0;
-        let mut observation_bytes = 0;
-        for mut output in outputs {
-            output.resolve(&cache);
-            output.batch.seal();
-            within_budget(source)?;
-            let (rows, bytes) = output.batch.observation_peak();
-            observation_rows += rows;
-            observation_bytes += bytes;
-            report.counts.add(&output.counts);
-            report.hash_time += output.read_time;
-            report.content_faults.append(&mut output.content_faults);
-            report.pattern_errors.append(&mut output.pattern_errors);
-            batches.push(output.batch);
-            owners.push(root.clone());
-        }
-        report.observation_rows_peak = report.observation_rows_peak.max(observation_rows);
-        report.observation_bytes_peak = report.observation_bytes_peak.max(observation_bytes);
-    }
-    report.counts.cached_inodes = cache.len() as u64;
-    report.counts.deferred_peak = cache.deferred_peak();
-    report.content_faults.sort_by(|a, b| a.0.cmp(&b.0));
-    report.counts.content_faults = report.content_faults.len() as u64;
-    report.walk_time = started.elapsed();
-    if crate::coverage::discard_denied_prefix_faults(&batches, &mut faults).is_none() {
-        return Err(IndexError::Coverage {
-            faults,
-            report: Box::new(report),
-        });
-    }
-    report.coverage_faults = faults;
-    Ok((Observed { batches, owners }, report))
-}
-
-/// Admits a bulk read of the next root from a bounded source with a bulk
-/// control. Between roots is a safe phase boundary: a refusal drops all
-/// unpublished batches, and no partial listing is published or cancelled.
-fn admit_bulk(source: Source<'_>, options: &IndexOptions) -> Result<(), IndexError> {
-    if let Source::Bounded(session, ..) = source
-        && let Some(control) = &options.bulk
-    {
-        control
-            .admit(ferret_catalog::bulk::Kind::FullRewalk, &session.view())
-            .map_err(IndexError::DeferredBulk)?;
-    }
-    Ok(())
-}
-
-/// Fails with the input limit once a bounded source's budget is spent.
-fn within_budget(source: Source<'_>) -> Result<(), IndexError> {
-    if let Source::Bounded(_, _, budget) = source
-        && budget.exceeded()
-    {
-        return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
-            budget.usage(),
-        )));
-    }
-    Ok(())
-}
-
-/// Walks `root` in parallel, returning each worker's hasher. A bulk read
-/// paces its reads by the bulk control's limiter.
-fn walk_root<'a>(
-    source: Source<'a>,
-    cache: &'a Cache,
-    root: &'a Path,
-    plan: &'a Plan,
-    options: &'a IndexOptions,
-    bulk_read: bool,
-) -> Vec<Hasher<'a>> {
-    let walk_options = WalkOptions {
-        workers: options.bulk.as_ref().map_or(options.workers, |control| {
-            control.workers().min(options.workers.max(1))
-        }),
-        boundaries: plan.boundaries(root),
-    };
-    walk_parallel(
-        root,
-        options.global.as_deref(),
-        options.config,
-        &walk_options,
-        || {
-            let mut hasher = Hasher::with_source(source, cache, root);
-            hasher.watch = options.watch.as_deref();
-            // An unpaced bulk control is an explicit command. Its workers
-            // keep the spawning thread's nice; background crawls still lower.
-            hasher.lower_priority = options.bulk.as_ref().is_none_or(|control| control.paced());
-            if bulk_read {
-                hasher.reader.limiter = options
-                    .bulk
-                    .as_ref()
-                    .filter(|control| control.paced())
-                    .map(|control| control.limiter());
-            }
-            hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
-            hasher
-        },
-    )
-}
-
 /// Settles an initial checkpoint's faults. D26 directory EACCES is opaque even
 /// for an initial root; every other initial fault lacks a trustworthy
 /// retention anchor, so its root is withdrawn where D119 allows and the run
@@ -932,17 +748,6 @@ fn initial(
         }
         _ => Err(unpublished(std::mem::take(report), failed)),
     }
-}
-
-/// The roots `catalog` holds; none without one.
-fn configured_roots(catalog: Option<&Catalog>) -> Vec<PathBuf> {
-    catalog
-        .map(|c| {
-            c.roots()
-                .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// D119: withdraws from this run each refreshed root that the previous
@@ -1012,116 +817,6 @@ fn withdraw(
         failed.push(FailedRoot { root, faults: own });
     }
     failed
-}
-
-/// Which roots a run walks, keeps and drops.
-struct Plan {
-    /// Every configured root, normalised and sorted.
-    roots: Vec<PathBuf>,
-    refresh: Vec<PathBuf>,
-    keep: Vec<PathBuf>,
-    dropped: Vec<PathBuf>,
-    selections: BTreeMap<PathBuf, std::sync::Arc<crate::refresh::Selection>>,
-}
-
-impl Plan {
-    fn new(
-        previous: Option<&Catalog>,
-        roots: &[PathBuf],
-        refresh: Refresh<'_>,
-        sniffer: u32,
-        policy: ferret_catalog::Hash,
-    ) -> Result<Plan, IndexError> {
-        let mut configured = roots
-            .iter()
-            .map(|r| normalise(r))
-            .collect::<Result<Vec<_>, _>>()?;
-        configured.sort();
-        configured.dedup();
-        let old: Vec<PathBuf> = previous
-            .map(|p| {
-                p.roots()
-                    .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let everything = matches!(refresh, Refresh::All)
-            || previous.is_some_and(|p| p.sniffer_version() != sniffer || p.policy() != policy);
-        let named = match refresh {
-            Refresh::All => Vec::new(),
-            Refresh::Only(paths) => {
-                let mut named = Vec::with_capacity(paths.len());
-                for path in paths {
-                    let path = normalise(path)?;
-                    if configured.binary_search(&path).is_err() {
-                        return Err(IndexError::NotConfigured(path));
-                    }
-                    named.push(path);
-                }
-                named
-            }
-        };
-        // Roots added or removed this run: a kept root with one of these
-        // strictly inside it would copy a subtree whose boundaries changed.
-        let changed: Vec<&PathBuf> = configured
-            .iter()
-            .filter(|r| !old.contains(r))
-            .chain(old.iter().filter(|r| configured.binary_search(r).is_err()))
-            .collect();
-        let (mut refresh, mut keep) = (Vec::new(), Vec::new());
-        for root in &configured {
-            let walk = everything
-                || named.contains(root)
-                || !old.contains(root)
-                || changed.iter().any(|c| strictly_inside(c, root));
-            if walk {
-                refresh.push(root.clone());
-            } else {
-                keep.push(root.clone());
-            }
-        }
-        let dropped = old
-            .into_iter()
-            .filter(|r| configured.binary_search(r).is_err())
-            .collect();
-        Ok(Plan {
-            roots: configured,
-            refresh,
-            keep,
-            dropped,
-            selections: BTreeMap::new(),
-        })
-    }
-
-    /// The configured roots strictly inside `root`, relative to it: where its
-    /// walk stops, because the innermost root owns its subtree (D34).
-    fn boundaries(&self, root: &Path) -> Vec<Boundary> {
-        self.roots
-            .iter()
-            .filter(|inner| strictly_inside(inner, root))
-            .filter_map(|inner| inner.strip_prefix(root).ok())
-            .map(|rel| Boundary {
-                path: rel.to_owned(),
-                id: None,
-            })
-            .collect()
-    }
-}
-
-/// Whether `inner` lies strictly below `outer`, by whole components.
-fn strictly_inside(inner: &Path, outer: &Path) -> bool {
-    inner != outer && inner.starts_with(outer)
-}
-
-/// `root` as the catalog names it: absolute, with `.` components and
-/// trailing slashes gone. A `..` is refused rather than resolved, since
-/// resolving it lexically can name a different directory than the kernel
-/// would.
-fn normalise(root: &Path) -> Result<PathBuf, IndexError> {
-    if !root.is_absolute() || root.components().any(|c| c == Component::ParentDir) {
-        return Err(IndexError::BadRoot(root.to_owned()));
-    }
-    Ok(root.components().collect())
 }
 
 // All configured roots are observed again: scoped batches cannot describe a
