@@ -279,6 +279,23 @@ impl<'a> Blocked<'a> {
         (packed & NULLS == 0 || raw != mask(width)).then(|| base.wrapping_add(raw))
     }
 
+    /// Every value of a nullable column in order, `None` where it holds none:
+    /// a pass over the column that decodes a block at a time, where
+    /// [`Blocked::nullable`] re-derives each row's block and position.
+    pub(crate) fn nullable_values(&self) -> impl Iterator<Item = Option<u64>> + '_ {
+        (0..self.count.div_ceil(BLOCK_ROWS)).flat_map(move |k| {
+            let (base, packed) = self.words(k);
+            let (offset, width) = ((packed >> 8) as usize, (packed & 0x7F) as u32);
+            let rows = BLOCK_ROWS.min(self.count - k * BLOCK_ROWS);
+            let mut raw = [0; BLOCK_ROWS];
+            Packed::new(&self.values[offset..], width).decode(0, &mut raw[..rows]);
+            let none = (packed & NULLS != 0).then(|| mask(width));
+            raw.into_iter()
+                .take(rows)
+                .map(move |raw| (none != Some(raw)).then(|| base.wrapping_add(raw)))
+        })
+    }
+
     /// Values `first..first + out.len()` into `out`, a run of a pass over the
     /// column; `first` is a multiple of 8. See [`Packed::decode`].
     pub(crate) fn decode(&self, first: usize, out: &mut [u64]) {
@@ -800,6 +817,7 @@ mod tests {
         for (i, &v) in values.iter().enumerate() {
             assert_eq!(column.nullable(i), v, "i {i}");
         }
+        assert!(column.nullable_values().eq(values.iter().copied()));
     }
 
     #[test]
@@ -810,6 +828,7 @@ mod tests {
         let column = Blocked::new(&bytes, 300);
         assert!(column.check(0, 0, true));
         assert!((0..300).all(|i| column.nullable(i).is_none()));
+        assert!(column.nullable_values().eq([None; 300]));
     }
 
     #[test]

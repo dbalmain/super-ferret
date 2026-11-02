@@ -241,11 +241,10 @@ fn check_doc_refs(
 /// No directory was retained after this generation.
 fn check_retained_at(l: &Layout, retained_at: &[u8]) -> Result<(), DecodeError> {
     let retained = l.blocked(Column::RetainedAt, retained_at);
-    if (0..l.dirs).any(|row| {
-        retained
-            .nullable(row)
-            .is_some_and(|n| n > l.generation.sequence)
-    }) {
+    if retained
+        .nullable_values()
+        .any(|n| n.is_some_and(|n| n > l.generation.sequence))
+    {
         return Err(DecodeError::Corrupt("retained at"));
     }
     Ok(())
@@ -277,10 +276,7 @@ pub(crate) fn document_references(
     // Bindings mostly ascend with the inode, so each search starts at the
     // last one's row.
     let mut at = 0;
-    for row in 0..l.inodes {
-        let Some(id) = bindings.nullable(row) else {
-            continue;
-        };
+    for id in bindings.nullable_values().flatten() {
         at = ids
             .sequence_row_near(id, l.docs, at)
             .ok_or(DecodeError::Corrupt("document references"))?;
