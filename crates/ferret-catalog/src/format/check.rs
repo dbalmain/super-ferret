@@ -1,6 +1,7 @@
 //! Each section's structural check, run once when a reader first loads it.
 
 use super::*;
+use crate::fan_out::{cores, fan_out};
 
 /// What one section's check found that a later check reuses, so that no
 /// check decodes a column a check before it already decoded. Kept by the
@@ -317,10 +318,47 @@ fn check_dictionary(l: &Layout, column: Column, bytes: &[u8]) -> Result<(), Deco
 /// One pass decodes each column once: name `i - 1`'s span is checked when
 /// row `i`'s offset, its end, has been. Returns the names whose child is a
 /// directory, for [`check_dir_names`].
+///
+/// A large table is checked in row ranges on a few threads, since this pass
+/// is most of the longest section chain an open waits for. The NUL count
+/// is reported first and then each range's first error in row order, which
+/// is the error a single pass would have met first.
 fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeError> {
-    if count_nuls(heap) != l.names {
+    let threads = if l.names >= PARALLEL_NAMES {
+        cores().min(NAME_THREADS)
+    } else {
+        1
+    };
+    let per = l.names.div_ceil(threads).next_multiple_of(RUN);
+    let ranges: Vec<_> = (0..threads)
+        .map(|k| (k * per).min(l.names)..((k + 1) * per).min(l.names))
+        .enumerate()
+        .collect();
+    let checked = fan_out(ranges, threads, |(k, range)| {
+        let nuls = &heap[k * heap.len() / threads..(k + 1) * heap.len() / threads];
+        (count_nuls(nuls), check_name_rows(l, rows, heap, range))
+    });
+    if checked.iter().map(|(nuls, _)| nuls).sum::<usize>() != l.names {
         return Err(DecodeError::Corrupt("name order"));
     }
+    checked.into_iter().map(|(_, dirs)| dirs).sum()
+}
+
+/// Names tables smaller than this are checked on the calling thread.
+const PARALLEL_NAMES: usize = 1 << 15;
+
+/// The most threads one names table is checked on.
+const NAME_THREADS: usize = 4;
+
+/// [`check_names`] over the rows in `range`, which starts at a multiple of
+/// [`RUN`]. The two rows before it are the previous range's to check; they
+/// seed this one, so a value only has to be safe to use here.
+fn check_name_rows(
+    l: &Layout,
+    rows: &[u8],
+    heap: &[u8],
+    range: std::ops::Range<usize>,
+) -> Result<usize, DecodeError> {
     let parents = l.blocked(Column::NameParent, rows);
     let children = l.blocked(Column::NameChild, rows);
     let offsets = l.blocked(Column::NameOffset, rows);
@@ -328,6 +366,25 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
     // the one before that, for sibling order.
     let mut open: Option<(u64, usize)> = None;
     let mut previous: Option<(u64, &[u8])> = None;
+    let (mut last_parent, mut next_offset) = (0, 0);
+    if let Some(before) = range.start.checked_sub(1) {
+        let (parent, offset) = (parents.get(before), offsets.get(before));
+        if offset >= heap.len() as u64 {
+            return Err(DecodeError::Corrupt("names"));
+        }
+        open = Some((parent, offset as usize));
+        (last_parent, next_offset) = (parent, offset + 1);
+        if let Some(before) = before.checked_sub(1) {
+            let start = offsets.get(before);
+            if start >= offset {
+                return Err(DecodeError::Corrupt("names"));
+            }
+            previous = Some((
+                parents.get(before),
+                &heap[start as usize..offset as usize - 1],
+            ));
+        }
+    }
     let mut close = |end: usize, open: Option<(u64, usize)>| {
         let Some((parent, start)) = open else {
             return Ok(());
@@ -340,10 +397,10 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
         previous = Some((parent, name));
         Ok(())
     };
-    let (mut last_parent, mut next_offset, mut dir_children) = (0, 0, 0);
+    let mut dir_children = 0;
     let mut block = [[0; RUN]; 3];
-    for first in (0..l.names).step_by(RUN) {
-        let n = RUN.min(l.names - first);
+    for first in range.clone().step_by(RUN) {
+        let n = RUN.min(range.end - first);
         let [p, c, o] = &mut block;
         parents.decode(first, &mut p[..n]);
         children.decode(first, &mut c[..n]);
@@ -368,7 +425,9 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
             dir_children += usize::from(child < l.dirs as u64);
         }
     }
-    close(heap.len(), open)?;
+    if range.end == l.names {
+        close(heap.len(), open)?;
+    }
     Ok(dir_children)
 }
 

@@ -1297,3 +1297,84 @@ fn a_small_resident_conversion_starts_no_thread() {
     catalog.into_resident().unwrap();
     assert_eq!(asked.load(Ordering::Relaxed), 0);
 }
+
+/// A names table checked in row ranges on several threads fails as one pass
+/// does, for corruptions on either side of each range's edge: the rows that
+/// seed a range, and the first rows it checks itself.
+#[test]
+fn a_names_table_checked_in_ranges_fails_as_one_pass_does() {
+    use crate::fan_out::seam::Seams;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    const FILES: usize = 40_000;
+    let scratch = Scratch::new("decode-names-ranges");
+    commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let root = w.root(b"/r", dir_stat(1));
+        for i in 0..FILES {
+            let name = format!("f{i:05}");
+            w.file(
+                root,
+                name.as_bytes(),
+                file_stat(10 + i as u64),
+                Content::Unindexed,
+            );
+        }
+        txn.add(w);
+    });
+    let bytes = std::fs::read(super::snapshot(&scratch.path)).unwrap();
+    // The decode's result on `cores` cores, and whether it asked for helpers.
+    let decode = |bytes: &[u8], cores| {
+        let seams = Seams {
+            cores: Some(cores),
+            ..Seams::default()
+        };
+        let asked = Arc::clone(&seams.asked);
+        let _seams = seams.set();
+        let result = Catalog::from_bytes(resigned(bytes.to_vec())).map(drop);
+        (result, asked.load(Ordering::Relaxed) > 0)
+    };
+    assert_eq!(decode(&bytes, 1), (Ok(()), false));
+    assert_eq!(decode(&bytes, 4), (Ok(()), true));
+    // Each name is 6 bytes and its NUL, in row order.
+    let heap = section_start(&bytes, Section::NameHeap);
+    assert_eq!(&bytes[heap + 7 * 12_345..heap + 7 * 12_346], b"f12345\0");
+    // Four threads take ranges of 10,048 rows, the row count rounded up to
+    // whole runs.
+    let mut cases = 0;
+    for edge in [10_048, 20_096, 30_144] {
+        for row in edge - 2..edge + 2 {
+            let mut corrupt = Vec::new();
+            // Out of sibling order after its predecessor, or before its
+            // successor.
+            for first in [b'a', b'~'] {
+                let mut flipped = bytes.clone();
+                flipped[heap + 7 * row] = first;
+                corrupt.push(flipped);
+            }
+            // An empty name: the previous name's NUL moved onto this one's
+            // first byte, keeping the count.
+            let mut emptied = bytes.clone();
+            emptied[heap + 7 * row - 1] = b'x';
+            emptied[heap + 7 * row] = 0;
+            corrupt.push(emptied);
+            // An offset moved back into an earlier name, unless it already
+            // starts its block, which leaves it where it is.
+            for raw in [0, 1] {
+                let mut moved = bytes.clone();
+                set_raw(&mut moved, Column::NameOffset, row, raw);
+                if moved != bytes {
+                    corrupt.push(moved);
+                }
+            }
+            for corrupt in corrupt {
+                let (serial, _) = decode(&corrupt, 1);
+                assert!(serial.is_err(), "row {row}");
+                assert_eq!(decode(&corrupt, 4).0, serial, "row {row}");
+                cases += 1;
+            }
+        }
+    }
+    assert!(cases >= 3 * 4 * 4, "{cases} cases");
+}
