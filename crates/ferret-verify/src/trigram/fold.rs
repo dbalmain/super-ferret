@@ -1,9 +1,13 @@
 //! The fold: Cox's five facts over folded byte strings, derived node by
 //! node from the HIR and simplified under [`Limits`].
 
+use std::collections::BTreeSet;
+
 use ferret_text::trigram_key;
+use regex_syntax::hir::Class;
 
 use super::*;
+use crate::trigram::tree::Facts;
 
 // ── limits ──
 

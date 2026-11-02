@@ -12,6 +12,7 @@ use ferret_text::trigram_key;
 
 use super::{GrepError, GrepFlags, LIMITS, Limits, Trigrams, Trims};
 use crate::Matcher;
+use crate::trigram::prefilter::{reset_window_scanned, window_scanned};
 
 // ── the oracle ──
 
@@ -1165,12 +1166,12 @@ fn filtered_spans_keep_matches_and_scan_one_window_once() {
     let grep = flags.compile_lines(r"[a-z]*?ing").unwrap();
     let spans = grep.search().spans(&bytes).collect::<Vec<_>>();
     assert_eq!(spans, grep.regex().spans(&bytes).collect::<Vec<_>>());
-    super::reset_window_scanned();
+    reset_window_scanned();
     grep.search().spans(&bytes).for_each(drop);
     assert!(
-        super::window_scanned() <= bytes.len() * 2,
+        window_scanned() <= bytes.len() * 2,
         "window boundary scans examined {} bytes for {} input bytes",
-        super::window_scanned(),
+        window_scanned(),
         bytes.len()
     );
 }
