@@ -141,8 +141,13 @@ impl Catalog {
             return Ok(());
         }
         let (start, end) = self.layout.range(section);
-        let mut bytes = vec![0; end - start].into_boxed_slice();
-        file.read_exact_at(&mut bytes, start as u64)
+        // Collected from a sized iterator, the slice is allocated once, in
+        // place: converting a boxed slice would copy every section again.
+        let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, end - start).collect();
+        let Some(buffer) = Arc::get_mut(&mut bytes) else {
+            unreachable!("a new slice has no other owner");
+        };
+        file.read_exact_at(buffer, start as u64)
             .map_err(OpenError::Io)?;
         read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         format::check(section, &self.layout, facts, |s| {
@@ -153,7 +158,7 @@ impl Catalog {
             }
         })
         .map_err(OpenError::Decode)?;
-        let Ok(()) = slot.set(bytes.into()) else {
+        let Ok(()) = slot.set(bytes) else {
             unreachable!("set only under its load lock");
         };
         Ok(())
