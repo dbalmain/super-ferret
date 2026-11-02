@@ -12,7 +12,7 @@
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io;
 use std::ops::Deref;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
-use rustix::fs::{AtFlags, CWD, StatxFlags, readlinkat, statat, statx};
+use rustix::fs::{AtFlags, CWD, readlinkat};
 
 use super::Options;
 use crate::threads::lock;
@@ -767,6 +767,10 @@ impl Drop for Charge {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use rustix::fs::{StatxFlags, statat, statx};
+
     use super::*;
 
     #[test]

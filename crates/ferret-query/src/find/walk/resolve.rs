@@ -1,6 +1,7 @@
 //! Resolving a path, symlinks and `..` included, against the catalog or a
 //! host's [`Namespace`] that agrees with it.
 
+use std::fs;
 use std::os::unix::ffi::OsStrExt;
 
 use super::*;

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use ferret_catalog::NameId;
 use ferret_query::ReadOutcome;
+use ferret_query::find::OutputBuffer;
 use ferret_query::line_grep::{InputResult, Output};
 #[cfg(test)]
 use ferret_query::{CheckedReader, ReadRequest};

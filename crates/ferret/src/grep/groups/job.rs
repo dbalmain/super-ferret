@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 
 use ferret_catalog::NameId;
+use ferret_query::find::OutputBuffer;
 use ferret_query::line_grep::{InputResult, ScanError};
 use ferret_query::{CheckedReader, ReadFault, ReadOutcome, ReadRequest, ReadVersion};
 

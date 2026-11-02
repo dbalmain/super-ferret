@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use ferret_query::find::OutputBuffer;
 use ferret_query::line_grep::{InputResult, ScanError};
 
 use super::*;

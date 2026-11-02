@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferret_policy::GrepSelection;
-use ferret_query::find::{EntrySource, OutputBuffer};
+use ferret_query::find::EntrySource;
 use ferret_query::line_grep::{self, Plan};
 
 use crate::cli::{self, Exit};
@@ -943,7 +943,7 @@ mod tests;
 #[cfg(any(test, debug_assertions))]
 mod seam {
     #[cfg(test)]
-    use super::OutputBuffer;
+    use ferret_query::find::OutputBuffer;
     #[cfg(test)]
     use std::cell::RefCell;
     use std::io::{self, Read};
