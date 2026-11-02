@@ -1,8 +1,10 @@
 //! A merge step: planning which segments of a run survive, writing their
 //! merged pair, and publishing the manifest that replaces the run.
 
+use super::files::retire;
 use super::paced::PacedInput;
 use super::*;
+use crate::regular;
 
 impl IndexWriter {
     /// Merges the segments at `run` into one, if their bytes fit the budget.
