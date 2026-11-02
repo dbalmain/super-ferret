@@ -22,7 +22,9 @@ use crate::lock;
 use crate::{RefreshReason, RefreshRequest, RefreshScope, RenameHint};
 
 mod aliases;
+mod burst;
 mod policy;
+mod retire;
 use aliases::FileAliases;
 
 const TRAILING: Duration = Duration::from_millis(200);
@@ -802,113 +804,6 @@ impl Watch {
             s.last.get_or_insert_with(Instant::now);
         }
     }
-    /// Retire watches only after checked catalog observation. Known removals
-    /// have an expected IGNORED; every unknown descriptor lifetime is loss.
-    pub fn reconcile(&self, view: &Catalog) {
-        let roots: BTreeSet<_> = view
-            .roots()
-            .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
-            .collect();
-        let protected = view
-            .dir_ids()
-            .filter(|&id| view.retained_at(id).is_some())
-            .filter_map(|id| crate::refresh::containing_root(view, id).ok())
-            .collect::<BTreeSet<_>>();
-        let snapshot = self.retire_policies(&mut lock(&self.state), view, &roots, &protected);
-        // Resolution may traverse a large watch set. Kernel intake must not
-        // wait on its catalog/path work or on a sweep's removal syscalls.
-        for (wd, directories) in snapshot {
-            self.retire_descriptor(view, wd, directories);
-        }
-    }
-    /// Drops policy inputs, failures and aliases whose root is gone or whose
-    /// refreshed policy no longer reads them, then rebuilds the gaps. Returns
-    /// the descriptors for an unlocked resolution pass.
-    fn retire_policies(
-        &self,
-        s: &mut State,
-        view: &Catalog,
-        roots: &BTreeSet<PathBuf>,
-        protected: &BTreeSet<PathBuf>,
-    ) -> Vec<(i32, Vec<Arc<Directory>>)> {
-        s.file_aliases.retain(|_, aliases| {
-            aliases.names.retain(|_, owners| {
-                owners.retain(|r| roots.contains(r));
-                !owners.is_empty()
-            });
-            !aliases.names.is_empty()
-        });
-        let refreshed = std::mem::take(&mut s.policy_refreshed);
-        let epochs = s.policy_epochs.clone();
-        let keep = |r: &Path, epoch: u64| {
-            roots.contains(r)
-                && (!refreshed.contains(r)
-                    || protected.contains(r)
-                    || epochs.get(r).is_some_and(|current| *current == epoch))
-        };
-        s.policy_epochs.retain(|r, _| roots.contains(&**r));
-        s.failures.retain(|r, f| {
-            if refreshed.contains(r) && !protected.contains(r) {
-                f.earlier = None;
-            }
-            f.len() > 0 && keep(r, f.epoch)
-        });
-        let mut retired = Vec::new();
-        for (&wd, inputs) in &mut s.policies {
-            inputs.retain(|i| keep(&i.root, i.epoch));
-            if inputs.is_empty() {
-                retired.push(wd);
-            }
-        }
-        for wd in retired {
-            s.policies.remove(&wd);
-            if !s.descriptors.contains_key(&wd) {
-                s.identities.retain(|_, value| *value != wd);
-                if inotify::remove_watch(&self.fd, wd).is_ok() {
-                    s.removed.insert(wd);
-                }
-            }
-        }
-        s.unreliable
-            .retain(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
-        // Failures are per root, so a root leaves the gaps once its own
-        // record is gone, whatever another root still holds.
-        s.gaps = s.unreliable.clone();
-        let failed = s.failures.keys().cloned().collect::<Vec<_>>();
-        s.gaps.extend(failed);
-        s.descriptors
-            .iter()
-            .map(|(&wd, d)| (wd, d.clone()))
-            .collect::<Vec<_>>()
-    }
-    /// Keeps the directories of watch `wd` that still resolve in `view`,
-    /// removing the watch when none do, unless it changed since `directories`
-    /// was taken.
-    fn retire_descriptor(&self, view: &Catalog, wd: i32, directories: Vec<Arc<Directory>>) {
-        let kept = directories
-            .iter()
-            .filter(|d| d.resolve(view).is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut s = lock(&self.state);
-        if s.descriptors.get(&wd).is_none_or(|ds| {
-            ds.len() != directories.len()
-                || ds.iter().zip(&directories).any(|(a, b)| !Arc::ptr_eq(a, b))
-        }) {
-            return;
-        }
-        if !kept.is_empty() {
-            s.descriptors.insert(wd, kept);
-            return;
-        }
-        s.descriptors.remove(&wd);
-        if !s.policies.contains_key(&wd) {
-            s.identities.retain(|_, value| *value != wd);
-        }
-        if !s.policies.contains_key(&wd) && inotify::remove_watch(&self.fd, wd).is_ok() {
-            s.removed.insert(wd);
-        }
-    }
 }
 /// Forgets watch `wd`, which the kernel removed. One this process removed
 /// was expected; any other loses events, and its policy roots become gaps.
@@ -1096,112 +991,6 @@ fn loss(s: &mut State, reason: RefreshReason) {
     s.first.get_or_insert_with(Instant::now);
     s.last = Some(Instant::now());
 }
-#[derive(Default)]
-struct MovePair {
-    old: Vec<(InoId, Vec<u8>)>,
-    new: Vec<(InoId, Vec<u8>)>,
-}
-impl Burst {
-    /// Whether this observation can retire directory watches. Ordinary file
-    /// bursts do not scan the entire watch set at each publication.
-    pub fn reconcile_watches(&self) -> bool {
-        self.marker.is_some()
-            || !self.roots.is_empty()
-            || self.pending.iter().any(|((_, name), h)| {
-                h.subtree || name == b".git" || ferret_policy::is_ignore_file(name)
-            })
-    }
-    /// Loss/backstop reason associated with this detached watermark.
-    pub fn reason(&self) -> RefreshReason {
-        self.marker.map_or(RefreshReason::Burst, |(_, r)| r)
-    }
-    /// Resolves parent/name locators in the current checked generation. Missing
-    /// ancestry or changed root boundaries widen observation conservatively.
-    pub fn request(&self, view: &Catalog) -> RefreshRequest {
-        let expected_generation = view.generation();
-        if self.marker.is_some() {
-            return RefreshRequest {
-                expected_generation,
-                scopes: Vec::new(),
-                rename_hints: Vec::new(),
-                reason: self.reason(),
-            };
-        }
-        let mut scopes = Vec::new();
-        let mut roots = self.roots.clone();
-        let mut moves: BTreeMap<u32, MovePair> = BTreeMap::new();
-        for ((_, name), hint) in &self.pending {
-            for directory in &hint.directories {
-                if name.is_empty() || name == b".git" || ferret_policy::is_ignore_file(name) {
-                    roots.insert((*directory.root).clone());
-                } else if let Some(parent) = directory.resolve(view) {
-                    scopes.push(RefreshScope::Entry {
-                        parent,
-                        basename: name.clone(),
-                    });
-                    if hint.cookie != 0 {
-                        let pair = moves.entry(hint.cookie).or_default();
-                        if hint.from {
-                            pair.old.push((parent, name.clone()));
-                        }
-                        if hint.to {
-                            pair.new.push((parent, name.clone()));
-                        }
-                    }
-                } else {
-                    roots.insert((*directory.root).clone());
-                }
-            }
-        }
-        let changed_boundary = roots
-            .iter()
-            .any(|root| !view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
-        if changed_boundary {
-            return RefreshRequest {
-                expected_generation,
-                scopes: Vec::new(),
-                rename_hints: Vec::new(),
-                reason: RefreshReason::Backstop,
-            };
-        }
-        scopes.retain(|scope| match scope {
-            RefreshScope::Entry { parent, .. } => {
-                let mut path = Vec::new();
-                view.dir_path(*parent, &mut path);
-                !roots
-                    .iter()
-                    .any(|root| Path::new(OsStr::from_bytes(&path)).starts_with(root))
-            }
-            _ => true,
-        });
-        scopes.extend(roots.into_iter().map(RefreshScope::Root));
-        RefreshRequest {
-            expected_generation,
-            scopes,
-            rename_hints: rename_hints(moves),
-            reason: self.reason(),
-        }
-    }
-}
 
-/// A hint for each move cookie seen exactly once on each side.
-fn rename_hints(moves: BTreeMap<u32, MovePair>) -> Vec<RenameHint> {
-    moves
-        .into_values()
-        .filter_map(|MovePair { mut old, mut new }| {
-            if old.len() != 1 || new.len() != 1 {
-                return None;
-            }
-            let (old_parent, old_name) = old.pop()?;
-            let (new_parent, new_name) = new.pop()?;
-            Some(RenameHint {
-                old_parent,
-                old_name,
-                new_parent,
-                new_name,
-            })
-        })
-        .collect()
-}
 #[cfg(test)]
 mod tests;
