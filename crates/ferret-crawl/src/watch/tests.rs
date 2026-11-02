@@ -5,6 +5,7 @@ use std::sync::RwLockReadGuard;
 
 use ferret_catalog::WriterSession;
 
+use super::failures::EXACT_FAILURES;
 use super::*;
 use crate::{IndexOptions, Refresh, RefreshScope, index};
 
