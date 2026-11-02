@@ -2,6 +2,7 @@
 //! many names or inodes: [`NameReader`] and its [`NameRuns`], and [`Kinds`].
 
 use super::*;
+use crate::packed::Blocked;
 use crate::seek::seek;
 
 /// The name columns and the name heap of one generation, resolved once
