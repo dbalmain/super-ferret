@@ -65,7 +65,6 @@
 //! documents: a path and a few words per position.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::ops::{ControlFlow, Range};
 use std::sync::Mutex;
 #[cfg(test)]
@@ -685,6 +684,8 @@ enum How {
     /// consumed.
     Here(u32),
 }
+
+// ── the pool ──
 
 impl Pool {
     fn new(positions: usize, threads: usize) -> Self {

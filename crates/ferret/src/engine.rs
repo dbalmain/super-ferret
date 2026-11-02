@@ -8,16 +8,14 @@
 //! through [`Engine::open_content`]: no writer lock, and nothing is repaired
 //! or removed.
 
-use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use ferret_catalog::{Catalog, Generation, OpenError, Section, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
-use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged, Pinned};
-use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
-use ferret_query::{Content, DocNames, NameIndex, Query, Row, RunError, Stats, UNCOVERED_BOUND};
+use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged};
+use ferret_query::{DocNames, NameIndex};
 
 use crate::lock;
 

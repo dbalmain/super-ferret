@@ -3,6 +3,7 @@
 
 use std::cell::Cell;
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
@@ -10,6 +11,8 @@ use std::time::SystemTime;
 use ferret_crawl::{IndexOptions, Refresh, RefreshReason, RefreshRequest, RefreshScope, index};
 
 use ferret_catalog::{NameId, Target};
+use ferret_index::Pinned;
+use ferret_query::Query;
 
 use super::*;
 

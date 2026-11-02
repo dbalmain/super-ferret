@@ -2,6 +2,12 @@
 //! derived name and document indexes it builds on demand, and grep's
 //! candidate documents.
 
+use std::ops::ControlFlow;
+
+use ferret_index::Pinned;
+use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
+use ferret_query::{Content, Query, Row, RunError, Stats, UNCOVERED_BOUND};
+
 use super::*;
 
 impl QuerySession {

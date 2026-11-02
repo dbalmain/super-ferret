@@ -1,7 +1,7 @@
 //! Settling one document, sequentially: reading it through a [`Hand`],
 //! verifying it whole or streamed, and the [`Settled`] answer.
 
-use std::io;
+use std::io::{self, Read};
 use std::time::Instant;
 
 use ferret_verify::{Search, TextMatcher};

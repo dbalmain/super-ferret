@@ -196,5 +196,3 @@ impl<'s, 'q, 'c, 'p, 'r, 'a, E: FnMut(&Row<'_>) -> ControlFlow<()>>
         Ok((self.emit)(&row))
     }
 }
-
-// ── the pool ──
