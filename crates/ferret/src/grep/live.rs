@@ -484,6 +484,7 @@ fn read_global(path: &Path) -> io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use ferret_catalog::Section;
+    use ferret_query::find::EntrySource;
 
     use super::anchors::OPENED;
     use super::*;
