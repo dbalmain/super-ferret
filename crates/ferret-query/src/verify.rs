@@ -54,15 +54,15 @@
 //! run vary with the thread count.
 //!
 //! Memory: a worker reserves a document's catalogued size (at most
-//! [`IN_FLIGHT_BYTES`](crate::IN_FLIGHT_BYTES)) from a shared [`Budget`] of
-//! that many bytes before reading it, and frees a buffer larger than
-//! [`KEPT_BUFFER`] before returning the reservation. The workers' buffers
-//! therefore hold at most `IN_FLIGHT_BYTES + threads × KEPT_BUFFER`, plus
-//! whatever the files being read grew beyond their catalogued size (each still
-//! under the reader's size cap). The calling thread's buffer is separate: it
-//! reads one document at a time, as before, and keeps the capacity of the
-//! largest it read. The ring holds finished rows, not documents: a path and a
-//! few words per position.
+//! [`IN_FLIGHT_BYTES`](crate::IN_FLIGHT_BYTES)) from a shared
+//! [`Budget`](crate::budget::Budget) of that many bytes before reading it, and
+//! frees a buffer larger than [`KEPT_BUFFER`] before returning the reservation.
+//! The workers' buffers therefore hold at most `IN_FLIGHT_BYTES + threads ×
+//! KEPT_BUFFER`, plus whatever the files being read grew beyond their
+//! catalogued size (each still under the reader's size cap). The calling
+//! thread's buffer is separate: it reads one document at a time, as before, and
+//! keeps the capacity of the largest it read. The ring holds finished rows, not
+//! documents: a path and a few words per position.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
