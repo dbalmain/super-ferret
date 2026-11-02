@@ -1,11 +1,11 @@
 //! Real effects and filesystem fixtures; the ignored differential extension
 //! compares the same tree, including tree mutations and output-file contents.
 
-use std::fs;
-use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{fs, io};
 
 use super::*;
 use crate::find::{Outcome, Plan, gnu};

@@ -1,6 +1,11 @@
 //! rg's argument grammar: spellings, clusters, attached values, `--rg`
 //! flags and pattern files, parsed into a [`Command`].
 
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+
+use ferret_verify::{GrepFlags, LineFlags};
+
 use super::*;
 
 /// A grep argument/profile failure, before any input is opened.

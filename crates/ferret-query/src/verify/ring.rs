@@ -2,7 +2,11 @@
 //! post each finished position to its batch's slot of a bounded ring, which
 //! the calling thread takes in order.
 
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Condvar, PoisonError};
+
 use super::*;
+use crate::budget::Budget;
 
 pub(super) trait Placed {
     fn place(&mut self, path: Range<usize>);

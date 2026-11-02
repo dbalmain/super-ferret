@@ -1,6 +1,8 @@
 //! One stat of an entry: [`Metadata`] from a live `statx`, and [`Stat`], which
 //! reads a field from the catalog or from that live stat.
 
+use rustix::fs::{FileType as RawType, Stat as RawStat, Statx, makedev};
+
 use super::*;
 
 pub(in crate::find) enum Stat<'a> {

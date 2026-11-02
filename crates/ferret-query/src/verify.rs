@@ -67,18 +67,17 @@
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::ops::{ControlFlow, Range};
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::Scope;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
 use ferret_index::Certainty;
-use ferret_verify::{MatchStats, Search, TextMatcher};
+use ferret_verify::MatchStats;
 
-use crate::budget::Budget;
 use crate::expr::{Test, Truth};
 use crate::plan::{ReadRequest, ReadVersion, Reader};
 use crate::run::NameTester;

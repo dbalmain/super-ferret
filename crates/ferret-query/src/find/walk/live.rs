@@ -1,6 +1,12 @@
 //! The live source: a depth-first walk over each directory's getdents
 //! listing, held level by level so a walk can split between workers.
 
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+
+use ferret_catalog::Contents;
+use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open, openat};
+
 use super::*;
 use crate::threads::lock;
 

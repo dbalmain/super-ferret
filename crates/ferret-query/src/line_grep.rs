@@ -2,14 +2,12 @@
 //! supplies input resolution, policy selection and output; matching and
 //! streaming are shared with content search through ferret-verify and `scan`.
 
-use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::ops::ControlFlow;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferret_verify::{Grep, GrepFlags, LineFlags, Search};
+use ferret_verify::{Grep, Search};
 
 mod args;
 mod context;

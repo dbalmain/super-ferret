@@ -620,8 +620,10 @@ impl Render<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::cell::Cell;
+    use std::ffi::OsString;
+
+    use super::*;
 
     thread_local! {
         static METADATA_FAILURE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };

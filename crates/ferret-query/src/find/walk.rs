@@ -14,36 +14,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
-use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rustix::fs::{
-    AtFlags, CWD, FileType as RawType, Mode, OFlags, RawDir, Stat as RawStat, Statx, StatxFlags,
-    makedev, open, openat, readlinkat, statat, statx,
-};
-
-use ferret_catalog::{Catalog, Contents, InoId, Kind, NameId, Target};
+use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
+use rustix::fs::{AtFlags, CWD, StatxFlags, readlinkat, statat, statx};
 
 use super::schedule::Share;
 use super::{Follow, Options};
+use crate::threads::lock;
 
 mod live;
 mod metadata;
 mod resolve;
 
-use crate::threads::lock;
 pub use live::LiveWalk;
 pub use metadata::Metadata;
 pub(super) use metadata::{Stat, metadata};
 use metadata::{metadata_at, stat_at};
 pub use resolve::{Namespace, resolve_in};
 pub(super) use resolve::{resolve, resolve_observed};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 
 /// Find's file kinds on Linux.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

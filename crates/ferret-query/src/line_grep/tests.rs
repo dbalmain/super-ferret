@@ -1,5 +1,8 @@
-use super::*;
+use std::ffi::OsString;
+
 use ferret_verify::Trigrams;
+
+use super::*;
 
 // A refused command reaches rg without the arguments the parser took as
 // `--rg`, and with every `--rg` it took as something else: a value, a
