@@ -277,7 +277,7 @@ fn retained_roots_follow_the_catalog_across_scoped_runs() {
             .unwrap_or_else(|e| panic!("open: {e}"))
             .unwrap_or_else(|| panic!("no catalog"));
         catalog.load_all().unwrap_or_else(|e| panic!("load: {e}"));
-        super::retained_roots(&catalog)
+        super::background::retained_roots(&catalog)
     };
     let add = |roots: &[PathBuf]| {
         run(
