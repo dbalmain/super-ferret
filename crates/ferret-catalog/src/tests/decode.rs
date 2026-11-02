@@ -1299,8 +1299,10 @@ fn a_small_resident_conversion_starts_no_thread() {
 }
 
 /// A names table checked in row ranges on several threads fails as one pass
-/// does, for corruptions on either side of each range's edge: the rows that
-/// seed a range, and the first rows it checks itself.
+/// does: for corruptions on either side of each range's edge (the rows that
+/// seed a range, and the first rows it checks itself) and at the table's
+/// end, and for two corruptions in different ranges, where the first in row
+/// order, or a wrong NUL count before either, must win.
 #[test]
 fn a_names_table_checked_in_ranges_fails_as_one_pass_does() {
     use crate::fan_out::seam::Seams;
@@ -1312,10 +1314,13 @@ fn a_names_table_checked_in_ranges_fails_as_one_pass_does() {
     commit(&scratch.path, |txn| {
         let mut w = txn.batch();
         let root = w.root(b"/r", dir_stat(1));
+        // Under a directory, so a seeded parent is 1, not the 0 a range
+        // starts from.
+        let dir = w.dir(root, b"d", dir_stat(2));
         for i in 0..FILES {
             let name = format!("f{i:05}");
             w.file(
-                root,
+                dir,
                 name.as_bytes(),
                 file_stat(10 + i as u64),
                 Content::Unindexed,
@@ -1337,44 +1342,79 @@ fn a_names_table_checked_in_ranges_fails_as_one_pass_does() {
     };
     assert_eq!(decode(&bytes, 1), (Ok(()), false));
     assert_eq!(decode(&bytes, 4), (Ok(()), true));
-    // Each name is 6 bytes and its NUL, in row order.
+    // Row 0 is `d`; row `r` after it is file `r - 1`, 6 bytes and its NUL.
+    // The heap's 280,002 bytes do not split evenly in four.
     let heap = section_start(&bytes, Section::NameHeap);
-    assert_eq!(&bytes[heap + 7 * 12_345..heap + 7 * 12_346], b"f12345\0");
-    // Four threads take ranges of 10,048 rows, the row count rounded up to
-    // whole runs.
-    let mut cases = 0;
-    for edge in [10_048, 20_096, 30_144] {
-        for row in edge - 2..edge + 2 {
-            let mut corrupt = Vec::new();
-            // Out of sibling order after its predecessor, or before its
-            // successor.
-            for first in [b'a', b'~'] {
-                let mut flipped = bytes.clone();
-                flipped[heap + 7 * row] = first;
-                corrupt.push(flipped);
-            }
-            // An empty name: the previous name's NUL moved onto this one's
-            // first byte, keeping the count.
-            let mut emptied = bytes.clone();
-            emptied[heap + 7 * row - 1] = b'x';
-            emptied[heap + 7 * row] = 0;
-            corrupt.push(emptied);
-            // An offset moved back into an earlier name, unless it already
-            // starts its block, which leaves it where it is.
-            for raw in [0, 1] {
-                let mut moved = bytes.clone();
-                set_raw(&mut moved, Column::NameOffset, row, raw);
-                if moved != bytes {
-                    corrupt.push(moved);
-                }
-            }
-            for corrupt in corrupt {
-                let (serial, _) = decode(&corrupt, 1);
-                assert!(serial.is_err(), "row {row}");
-                assert_eq!(decode(&corrupt, 4).0, serial, "row {row}");
-                cases += 1;
+    let at = |row: usize| heap + 2 + 7 * (row - 1);
+    assert_eq!(&bytes[at(12_346)..at(12_347)], b"f12345\0");
+    let mut cases = Vec::new();
+    // Four threads take ranges of 10,048 rows, the 40,001 rounded up to
+    // whole runs; the last ends at the table's end.
+    for row in [10_048, 20_096, 30_144]
+        .into_iter()
+        .flat_map(|edge| edge - 2..edge + 2)
+        .chain([FILES - 1, FILES])
+    {
+        // Out of sibling order after its predecessor, or before its
+        // successor.
+        for first in [b'a', b'~'] {
+            let mut flipped = bytes.clone();
+            flipped[at(row)] = first;
+            cases.push(flipped);
+        }
+        // An empty name: the previous name's NUL moved onto this one's
+        // first byte, keeping the count.
+        let mut emptied = bytes.clone();
+        emptied[at(row) - 1] = b'x';
+        emptied[at(row)] = 0;
+        cases.push(emptied);
+        // One NUL too many, inside a name.
+        let mut extra = bytes.clone();
+        extra[at(row) + 1] = 0;
+        cases.push(extra);
+        // An offset moved back into an earlier name, unless it already
+        // starts its block, which leaves it where it is.
+        for raw in [0, 1] {
+            let mut moved = bytes.clone();
+            set_raw(&mut moved, Column::NameOffset, row, raw);
+            if moved != bytes {
+                cases.push(moved);
             }
         }
     }
-    assert!(cases >= 3 * 4 * 4, "{cases} cases");
+    // Rows 20,096 to 20,223, one block that starts the third range, back
+    // under the root: a parent that falls across the range's edge.
+    let mut fallen = bytes.clone();
+    set_block_base(
+        &mut fallen,
+        Column::NameParent,
+        20_096 / packed::BLOCK_ROWS,
+        0,
+    );
+    cases.push(fallen);
+    // A sibling-order error in the first range and an offset error in the
+    // second; an offset error in the first and one NUL too many in the last.
+    // A one-thread decode runs the same code, so these say what must win.
+    let mut two = bytes.clone();
+    two[at(5)] = b'a';
+    set_raw(&mut two, Column::NameOffset, 10_100, 0);
+    assert_eq!(decode(&two, 4).0, Err(DecodeError::Corrupt("name order")));
+    cases.push(two);
+    let mut two = bytes.clone();
+    set_raw(&mut two, Column::NameOffset, 3, 0);
+    assert_eq!(decode(&two, 4).0, Err(DecodeError::Corrupt("names")));
+    two[at(35_000) + 1] = 0;
+    assert_eq!(decode(&two, 4).0, Err(DecodeError::Corrupt("name order")));
+    cases.push(two);
+    let mut rejected = 0;
+    for case in &cases {
+        let (serial, _) = decode(case, 1);
+        rejected += usize::from(serial.is_err());
+        assert_eq!(decode(case, 4).0, serial, "case {rejected}");
+    }
+    assert!(
+        rejected + 2 >= cases.len(),
+        "{rejected} of {} rejected",
+        cases.len()
+    );
 }

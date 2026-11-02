@@ -144,7 +144,7 @@ pub(crate) struct Overlay {
     docs_checked: OnceLock<()>,
 }
 pub(crate) struct Namespace {
-    pub(crate) rows: Projection,
+    rows: Projection,
     keys: ChildKeys,
     /// Directories with any child key row: every other directory's children
     /// are its checkpoint range, unchanged and still in basename order.
@@ -153,7 +153,7 @@ pub(crate) struct Namespace {
     pub(crate) names: Vec<u32>,
     pub(crate) heap: Vec<u8>,
     pub(crate) spans: Vec<(usize, u32)>,
-    pub(crate) references: BTreeMap<u32, i64>,
+    references: BTreeMap<u32, i64>,
 }
 impl Overlay {
     pub(crate) fn empty(base: Catalog, manifest: Manifest) -> Self {
