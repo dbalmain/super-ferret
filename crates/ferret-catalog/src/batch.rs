@@ -24,7 +24,7 @@ pub use observe::{DirectoryObservation, FileObservation};
 use seen::Seen;
 
 use crate::format::NONE;
-use crate::{Catalog, ContentState, Generation, Hash, InoId, Kind, NameId};
+use crate::{Catalog, ContentState, Hash, InoId, Kind, NameId};
 
 /// A directory, as minted by the batch that recorded it. Valid only within the
 /// transaction whose batch minted it. `Copy + Send`, for the walker's

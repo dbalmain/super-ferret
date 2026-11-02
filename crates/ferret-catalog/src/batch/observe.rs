@@ -3,6 +3,7 @@
 //! the pinned view, and its counts.
 
 use super::*;
+use crate::Generation;
 
 /// Borrowed directory observation. Tokens remain local to the producing run.
 #[derive(Clone, Copy)]

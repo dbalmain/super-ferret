@@ -1,6 +1,7 @@
 //! The catalog's work trees and its documents' content hashes.
 
 use super::*;
+use crate::format::{HASH_ROW, WORK_TREE_ROW, u64_at};
 
 impl Catalog {
     /// Every work tree whose top is at or below a root, by top directory.

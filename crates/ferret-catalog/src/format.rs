@@ -112,14 +112,12 @@
 //! that spans sections (a directory's name edge against the name rows) runs
 //! when the later one loads, after the sections it [needs](Section::needs).
 
-use std::fmt;
 use std::fs::File;
-use std::io;
 use std::os::unix::fs::FileExt;
-use std::sync::OnceLock;
+use std::{fmt, io};
 
 use crate::generation::{Generation, checksum};
-use crate::packed::{self, Blocked, Packed, RUN};
+use crate::packed::{self, Blocked, Packed};
 use crate::seek::{partition_point, seek};
 
 mod check;

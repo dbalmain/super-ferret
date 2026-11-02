@@ -1,7 +1,10 @@
 //! The catalog's namespace: names and their bytes, a directory's children,
 //! lookups and paths, and the configured roots.
 
+use std::os::unix::fs::FileExt;
+
 use super::*;
+use crate::seek::gallop;
 
 impl Catalog {
     /// Every name, NUL-terminated, in `NameId` order: the bytes a filename

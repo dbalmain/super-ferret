@@ -1,7 +1,10 @@
 //! Each section's structural check, run once when a reader first loads it.
 
+use std::sync::OnceLock;
+
 use super::*;
 use crate::fan_out::{cores, fan_out};
+use crate::packed::RUN;
 
 /// What one section's check found that a later check reuses, so that no
 /// check decodes a column a check before it already decoded. Kept by the

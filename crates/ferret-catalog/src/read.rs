@@ -19,26 +19,24 @@
 //! as indexing a slice does. Anything read from the file cannot panic: that is
 //! what loading validated.
 
-use std::fmt;
 use std::fs::File;
-use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::{fmt, io};
 
 use crate::batch::{Stat, WorkTreeKind};
 use crate::fan_out::fan_out;
 use crate::format::{
-    self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
-    WORK_TREE_ROW, u32_at, u64_at,
+    self, COLUMNS, Column, Facts, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View, u32_at,
 };
 use crate::generation::Manifest;
 use crate::log::{Family, Record};
 use crate::overlay::{self, Overlay};
 use crate::packed::{self, Blocked};
 use crate::regular::{self, Access};
-use crate::seek::{gallop, partition_point, seek};
+use crate::seek::partition_point;
 use crate::{
     ContentState, DecodeError, DocId, Generation, Handle, Hash, InoId, NameId, RetryFromCurrent,
     lock,
