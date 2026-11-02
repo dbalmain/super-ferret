@@ -1,11 +1,18 @@
 mod capture;
+use std::cell::Cell;
+use std::os::unix::ffi::OsStrExt;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+
+use ferret_catalog::NameId;
+use ferret_query::{
+    CheckedReader, ReadFault, ReadOperation, ReadOutcome, ReadRequest, ReadVersion,
+};
+
 use super::job::{Cache, Cached, Job, JobPath, Worker, observe};
 use super::render::{Cancellable, OutputCapture, Record, Recording};
 use super::*;
-use ferret_query::{ReadOperation, ReadVersion};
-use std::cell::Cell;
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use crate::lock;
 
 impl From<&str> for JobPath {
     fn from(path: &str) -> Self {

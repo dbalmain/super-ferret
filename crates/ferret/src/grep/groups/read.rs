@@ -1,8 +1,12 @@
 //! How a job's bytes are read: explicit and walked files, catalogued
 //! documents, the size cap and the binary probe.
 
+use ferret_catalog::NameId;
+use ferret_query::{
+    CheckedReader, ReadFault, ReadOperation, ReadOutcome, ReadRequest, ReadVersion,
+};
+
 use super::*;
-use ferret_query::{ReadOperation, ReadVersion};
 
 /// Reads an explicit operand by `path`, following symlinks, or, given the
 /// `listed` directory a walk found it in, a walked file by its name beneath

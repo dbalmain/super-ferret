@@ -1,9 +1,12 @@
 //! Grep's namespace choice over find's constructors. Both content and
 //! names-only modes retain physical traversal, cancellation and start spelling.
 
-use super::*;
+use std::os::unix::ffi::OsStrExt;
+
 use ferret_catalog::Catalog;
-use ferret_query::find::{Entry, LiveWalk, WalkError};
+use ferret_query::find::{CatalogSource, Entry, EntrySource, LiveWalk, WalkError};
+
+use super::*;
 
 pub(super) enum Directory {
     Catalog(CatalogSource),

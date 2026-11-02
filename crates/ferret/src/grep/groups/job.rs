@@ -1,14 +1,19 @@
 //! File jobs: one input read into a rendered group, retried while unpublished,
 //! or replayed from the bounded duplicate cache.
 
-use super::read::{read_catalogued, read_file, read_file_policy};
-use super::render::{Cursor, OutputCapture, Record, Recording, Render, record_size};
-use super::*;
-use ferret_query::ReadVersion;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
+
+use ferret_catalog::NameId;
+use ferret_query::line_grep::{InputResult, ScanError};
+use ferret_query::{CheckedReader, ReadFault, ReadOutcome, ReadRequest, ReadVersion};
+
+use super::read::{read_catalogued, read_file, read_file_policy};
+use super::render::{Cursor, OutputCapture, Record, Recording, Render, record_size};
+use super::*;
+use crate::lock;
 
 pub(in super::super) struct Group {
     pub result: InputResult,

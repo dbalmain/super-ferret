@@ -3,8 +3,10 @@
 //! `--live`). Content search and `--files` share it; what each does with a
 //! selected file is its own.
 
-use ferret_query::find::Entry;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+
+use ferret_query::find::{Entry, FileKind};
 
 use super::*;
 

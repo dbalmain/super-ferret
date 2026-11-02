@@ -1,12 +1,16 @@
 //! Which entries a walk searches: the per-entry filter, and the serial operand
 //! source that feeds [`run`](super::run).
 
+use std::ops::ControlFlow;
+use std::sync::Mutex;
+
+use ferret_query::find::EntrySource;
+
 use super::super::holders::Holders;
 use super::super::visibility::{Visibility, Visit};
 use super::job::{Job, JobPath};
 use super::*;
-use std::ops::ControlFlow;
-use std::sync::Mutex;
+use crate::lock;
 
 /// Index candidates: the documents that may hold a match.
 pub(in super::super) trait Candidates: Sync {

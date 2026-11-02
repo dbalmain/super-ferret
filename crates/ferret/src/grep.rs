@@ -10,6 +10,14 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ferret_policy::GrepSelection;
+use ferret_query::find::{EntrySource, OutputBuffer};
+use ferret_query::line_grep::{self, Plan};
+
+use crate::cli::{self, Exit};
+use crate::engine::{self, Engine};
+use crate::xdg::Dirs;
+
 mod groups;
 mod holders;
 mod host;
@@ -24,15 +32,6 @@ mod routing;
 mod sources;
 mod visibility;
 
-use ferret_catalog::NameId;
-use ferret_policy::GrepSelection;
-use ferret_query::find::{CatalogSource, EntrySource, FileKind, OutputBuffer};
-use ferret_query::line_grep::{self, InputResult, Output, Plan, ScanError};
-use ferret_query::{CheckedReader, ReadFault, ReadOutcome, ReadRequest};
-
-use crate::cli::{self, Exit};
-use crate::engine::{self, Engine};
-use crate::xdg::Dirs;
 use host::{Host, block_stdout, buffered_path_output, label, report_shortfall};
 
 const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\

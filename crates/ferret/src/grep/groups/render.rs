@@ -1,8 +1,11 @@
 //! Line rendering: a file's records written as grep or JSON lines into a
 //! bounded capture that streams once it outgrows the shared budget.
 
-use super::*;
 use std::sync::Arc;
+
+use ferret_query::line_grep::{InputResult, ScanError};
+
+use super::*;
 
 pub(in super::super) struct Render<'a> {
     pub plan: &'a Plan,

@@ -4,10 +4,12 @@
 //! but each diagnostic and policy warning still follows the names its worker
 //! listed before it.
 
-use super::*;
-use ferret_query::find::LiveWalk;
-use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
 use std::sync::mpsc::{self, SyncSender};
+
+use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
+use ferret_query::find::{EntrySource, LiveWalk};
+
+use super::*;
 
 /// Bytes of names a worker gathers before sending them.
 const CHUNK: usize = 16 << 10;

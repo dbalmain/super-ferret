@@ -2,13 +2,16 @@
 //! for uncovered operands. Coverage is resolved before engine/daemon routing.
 //! ferret-policy owns rule decisions; ferret-crawl owns scoped input reads.
 
-use super::*;
-use crate::config_file::Contents;
-use ferret_catalog::{Catalog, Section};
-use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry};
-use ferret_query::find::Entry;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Component;
 use std::sync::{Arc, OnceLock};
+
+use ferret_catalog::{Catalog, Section};
+use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry};
+use ferret_query::find::{Entry, FileKind};
+
+use super::*;
+use crate::config_file::Contents;
 
 #[derive(Clone)]
 pub(super) struct Anchors {

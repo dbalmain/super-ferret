@@ -13,7 +13,6 @@ mod tests;
 mod walk;
 
 use super::*;
-use crate::lock;
 
 pub(super) use job::{Observed, observe_streaming};
 pub(super) use publish::run;

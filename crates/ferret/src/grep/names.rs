@@ -2,12 +2,14 @@
 //! loads catalog namespace sections; remote::serve supplies its pinned catalog.
 //! Neither path prepares document identities, postings or content sections.
 
-use ferret_catalog::{Catalog, Section};
-use ferret_query::line_grep::{Names, Sort};
 use std::cmp::Reverse;
 use std::io::IsTerminal;
 use std::time::SystemTime;
 use std::{panic, thread};
+
+use ferret_catalog::{Catalog, Section};
+use ferret_query::find::{CatalogSource, EntrySource};
+use ferret_query::line_grep::{Names, Sort};
 
 use super::visibility::{Visibility, Visit};
 use super::*;

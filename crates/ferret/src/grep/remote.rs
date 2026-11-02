@@ -1,13 +1,14 @@
 //! Socket adapter for the shared grep host. Environment and pattern-file
 //! reads belong to the client; the server only parses supplied bytes.
 
+use std::io::{BufWriter, LineWriter};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 use super::*;
 use crate::protocol::{GrepOptions, Request};
 use crate::transport::Destination;
-use std::io::{BufWriter, LineWriter};
-use std::os::unix::ffi::OsStringExt;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 pub(super) fn run(
     args: &[OsString],

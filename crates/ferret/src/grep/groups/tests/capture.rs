@@ -1,9 +1,14 @@
 //! D109 regressions through the real scheduler, renderer and publisher.
 
-use super::*;
-use crate::grep::groups::capture::{self, Budget};
 use std::sync::Condvar;
 use std::time::Duration;
+
+use ferret_catalog::NameId;
+use ferret_query::{CheckedReader, ReadOutcome, ReadRequest};
+
+use super::*;
+use crate::grep::groups::capture::{self, Budget};
+use crate::lock;
 
 struct ObservedBudget(Arc<Mutex<Option<Arc<Budget>>>>);
 

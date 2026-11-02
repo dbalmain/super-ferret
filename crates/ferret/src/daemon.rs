@@ -26,12 +26,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
+use endpoint::Endpoint;
+
 use crate::engine::{Engine, QuerySession};
 use crate::find_json::{emit_to, generation};
 use crate::lock;
 use crate::protocol::{self, Op, Request};
 use crate::transport::Destination;
-use endpoint::Endpoint;
 
 const BUILD: &str = env!("FERRET_BUILD");
 const MAJOR: u64 = 1;

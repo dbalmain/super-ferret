@@ -1,15 +1,18 @@
 //! The parallel live walk (D105): workers lend subtrees and search the files
 //! they reach.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
+use ferret_query::find::{EntrySource, LiveWalk};
+use ferret_query::{Lane, Shortfall};
+
 use super::job::{Job, Observed, Scratch};
 use super::publish::{Handoff, Search, weight};
 use super::source::{Filter, Source};
 use super::*;
-use ferret_query::find::LiveWalk;
-use ferret_query::find::schedule::{self, Schedule, Step, Visitor};
-use ferret_query::{Lane, Shortfall};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::lock;
 
 /// Searches `source`'s operands with the walk itself spread over `threads`
 /// workers (D105): find's walk schedule lends subtrees of each live

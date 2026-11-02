@@ -1,13 +1,17 @@
 //! What one search's workers share, the relay that hands their groups to the
 //! publishing thread, and [`run`], the parallel feed.
 
-use super::job::{Cache, Job, Observed, Worker};
-use super::*;
-use ferret_query::GroupSchedule;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
+
+use ferret_query::line_grep::InputResult;
+use ferret_query::{CheckedReader, GroupSchedule};
+
+use super::job::{Cache, Job, Observed, Worker};
+use super::*;
+use crate::lock;
 
 type Fork<'a> = dyn Fn() -> Option<Box<CheckedReader<'a>>> + Sync + 'a;
 
