@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::time::{Duration, UNIX_EPOCH};
 
-use super::{Settled, Verifier};
+use super::settle::{Settled, Verifier};
 use crate::{Query, ReadRequest, ReadVersion};
 
 #[test]
