@@ -1,7 +1,10 @@
 //! Segment files behind the host's pacer: [`Paced`] for a segment being
 //! written, [`PacedInput`] for a merge input being read.
 
+use std::io::Write;
+
 use super::*;
+use crate::segment::{CHUNK, ReadAt};
 
 /// A segment file being written, with the host's pacer in front of every
 /// transfer.

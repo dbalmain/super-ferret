@@ -1,7 +1,10 @@
 //! A follow pass: reading new documents into a segment's buffers, sealing
 //! and writing each segment as the buffers fill, and publishing the pass.
 
+use std::io::{BufWriter, Write};
+
 use super::*;
+use crate::extract::Extracted;
 
 impl IndexWriter {
     pub(super) fn follow_inner(

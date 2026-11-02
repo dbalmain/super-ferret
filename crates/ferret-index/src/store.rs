@@ -29,21 +29,19 @@
 
 use std::cell::RefCell;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::thread::ScopedJoinHandle;
 
 use ferret_text::{TERM_VERSION, TRIGRAM_VERSION};
 
-use crate::extract::Extracted;
 use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
-use crate::merge;
-use crate::regular;
 use crate::segment::{
-    CHUNK, Hit, Inverter, ReadAt, ReadError, Segment, Sizes, TrigramInverter, WriteError, Writer,
+    Hit, Inverter, ReadError, Segment, Sizes, TrigramInverter, WriteError, Writer,
 };
+use crate::{merge, regular};
 
 mod follow;
 mod merging;

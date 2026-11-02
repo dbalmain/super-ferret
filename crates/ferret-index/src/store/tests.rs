@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 use crate::manifest;
-use crate::segment::Section;
+use crate::segment::{CHUNK, ReadAt, Section};
 
 const WORDS: [&str; 16] = [
     "amber", "basalt", "cobalt", "dune", "ember", "fjord", "garnet", "heath", "iris", "jade",
