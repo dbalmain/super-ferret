@@ -162,7 +162,7 @@ impl TrigramInverter {
         added
     }
 
-    /// [`Self::add_limited`] for keys already found by a [`KeySet`].
+    /// `add_limited` for keys already found by a [`KeySet`].
     pub(crate) fn add_keys(
         &mut self,
         doc: u32,

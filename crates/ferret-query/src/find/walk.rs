@@ -609,7 +609,7 @@ struct Saved {
     /// The listing directory's `(dev, ino)`, where a walk bounded by
     /// [`Charge`] closed it instead of retaining it.
     listed: Option<(u64, u64)>,
-    /// The listing directory's hidden names; see [`Level::hidden`].
+    /// The listing directory's hidden names; see `live::Level::hidden`.
     hidden: Hidden,
 }
 

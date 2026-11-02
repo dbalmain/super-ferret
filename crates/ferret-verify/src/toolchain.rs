@@ -6,7 +6,7 @@
 //! way, and `scan`'s tests run every arm the host can execute against a
 //! reference; what a newer rustc can change is whether it still pays, since
 //! LLVM may vectorise the SWAR loop better or schedule the AVX2 loop worse.
-//! [`toolchain_moved_recheck_the_ledger`] fails when the compiling rustc is
+//! `toolchain_moved_recheck_the_ledger` fails when the compiling rustc is
 //! not [`RECHECKED_WITH`], so a toolchain bump cannot land without someone
 //! reading this list.
 //!

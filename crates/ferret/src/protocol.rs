@@ -5,8 +5,8 @@
 //! `ferret` crate parses only its own small request schema, never a general
 //! `serde_json::Value`. [`json`](crate::json) is the matching writer; a
 //! byte-valued field here is the inverse of
-//! [`json::Object::byte_strings`]'s per-item encoding: a UTF-8 string, or
-//! `{"base64":"..."}` with the exact bytes.
+//! [`crate::json::Object::byte_strings`]'s per-item encoding: a UTF-8 string,
+//! or `{"base64":"..."}` with the exact bytes.
 //!
 //! This reader takes untrusted input (other tools may eventually talk to the
 //! daemon over this same codec), so [`parse_request`] never panics and never

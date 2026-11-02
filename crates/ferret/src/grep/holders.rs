@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 
 /// Directories whose subtree holds a name the walk can yield a job for.
 /// Every other catalogued directory is left unlisted. Their files would each
-/// be dropped by [`Filter`](super::groups::Filter) as a non-candidate, or by
+/// be dropped by `groups::source::Filter` as a non-candidate, or by
 /// the walk's selection for a name its globs and types reject, and
 /// they hold no directory listed live, so skipping them changes only which
 /// files count as searched (D99), which the caller settles separately.
