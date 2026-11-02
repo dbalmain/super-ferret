@@ -4,6 +4,8 @@
 
 use std::ops::ControlFlow;
 
+use ferret_verify::Search;
+
 use super::*;
 
 /// Where a record sits in the source: what every [`Line`] the plain scan

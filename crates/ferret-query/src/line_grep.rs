@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferret_verify::{Grep, Search};
+use ferret_verify::Grep;
 
 mod args;
 mod context;
