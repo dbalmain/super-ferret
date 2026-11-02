@@ -117,7 +117,7 @@ use std::os::unix::fs::FileExt;
 use std::{fmt, io};
 
 use crate::generation::{Generation, checksum};
-use crate::packed::{self, Blocked, Packed};
+use crate::packed;
 
 mod check;
 mod encode;

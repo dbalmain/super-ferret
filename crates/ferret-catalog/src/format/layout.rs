@@ -3,6 +3,7 @@
 //! column, and the [`View`] that reads them.
 
 use super::*;
+use crate::packed::{Blocked, Packed};
 use crate::seek::{partition_point, seek};
 
 /// The NUL bytes in `bytes`. Summed as `u8` per 255-byte chunk, which the
