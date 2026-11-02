@@ -78,11 +78,11 @@
 //!   made together, share their high bits. The descriptor's base is the bytes
 //!   of packed values after the table, and its width the widest block's.
 //! - **Nullable blocked:** blocked, with each block framed by its real values
-//!   alone. A block that holds a none sets `packed::NULLS` beside its width,
-//!   and its width's all-ones value is none; a block of nothing but nones is
-//!   width 0, and a block without one keeps its plain width. For the inodes'
-//!   documents, which directories and unhashed files leave out in runs, and
-//!   entry counts.
+//!   alone. A block that holds a none sets `packed::blocked::NULLS` beside its
+//!   width, and its width's all-ones value is none; a block of nothing but
+//!   nones is width 0, and a block without one keeps its plain width. For the
+//!   inodes' documents, which directories and unhashed files leave out in runs,
+//!   and entry counts.
 //! - **Sequence:** row `i`'s value is `base + i + packed`, for ids sorted
 //!   strictly increasing. Ids without holes are all `packed` 0: width 0, no
 //!   bytes but the padding, and a row found from its id by subtraction. A hole
