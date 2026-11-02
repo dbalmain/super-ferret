@@ -12,7 +12,7 @@ use super::files::{FAIL_OPEN_SPAWN_AT, OPEN_SPAWNS};
 use super::paced::{PacedInput, RECENT_PAGES};
 use super::*;
 use crate::manifest;
-use crate::segment::{CHUNK, ReadAt, Section};
+use crate::segment::{CHUNK, Hit, ReadAt, Section};
 
 const WORDS: [&str; 16] = [
     "amber", "basalt", "cobalt", "dune", "ember", "fjord", "garnet", "heath", "iris", "jade",
