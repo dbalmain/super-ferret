@@ -80,10 +80,9 @@ impl Catalog {
     /// ignoring failures: [`Catalog::load_all`] then finds them loaded, and
     /// loads any that failed again in order, so it reports what a serial
     /// load would. Each section with nothing to wait for heads a chain, and
-    /// a section needing only such sections follows its largest need in
-    /// that need's chain, so it starts as soon as the need is checked rather
-    /// than when every need is. Longest chains go first; the rest are a few
-    /// bytes and load serially.
+    /// every other section follows its largest need in that need's chain, at
+    /// any depth, so it starts as soon as the need is checked rather than
+    /// when every chain is. Longest chains go first.
     pub(super) fn prefetch(&self, skip: &[Section]) {
         const WORKERS: usize = 4;
         if !matches!(self.source.as_ref(), Source::File { .. }) {
@@ -93,19 +92,31 @@ impl Catalog {
             let (start, end) = self.layout.range(section);
             end - start
         };
-        let sections = SECTIONS.into_iter().filter(|s| !skip.contains(s));
-        let mut chains: Vec<Vec<_>> = sections
-            .clone()
-            .filter(|s| s.needs().is_empty())
-            .map(|s| vec![s])
-            .collect();
-        for section in sections
-            .filter(|s| !s.needs().is_empty() && s.needs().iter().all(|n| n.needs().is_empty()))
-        {
-            let lead = section.needs().iter().copied().max_by_key(|&n| size(n));
-            match chains.iter_mut().find(|chain| Some(chain[0]) == lead) {
-                Some(chain) => chain.push(section),
-                None => chains.push(vec![section]),
+        let mut chains: Vec<Vec<Section>> = Vec::new();
+        let mut chain_of = [None; SECTIONS.len()];
+        let mut pending: Vec<_> = SECTIONS.into_iter().filter(|s| !skip.contains(s)).collect();
+        // Needs are acyclic, so each pass places at least one section.
+        while !pending.is_empty() {
+            let before = pending.len();
+            pending.retain(|&section| {
+                let needs = section.needs().iter().filter(|n| !skip.contains(n));
+                if needs.clone().any(|&n| chain_of[n as usize].is_none()) {
+                    return true;
+                }
+                let lead = needs.max_by_key(|&&n| size(n));
+                let index = match lead.and_then(|&n| chain_of[n as usize]) {
+                    Some(index) => index,
+                    None => {
+                        chains.push(Vec::new());
+                        chains.len() - 1
+                    }
+                };
+                chains[index].push(section);
+                chain_of[section as usize] = Some(index);
+                false
+            });
+            if pending.len() == before {
+                break;
             }
         }
         chains
