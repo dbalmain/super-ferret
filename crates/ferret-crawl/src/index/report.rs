@@ -291,7 +291,7 @@ pub struct Published {
 }
 
 impl Published {
-    pub(super) fn of(catalog: &Catalog) -> Self {
+    fn of(catalog: &Catalog) -> Self {
         Self {
             dirs: catalog.dir_count(),
             inodes: catalog.inode_count(),

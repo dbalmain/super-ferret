@@ -1070,9 +1070,7 @@ impl<'a> Final<'a> {
         }
         Ok(())
     }
-}
 
-impl Final<'_> {
     fn retained_sequence(&self, id: InoId) -> Option<u64> {
         self.old.retained_at(id).or_else(|| {
             self.old
