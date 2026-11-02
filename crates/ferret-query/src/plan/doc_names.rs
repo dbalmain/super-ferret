@@ -2,6 +2,12 @@
 //! through, built once per catalog generation and adopted across an
 //! overlay's small changes rather than rebuilt.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use ferret_catalog::{InoId, OpenError, Target};
+use ferret_index::DocSet;
+
 use super::*;
 
 /// Names [`DocNames::adopt`] may place for each overlay inode or name row

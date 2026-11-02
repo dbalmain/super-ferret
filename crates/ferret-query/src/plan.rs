@@ -23,14 +23,12 @@
 //! inverse ([`DocNames`], built once per catalog generation) and the
 //! checked reader; this crate opens no file.
 
-use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ferret_catalog::{Catalog, InoId, NameId, OpenError, Section, Target};
-use ferret_index::{Advance, Certainty, Cursor, DocSet, Pinned};
+use ferret_catalog::{Catalog, NameId, Section};
+use ferret_index::{Advance, Certainty, Cursor, Pinned};
 use ferret_verify::MatchStats;
 
 use crate::content::ReadAtom;
@@ -39,9 +37,11 @@ use crate::query::{Cmp, MetaTest, NameTest, Query};
 use crate::verify::{Probed, Readers, Workers};
 use crate::{NameIndex, Row, RunError, Stats};
 
-pub(crate) mod doc_names;
+mod doc_names;
 
 pub use doc_names::DocNames;
+#[cfg(test)]
+pub(crate) use doc_names::order;
 
 /// The default bound on uncovered documents a query verifies rather than
 /// refusing (docs/S2.md § Coverage): a judgement, not a measurement.

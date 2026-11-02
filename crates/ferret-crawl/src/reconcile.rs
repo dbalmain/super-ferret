@@ -12,7 +12,7 @@ use std::path::PathBuf;
 mod files;
 mod finish;
 
-use ferret_catalog::batch::{DirectoryObservation, FileObservation};
+use ferret_catalog::batch::DirectoryObservation;
 use ferret_catalog::log::{ChangeSet, Error, Record};
 use ferret_catalog::{
     Batch, Catalog, Content, DecodeError, DirToken, DocId, Hash, InoId, Kind, NameId, Stat, Target,
@@ -76,20 +76,6 @@ struct Directory<'a> {
     blocked: bool,
     opaque: bool,
     denied: bool,
-}
-
-#[derive(Clone, Copy)]
-enum File {
-    Full(u32, u32),
-    Reused(u32, u32),
-}
-impl File {
-    fn observation(self, batches: &[Batch]) -> FileObservation<'_> {
-        match self {
-            Self::Full(b, i) => batches[b as usize].file_observation(i as usize),
-            Self::Reused(b, i) => batches[b as usize].reused_name_observation(NameId(i)),
-        }
-    }
 }
 
 #[derive(Default)]

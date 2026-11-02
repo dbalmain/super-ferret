@@ -3,6 +3,21 @@
 //! new one, and given their edges.
 
 use super::*;
+use ferret_catalog::batch::FileObservation;
+
+#[derive(Clone, Copy)]
+enum File {
+    Full(u32, u32),
+    Reused(u32, u32),
+}
+impl File {
+    fn observation(self, batches: &[Batch]) -> FileObservation<'_> {
+        match self {
+            Self::Full(b, i) => batches[b as usize].file_observation(i as usize),
+            Self::Reused(b, i) => batches[b as usize].reused_name_observation(NameId(i)),
+        }
+    }
+}
 
 impl Final<'_> {
     /// Keeps untouched scopes' rows, returning the kept directories.
