@@ -3522,6 +3522,64 @@ dominate.
 > Dave (2026-10-11): Agree: B now, A′ when reactivation is wanted, and drop the
 > git-index idea.
 
+### A′ design (2026-11-06)
+
+**Status: answered, A′ (Dave, 2026-11-06: "Why not do A′? It doesn't seem
+like it would be a big cost").** Designed in a two-round conversation with
+Astra. Its first round proposed exact per-segment membership files, a forced
+index rebuild and optimistic merge commits; the second withdrew all three in
+favour of the shape below. The cost of A′ is a merge-ordering protocol, not
+runtime: the catalog keeps 16 B of hash plus a DocId per dormant document,
+under a cap.
+
+**Rule.** A dead DocId may become live again only by consuming a dormant
+row, and a dormant row is a permission granted once and revoked explicitly:
+
+1. **Dormancy.** When a catalog commit removes a document's last reference,
+   the host, holding the writer gate, makes it dormant only if the selected
+   compatible content view covers it: `id < frontier` and not unreadable.
+   Otherwise it is forgotten, as under B. Permission is never inferred later
+   for an already-dead id.
+2. **Revival.** A returning hash takes a live match first, then the highest
+   dormant id with that hash. The row is consumed, the id is live with
+   positive references, and `next_doc` does not move. The catalog keeps at
+   most one dormant row per hash and at most 1,000,000 rows, evicting the
+   lowest ids first. `docs()` stays live-only.
+3. **Merges revoke before they pin.** Every merge (size tier, dead fraction,
+   forced, all-dead) takes writer then content, selects its exact inputs
+   against current liveness, durably forgets the dormant ids in their
+   ranges, pins that catalog view, and releases the writer while keeping
+   content to the end. It must not reuse the daemon's earlier admission
+   pin: a revival between admission and setup would then be purged. A
+   merge that omits an id therefore always pinned it dead after its
+   permission was gone.
+4. **Reset and startup** clear dormant rows durably before any follow or
+   revival: on reset, on a version mismatch, and when an unusable index was
+   replaced with an empty one.
+5. **Invariant.** For the writer's compatible catalog and index, live ids
+   below frontier are fully indexed except those marked unreadable. That is
+   B's invariant with liveness now able to toggle for permitted ids only.
+   `alive()` and the dead-fraction arithmetic are unchanged. A cached
+   dead-fraction selection is re-checked at setup, since a revival can
+   bring a segment back under 25%.
+6. **Formats.** The catalog and log gain a dormant table and its
+   transitions, migrated with incarnation, live ids and `next_doc`
+   preserved and the table empty. Index formats do not change, legacy
+   segments are reused, and no crate edge changes. DESIGN's ownership prose
+   names the host-mediated flow: the host grants and revokes permissions
+   from index coverage; the catalog stores identities, never postings.
+
+**Found on the way, a bug under B.** A query-only open (`ferret search`,
+`ferret grep`, batch open and reload) reads the catalog and then the content
+index with no bracket. If the writer kills a covered document and a merge
+purges it between those reads, the old catalog still has it live, `fits()`
+accepts the newer index, and the document is neither in postings nor in
+`uncovered`: a silent missed candidate. Traced by Astra, not yet reproduced.
+It is fixed separately from A′; one candidate is to re-read the catalog
+generation after pinning the index and retry if it moved.
+
+The round-table transcripts are in `.ai/d60/` (local).
+
 ## D61 — Term frequencies in S2's postings
 
 **Status: answered, B (Dave).** S2 M0, 2026-10-06;
