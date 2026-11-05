@@ -5,6 +5,7 @@ mod carry;
 mod commit;
 mod compact;
 mod decode;
+mod dormant;
 mod epoch;
 mod log;
 mod overlay;

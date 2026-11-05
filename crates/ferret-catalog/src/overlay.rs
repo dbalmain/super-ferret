@@ -39,7 +39,10 @@ fn record_key(r: &Record) -> u64 {
         Record::InodePut { id, .. } => (INODE, *id),
         Record::LinkPut { id, .. } | Record::LinkDelete { id } => (LINK, *id),
         Record::WorkTreePut { id, .. } | Record::WorkTreeDelete { id } => (WORKTREE, *id),
-        Record::DocPut { id, .. } | Record::DocDelete { id } => (DOC, *id),
+        Record::DocPut { id, .. }
+        | Record::DocDelete { id }
+        | Record::DocDormant { id, .. }
+        | Record::DocForget { id } => (DOC, *id),
     };
     key(category, id)
 }
@@ -335,44 +338,58 @@ impl Overlay {
         next: [u32; 3],
         counts: &mut [u32; 4],
     ) -> Result<(), OpenError> {
-        self.base.load(&[Section::Docs])?;
+        self.base.load(&[Section::Docs, Section::Dormant])?;
         let mut final_rows = BTreeMap::new();
         for r in records {
             final_rows.insert(record_key(r), r.as_ref());
         }
         let mut births = BTreeSet::new();
         for r in final_rows.values() {
+            let id = match r {
+                Record::DocPut { id, .. }
+                | Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => *id,
+                _ => continue,
+            };
+            let (live, dormant) = match p.get(DOC, id) {
+                Some(Record::DocPut { hash, .. }) => (Some(*hash), None),
+                Some(Record::DocDormant { hash, .. }) => (None, Some(*hash)),
+                Some(_) => (None, None),
+                None => (
+                    self.base.doc_hash(crate::DocId(id)),
+                    self.base.dormant_hash(crate::DocId(id)),
+                ),
+            };
             match r {
-                Record::DocPut { id, hash, .. } => {
-                    let previous = match p.get(DOC, *id) {
-                        Some(Record::DocPut { hash, .. }) => Some(*hash),
-                        Some(Record::DocDelete { .. }) => {
-                            return Err(bad("retired document reused"));
-                        }
-                        _ => self.base.doc_hash(crate::DocId(*id)),
-                    };
-                    if *id >= counters[2] {
-                        births.insert(*id);
+                Record::DocPut { hash, .. } => {
+                    if id >= counters[2] {
+                        births.insert(id);
                         counts[3] += 1;
-                    } else if previous.is_none() {
-                        return Err(bad("unassigned/retired document reused"));
-                    }
-                    if previous.is_some_and(|old| old != *hash) {
-                        return Err(bad("document hash changed"));
+                    } else if let Some(old) = live.or(dormant) {
+                        if old != *hash {
+                            return Err(bad("document hash changed"));
+                        }
+                        counts[3] += u32::from(live.is_none());
+                    } else {
+                        return Err(bad("unassigned/forgotten document reused"));
                     }
                 }
-                Record::DocDelete { id } => {
-                    let existed = match p.get(DOC, *id) {
-                        Some(Record::DocPut { .. }) => true,
-                        Some(Record::DocDelete { .. }) => false,
-                        _ => self.base.doc_hash(crate::DocId(*id)).is_some(),
-                    };
-                    if !existed {
+                Record::DocDelete { .. } | Record::DocDormant { .. } => {
+                    let Some(hash) = live else {
                         return Err(bad("delete absent document"));
+                    };
+                    if let Record::DocDormant { hash: retained, .. } = r
+                        && hash != *retained
+                    {
+                        return Err(bad("dormant hash changed"));
                     }
                     counts[3] = counts[3]
                         .checked_sub(1)
                         .ok_or_else(|| bad("document counts"))?;
+                }
+                Record::DocForget { .. } if dormant.is_none() => {
+                    return Err(bad("forget absent dormant document"));
                 }
                 _ => {}
             }
@@ -395,7 +412,7 @@ impl Overlay {
             Section::Links | Section::Specials | Section::WorkTrees => {
                 self.families[Family::Aux as usize].get().is_some()
             }
-            Section::Docs => {
+            Section::Docs | Section::Dormant => {
                 self.families[Family::Docs as usize].get().is_some()
                     && (self.families[Family::Inodes as usize].get().is_none()
                         || self.docs_checked.get().is_some())

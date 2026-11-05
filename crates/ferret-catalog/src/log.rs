@@ -193,7 +193,13 @@ impl Log {
             sequence: m.checkpoint_sequence,
             ..m.generation
         };
-        if bytes != header(base) {
+        let mut expected = header(base);
+        if u32_at(&bytes, 8) == 5 {
+            expected[8..12].copy_from_slice(&5u32.to_le_bytes());
+            let digest = checksum(&expected[..48]);
+            expected[48..].copy_from_slice(&digest);
+        }
+        if bytes != expected {
             return Err(corrupt("log header identity/checksum"));
         }
         let mut at = HEADER;
@@ -309,7 +315,7 @@ fn read_envelope(
     let mut head = [0; 64];
     file.read_exact_at(&mut head, at).map_err(io_error)?;
     if &head[..8] != TX_MAGIC
-        || u32_at(&head, 8) != crate::format::VERSION
+        || !matches!(u32_at(&head, 8), 5 | crate::format::VERSION)
         || head[52..64] != [0; 12]
     {
         return Err(corrupt("log transaction header"));

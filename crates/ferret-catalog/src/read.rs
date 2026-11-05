@@ -621,12 +621,18 @@ impl Catalog {
     pub fn doc_references(&self, id: DocId) -> Option<u32> {
         match self.family_record(Family::Docs, overlay::DOC, id.0) {
             Some(Record::DocPut { references, .. }) => return Some(*references),
-            Some(Record::DocDelete { .. }) => return None,
+            Some(
+                Record::DocDelete { .. } | Record::DocDormant { .. } | Record::DocForget { .. },
+            ) => return None,
             _ => {}
         }
         self.column(Column::DocId)
             .sequence_row(u64::from(id.0), self.layout.docs)
             .map(|row| u32_at(self.section(Section::DocRefs), row * 4))
+    }
+
+    pub(crate) fn format_version(&self) -> u32 {
+        self.layout.version
     }
 
     pub(crate) fn manifest(&self) -> Manifest {

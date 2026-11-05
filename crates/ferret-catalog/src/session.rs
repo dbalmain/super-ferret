@@ -17,6 +17,10 @@ pub struct WriterSession {
     lookup_base: Catalog,
     identities: Vec<InoId>,
     documents: Vec<u32>,
+    dormant_documents: Vec<DocId>,
+    dormant_changes: BTreeMap<Hash, Option<DocId>>,
+    coverage: Option<crate::Coverage>,
+    dormant_cap: usize,
     directories: Vec<(InoId, InoId)>,
     directory_changes: BTreeMap<(u32, u64, u64), Vec<InoId>>,
     identity_changes: BTreeMap<(u64, u64), Option<InoId>>,
@@ -51,6 +55,10 @@ impl WriterSession {
             writer,
             identities: Vec::new(),
             documents: Vec::new(),
+            dormant_documents: Vec::new(),
+            dormant_changes: BTreeMap::new(),
+            coverage: None,
+            dormant_cap: crate::dormant::CAP,
             directories: Vec::new(),
             directory_changes: BTreeMap::new(),
             identity_changes: BTreeMap::new(),
@@ -87,7 +95,9 @@ impl WriterSession {
                 Record::DocPut { id, hash, .. } => {
                     document_changes.insert(*hash, Some(DocId(*id)));
                 }
-                Record::DocDelete { id } => {
+                Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => {
                     if let Some(hash) = view.base_doc_hash(DocId(*id)) {
                         document_changes.insert(hash, None);
                     }
@@ -115,6 +125,10 @@ impl WriterSession {
         self.lookup_base = view;
         self.identities = identities;
         self.documents = documents;
+        let mut dormant: Vec<_> = self.lookup_base.dormant_docs().map(|row| row.0).collect();
+        dormant.sort_unstable_by_key(|&id| self.lookup_base.dormant_hash(id));
+        self.dormant_documents = dormant;
+        self.dormant_changes.clear();
         self.identity_changes.clear();
         self.document_changes = document_changes;
         self.directories = directories;
@@ -128,6 +142,8 @@ impl WriterSession {
     fn release_lookups(&mut self) {
         self.identities = Vec::new();
         self.documents = Vec::new();
+        self.dormant_documents = Vec::new();
+        self.dormant_changes.clear();
         self.directories = Vec::new();
         self.first_names = Vec::new();
         self.alias_names.clear();
@@ -173,7 +189,13 @@ impl WriterSession {
         for batch in &mut batches {
             batch.release_full_source();
         }
-        let result = self.writer.rebuild_checkpoint(batches, sniffer, policy);
+        let result = self.writer.rebuild_checkpoint(
+            batches,
+            sniffer,
+            policy,
+            self.coverage.clone(),
+            self.dormant_cap,
+        );
         self.rebuild();
         result?;
         Ok(self.view())
@@ -220,7 +242,10 @@ impl WriterSession {
 
     /// Transfers the held lock and view to the explicit checkpoint fallback.
     pub fn into_checkpoint(self, sniffer: u32) -> crate::Transaction {
-        self.writer.into_checkpoint(sniffer)
+        let mut transaction = self.writer.into_checkpoint(sniffer);
+        transaction.set_coverage(self.coverage);
+        transaction.dormant_cap = self.dormant_cap;
+        transaction
     }
 
     /// Shares the current checked view, retaining old generations for readers.
@@ -286,6 +311,68 @@ impl WriterSession {
         Some(self.lookup_base.base_doc(self.documents[at]))
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_dormant_cap(&mut self, cap: usize) {
+        self.dormant_cap = cap;
+    }
+
+    /// Authorizes retention and revival for the next host mutation. The host
+    /// must refresh this from its selected content view under its writer gate.
+    /// Catalog-only writers leave it unset and allocate fresh identities.
+    pub fn set_coverage(&mut self, coverage: Option<crate::Coverage>) {
+        self.coverage = coverage;
+    }
+
+    /// A live hash wins; otherwise consume the retained dormant identity when
+    /// the host has enabled content reuse. The subsequent commit checks it.
+    pub fn returning_document(&self, hash: Hash) -> Option<DocId> {
+        if let Some(id) = self.document(hash) {
+            return Some(id);
+        }
+        self.coverage.as_ref()?;
+        if let Some(id) = self.dormant_changes.get(&hash) {
+            return *id;
+        }
+        let at = self
+            .dormant_documents
+            .binary_search_by_key(&Some(hash), |&id| self.lookup_base.dormant_hash(id))
+            .ok()?;
+        Some(self.dormant_documents[at])
+    }
+
+    /// Durably revokes permissions in the selected merge inputs. A no-op
+    /// publishes nothing. Call under the host writer and content gates before
+    /// taking the merge's liveness pin.
+    pub fn forget_dormant(
+        &mut self,
+        ranges: &[std::ops::RangeInclusive<u32>],
+    ) -> Result<Catalog, Error> {
+        let view = self.view();
+        let records = view
+            .dormant_docs()
+            .filter(|(id, _)| ranges.iter().any(|range| range.contains(&id.0)))
+            .map(|(id, _)| Record::DocForget { id: id.0 })
+            .collect();
+        self.commit(
+            &ChangeSet {
+                records,
+                counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+                counts: [
+                    view.inode_count(),
+                    view.name_count(),
+                    view.dir_count(),
+                    view.doc_count(),
+                ],
+            },
+            view.sniffer_version(),
+        )
+    }
+
+    /// Clears all permissions before content reset or an unusable-index open.
+    pub fn clear_dormant(&mut self) -> Result<Catalog, Error> {
+        self.forget_dormant(&[0..=u32::MAX])
+    }
+
     /// Exact indexed-name count, independent of filesystem `st_nlink`.
     pub fn name_references(&self, id: InoId) -> u32 {
         self.writer.view().indexed_name_count(id)
@@ -340,6 +427,9 @@ impl WriterSession {
     /// Publishes a final set, updating cached lookups only after success.
     pub fn commit(&mut self, changes: &ChangeSet, sniffer: u32) -> Result<Catalog, Error> {
         let previous = self.writer.view();
+        let changes =
+            crate::dormant::prepare(&previous, changes, self.coverage.as_ref(), self.dormant_cap);
+        let changes = &changes;
         self.writer
             .commit_budgeted(previous.generation(), changes, sniffer, self.limits)?;
         let view = self.writer.view();
@@ -412,6 +502,21 @@ impl WriterSession {
                 }
                 Record::DocPut { id, hash, .. } => {
                     self.document_changes.insert(*hash, Some(DocId(*id)));
+                    if previous.dormant_hash(DocId(*id)).is_some() {
+                        self.dormant_changes.insert(*hash, None);
+                    }
+                }
+                Record::DocDormant { id, hash } => {
+                    self.document_changes.insert(*hash, None);
+                    self.dormant_changes.insert(*hash, Some(DocId(*id)));
+                }
+                Record::DocForget { id } => {
+                    if let Some(hash) = previous.dormant_hash(DocId(*id)) {
+                        let entry = self.dormant_changes.entry(hash).or_insert(None);
+                        if *entry == Some(DocId(*id)) {
+                            *entry = None;
+                        }
+                    }
                 }
                 Record::DocDelete { id } => {
                     if let Some(hash) = previous.doc_hash(DocId(*id)) {

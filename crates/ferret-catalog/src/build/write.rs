@@ -92,6 +92,7 @@ pub(crate) fn write(
         format::put_u32(&mut revealed, name)?;
     }
     revealed.finish()?;
+    crate::dormant::write(&plan.dormant, &file)?;
     format::seal(out)
 }
 

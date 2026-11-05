@@ -105,7 +105,7 @@ impl Writer {
             Ok((log, manifest, current, budget))
         })();
         let (log, manifest, current, budget) = result?;
-        Ok(Self {
+        let mut writer = Self {
             dir: dir.to_owned(),
             _lock: lock,
             log,
@@ -114,7 +114,11 @@ impl Writer {
             current,
             budget,
             bulk: None,
-        })
+        };
+        if writer.current.format_version() == 5 {
+            writer.checkpoint_view(writer.view())?;
+        }
+        Ok(writer)
     }
     /// Revalidates the published prefix and retires an uncertain tail while
     /// retaining the same writer lock. A failed recovery leaves this writer
@@ -217,6 +221,8 @@ impl Writer {
         batches: Vec<crate::Batch>,
         sniffer: u32,
         policy: crate::Hash,
+        coverage: Option<crate::Coverage>,
+        dormant_cap: usize,
     ) -> Result<(), Error> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -225,6 +231,8 @@ impl Writer {
         let mut txn =
             crate::Transaction::from_locked(self.dir.clone(), lock, Some(self.view()), sniffer);
         txn.set_policy(policy);
+        txn.set_coverage(coverage);
+        txn.dormant_cap = dormant_cap;
         for batch in batches {
             txn.add(batch);
         }

@@ -176,14 +176,13 @@ impl Overlay {
                             return Err(bad("document hash changed"));
                         }
                     } else {
-                        if *id < self.base.next_doc().0 {
-                            return Err(bad("retired document reused"));
-                        }
                         live_docs += 1;
                     }
                     affected.insert(*id);
                 }
-                Record::DocDelete { id } => {
+                Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => {
                     if self.base.doc_hash(crate::DocId(*id)).is_some() {
                         live_docs -= 1;
                     }
@@ -202,9 +201,22 @@ impl Overlay {
             return Ok(());
         }
         self.check_fields()?;
-        if let Some(parent) = &self.parent
-            && parent.checked.get().is_some()
+        // Removing or consuming permissions cannot violate hash uniqueness
+        // or the cap. Only a new dormant row needs a complete retained scan.
+        let proven = self
+            .parent
+            .as_ref()
+            .filter(|parent| parent.checked.get().is_some());
+        if proven.is_none()
+            || self
+                .delta
+                .iter()
+                .any(|r| matches!(r.as_ref(), Record::DocDormant { .. }))
         {
+            let hashes: Vec<_> = view.dormant_docs().map(|(_, hash)| hash).collect();
+            crate::dormant::check_hashes(hashes).map_err(OpenError::Decode)?;
+        }
+        if let Some(parent) = proven {
             self.validate_delta(view, parent)?;
             let _ = self.docs_checked.set(());
             let _ = self.checked.set(());
@@ -282,7 +294,10 @@ impl Overlay {
                 Record::InodePut { id, .. } | Record::InodeDelete { id } => {
                     changed.insert(*id);
                 }
-                Record::DocPut { id, .. } | Record::DocDelete { id } => {
+                Record::DocPut { id, .. }
+                | Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => {
                     docs.entry(*id).or_default();
                 }
                 Record::LinkPut { id, .. }
@@ -352,7 +367,9 @@ impl Overlay {
         for (id, delta) in docs {
             let prior = match parent.projection(Family::Docs).get(DOC, id) {
                 Some(Record::DocPut { references, .. }) => Some(*references),
-                Some(Record::DocDelete { .. }) => None,
+                Some(
+                    Record::DocDelete { .. } | Record::DocDormant { .. } | Record::DocForget { .. },
+                ) => None,
                 _ => self.base.doc_references(crate::DocId(id)),
             };
             let now = view.doc_references(crate::DocId(id));
@@ -360,9 +377,6 @@ impl Overlay {
                 return Err(bad("document reference count"));
             }
             if prior.is_none() && now.is_some() {
-                if id < parent.manifest.counters[2] {
-                    return Err(bad("retired document reused"));
-                }
                 count += 1;
             }
             if prior.is_some() && now.is_none() {
@@ -370,7 +384,9 @@ impl Overlay {
             }
             let old_hash = match parent.projection(Family::Docs).get(DOC, id) {
                 Some(Record::DocPut { hash, .. }) => Some(*hash),
-                Some(Record::DocDelete { .. }) => None,
+                Some(
+                    Record::DocDelete { .. } | Record::DocDormant { .. } | Record::DocForget { .. },
+                ) => None,
                 _ => self.base.doc_hash(crate::DocId(id)),
             };
             if let (Some(a), Some(b)) = (old_hash, view.doc_hash(crate::DocId(id)))

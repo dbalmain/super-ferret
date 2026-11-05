@@ -35,7 +35,7 @@ impl Catalog {
                         o.load(Family::Aux)?;
                         o.check_aux()?;
                     }
-                    Section::Docs => o.load(Family::Docs)?,
+                    Section::Docs | Section::Dormant => o.load(Family::Docs)?,
                     Section::DocRefs => {
                         o.load(Family::Inodes)?;
                         o.check_fields()?;

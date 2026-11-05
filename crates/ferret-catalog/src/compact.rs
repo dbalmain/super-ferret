@@ -245,6 +245,7 @@ impl Plan {
         sizes.lens[Section::Docs as usize] = self.docs.len() as u64 * 16;
         sizes.lens[Section::DocRefs as usize] = self.docs.len() as u64 * 4;
         sizes.lens[Section::Policy as usize] = 16;
+        sizes.lens[Section::Dormant as usize] = view.dormant_docs().count() as u64 * 20;
         Ok(())
     }
 }
@@ -264,6 +265,9 @@ pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::R
     let mut policy = file.section(Section::Policy);
     policy.write_all(&view.policy())?;
     policy.finish()?;
+    let mut dormant: Vec<_> = view.dormant_docs().collect();
+    dormant.sort_unstable_by_key(|row| row.0);
+    crate::dormant::write(&dormant, &file)?;
     format::seal(out)
 }
 

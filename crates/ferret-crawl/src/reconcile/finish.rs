@@ -218,6 +218,7 @@ impl Final<'_> {
                 let hash = self
                     .old
                     .doc_hash(DocId(id))
+                    .or_else(|| self.old.dormant_hash(DocId(id)))
                     .or_else(|| hashes.get(&id).copied())
                     .ok_or_else(|| invalid("recrawl document hash"))?;
                 if old.is_none() {

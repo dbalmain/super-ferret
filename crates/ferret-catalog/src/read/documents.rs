@@ -96,7 +96,9 @@ impl Catalog {
             .flat_map(|o| o.projection(Family::Docs).records(overlay::DOC))
             .filter_map(|record| match record {
                 Record::DocPut { id, .. } => Some((DocId(*id), true)),
-                Record::DocDelete { id } => Some((DocId(*id), false)),
+                Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => Some((DocId(*id), false)),
                 _ => None,
             })
     }
@@ -180,7 +182,9 @@ impl Catalog {
     pub fn doc_hash(&self, doc: DocId) -> Option<Hash> {
         match self.family_record(Family::Docs, overlay::DOC, doc.0) {
             Some(Record::DocPut { hash, .. }) => return Some(*hash),
-            Some(Record::DocDelete { .. }) => return None,
+            Some(
+                Record::DocDelete { .. } | Record::DocDormant { .. } | Record::DocForget { .. },
+            ) => return None,
             _ => {}
         }
         self.base_doc_hash(doc)
@@ -192,5 +196,61 @@ impl Catalog {
         let mut hash = [0; HASH_ROW];
         hash.copy_from_slice(&self.section(Section::Docs)[at..at + HASH_ROW]);
         hash
+    }
+}
+
+impl Catalog {
+    /// Retained revival permissions, excluding live and forgotten documents.
+    /// Needs [`Section::Dormant`]. Iteration is base then replacements.
+    pub fn dormant_docs(&self) -> impl Iterator<Item = (DocId, Hash)> + '_ {
+        let base = crate::dormant::rows(self.section(Section::Dormant)).filter(|(id, _)| {
+            self.family_record(Family::Docs, overlay::DOC, id.0)
+                .is_none()
+        });
+        let delta = self
+            .changed_doc_records()
+            .filter_map(|record| match record {
+                Record::DocDormant { id, hash } => Some((DocId(*id), *hash)),
+                _ => None,
+            });
+        base.chain(delta)
+    }
+
+    /// Additional memory and checkpoint disk headroom for retained identities.
+    /// Includes compact columns, lookup ordinals, sorting/validation scratch,
+    /// sparse session and overlay records, and old/new checkpoint columns.
+    /// Needs [`Section::Dormant`]; intended for bulk admission boundaries.
+    pub fn dormant_resources(&self) -> (u64, u64) {
+        let rows = self.dormant_docs().count() as u64;
+        let columns = rows * 20;
+        let scratch = rows
+            * (3 * std::mem::size_of::<(DocId, Hash)>()
+                + std::mem::size_of::<Hash>()
+                + std::mem::size_of::<u32>()
+                + 2 * std::mem::size_of::<Record>()
+                + 64) as u64;
+        (columns + scratch, columns * 2)
+    }
+
+    /// The retained hash for a dead id; absence never authorizes revival.
+    /// Needs [`Section::Dormant`].
+    pub fn dormant_hash(&self, id: DocId) -> Option<Hash> {
+        match self.family_record(Family::Docs, overlay::DOC, id.0) {
+            Some(Record::DocDormant { hash, .. }) => Some(*hash),
+            Some(_) => None,
+            None => self.base_dormant_hash(id),
+        }
+    }
+
+    pub(crate) fn base_dormant_hash(&self, id: DocId) -> Option<Hash> {
+        let bytes = self.section(Section::Dormant);
+        let count = bytes.len() / 20;
+        let row = partition_point(count, |row| u32_at(bytes, row * 4) < id.0);
+        if row == count || u32_at(bytes, row * 4) != id.0 {
+            return None;
+        }
+        let mut hash = [0; 16];
+        hash.copy_from_slice(&bytes[count * 4 + row * 16..count * 4 + (row + 1) * 16]);
+        Some(hash)
     }
 }

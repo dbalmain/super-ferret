@@ -158,6 +158,8 @@ pub struct Transaction {
     sniffer: u32,
     policy: Hash,
     previous: Option<Catalog>,
+    coverage: Option<crate::Coverage>,
+    pub(crate) dormant_cap: usize,
     /// Old file and symlink rows sorted by `(dev, ino)`, for carry-over:
     /// 4 B per inode where a map measured 40 (D40). Empty when the sniffer
     /// changed, since old classifications no longer hold.
@@ -222,11 +224,18 @@ impl Transaction {
             sniffer,
             policy: previous.as_ref().map_or([0; 16], Catalog::policy),
             previous,
+            coverage: None,
+            dormant_cap: crate::dormant::CAP,
             by_identity: OnceLock::new(),
             next_batch: AtomicU32::new(0),
             batches: Vec::new(),
             kept: Vec::new(),
         }
+    }
+
+    /// Supplies host coverage authorization for covered deaths and revival.
+    pub fn set_coverage(&mut self, coverage: Option<crate::Coverage>) {
+        self.coverage = coverage;
     }
 
     /// The generation this transaction replaces, if any: its roots, and
@@ -490,8 +499,22 @@ impl Transaction {
             }));
         }
         let mut docs = Vec::new();
+        let mut dormant = Vec::new();
         let next_doc = self.previous.take().map_or(0, |old| {
+            dormant.extend(old.dormant_docs());
             docs.extend(old.docs().map(|(doc, hash)| (hash, doc.0)));
+            docs.sort_unstable();
+            if let Some(coverage) = &self.coverage {
+                // Search the sorted live table before appending dormant rows:
+                // live matches win without a second hash table of live docs.
+                let returning: Vec<_> = dormant
+                    .iter()
+                    .filter(|(_, hash)| docs.binary_search_by_key(hash, |row| row.0).is_err())
+                    .map(|(id, hash)| (*hash, id.0))
+                    .collect();
+                docs.extend(returning);
+                dormant.extend(old.docs().filter(|(id, _)| coverage.covers(*id)));
+            }
             old.next_doc().0
         });
         docs.sort_unstable();
@@ -499,6 +522,8 @@ impl Transaction {
         let known = Known {
             docs: &docs,
             next_doc,
+            dormant,
+            dormant_cap: self.dormant_cap,
         };
         let plan =
             build::plan(&mut self.batches, self.sniffer, known).map_err(CommitError::Build)?;

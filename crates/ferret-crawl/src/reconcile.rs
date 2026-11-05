@@ -522,7 +522,7 @@ impl<'a> Final<'a> {
                 .filter(|&doc| self.old.doc_hash(doc) == Some(hash))
                 .map(|doc| doc.0);
             match continuing
-                .or_else(|| self.session.document(hash).map(|id| id.0))
+                .or_else(|| self.session.returning_document(hash).map(|id| id.0))
                 .or_else(|| self.new_docs.get(&hash).copied())
             {
                 Some(id) => Some(id),
@@ -572,6 +572,8 @@ fn record_key(record: &Record) -> (u8, u32) {
         Record::WorkTreeDelete { id } => (13, *id),
         Record::DocPut { id, .. } => (14, *id),
         Record::DocDelete { id } => (15, *id),
+        Record::DocDormant { id, .. } => (16, *id),
+        Record::DocForget { id } => (17, *id),
     }
 }
 

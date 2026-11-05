@@ -21,6 +21,7 @@ mod budget;
 mod build;
 pub mod bulk;
 mod compact;
+mod dormant;
 mod fan_out;
 mod format;
 mod generation;
@@ -57,6 +58,7 @@ pub use format::{DecodeError, Section};
 /// Checkpoint format understood by this reader, for host compatibility hello.
 pub const FORMAT_VERSION: u32 = format::VERSION;
 
+pub use dormant::Coverage;
 pub use generation::{Generation, Handle, RetryFromCurrent};
 pub use input::{InputBudget, InputLimits, InputUsage};
 pub use read::{
@@ -83,8 +85,9 @@ pub struct InoId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NameId(pub u32);
 
-/// A document: one distinct content. Stable across commits and never reused
-/// (D4, D36 B); the id space has holes where documents died.
+/// A document permanently bound to one content hash in its incarnation.
+/// Fresh allocation is monotonic; a covered death can retain a dormant
+/// permission for revival (D4, D36, D60 A′). Forgotten ids stay holes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocId(pub u32);
 

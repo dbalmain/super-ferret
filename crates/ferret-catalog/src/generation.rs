@@ -76,7 +76,8 @@ impl Generation {
 }
 
 pub(crate) const MANIFEST_LEN: usize = 128;
-const MAGIC: &[u8; 8] = b"FERRETCR";
+const MAGIC: &[u8; 8] = b"FERRETC6";
+const LEGACY_MAGIC: &[u8; 8] = b"FERRETCR";
 
 pub(crate) fn checksum(bytes: &[u8]) -> [u8; 16] {
     let mut digest = [0; 16];
@@ -149,13 +150,16 @@ impl Manifest {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         if bytes.len() != MANIFEST_LEN
-            || &bytes[..8] != MAGIC
+            || (&bytes[..8] != MAGIC && &bytes[..8] != LEGACY_MAGIC)
             || checksum(&bytes[..112]) != bytes[112..]
         {
             return Err(DecodeError::Corrupt("manifest"));
         }
-        if u32_at(bytes, 8) != crate::format::VERSION {
+        if u32_at(bytes, 8) != crate::format::VERSION && u32_at(bytes, 8) != 5 {
             return Err(DecodeError::Version(u32_at(bytes, 8)));
+        }
+        if (&bytes[..8] == LEGACY_MAGIC) != (u32_at(bytes, 8) == 5) {
+            return Err(DecodeError::Corrupt("manifest version/magic"));
         }
         let mut incarnation = [0; 16];
         incarnation.copy_from_slice(&bytes[16..32]);

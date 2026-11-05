@@ -44,6 +44,7 @@ pub(super) const CHECK_ORDER: [Section; SECTIONS.len()] = [
     Section::RetainedAt,
     Section::Policy,
     Section::Revealed,
+    Section::Dormant,
 ];
 
 /// Validates one section, given its bytes and those of every section it
@@ -86,6 +87,7 @@ pub(crate) fn check<'a>(
         Section::RetainedAt => check_retained_at(l, get(section))?,
         Section::Policy => {}
         Section::Revealed => check_revealed(l, get(section))?,
+        Section::Dormant => crate::dormant::check(l, get(section), get(Section::Docs))?,
         Section::Entries
         | Section::Traversed
         | Section::Ino

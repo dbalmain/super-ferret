@@ -110,6 +110,8 @@ pub(crate) struct Known<'a> {
     pub(crate) docs: &'a [(Hash, u32)],
     /// The persisted next-id counter; never goes back (D36 B).
     pub(crate) next_doc: u32,
+    pub(crate) dormant: Vec<(crate::DocId, Hash)>,
+    pub(crate) dormant_cap: usize,
 }
 
 /// Global entry numbers: directories `0..dirs` in batch order, then files
@@ -169,6 +171,7 @@ impl Index {
 pub(crate) struct Plan {
     sniffer: u32,
     next_doc: u32,
+    dormant: Vec<(crate::DocId, Hash)>,
     index: Index,
     /// Entry numbers grouped by parent directory, each group sorted by name:
     /// directory `g`'s children are `edges[edge_start[g]..edge_start[g + 1]]`.
@@ -399,6 +402,7 @@ impl Plan {
             (Section::DocRefs, self.docs.len() * 4),
             (Section::Policy, 16),
             (Section::Revealed, self.revealed.len() * 4),
+            (Section::Dormant, self.dormant.len() * 20),
         ] {
             lens[section as usize] = len as u64;
         }
@@ -509,6 +513,7 @@ pub(crate) fn plan(
     let mut plan = Plan {
         sniffer,
         next_doc: known.next_doc,
+        dormant: known.dormant,
         index,
         edges,
         edge_start,
@@ -539,6 +544,9 @@ pub(crate) fn plan(
 
     number_files(&mut plan, batches, file_pos)?;
     assign_docs(&mut plan, batches, known.docs)?;
+    plan.dormant
+        .retain(|(id, _)| plan.docs.binary_search_by_key(&id.0, |row| row.1).is_err());
+    crate::dormant::canonicalize(&mut plan.dormant, known.dormant_cap);
     push_links(&mut plan, batches)?;
     push_work_trees(&mut plan, batches, &tokens)?;
     Ok(plan)

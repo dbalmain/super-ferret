@@ -3,10 +3,10 @@
 //! ```text
 //! header       v3's 40 B fields, incarnation 16 B, checkpoint/sequence u64,
 //!              next inode/name u32, reserved zeros 16 B                 (96 B)
-//! table        (offset u64, length u64, checksum 16 B) per section      (832 B)
+//! table        (offset u64, length u64, checksum 16 B) per section      (896 B)
 //! descriptors  (base u64, width u32, dictionary length u32) per column (288 B)
 //! head digest  BLAKE3-128 of every preceding head byte                  (16 B)
-//! sections     contiguous from byte 1232 to the end, in SECTIONS order
+//! sections     contiguous from byte 1296 to the end, in SECTIONS order
 //! ```
 //!
 //! All integers are little-endian. The sections a name query reads come
@@ -49,6 +49,8 @@
 //! policy      BLAKE3-128 fingerprint of global rules and eligibility
 //! revealed    u32 per name a repository ignore file's `!` line reveals
 //!             although it is hidden (D127): its NameId, strictly rising
+//! dormant     u32 DocIds followed by 16-byte hashes, sorted by id; at most
+//!             one permission per hash and one million rows (D60 A′)
 //! ```
 //!
 //! A column is its dictionary (`u64` values, present only in a dictionary
@@ -133,7 +135,8 @@ pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 /// 3: ignored type tags, collapsed opaque directories and visible specials.
 /// 4: checked checkpoint, incarnation, allocation counters and writer sections.
 /// 5: the revealed-names section and the log's `NamePut` flags (D127).
-pub(crate) const VERSION: u32 = 5;
+/// 6: dormant document permissions and checked log transitions (D60 A′).
+pub(crate) const VERSION: u32 = 6;
 /// "No id" in the builder's plan, and in the `u32` ids of fixed-width rows.
 pub(crate) const NONE: u32 = u32::MAX;
 
@@ -201,9 +204,11 @@ pub enum Section {
     Policy,
     /// Hidden names a repository ignore file's `!` line reveals (D127).
     Revealed,
+    /// Revivable documents: u32 ids followed by 16-byte hashes, by id.
+    Dormant,
 }
 
-pub(crate) const SECTIONS: [Section; 27] = [
+pub(crate) const SECTIONS: [Section; 28] = [
     Section::Names,
     Section::NameHeap,
     Section::DirNames,
@@ -231,6 +236,7 @@ pub(crate) const SECTIONS: [Section; 27] = [
     Section::RetainedAt,
     Section::Policy,
     Section::Revealed,
+    Section::Dormant,
 ];
 
 /// One bit-packed column. Each lies in one section, in this order; only the
@@ -550,6 +556,7 @@ impl Section {
             Section::Links => &[Section::Strings, Section::Specials],
             Section::WorkTrees => &[Section::Strings],
             Section::DocRefs => &[Section::Docs, Section::Doc],
+            Section::Dormant => &[Section::Docs],
             _ => &[],
         }
     }
@@ -584,6 +591,7 @@ impl Section {
             Section::RetainedAt => "retained at",
             Section::Policy => "policy",
             Section::Revealed => "revealed",
+            Section::Dormant => "dormant documents",
         }
     }
 }

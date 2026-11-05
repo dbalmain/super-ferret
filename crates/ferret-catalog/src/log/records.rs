@@ -76,6 +76,15 @@ pub enum Record {
     DocDelete {
         id: u32,
     },
+    /// A covered last-reference death, authorized by the host.
+    DocDormant {
+        id: u32,
+        hash: Hash,
+    },
+    /// Terminal revocation of a dormant permission.
+    DocForget {
+        id: u32,
+    },
 }
 
 impl Record {
@@ -86,7 +95,10 @@ impl Record {
             | Self::LinkDelete { .. }
             | Self::WorkTreePut { .. }
             | Self::WorkTreeDelete { .. } => Family::Aux,
-            Self::DocPut { .. } | Self::DocDelete { .. } => Family::Docs,
+            Self::DocPut { .. }
+            | Self::DocDelete { .. }
+            | Self::DocDormant { .. }
+            | Self::DocForget { .. } => Family::Docs,
             _ => Family::Namespace,
         }
     }
@@ -232,6 +244,16 @@ impl Record {
                 delete(out, *id);
                 15
             }
+            Self::DocDormant { id, hash } => {
+                put32(out, *id);
+                put32(out, 0);
+                out.extend_from_slice(hash);
+                16
+            }
+            Self::DocForget { id } => {
+                delete(out, *id);
+                17
+            }
         };
         while !(out.len() - start).is_multiple_of(8) {
             out.push(0);
@@ -324,7 +346,10 @@ pub(super) fn decode(
         let limit = match record {
             Record::PolicyPut { .. } => None,
             Record::NamePut { .. } | Record::NameDelete { .. } => Some(counters[1]),
-            Record::DocPut { .. } | Record::DocDelete { .. } => Some(counters[2]),
+            Record::DocPut { .. }
+            | Record::DocDelete { .. }
+            | Record::DocDormant { .. }
+            | Record::DocForget { .. } => Some(counters[2]),
             _ => Some(counters[0]),
         };
         if limit.is_some_and(|n| id >= n) {
@@ -523,6 +548,19 @@ fn record(b: &[u8], counters: [u32; 3], sequence: u64) -> Result<Record, DecodeE
         15 => {
             deleted()?;
             Record::DocDelete { id }
+        }
+        16 => {
+            exact(32)?;
+            if b[12..16] != [0; 4] {
+                return Err(bad());
+            }
+            let mut hash = [0; 16];
+            hash.copy_from_slice(&b[16..32]);
+            Record::DocDormant { id, hash }
+        }
+        17 => {
+            deleted()?;
+            Record::DocForget { id }
         }
         _ => return Err(bad()),
     })

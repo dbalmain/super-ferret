@@ -132,6 +132,7 @@ impl<'a> View<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {
     pub(crate) generation: Generation,
+    pub(crate) version: u32,
     pub(crate) sniffer: u32,
     pub(crate) next_doc: u32,
     pub(crate) sections: [(usize, usize); SECTIONS.len()],
@@ -194,6 +195,7 @@ impl Layout {
 /// is the whole file's length, which the sections must tile exactly.
 pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeError> {
     let generation = decode_header(head)?;
+    let version = u32_at(head, 8);
     let (sections, checksums) = decode_sections(head, file_len)?;
     let counts = Counts {
         dirs: u32_at(head, 24),
@@ -209,6 +211,7 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     let (columns, hashes) = place_columns(head, &counts, len)?;
     Ok(Layout {
         generation,
+        version,
         checksums,
         sniffer: u32_at(head, 12),
         next_doc: u32_at(head, 16),
@@ -248,13 +251,15 @@ fn decode_header(head: &[u8]) -> Result<Generation, DecodeError> {
         return Err(DecodeError::NotACatalog);
     }
     let version = u32_at(head, 8);
-    if version != VERSION {
+    if version != VERSION && version != 5 {
         return Err(DecodeError::Version(version));
     }
-    if head.len() < TABLE_END || u32_at(head, 20) as usize != SECTIONS.len() {
+    let sections = SECTIONS.len() - usize::from(version == 5);
+    let table_end = HEADER + sections * 32 + COLUMNS.len() * 16 + 16;
+    if head.len() < table_end || u32_at(head, 20) as usize != sections {
         return Err(DecodeError::Layout);
     }
-    if checksum(&head[..TABLE_END - 16]) != head[TABLE_END - 16..TABLE_END] {
+    if checksum(&head[..table_end - 16]) != head[table_end - 16..table_end] {
         return Err(DecodeError::Corrupt("head"));
     }
     let mut incarnation = [0; 16];
@@ -284,8 +289,9 @@ type SectionTable = ([(usize, usize); SECTIONS.len()], [[u8; 16]; SECTIONS.len()
 fn decode_sections(head: &[u8], file_len: u64) -> Result<SectionTable, DecodeError> {
     let mut sections = [(0, 0); SECTIONS.len()];
     let mut checksums = [[0; 16]; SECTIONS.len()];
-    let mut expect = TABLE_END as u64;
-    for (i, slot) in sections.iter_mut().enumerate() {
+    let count = SECTIONS.len() - usize::from(u32_at(head, 8) == 5);
+    let mut expect = (HEADER + count * 32 + COLUMNS.len() * 16 + 16) as u64;
+    for (i, slot) in sections.iter_mut().enumerate().take(count) {
         let offset = u64_at(head, HEADER + i * 32);
         let len = u64_at(head, HEADER + i * 32 + 8);
         let end = offset.checked_add(len).ok_or(DecodeError::Layout)?;
@@ -302,6 +308,10 @@ fn decode_sections(head: &[u8], file_len: u64) -> Result<SectionTable, DecodeErr
     if expect != file_len {
         return Err(DecodeError::Layout);
     }
+    if count < SECTIONS.len() {
+        sections[count] = (expect as usize, expect as usize);
+        checksums[count] = checksum(&[]);
+    }
     Ok((sections, checksums))
 }
 
@@ -313,6 +323,7 @@ fn check_lengths(counts: &Counts, len: impl Fn(Section) -> u64) -> Result<(), De
         (Section::Specials, PAIR_ROW),
         (Section::WorkTrees, WORK_TREE_ROW),
         (Section::Revealed, 4),
+        (Section::Dormant, 20),
     ] {
         if !len(section).is_multiple_of(row as u64) {
             return Err(DecodeError::Corrupt(section.label()));
@@ -346,7 +357,8 @@ fn place_columns(
     let mut columns = [Placed::default(); COLUMNS.len()];
     let mut used = [0u64; SECTIONS.len()];
     for (i, column) in COLUMNS.into_iter().enumerate() {
-        let at = HEADER + TABLE + i * 16;
+        let table = TABLE - if u32_at(head, 8) == 5 { 32 } else { 0 };
+        let at = HEADER + table + i * 16;
         let desc = Descriptor {
             base: u64_at(head, at),
             width: u32_at(head, at + 8),
