@@ -635,22 +635,29 @@ fn merge_publication_crash_cuts_preserve_exactly_the_valid_revival_permissions()
 }
 
 #[test]
-fn failed_reattach_disables_the_old_content_writer_before_any_revival() {
-    let (tree, engine) = covered(10);
-    let old = id(&engine, 0);
-    remove(&tree, &engine, 0..1);
-    let manifest = tree.0.join("index/index/manifest");
-    fs::remove_file(&manifest).unwrap();
-    fs::create_dir(&manifest).unwrap();
-    assert!(engine.attach_content(&tree.0.join("index")).is_err());
-    assert!(engine.pin().content().is_none());
-    assert!(matches!(
-        engine.follow_content(&Budget::unbounded(), None),
-        Err(Error::NoContentIndex)
-    ));
-    restore(&tree, &engine, 0);
-    assert_ne!(id(&engine, 0), old);
-    fs::remove_dir(manifest).unwrap();
-    engine.attach_content(&tree.0.join("index")).unwrap();
-    assert_eq!(engine.pin().catalog().dormant_docs().count(), 0);
+fn failed_reattach_or_reset_disables_the_old_writer_before_any_revival() {
+    for reset in [false, true] {
+        let (tree, engine) = covered(10);
+        let old = id(&engine, 0);
+        remove(&tree, &engine, 0..1);
+        let manifest = tree.0.join("index/index/manifest");
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        let result = if reset {
+            engine.reset_content()
+        } else {
+            engine.attach_content(&tree.0.join("index"))
+        };
+        assert!(result.is_err());
+        assert!(engine.pin().content().is_none());
+        assert!(matches!(
+            engine.follow_content(&Budget::unbounded(), None),
+            Err(Error::NoContentIndex)
+        ));
+        restore(&tree, &engine, 0);
+        assert_ne!(id(&engine, 0), old);
+        fs::remove_dir(manifest).unwrap();
+        engine.attach_content(&tree.0.join("index")).unwrap();
+        assert_eq!(engine.pin().catalog().dormant_docs().count(), 0);
+    }
 }

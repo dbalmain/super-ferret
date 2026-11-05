@@ -485,9 +485,22 @@ impl Engine {
         self.select(view.clone());
         writer.set_coverage(None);
         let live = live_documents(&view);
-        let result = index.reset(&catalog_view(&view, &live));
-        self.select_content(index.view());
-        result.map_err(Error::Content)
+        match index.reset(&catalog_view(&view, &live)) {
+            Ok(()) => {
+                self.select_content(index.view());
+                Ok(())
+            }
+            Err(error) => {
+                // The empty manifest may already be visible. Disable the old
+                // writer and coverage until a checked reattach completes.
+                content.take();
+                self.current
+                    .write()
+                    .map_err(|_| Error::WriterPanicked)?
+                    .content = None;
+                Err(Error::Content(error))
+            }
+        }
     }
 
     /// One policy merge, revoking permissions before pinning current liveness.
