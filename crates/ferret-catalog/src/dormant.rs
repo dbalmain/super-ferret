@@ -1,11 +1,14 @@
 //! Revivable identities (D60 A′). The host supplies coverage under its writer
 //! gate; this crate stores permissions and never infers coverage from death.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
 use crate::format::{self, Column, Layout, Output, Section, u32_at};
 use crate::{DecodeError, DocId, Hash};
+
+mod state;
+pub(crate) use state::State;
 
 pub(crate) const CAP: usize = 1_000_000;
 
@@ -98,21 +101,38 @@ pub(crate) fn check_hashes(mut hashes: Vec<Hash>) -> Result<(), DecodeError> {
 
 /// Authorizes only deaths in this transaction's pre-commit live view. A later
 /// frontier cannot retroactively grant permission for a forgotten document.
+/// `retained_ids` is the writer's ordered copy of `view`'s retained ids, so
+/// same-hash replacement and cap eviction cost a logarithmic probe per
+/// changed or evicted row rather than a pass over the retained table.
 pub(crate) fn prepare<'a>(
     view: &crate::Catalog,
     changes: &'a crate::log::ChangeSet,
     coverage: Option<&Coverage>,
     cap: usize,
+    retained_ids: &BTreeSet<DocId>,
 ) -> std::borrow::Cow<'a, crate::log::ChangeSet> {
     use crate::log::Record;
-    let eligible: Vec<_> = changes
+    debug_assert_eq!(retained_ids.len(), view.dormant_count());
+    let final_rows: BTreeMap<_, _> = changes
         .records
         .iter()
         .filter_map(|record| {
-            let Record::DocDelete { id } = record else {
-                return None;
+            let id = match record {
+                Record::DocPut { id, .. }
+                | Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => DocId(*id),
+                _ => return None,
             };
-            let id = DocId(*id);
+            Some((id, record))
+        })
+        .collect();
+    let mut eligible: Vec<_> = final_rows
+        .iter()
+        .filter_map(|(&id, record)| {
+            if !matches!(record, Record::DocDelete { .. }) {
+                return None;
+            }
             coverage.filter(|coverage| coverage.covers(id))?;
             view.doc_hash(id).map(|hash| (id, hash))
         })
@@ -120,40 +140,63 @@ pub(crate) fn prepare<'a>(
     if eligible.is_empty() {
         return std::borrow::Cow::Borrowed(changes);
     }
-    let changed: BTreeSet<_> = changes
-        .records
-        .iter()
-        .filter_map(|record| match record {
-            Record::DocPut { id, .. }
-            | Record::DocDelete { id }
-            | Record::DocDormant { id, .. }
-            | Record::DocForget { id } => Some(DocId(*id)),
-            _ => None,
-        })
-        .collect();
-    let mut retained: Vec<_> = view
-        .dormant_docs()
-        .filter(|(id, _)| !changed.contains(id))
-        .collect();
-    retained.extend(eligible.iter().copied());
-    canonicalize(&mut retained, cap.min(CAP));
+    // Canonicalize only the newly dying identities, then resolve each hash
+    // against its retained holder, if any: the higher id keeps it.
+    canonicalize(&mut eligible, usize::MAX);
+    let mut revoked = BTreeSet::new();
+    eligible.retain(|&(id, hash)| {
+        if let Some(prior) = view.dormant_state().find(hash)
+            && !final_rows.contains_key(&prior)
+        {
+            if prior > id {
+                return false;
+            }
+            revoked.insert(prior);
+        }
+        true
+    });
+    let eligible: BTreeMap<_, _> = eligible.into_iter().collect();
+    let removed = final_rows
+        .keys()
+        .filter(|&&id| view.dormant_hash(id).is_some())
+        .count();
+    let mut count = view.dormant_count() - removed - revoked.len() + eligible.len();
+    let mut old = retained_ids.iter().peekable();
+    let mut new = eligible.keys().peekable();
+    let mut evicted = BTreeSet::new();
+    while count > cap.min(CAP) {
+        while old
+            .peek()
+            .is_some_and(|&&id| final_rows.contains_key(&id) || revoked.contains(&id))
+        {
+            old.next();
+        }
+        let oldest = old.peek().copied().copied();
+        let newest = new.peek().copied().copied();
+        if newest.is_some_and(|id| oldest.is_none_or(|old| id < old)) {
+            let Some(&id) = new.next() else {
+                unreachable!("peeked candidate")
+            };
+            evicted.insert(id);
+        } else {
+            let Some(&id) = old.next() else {
+                unreachable!("retained count has a lowest id")
+            };
+            revoked.insert(id);
+        }
+        count -= 1;
+    }
     let mut prepared = changes.clone();
     for record in &mut prepared.records {
         if let Record::DocDelete { id } = record
-            && let Ok(at) = retained.binary_search_by_key(&DocId(*id), |row| row.0)
+            && let Some(&hash) = eligible.get(&DocId(*id))
+            && !evicted.contains(&DocId(*id))
         {
-            *record = Record::DocDormant {
-                id: *id,
-                hash: retained[at].1,
-            };
+            *record = Record::DocDormant { id: *id, hash };
         }
     }
-    prepared.records.extend(
-        view.dormant_docs()
-            .filter(|(id, _)| {
-                !changed.contains(id) && retained.binary_search_by_key(id, |row| row.0).is_err()
-            })
-            .map(|(id, _)| Record::DocForget { id: id.0 }),
-    );
+    prepared
+        .records
+        .extend(revoked.into_iter().map(|id| Record::DocForget { id: id.0 }));
     std::borrow::Cow::Owned(prepared)
 }

@@ -2,7 +2,7 @@
 //! stay independent: namespace graph checks wait for a name/path consumer.
 mod ids;
 mod namespace;
-mod runs;
+pub(crate) mod runs;
 mod validate;
 use crate::generation::Manifest;
 use crate::log::{Family, Log, Record};
@@ -70,6 +70,8 @@ pub(crate) struct Projection {
     /// tree, a 13k-record overlay otherwise made a daemon grep twice as
     /// slow (2026-10-30).
     present: [Ids; CATEGORIES],
+    /// Retained permissions as of the last applied transaction; Docs only.
+    pub(crate) dormant: Option<crate::dormant::State>,
 }
 impl Projection {
     pub(crate) fn get(&self, category: u64, id: u32) -> Option<&Record> {
@@ -237,6 +239,10 @@ impl Overlay {
         if let Some(log) = &self.log {
             log.load(family)?;
         }
+        if family == Family::Docs && p.dormant.is_none() {
+            self.base.load(&[Section::Dormant])?;
+            p.dormant = Some(self.base.dormant_state().clone());
+        }
         let mut counters = self
             .parent
             .as_ref()
@@ -252,6 +258,9 @@ impl Overlay {
                 }
                 Family::Docs => self.check_docs(&p, &records, counters, next, &mut counts)?,
                 _ => {}
+            }
+            if family == Family::Docs {
+                self.advance_dormant(&mut p, &records, seq)?;
             }
             p.apply(seq, records.into_iter());
             counters = next;
@@ -396,6 +405,49 @@ impl Overlay {
         }
         check_births(&births, counters[2]..next[2], "document allocation gaps")
     }
+    /// Checks a transaction's permission changes against the retained state
+    /// before it: dormant hashes stay unique and within the cap. Costs are in
+    /// the transaction's final document rows, not the retained table.
+    fn advance_dormant(
+        &self,
+        projection: &mut Projection,
+        records: &[Arc<Record>],
+        sequence: u64,
+    ) -> Result<(), OpenError> {
+        let mut final_rows = BTreeMap::new();
+        for record in records {
+            let id = match record.as_ref() {
+                Record::DocPut { id, .. }
+                | Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => *id,
+                _ => continue,
+            };
+            final_rows.insert(id, record.as_ref());
+        }
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        for (id, record) in final_rows {
+            let prior = match projection.get(DOC, id) {
+                Some(Record::DocDormant { hash, .. }) => Some(*hash),
+                Some(_) => None,
+                None => self.base.dormant_hash(crate::DocId(id)),
+            };
+            if let Some(hash) = prior {
+                removed.push((crate::DocId(id), hash));
+            }
+            if let Record::DocDormant { hash, .. } = record {
+                added.push((crate::DocId(id), *hash));
+            }
+        }
+        let Some(state) = projection.dormant.as_mut() else {
+            unreachable!("Docs projection initializes retained metadata");
+        };
+        state
+            .advance(sequence, &removed, &added)
+            .map_err(OpenError::Decode)
+    }
+
     pub(crate) fn loaded(&self, section: Section) -> bool {
         if self.families[Family::Namespace as usize].get().is_none() {
             return false;

@@ -251,6 +251,7 @@ pub struct Catalog {
     source: Arc<Source>,
     overlay: Option<Arc<Overlay>>,
     name_references: Arc<OnceLock<Vec<u32>>>,
+    dormant_base: Arc<OnceLock<crate::dormant::State>>,
 }
 
 enum Source {
@@ -346,6 +347,7 @@ impl Catalog {
             layout,
             overlay: None,
             name_references: Default::default(),
+            dormant_base: Default::default(),
             source: Arc::new(Source::File {
                 file,
                 sections: Default::default(),
@@ -646,6 +648,7 @@ impl Catalog {
             layout,
             overlay: None,
             name_references: Default::default(),
+            dormant_base: Default::default(),
             source: Arc::new(Source::Whole(bytes)),
         })
     }

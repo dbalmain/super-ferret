@@ -61,17 +61,23 @@ fn inode(view: &Catalog, doc: u32, content: bool) -> Record {
     }
 }
 fn die(session: &mut WriterSession, doc: u32) {
+    die_together(session, &[doc]);
+}
+/// Kills `docs` in one transaction.
+fn die_together(session: &mut WriterSession, docs: &[u32]) {
     let view = session.view();
+    let records = docs
+        .iter()
+        .flat_map(|&doc| [inode(&view, doc, false), Record::DocDelete { id: doc }])
+        .collect();
+    let live = view.doc_count() - docs.len() as u32;
     session
-        .commit(
-            &changes(
-                &view,
-                vec![inode(&view, doc, false), Record::DocDelete { id: doc }],
-                view.doc_count() - 1,
-            ),
-            SNIFFER,
-        )
+        .commit(&changes(&view, records, live), SNIFFER)
         .unwrap();
+}
+fn retained(view: &Catalog) -> Vec<u32> {
+    assert_eq!(view.dormant_count(), view.dormant_docs().count());
+    view.dormant_docs().map(|row| row.0.0).collect()
 }
 fn revive(
     session: &mut WriterSession,
@@ -376,14 +382,14 @@ fn v5_checkpoint_and_log_migrate_without_invalidating_legacy_docids() {
     assert_eq!(session.view().dormant_hash(DocId(0)), Some(hash(0)));
 }
 
-#[test]
-fn live_hash_wins_and_a_later_death_replaces_the_older_same_hash_candidate() {
-    let s = fixture("dormant-same-hash", 1);
+/// Dormant doc 0 and live doc 1 share `hash(0)`: a catalog-only writer
+/// follows B and allocates a second identity while preserving the older,
+/// still valid content permission.
+fn live_beside_dormant(label: &str) -> Scratch {
+    let s = fixture(label, 1);
     let mut writer = session(&s);
     die(&mut writer, 0);
     drop(writer);
-    // A catalog-only writer follows B and allocates a second identity while
-    // preserving the older, still valid content permission.
     let view = commit(&s.path, |tx| {
         let mut batch = tx.batch();
         let root = batch.root(b"/r", dir_stat(1));
@@ -392,6 +398,12 @@ fn live_hash_wins_and_a_later_death_replaces_the_older_same_hash_candidate() {
     });
     assert_eq!(view.doc_hash(DocId(1)), Some(hash(0)));
     assert_eq!(view.dormant_hash(DocId(0)), Some(hash(0)));
+    s
+}
+
+#[test]
+fn live_hash_wins_and_a_later_death_replaces_the_older_same_hash_candidate() {
+    let s = live_beside_dormant("dormant-same-hash");
     let mut writer = session(&s);
     assert_eq!(writer.returning_document(hash(0)), Some(DocId(1)));
     let view = writer.view();
@@ -416,4 +428,64 @@ fn live_hash_wins_and_a_later_death_replaces_the_older_same_hash_candidate() {
     let writer = session(&s);
     assert_eq!(writer.returning_document(hash(0)), Some(DocId(1)));
     assert_eq!(writer.document(hash(0)), None);
+}
+
+#[test]
+fn cap_evicts_lowest_of_retained_and_dying_ids_across_transactions() {
+    let s = fixture("dormant-cap-incremental", 6);
+    let mut session = session(&s);
+    session.set_dormant_cap(3);
+    die(&mut session, 4);
+    die(&mut session, 5);
+    // A dying id below every retained one is the one evicted.
+    die_together(&mut session, &[0, 2]);
+    assert_eq!(retained(&session.view()), [2, 4, 5]);
+    assert!(revive(&mut session, 0, hash(0)).is_err());
+    // A retained id below every dying one is the one evicted.
+    die(&mut session, 3);
+    assert_eq!(retained(&session.view()), [3, 4, 5]);
+    assert_eq!(session.returning_document(hash(2)), None);
+    // From a checkpoint's ordering, one transaction evicts from both sides.
+    session.compact().unwrap();
+    session.set_dormant_cap(2);
+    die(&mut session, 1);
+    assert_eq!(retained(&session.view()), [4, 5]);
+    assert_eq!(retained(&reopen(&s.path)), [4, 5]);
+    revive(&mut session, 4, hash(4)).unwrap();
+    assert_eq!(retained(&session.view()), [5]);
+}
+
+#[test]
+fn a_dormant_row_duplicating_a_retained_hash_is_refused() {
+    let s = live_beside_dormant("dormant-duplicate-hash");
+    // Without coverage the writer passes the record through unprepared, and
+    // unlimited budgets keep it in the log, away from the checkpoint's check:
+    // only the per-transaction retained-hash check stands in its way.
+    let mut writer = session(&s);
+    writer.set_coverage(None);
+    let view = writer.view();
+    let records = vec![
+        Record::InodePut {
+            id: 1,
+            kind: Kind::File,
+            state: ContentState::Unindexed,
+            doc: None,
+            stat: view.inode(InoId(1)).stat,
+        },
+        Record::DocDormant {
+            id: 1,
+            hash: hash(0),
+        },
+    ];
+    let Err(refused) = writer.commit(&changes(&view, records, 0), SNIFFER) else {
+        panic!("a duplicate retained hash was published");
+    };
+    assert!(
+        format!("{refused:?}").contains("duplicate dormant hash"),
+        "{refused:?}"
+    );
+    drop(writer);
+    let disk = reopen(&s.path);
+    assert_eq!(retained(&disk), [0]);
+    assert_eq!(disk.doc_hash(DocId(1)), Some(hash(0)));
 }

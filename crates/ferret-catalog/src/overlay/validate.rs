@@ -201,21 +201,12 @@ impl Overlay {
             return Ok(());
         }
         self.check_fields()?;
-        // Removing or consuming permissions cannot violate hash uniqueness
-        // or the cap. Only a new dormant row needs a complete retained scan.
+        // Dormant hash uniqueness and the cap were checked per transaction
+        // as the Docs family loaded (`dormant::State::advance`).
         let proven = self
             .parent
             .as_ref()
             .filter(|parent| parent.checked.get().is_some());
-        if proven.is_none()
-            || self
-                .delta
-                .iter()
-                .any(|r| matches!(r.as_ref(), Record::DocDormant { .. }))
-        {
-            let hashes: Vec<_> = view.dormant_docs().map(|(_, hash)| hash).collect();
-            crate::dormant::check_hashes(hashes).map_err(OpenError::Decode)?;
-        }
         if let Some(parent) = proven {
             self.validate_delta(view, parent)?;
             let _ = self.docs_checked.set(());

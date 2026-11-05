@@ -216,12 +216,53 @@ impl Catalog {
         base.chain(delta)
     }
 
+    /// Number of retained permissions, kept by each checked transaction
+    /// rather than counted. Needs [`Section::Dormant`].
+    pub(crate) fn dormant_count(&self) -> usize {
+        match &self.overlay {
+            Some(overlay) => self.dormant_state_from(overlay).count(),
+            None => {
+                let (start, end) = self.layout.range(Section::Dormant);
+                (end - start) / 20
+            }
+        }
+    }
+
+    /// The checked hash lookup for retained permissions. A checkpoint sorts
+    /// its rows by hash once; overlays carry it forward per transaction.
+    /// Needs [`Section::Dormant`].
+    pub(crate) fn dormant_state(&self) -> &crate::dormant::State {
+        if let Some(overlay) = &self.overlay {
+            return self.dormant_state_from(overlay);
+        }
+        self.dormant_base.get_or_init(|| {
+            let bytes = match self.source.as_ref() {
+                Source::File { sections, .. } => {
+                    let Some(bytes) = sections[Section::Dormant as usize].get() else {
+                        unreachable!("Dormant loaded before metadata");
+                    };
+                    bytes.clone()
+                }
+                Source::Resident { sections, .. } => sections[Section::Dormant as usize].clone(),
+                Source::Whole(_) => Arc::from(self.section(Section::Dormant)),
+            };
+            crate::dormant::State::new(bytes)
+        })
+    }
+
+    fn dormant_state_from<'a>(&self, overlay: &'a Overlay) -> &'a crate::dormant::State {
+        let Some(state) = &overlay.projection(Family::Docs).dormant else {
+            unreachable!("loaded Docs projection owns retained metadata");
+        };
+        state
+    }
+
     /// Additional memory and checkpoint disk headroom for retained identities.
     /// Includes compact columns, lookup ordinals, sorting/validation scratch,
     /// sparse session and overlay records, and old/new checkpoint columns.
     /// Needs [`Section::Dormant`]; intended for bulk admission boundaries.
     pub fn dormant_resources(&self) -> (u64, u64) {
-        let rows = self.dormant_docs().count() as u64;
+        let rows = self.dormant_count() as u64;
         let columns = rows * 20;
         let scratch = rows
             * (3 * std::mem::size_of::<(DocId, Hash)>()

@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub(super) struct Row<K, V> {
-    pub(super) key: K,
-    pub(super) sequence: u64,
-    pub(super) value: V,
+pub(crate) struct Row<K, V> {
+    pub(crate) key: K,
+    pub(crate) sequence: u64,
+    pub(crate) value: V,
 }
 
 struct Run<K, V> {
@@ -15,7 +15,7 @@ struct Run<K, V> {
     rows: Vec<Row<K, V>>,
 }
 
-pub(super) struct Runs<K, V> {
+pub(crate) struct Runs<K, V> {
     levels: Vec<Option<Arc<Run<K, V>>>>,
 }
 impl<K, V> Default for Runs<K, V> {
@@ -31,7 +31,7 @@ impl<K, V> Clone for Runs<K, V> {
     }
 }
 impl<K: Ord + Clone, V: Clone> Runs<K, V> {
-    pub(super) fn insert(&mut self, mut rows: Vec<Row<K, V>>) {
+    pub(crate) fn insert(&mut self, mut rows: Vec<Row<K, V>>) {
         if rows.is_empty() {
             return;
         }
@@ -85,7 +85,7 @@ impl<K: Ord + Clone, V: Clone> Runs<K, V> {
             rows = combined;
         }
     }
-    pub(super) fn get(&self, key: &K) -> Option<&V> {
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
         self.get_by(|k| k.cmp(key))
     }
     /// Looks a row up by a comparator against the key, rather than an owned
