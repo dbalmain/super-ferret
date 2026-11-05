@@ -310,7 +310,7 @@ fn v5_checkpoint_and_log_migrate_without_invalidating_legacy_docids() {
     let s = fixture("dormant-migration", 2);
     let mut session = session(&s);
     let view = session.view();
-    let mut record = match inode(&view, 0, true) {
+    let record = match inode(&view, 0, true) {
         Record::InodePut {
             id,
             kind,
@@ -331,7 +331,20 @@ fn v5_checkpoint_and_log_migrate_without_invalidating_legacy_docids() {
     };
     session
         .commit(
-            &changes(&view, vec![record.clone()], view.doc_count()),
+            &changes(
+                &view,
+                vec![
+                    record,
+                    Record::NamePut {
+                        id: 0,
+                        parent: 0,
+                        child: 1,
+                        name: b"a".to_vec(),
+                        revealed: true,
+                    },
+                ],
+                view.doc_count(),
+            ),
             SNIFFER,
         )
         .unwrap();
@@ -355,12 +368,10 @@ fn v5_checkpoint_and_log_migrate_without_invalidating_legacy_docids() {
         before.docs().collect::<Vec<_>>()
     );
     assert_eq!(migrated.dormant_docs().count(), 0);
+    assert!(migrated.is_revealed(crate::NameId(0)));
     // Old live coverage can authorize a subsequent death; migration itself
     // creates no permissions for historical holes.
     session.set_coverage(Some(Coverage::new(2, vec![])));
-    if let Record::InodePut { stat, .. } = &mut record {
-        stat.ctime_nsec += 1;
-    }
     die(&mut session, 0);
     assert_eq!(session.view().dormant_hash(DocId(0)), Some(hash(0)));
 }
@@ -385,13 +396,21 @@ fn live_hash_wins_and_a_later_death_replaces_the_older_same_hash_candidate() {
     assert_eq!(writer.returning_document(hash(0)), Some(DocId(1)));
     let view = writer.view();
     let records = vec![
-        Record::InodePut { id: 1, kind: Kind::File, state: ContentState::Unindexed,
-            doc: None, stat: view.inode(InoId(1)).stat },
+        Record::InodePut {
+            id: 1,
+            kind: Kind::File,
+            state: ContentState::Unindexed,
+            doc: None,
+            stat: view.inode(InoId(1)).stat,
+        },
         Record::DocDelete { id: 1 },
     ];
     writer.commit(&changes(&view, records, 0), SNIFFER).unwrap();
     assert_eq!(writer.returning_document(hash(0)), Some(DocId(1)));
-    assert_eq!(writer.view().dormant_docs().collect::<Vec<_>>(), [(DocId(1), hash(0))]);
+    assert_eq!(
+        writer.view().dormant_docs().collect::<Vec<_>>(),
+        [(DocId(1), hash(0))]
+    );
     writer.compact().unwrap();
     drop(writer);
     let writer = session(&s);

@@ -39,5 +39,6 @@ pub use live::DocSet;
 pub use manifest::{Manifest, SegmentEntry};
 pub use segment::ReadError;
 pub use store::{
-    BUFFER, Budget, CatalogView, Error, Fault, Followed, IndexWriter, Merged, Reader, Stopped, View,
+    BUFFER, Budget, CatalogView, Error, Fault, Followed, IndexWriter, MergePlan, Merged, Reader,
+    Stopped, View,
 };

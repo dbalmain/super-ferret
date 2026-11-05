@@ -992,3 +992,5 @@ fn grep_candidates_outside_the_probe_decode_every_candidate() {
     assert!(ask(b"far.txt"), "an unprobed candidate was dropped");
     assert!(!ask(b"250.txt"), "an unprobed non-candidate was kept");
 }
+
+mod dormant;

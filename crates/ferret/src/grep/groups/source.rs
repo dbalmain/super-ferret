@@ -1,5 +1,5 @@
 //! Which entries a walk searches: the per-entry filter, and the serial operand
-//! source that feeds [`run`](super::run).
+//! source that feeds [`run`].
 
 use std::ops::ControlFlow;
 use std::sync::Mutex;
@@ -297,7 +297,7 @@ impl<'a> Source<'a> {
         self
     }
 
-    /// Whether a directory operand walks the live tree, which [`walk`] can
+    /// Whether a directory operand walks the live tree, which [`walk()`] can
     /// spread over workers.
     pub(in super::super) fn walks_live(&self) -> bool {
         self.inputs.as_slice().iter().any(|input| {

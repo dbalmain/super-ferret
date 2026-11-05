@@ -73,6 +73,7 @@ production code parks on it at a real checkpoint.
 | Variable                                                        | Read in                             | Injection                                                                                              | Covered by                                                               |
 | --------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
 | `FERRET_CATALOG_TEST_FAIL`                                      | `ferret-catalog` `publication.rs`   | Fails the publication point it names (`ManifestRename`, say) on every visit, in any process.           | `tests/cli.rs`, `tests/daemon.rs`, `ferret-crawl` `tests/partial.rs`     |
+| `FERRET_INDEX_TEST_FAIL` | `ferret-index` `store.rs` | Fails the named merge/publication point, preserving crash debris for recovery. | `ferret/src/engine/tests/dormant.rs` |
 | `FERRET_LOCK_DIAG`                                              | `ferret-catalog` `lock.rs`          | A file to append, on a refused catalog lock, the `/proc/locks` holders and every process with it open. | fixtures set it; `tests/daemon.rs`, `tests/watch.rs` print it on failure |
 | `FERRET_CONTENT_TEST_GATE`                                      | `ferret` `daemon/writer/content.rs` | Parks content indexing at a named phase's cancellation checkpoint.                                     | `tests/daemon.rs`, `tests/watch.rs`                                      |
 | `FERRET_CRAWL_TEST_GATE`                                        | `ferret-crawl` `index.rs`           | Parks each crawl worker after its priority decision, recording its thread id.                          | `tests/watch.rs`                                                         |
@@ -99,6 +100,7 @@ child copy of its own binary.
 
 | Variable                                          | Owning test module                        |
 | ------------------------------------------------- | ----------------------------------------- |
+| `FERRET_D60_MERGE_CHILD`, `FERRET_D60_LIVE_AT_PIN` | `ferret/src/engine/tests/dormant.rs` |
 | `FERRET_TEST_COMPLETION_CHILD`                    | `ferret-query/src/completion.rs`          |
 | `FERRET_TEST_CONTROLLER_CASE`                     | `ferret/src/config.rs`                    |
 | `FERRET_TEST_LATE_SPILL`                          | `ferret/src/grep/groups.rs`               |

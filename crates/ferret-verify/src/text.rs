@@ -38,7 +38,7 @@
 //!    token's span lowercases on its own (Σ, the one exception, lowercases to σ
 //!    or ς either way), to at least one character. An ASCII character
 //!    lowercases to one ASCII byte, and no non-ASCII character outside
-//!    [`ASCII_FROM_NON_ASCII`] lowercases to anything holding an ASCII byte. So
+//!    `ASCII_FROM_NON_ASCII` lowercases to anything holding an ASCII byte. So
 //!    in a document holding none of those, a run of ASCII bytes in a token
 //!    comes from a run of ASCII characters in its span, equal up to ASCII case.
 //!    A document holding one is tokenized whole. A unit with no ASCII has no
@@ -78,7 +78,7 @@ use crate::Trigrams;
 /// through the tokenizer.
 pub(crate) const ASCII_FROM_NON_ASCII: [char; 2] = ['\u{130}', '\u{212A}'];
 
-/// Matches the UTF-8 encoding of any [`ASCII_FROM_NON_ASCII`] character.
+/// Matches the UTF-8 encoding of any `ASCII_FROM_NON_ASCII` character.
 /// `None` only if the fixed pattern failed to compile, when every document
 /// counts as holding one: tokenizing whole is always sound.
 static UNSAFE: LazyLock<Option<Regex>> = LazyLock::new(|| {

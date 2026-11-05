@@ -110,7 +110,7 @@
 //!
 //! Validation is split so that it can run per section: [`decode_table`]
 //! checks the header, the table, the descriptors and every count and length
-//! at open, and [`check`] validates one section when it is loaded. A check
+//! at open, and [`check()`] validates one section when it is loaded. A check
 //! that spans sections (a directory's name edge against the name rows) runs
 //! when the later one loads, after the sections it [needs](Section::needs).
 
@@ -542,7 +542,7 @@ impl Section {
         Section::States,
     ];
 
-    /// The sections loaded with this one: those whose bytes [`check`] reads
+    /// The sections loaded with this one: those whose bytes [`check()`] reads
     /// to validate it, which must be loaded first, and those an accessor
     /// documented against this section also reads. Everything else a check
     /// needs is a count, a length or a descriptor from the head of the file.

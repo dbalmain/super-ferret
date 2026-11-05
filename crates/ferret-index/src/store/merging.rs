@@ -180,6 +180,7 @@ impl IndexWriter {
         trigrams.splice(run, trigram);
         self.publish(manifest, segments, trigrams)?;
         retire(&self.dir, &retired);
+        hit(Point::Retired)?;
         Ok(retired)
     }
 }

@@ -31,7 +31,8 @@ pub struct Engine {
     current: RwLock<QuerySession>,
     writer: Mutex<Option<WriterSession>>,
     /// Content mutation is independent of catalog refresh. When both are
-    /// needed, lock `writer` first; merges hold only this mutex and a pin.
+    /// needed, lock `writer` first. Merge setup revokes permissions there,
+    /// then streams with only this mutex and the resulting liveness pin.
     content: Mutex<Option<IndexWriter>>,
     retired: Mutex<Vec<(u64, Weak<OnceLock<NameIndex>>)>>,
 }
@@ -234,6 +235,7 @@ impl Engine {
     ) -> Result<RefreshReport, Error> {
         let mut writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let writer = writer.as_mut().ok_or(Error::ReadOnly)?;
+        self.authorize_content(writer);
         let report = match ferret_crawl::refresh(writer, request, options) {
             Ok(report) => report,
             Err(error) => {
@@ -267,6 +269,7 @@ impl Engine {
         let writer = guard.as_mut().ok_or(ferret_crawl::IndexError::Begin(
             ferret_catalog::BeginError::Locked,
         ))?;
+        self.authorize_content(writer);
         let report = match ferret_crawl::session_change(writer, change, refresh, options) {
             Ok(report) => report,
             Err(error) => {
@@ -327,16 +330,30 @@ impl Engine {
     /// Segments open on the search thread count.
     pub fn attach_content(&self, catalog_dir: &Path) -> Result<(), Error> {
         let threads = self.pin().search_threads();
-        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
-        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let mut writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let writer = writer.as_mut().ok_or(Error::ReadOnly)?;
+        let view = writer.view();
         let live = live_documents(&view);
         let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
+        // Open may reset files before reporting failure. Retire the previous
+        // writer and selection first so an error cannot leave revival or
+        // follow enabled against descriptors whose names open just removed.
+        content.take();
+        self.current
+            .write()
+            .map_err(|_| Error::WriterPanicked)?
+            .content = None;
+        writer.set_coverage(None);
         let opened = IndexWriter::open_with_threads(
             &catalog_dir.join(CONTENT_DIR),
             &catalog_view(&view, &live),
             threads,
         )
         .map_err(Error::Content)?;
+        if opened.reset_at_open() || opened.view().manifest().segments.is_empty() {
+            let view = writer.clear_dormant().map_err(Error::CatalogWrite)?;
+            self.select(view);
+        }
         let published = opened.view();
         *content = Some(opened);
         self.select_content(published);
@@ -438,46 +455,118 @@ impl Engine {
         followed.map_err(Error::Content)
     }
 
-    /// One merge step of the content index, if its policy wants one. Holds
-    /// only the content mutex and a catalog pin, so refreshes can publish
-    /// while the merge streams its immutable inputs.
-    pub fn merge_content(&self, budget: &Budget) -> Result<Option<Merged>, Error> {
-        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
-        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+    /// Grants coverage only from the selected committed view under writer.
+    /// Reading it needs no content mutex, so refresh can progress beside merge.
+    fn authorize_content(&self, writer: &mut WriterSession) {
         let pin = self.pin();
-        self.merge_locked(index, &pin, budget)
+        let view = writer.view();
+        let coverage = pin
+            .content()
+            .filter(|content| {
+                let manifest = content.manifest();
+                manifest.incarnation == view.generation().incarnation
+                    && manifest.high_water <= view.next_doc().0
+            })
+            .map(|content| {
+                let manifest = content.manifest();
+                ferret_catalog::Coverage::new(manifest.frontier, manifest.unreadable.clone())
+            });
+        writer.set_coverage(coverage);
     }
 
-    /// Uses the same catalog pin that admitted the daemon's merge resources.
-    /// A content publisher that overtook admission invalidates that attempt;
-    /// never reconcile a newer index backwards against an old catalog pin.
-    pub(crate) fn merge_content_at(
-        &self,
-        pin: &QuerySession,
-        budget: &Budget,
-    ) -> Result<Option<Merged>, Error> {
+    /// Clears dormant permissions durably before resetting the content index.
+    /// Writer→content ownership waits for any streaming merge to finish.
+    pub fn reset_content(&self) -> Result<(), Error> {
+        let mut writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let writer = writer.as_mut().ok_or(Error::ReadOnly)?;
         let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let index = content.as_mut().ok_or(Error::NoContentIndex)?;
-        let view = index.view();
-        if view.manifest().incarnation != pin.generation().incarnation
-            || pin
-                .content()
-                .is_none_or(|admitted| view.manifest().sequence != admitted.manifest().sequence)
+        let view = writer.clear_dormant().map_err(Error::CatalogWrite)?;
+        self.select(view.clone());
+        writer.set_coverage(None);
+        let live = live_documents(&view);
+        let result = index.reset(&catalog_view(&view, &live));
+        self.select_content(index.view());
+        result.map_err(Error::Content)
+    }
+
+    /// One policy merge, revoking permissions before pinning current liveness.
+    /// Streaming retains content ownership while refresh can take writer.
+    pub fn merge_content(&self, budget: &Budget) -> Result<Option<Merged>, Error> {
+        self.merge_content_inner(None, budget, false)
+    }
+
+    /// Forced full merge under the same permission protocol as policy merges.
+    pub fn merge_all_content(&self, budget: &Budget) -> Result<Option<Merged>, Error> {
+        self.merge_content_inner(None, budget, true)
+    }
+
+    /// Revalidates the daemon's advisory resource admission against the exact
+    /// current inputs. Its older catalog pin must never filter the output.
+    pub(crate) fn merge_content_at(
+        &self,
+        admitted: &QuerySession,
+        budget: &Budget,
+    ) -> Result<Option<Merged>, Error> {
+        self.merge_content_inner(Some(admitted), budget, false)
+    }
+
+    fn merge_content_inner(
+        &self,
+        admitted: Option<&QuerySession>,
+        budget: &Budget,
+        all: bool,
+    ) -> Result<Option<Merged>, Error> {
+        let mut writer_guard = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let writer = writer_guard.as_mut().ok_or(Error::ReadOnly)?;
+        // Routine background work must never wait behind content while
+        // holding writer: refresh needs writer during the streaming phase.
+        let mut content = match self.content.try_lock() {
+            Ok(content) => content,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WriterPanicked),
+        };
+        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        let current = index.view();
+        if let Some(admitted) = admitted
+            && admitted.content().is_none_or(|view| {
+                view.manifest().incarnation != current.manifest().incarnation
+                    || view.manifest().sequence != current.manifest().sequence
+            })
         {
             return Ok(None);
         }
-        self.merge_locked(index, pin, budget)
-    }
-
-    fn merge_locked(
-        &self,
-        index: &mut IndexWriter,
-        pin: &QuerySession,
-        budget: &Budget,
-    ) -> Result<Option<Merged>, Error> {
-        let merged = index.merge_if_needed(&catalog_view(pin.catalog(), pin.live()), budget);
+        let pin = self.pin();
+        let Some(plan) = index
+            .prepare_merge(&catalog_view(pin.catalog(), pin.live()), budget, all)
+            .map_err(Error::Content)?
+        else {
+            return Ok(None);
+        };
+        if let Some(admitted) = admitted {
+            let selection = admitted
+                .content()
+                .and_then(|view| view.merge_selection(admitted.live()));
+            if selection.is_none_or(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.number)
+                    .ne(plan.entries().iter().map(|entry| entry.number))
+            }) {
+                return Ok(None);
+            }
+        }
+        let view = writer
+            .forget_dormant(&plan.ranges())
+            .map_err(Error::CatalogWrite)?;
+        if view.generation() != pin.generation() {
+            self.select(view);
+        }
+        let pin = self.pin();
+        drop(writer_guard);
+        let result = index.merge_selected(&catalog_view(pin.catalog(), pin.live()), budget, plan);
         self.select_content(index.view());
-        merged.map_err(Error::Content)
+        result.map_err(Error::Content)
     }
 
     /// Publishes a content view beside the current catalog view. Publishers
@@ -607,6 +696,8 @@ pub enum Error {
     WriterPanicked,
     Refresh(ferret_crawl::IndexError),
     Compact(ferret_catalog::log::Error),
+    /// Permission publication failed; content mutation must not proceed.
+    CatalogWrite(ferret_catalog::log::Error),
     /// The engine has no content index attached.
     NoContentIndex,
     Content(ferret_index::Error),
@@ -619,7 +710,7 @@ impl std::fmt::Display for Error {
             Self::ReadOnly => f.write_str("the engine has no writer"),
             Self::WriterPanicked => f.write_str("the engine writer panicked"),
             Self::Refresh(error) => error.fmt(f),
-            Self::Compact(error) => error.fmt(f),
+            Self::Compact(error) | Self::CatalogWrite(error) => error.fmt(f),
             Self::NoContentIndex => f.write_str("the engine has no content index"),
             Self::Content(error) => error.fmt(f),
             Self::Catalog(error) => error.fmt(f),
@@ -634,7 +725,7 @@ impl std::error::Error for Error {
             Self::Content(error) => Some(error),
             Self::Catalog(error) => Some(error),
             Self::Refresh(error) => Some(error),
-            Self::Compact(error) => Some(error),
+            Self::Compact(error) | Self::CatalogWrite(error) => Some(error),
         }
     }
 }
@@ -651,7 +742,7 @@ const SEARCH_THREADS: usize = 16;
 /// Otherwise `stored`, the index's `search_threads` setting (the physical
 /// cores counted when it was created), capped by `available` so CPU
 /// affinity, cgroup quotas and a smaller machine still apply. Without a
-/// stored count, `available` up to [`SEARCH_THREADS`].
+/// stored count, `available` up to `SEARCH_THREADS`.
 pub fn search_threads(env: Option<usize>, stored: Option<usize>, available: usize) -> usize {
     env.unwrap_or_else(|| available.min(stored.unwrap_or(SEARCH_THREADS)))
 }

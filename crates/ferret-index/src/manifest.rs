@@ -344,7 +344,8 @@ impl Manifest {
         crate::store::hit(crate::store::Point::ManifestSynced)?;
         fs::rename(&temp, dir.join(FILE))?;
         crate::store::hit(crate::store::Point::ManifestRenamed)?;
-        File::open(dir)?.sync_all()
+        File::open(dir)?.sync_all()?;
+        crate::store::hit(crate::store::Point::ManifestDirectorySynced)
     }
 }
 

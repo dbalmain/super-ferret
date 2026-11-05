@@ -223,7 +223,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
 
 /// Runs `ferret --json find ARGS...`: the CLI's own structured-output host.
 /// Emits the same framed block as a batch or socket find
-/// ([`find_json::run_block`]) under the fixed id `"find"` — there is only ever
+/// (`find_json::run_block`) under the fixed id `"find"` — there is only ever
 /// one find request in this process, so no id negotiation is needed. The
 /// child's stdin inherits the caller's, as the raw CLI does; `-ok`/`-okdir`
 /// still refuse outside a terminal (`FrameOutput::confirm` checks that

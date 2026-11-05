@@ -1,5 +1,5 @@
 //! Checkpoint replay: complete rewalk observations and the retained
-//! boundaries [`resolve`](super::resolve) protected, carried through the
+//! boundaries [`resolve`] protected, carried through the
 //! full builder.
 
 use super::*;

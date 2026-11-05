@@ -128,7 +128,7 @@ pub const BLOCK: usize = 32;
 pub const CHUNK: usize = 4096;
 
 /// A segment's sections. The discriminant indexes per-section arrays; file
-/// order is the codec's ([`sections`]).
+/// order is the codec's (`sections`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Blocks = 0,

@@ -1,4 +1,4 @@
-//! Find's expression over the [`schedule`](super::schedule) walk. Tasks own
+//! Find's expression over the [`schedule`] walk. Tasks own
 //! expression control and directory-local batches; ordinary batches are shared
 //! across the run. Effects are worker-local handles to the host's synchronized
 //! output and prompt sinks.

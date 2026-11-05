@@ -126,7 +126,7 @@ impl LiveWalk {
     /// descriptor per directory on the walk's stack, plus one per start for
     /// the start's parent; the syscalls are the same.
     ///
-    /// Those descriptors are charged to a process-wide budget ([`Charge`]).
+    /// Those descriptors are charged to a process-wide budget (`Charge`).
     /// Past it a listed directory is closed as an unretaining walk closes
     /// it, keeping only its `(dev, ino)` from one `fstat`
     /// ([`Entry::directory_identity`]), so a deep tree under a low open-file

@@ -1,12 +1,12 @@
 //! Walking configured roots.
 //!
-//! [`walk`] and [`walk_parallel`] visit one root and report each entry
+//! [`walk()`] and [`walk_parallel`] visit one root and report each entry
 //! [`ferret_policy`] decides, with the `lstat` fields the catalog will store.
 //! The root is opened by the path the user named; every operation below it is
 //! relative to a directory handle, so a name swapped for a symlink cannot
 //! redirect the walk (D21).
 //!
-//! [`index`] turns walks into a published catalog generation: it takes the
+//! [`index()`] turns walks into a published catalog generation: it takes the
 //! writer lock, walks the roots that need it with a visitor that carries,
 //! sniffs and hashes content on the worker (D26, D31, D33), retains checked
 //! old scopes under typed coverage faults, and commits trustworthy changes.

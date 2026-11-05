@@ -26,7 +26,7 @@
 //! by parent with a counting pass, files are deduplicated by sorting
 //! `(fingerprint, name position, file)` triples rather than through a map, and
 //! documents by sorting `(hash, inode)` pairs; each batch's entry counts are
-//! freed as soon as the plan has them. [`write`] then writes every section
+//! freed as soon as the plan has them. [`write()`] then writes every section
 //! to its place in the file through a bounded buffer per column, filling all
 //! of a table's columns in one pass over its rows, so the encoded generation
 //! is never held in memory; it frees each batch's names once the name
@@ -166,7 +166,7 @@ impl Index {
     }
 }
 
-/// Every id of the new generation, decided; [`write`] needs only this and the
+/// Every id of the new generation, decided; [`write()`] needs only this and the
 /// batches.
 pub(crate) struct Plan {
     sniffer: u32,
@@ -632,7 +632,7 @@ fn push_known(sizer: &mut BlockSizer, id: u32) {
     }
 }
 
-/// The largest name heap: its offsets, and the running offset [`write`]
+/// The largest name heap: its offsets, and the running offset [`write()`]
 /// keeps, are `u32`.
 fn heap_limit() -> usize {
     #[cfg(test)]

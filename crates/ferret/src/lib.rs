@@ -4,7 +4,7 @@
 //! and writer adoption for the CLI, batch and daemon hosts.
 //!
 //! - [`cli`]: the entry point, exit statuses, where the index is, usage.
-//! - [`batch`]: resident query executor and the sequential S1B JSON-lines host.
+//! - `batch`: resident query executor and the sequential S1B JSON-lines host.
 //! - [`daemon`]: socket host. It retains the writer (watches, catalog refresh,
 //!   content follow and merge), the endpoint lifecycle and ordinary clients.
 //! - `transport`: shared event destinations; no parallel socket encoder.
@@ -20,8 +20,8 @@
 //!   (D77).
 //! - `config_file`: reads a user's configuration file without blocking on a
 //!   FIFO or other special file.
-//! - [`protocol`]: the shared bounded reader for batch requests, socket
-//!   envelopes and events.
+//! - `protocol`: the shared bounded reader for batch requests, socket envelopes
+//!   and events.
 //!
 //! **Paths that are not UTF-8.** Human output writes a path's raw bytes. In
 //! JSON lines, `path` is always a string: the path's text, with each invalid

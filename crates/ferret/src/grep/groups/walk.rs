@@ -136,7 +136,7 @@ pub(in super::super) fn walk<W: Write>(
     search.finish(host).map(|()| Walk::Done)
 }
 
-/// How [`walk`] ended.
+/// How [`walk()`] ended.
 pub(in super::super) enum Walk {
     /// The operands were searched.
     Done,
@@ -155,7 +155,7 @@ struct Walked {
     selected: Option<(u64, Job)>,
 }
 
-/// One worker of [`walk`]: filters each entry its task reaches and searches
+/// One worker of [`walk()`]: filters each entry its task reaches and searches
 /// the selected files.
 struct Walker<'w, 's> {
     search: &'w Search<'s>,

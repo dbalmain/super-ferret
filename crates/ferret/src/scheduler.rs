@@ -170,14 +170,17 @@ impl Scheduler {
             Kind::FullRewalk => self.config.full_memory,
             Kind::Checkpoint => self.config.checkpoint_memory,
         };
+        let (dormant_memory, dormant_disk) = view.dormant_resources();
         let required_memory = scaled(configured_memory, view.name_count())
             .max(memory)
             .max(self.config.memory_floor)
             .saturating_add(self.config.additional_memory)
-            .saturating_add(watch_bytes);
+            .saturating_add(watch_bytes)
+            .saturating_add(dormant_memory);
         let required_disk = scaled(self.config.disk, view.name_count())
             .max(self.config.disk.min(16 << 20))
-            .max(disk_bytes);
+            .max(disk_bytes)
+            .saturating_add(dormant_disk);
         let result = if polite && let Some(reason) = m.status.paused {
             Err(reason)
         } else if m.status.sample.memory.is_none_or(|n| n < required_memory) {

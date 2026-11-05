@@ -5,7 +5,7 @@
 //! occupying a worker. Find evaluates its expression per entry; grep searches
 //! each file.
 //!
-//! A task offers a loan every [`STEPS_PER_LOAN`] steps, and after any step
+//! A task offers a loan every `STEPS_PER_LOAN` steps, and after any step
 //! while a worker is idle. One grep step can search a 1 GiB file, so a cadence
 //! counted in steps alone leaves idle workers waiting for seconds; a visitor
 //! whose next step is such a search says so ([`Visitor::holding`]), and the

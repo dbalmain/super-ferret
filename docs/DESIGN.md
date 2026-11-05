@@ -55,6 +55,13 @@ ferret-bench   → anything; nothing depends on it
 | `ferret-query`   | query syntax, planning, execution, result rows; find's parser, walk and actions; grep's argv, line records and verification scheduling | any structure's on-disk format       |
 | `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                                      | —                                    |
 
+The host coordinates D60 A′ revival permissions without a crate edge: under
+its writer gate, `ferret` grants dormancy from the selected index's coverage
+and revokes permissions in exact merge input ranges before pinning liveness.
+The catalog stores retained identities and checked transitions; it never
+reads content postings. Merges keep content ownership through publication and
+retirement while catalog refresh can proceed.
+
 Grep M1 (2026-10-16) adds no dependency edge: query’s `line_grep` owns
 rg argv parsing, candidate selection and line records; verify owns its resolved
 line profile and matcher; policy owns override globs/hidden selection; the
@@ -213,11 +220,13 @@ impl Cursor<'_> {                           // And, Or, AndNot, Filter, Maybe, B
 
 ## The catalog (D4, D5)
 
-Six tables. `names` and `inodes` have `u32` ids that are dense in a checkpoint
+Seven tables. `names` and `inodes` have `u32` ids that are dense in a checkpoint
 and renumbered by each compaction (D27, D52 B). Between checkpoints they are
 epoch-scoped: the log's births take new ids and its deaths leave holes until
-the next compaction. `docs` holds live documents only, keyed by a `DocId` that
-is never reused (D36); `roots`, `links` and `worktrees` hang off an existing
+the next compaction. `docs` holds live documents only, keyed by a `DocId`
+permanently bound to one content hash. `dormant` retains bounded permissions
+to revive covered deaths (D60 A′), without moving the next-id counter;
+forgotten ids stay holes. `roots`, `links` and `worktrees` hang off an existing
 `InoId`. Raw inode numbers are data, never keys.
 
 | Table       | Id       | Row                                                                                                                                                                     |
@@ -225,6 +234,7 @@ is never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 | `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId` or an ignored-type tag (no inode row)                                                            |
 | `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, nlink, `DocId` or none; a 2-bit content state beside it (D37); a directory's raw entry count (D47)                    |
 | `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died, the ids a sequence column (implicit when there are no holes)                    |
+| `dormant`   | `DocId`  | hash of covered dead content; one row per hash, capped at 1,000,000, lowest ids evicted |
 | `roots`     | —        | configured root paths and the `InoId` of each; nested roots are separate trees, and adding or removing a root inside a kept root requires refreshing the kept one (D34) |
 | `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the strings heap)                                                                                         |
 | `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's `(dev, ino)`) and its path for display                     |
@@ -274,16 +284,24 @@ What each change costs:
 
 Liveness is catalog state: a doc is live while some inode points at it. The
 index reads a live-docs bitset from the catalog rather than keeping its own
-tombstones, so there is one source of truth.
+tombstones, so there is one source of truth. A returning hash takes a live
+match first, then consumes its dormant permission. Only a covered live→dead
+transition can grant dormancy; advancing coverage never grants it later.
+Every merge durably revokes dormant ids in its selected ranges before taking
+its current liveness pin. Reset and unusable-index startup clear permissions
+durably before follow or revival.
 
-**Storage.** S1+ now publishes a checked v5 snapshot plus a bounded transaction
+**Storage.** S1+ now publishes a checked v6 snapshot plus a bounded transaction
 log under a manifest, with epoch-scoped inode/name ids and stable DocIds.
 [S1PLUS.md](S1PLUS.md) defines the implemented publication, recovery and
 effective-reader contract. The column-layout description below records the
 S1a/find baseline; its per-run snapshot replacement is superseded by S1+.
 Version 5 (D127) adds the revealed section, the ids of hidden names that a
 repository ignore file's `!` line reveals to `grep --rg`, and the matching
-NamePut flag; [S1PLUS.md](S1PLUS.md) has the current section count.
+NamePut flag. Version 6 (D60 A′) adds dormant identities and checked log
+transitions, migrating v5 without changing incarnation, live ids or the
+allocation counter. Its distinct manifest magic makes old writers refuse
+mutation. [S1PLUS.md](S1PLUS.md) has the current section count.
 The snapshot contains a versioned header (magic, format version, sniffer version, next
 `DocId`, the directory, inode, name and document counts), a table of 23 sections by
 offset and length, a descriptor per packed column, and the sections themselves.

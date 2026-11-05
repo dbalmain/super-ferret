@@ -348,7 +348,7 @@ const HANDOFF_GROUPS: usize = 16;
 const SWEEP: std::time::Duration = std::time::Duration::from_micros(500);
 
 /// A worker's completed groups not yet handed to the caller: at most
-/// [`HANDOFF_BYTES`] and [`HANDOFF_GROUPS`] of them.
+/// `HANDOFF_BYTES` and [`HANDOFF_GROUPS`] of them.
 struct Held<G> {
     groups: Vec<G>,
     bytes: u64,
@@ -366,7 +366,7 @@ impl<G> Default for Held<G> {
 impl<G> Held<G> {
     /// Holds a completed group of `weight` bytes and returns the batches to
     /// hand off now, in completion order: first the held batch, when this
-    /// group would push it past [`HANDOFF_BYTES`] or reaches that size alone;
+    /// group would push it past `HANDOFF_BYTES` or reaches that size alone;
     /// then the large group alone, or the batch this group filled to
     /// [`HANDOFF_GROUPS`].
     fn add(&mut self, group: G, weight: u64) -> [Option<Vec<G>>; 2] {
@@ -416,15 +416,15 @@ pub enum GroupSchedule {
 ///
 /// Workers hand groups over in batches through a bounded queue of `threads`
 /// handoffs: a group whose `weight` (its capture's allocation) reaches
-/// [`HANDOFF_BYTES`] goes alone, smaller ones together up to that many bytes.
+/// `HANDOFF_BYTES` goes alone, smaller ones together up to that many bytes.
 /// So the queue holds at most `threads` large groups; each worker owns one in
-/// progress and a held batch of at most [`HANDOFF_BYTES`]; the caller owns one
+/// progress and a held batch of at most `HANDOFF_BYTES`; the caller owns one
 /// handoff.
 ///
 /// Workers send only full batches and large groups. The caller takes every
 /// held batch whenever the queue is empty, and with nothing held sleeps at
-/// most [`SWEEP`] before looking again. So a held group waits on other
-/// output or at most [`SWEEP`], never on its worker's next file, nor on a
+/// most `SWEEP` before looking again. So a held group waits on other
+/// output or at most `SWEEP`, never on its worker's next file, nor on a
 /// worker asleep waiting for the producer, and a worker never pays a wakeup
 /// for a partial batch.
 ///
@@ -640,7 +640,7 @@ impl Drop for Reservation<'_> {
 
 /// Collects handoffs on the caller until every lane has gone, the run stops
 /// or `emit` breaks. Takes every held batch before sleeping, and sleeps at
-/// most [`SWEEP`].
+/// most `SWEEP`.
 fn collect<Group>(
     receiver: &std::sync::mpsc::Receiver<Vec<Group>>,
     held: &[Mutex<Held<Group>>],

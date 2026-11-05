@@ -21,11 +21,14 @@
 //! are removed when the next writer opens. Old [`View`]s keep their
 //! descriptors, so a merge may unlink its inputs under a reader (D32).
 //!
-//! **Invariant.** A segment holds only DocIds below the `next_doc` of the
-//! catalog view its pass was based on, and only documents live in that
-//! view. DocIds are never reused (D36 B, D60 B), so a committed segment is
-//! never wrong about a document; at worst it holds a dead one, which
-//! liveness hides and a merge purges.
+//! **Invariant.** Each DocId is permanently bound to one content hash and
+//! fresh allocation is monotonic. The host may revive a dead id only by
+//! consuming a dormant permission granted at a covered live→dead transition.
+//! Before any merge pins an id dead and may omit it, the host durably revokes
+//! its permission. For the writer's compatible catalog/index pair, live ids
+//! below frontier are therefore fully indexed except those marked unreadable.
+//! Historical catalog/new-index reader pairings require separate compatibility
+//! handling (D60 A′).
 
 use std::cell::RefCell;
 use std::fs::{self, File};
@@ -207,6 +210,28 @@ pub struct Merged {
     pub segment: Option<SegmentEntry>,
 }
 
+/// Exact immutable merge inputs. The host holds content continuously from
+/// selection through permission revocation, filtering and publication.
+#[derive(Debug)]
+pub struct MergePlan {
+    view: Arc<View>,
+    run: std::ops::Range<usize>,
+}
+impl MergePlan {
+    /// Catalog id ranges whose dormant permissions must be revoked.
+    pub fn ranges(&self) -> Vec<std::ops::RangeInclusive<u32>> {
+        self.entries()
+            .iter()
+            .map(|entry| entry.first..=entry.last)
+            .collect()
+    }
+
+    /// Exact segment identities, also used to validate resource admission.
+    pub fn entries(&self) -> &[SegmentEntry] {
+        &self.view.manifest.segments[self.run.clone()]
+    }
+}
+
 /// Why an index operation failed. Except for cooperative cancellation, an
 /// error poisons the writer: reopen to remove the failed operation's files.
 #[derive(Debug)]
@@ -216,6 +241,8 @@ pub enum Error {
     Segment(ReadError),
     /// A previous operation failed; reopen the writer.
     Poisoned,
+    /// The exact input view selected for a merge is no longer current.
+    StaleMerge,
     /// A cooperative merge pause; the old manifest remains selected.
     Cancelled,
 }
@@ -225,6 +252,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "index I/O failed: {error}"),
             Self::Segment(error) => error.fmt(f),
+            Self::StaleMerge => f.write_str("merge inputs changed; select and admit again"),
             Self::Cancelled => f.write_str("content merge paused"),
             Self::Poisoned => f.write_str("an earlier index write failed; reopen the index"),
         }
@@ -236,7 +264,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Segment(error) => Some(error),
-            Self::Poisoned | Self::Cancelled => None,
+            Self::Poisoned | Self::StaleMerge | Self::Cancelled => None,
         }
     }
 }
@@ -272,6 +300,7 @@ pub struct IndexWriter {
     codec: u32,
     trigrams: TrigramInverter,
     publishing: bool,
+    reset_at_open: bool,
 }
 
 impl IndexWriter {
@@ -341,6 +370,7 @@ impl IndexWriter {
             codec,
             trigrams: TrigramInverter::with_capacity(PairBuffer::CAPACITY),
             publishing: false,
+            reset_at_open: opened.is_none(),
         };
         match opened {
             Some(view) => writer.current = Arc::new(view),
@@ -348,6 +378,27 @@ impl IndexWriter {
         }
         remove_unnamed(dir, &writer.current.manifest)?;
         Ok(writer)
+    }
+
+    /// Whether open replaced an absent, incompatible or unusable index.
+    /// Hosts must durably clear dormant permissions before follow or revival.
+    pub fn reset_at_open(&self) -> bool {
+        self.reset_at_open
+    }
+
+    /// Whether the current index is compatible with this catalog.
+    pub fn compatible(&self, catalog: &CatalogView) -> bool {
+        fits(&self.current.manifest, catalog)
+    }
+
+    /// Explicit content reset. An A′ host first holds writer→content and
+    /// durably clears all dormant permissions before calling this method.
+    pub fn reset(&mut self, catalog: &CatalogView) -> Result<(), Error> {
+        self.guard(|writer| {
+            writer.manifest_only(Manifest::empty(catalog.incarnation))?;
+            remove_unnamed(&writer.dir, &writer.current.manifest)?;
+            Ok(())
+        })
     }
 
     /// The published state a query pins with its catalog view.
@@ -388,8 +439,68 @@ impl IndexWriter {
         self.guard(|writer| writer.follow_inner(catalog, budget, readers))
     }
 
+    /// Selects exact merge inputs using current liveness, checking cancellation
+    /// and the byte budget before the host sacrifices dormant permissions.
+    /// Keep exclusive content ownership until [`Self::merge_selected`] ends.
+    pub fn prepare_merge(
+        &self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        all: bool,
+    ) -> Result<Option<MergePlan>, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        if !self.compatible(catalog) {
+            return Err(Error::StaleMerge);
+        }
+        if (budget.cancelled)() {
+            return Err(Error::Cancelled);
+        }
+        let run = if all {
+            if self.current.manifest.segments.is_empty() {
+                return Ok(None);
+            }
+            0..self.current.manifest.segments.len()
+        } else {
+            let Some(run) = self.current.merge_run(catalog.live) else {
+                return Ok(None);
+            };
+            run
+        };
+        let read: u64 = self.current.manifest.segments[run.clone()]
+            .iter()
+            .map(SegmentEntry::total_bytes)
+            .sum();
+        if read > budget.bytes {
+            return Ok(None);
+        }
+        Ok(Some(MergePlan {
+            view: self.current.clone(),
+            run,
+        }))
+    }
+
+    /// Executes the exact selected inputs with the host's post-revocation
+    /// liveness pin. A′ writers must durably forget dormant ids in
+    /// [`MergePlan::ranges`] before taking that pin. No re-selection occurs.
+    pub fn merge_selected(
+        &mut self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        plan: MergePlan,
+    ) -> Result<Option<Merged>, Error> {
+        if !Arc::ptr_eq(&self.current, &plan.view) || !self.compatible(catalog) {
+            return Err(Error::StaleMerge);
+        }
+        self.guard(|writer| writer.merge_run(catalog, budget, plan.run))
+    }
+
     /// One merge step if the policy wants one (adjacent levels, or a segment
     /// past the dead-fraction trigger) and it fits `budget.bytes`.
+    /// Revival-capable hosts must instead bracket [`Self::merge_selected`]
+    /// with durable revocation after [`Self::prepare_merge`]. This convenience
+    /// entry assumes dead ids cannot return.
     pub fn merge_if_needed(
         &mut self,
         catalog: &CatalogView,
@@ -405,7 +516,9 @@ impl IndexWriter {
     }
 
     /// Merges every segment into one, purging dead documents: a forced full
-    /// merge, for measurement and for an explicit optimise.
+    /// merge, for measurement and for an explicit optimise. Revival-capable
+    /// hosts use [`Self::prepare_merge`] with `all` and revoke permissions
+    /// before [`Self::merge_selected`]; this entry assumes dead ids stay dead.
     pub fn merge_all(
         &mut self,
         catalog: &CatalogView,
@@ -608,7 +721,9 @@ fn fits(manifest: &Manifest, catalog: &CatalogView) -> bool {
 
 /// Indexed documents of `segment` still live: the live documents in its
 /// range less the unreadable ones, which sit in the range with no postings.
-/// No document in the range can have become live since (D60 B).
+/// Revival consumes a permission revoked before any merge pinned that id
+/// dead could omit it. Revivals restore the live count toward the fixed indexed
+/// count, never above it; dead unreadable ids have no revival permission.
 fn alive(segment: &SegmentEntry, live: &DocSet, unreadable: &[u32]) -> u32 {
     let end = segment.last.saturating_add(1);
     let skipped = unreadable
@@ -646,6 +761,10 @@ pub(crate) enum Point {
     ManifestRenamed,
     /// Publication has synced its temporary but has not renamed it yet.
     ManifestSynced,
+    /// The manifest's directory sync completed.
+    ManifestDirectorySynced,
+    /// The merge retired its old input files.
+    Retired,
     /// A merge has written part of its output.
     MergeMidway,
 }
@@ -663,7 +782,13 @@ pub(crate) fn hit(point: Point) -> io::Result<()> {
         CANCEL_AT.set(None);
         CANCELLED.set(true);
     }
-    #[cfg(not(test))]
+    #[cfg(debug_assertions)]
+    if std::env::var_os("FERRET_INDEX_TEST_FAIL")
+        .is_some_and(|name| name.to_str() == Some(&format!("{point:?}")))
+    {
+        return Err(io::Error::other(InjectedStop(point)));
+    }
+    #[cfg(not(any(test, debug_assertions)))]
     let _ = point;
     Ok(())
 }
@@ -691,20 +816,20 @@ fn timestamp() -> u64 {
 
 // Crash injection leaves files as a terminated process would. Ordinary errors
 // still exercise eager cleanup through the same operation and publication path.
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug)]
 struct InjectedStop(Point);
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl std::fmt::Display for InjectedStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "injected crash at {:?}", self.0)
     }
 }
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl std::error::Error for InjectedStop {}
 
 fn injected_crash(error: &Error) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     if let Error::Io(io) = error {
         return io.get_ref().is_some_and(|e| e.is::<InjectedStop>());
     }

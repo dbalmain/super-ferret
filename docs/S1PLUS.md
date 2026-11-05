@@ -126,9 +126,10 @@ The import keeps that file available until the new manifest is durable.
 M1 uses version 4. Its 96 B header keeps v3's fields at 0..40, adds
 incarnation at 40..56, checkpoint at 56, checkpoint sequence at 64,
 next InoId at 72 and next NameId at 76, and reserves 80..96 as zeros.
-Twenty-seven 32 B section entries hold offset, length and BLAKE3-128 checksum.
+Version 6 has twenty-eight 32 B section entries holding offset, length and
+BLAKE3-128 checksum.
 Eighteen 16 B column descriptors follow, including nullable-blocked RetainedAt.
-A 16 B checksum over all preceding head bytes ends the 1,264 B head.
+A 16 B checksum over all preceding head bytes ends the 1,296 B head.
 DocRefs stores one u32 per live Docs row, counting indexed inode bindings;
 multiple hard links to one inode count once. Policy holds 16 B. Revealed,
 after Policy, holds the NameIds of hidden entries a repository ignore file's
@@ -140,11 +141,19 @@ BLAKE3-128. A change refreshes every configured root before PolicyPut. Local
 rule bytes are read by the actual refreshed walk. Zero remains unknown for
 legacy imports and callers that supply no fingerprint.
 
+Version 6 (D60 A′) appends Dormant: contiguous u32 DocIds followed by 16-byte
+hashes, ordered by id, one permission per hash and at most 1,000,000 rows.
+Live Docs and Dormant are disjoint. Migration reads v5 checkpoints and logs
+under the retained writer lock and publishes v6 with incarnation, live ids,
+logical sequence and next_doc preserved, starting dormant empty. The v6
+manifest uses distinct magic so v5 writers refuse it instead of treating an
+unsupported version as authorization to rebuild. Index formats are unchanged.
+
 `current`'s fixed layout is:
 
 | Offset | Field | Bytes |
 | ---: | --- | ---: |
-| 0 | `FERRETCR`, version u32, reserved zeros | 16 |
+| 0 | `FERRETC6`, version u32, reserved zeros | 16 |
 | 16 | incarnation | 16 |
 | 32 | checkpoint, sequence, committed log end, checkpoint sequence | 32 |
 | 64 | sniffer version | 4 |
@@ -224,6 +233,17 @@ to the same row into its final value.
 | DirPut | id, own NameId or none, raw entry count or unknown, flags u32; retained-at sequence u64 | 32 |
 | DocPut | DocId u32; indexed-inode references u32; hash 16 B | 32 |
 | DocDelete | DocId u32; reserved u32 | 16 |
+| DocDormant | DocId u32; reserved u32; hash 16 B | 32 |
+| DocForget | DocId u32; reserved u32 | 16 |
+
+DocDormant checks a live→dormant transition with the unchanged hash and zero
+remaining inode bindings. DocPut checks either continuing live content or a
+matching dormant→live transition with positive references; revival consumes
+the permission without advancing next_doc. DocForget checks dormant→forgotten;
+a forgotten id cannot return. Opcodes 16 and 17 encode the new transitions.
+The host grants covered deaths and durably revokes selected ranges before a
+merge takes its filter pin. Catalog-only writers grant no new permissions and
+use fresh allocation for returning dead content.
 
 A completely covered sniffer transition updates the manifest's sniffer version
 in the same transaction, including a PolicyPut when all entry rows are equal.

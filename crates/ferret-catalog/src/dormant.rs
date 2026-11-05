@@ -17,6 +17,8 @@ pub struct Coverage {
     unreadable: Vec<u32>,
 }
 impl Coverage {
+    /// Records a committed frontier and its unreadable exceptions. The host
+    /// remains responsible for selecting a compatible index under writer.
     pub fn new(frontier: u32, mut unreadable: Vec<u32>) -> Self {
         unreadable.sort_unstable();
         unreadable.dedup();

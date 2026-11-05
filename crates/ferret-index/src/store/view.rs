@@ -82,6 +82,8 @@ impl View {
                 .iter()
                 .map(|s| s.number)
                 .eq(selection.iter().copied())
+            && (entries.len() > 1
+                || merge::choose(entries, &|s| alive(s, live, &self.manifest.unreadable)).is_some())
         {
             return Some(start..start + selection.len());
         }
