@@ -169,14 +169,15 @@ pub fn index_change(
 }
 
 /// Publishes a root change, then calls `after` under the same writer lock.
-/// The callback observes the committed catalog; its result is separate because
-/// it cannot undo that publication. Used by the one-shot host for content.
+/// The callback owns the committed writer session and can transfer it to the
+/// content host without releasing the catalog lock. Its result is separate
+/// because it cannot undo the catalog publication.
 pub fn index_change_then<T>(
     catalog_dir: &Path,
     change: RootChange<'_>,
     refresh: Refresh<'_>,
     options: &IndexOptions,
-    after: impl FnOnce(&Catalog) -> T,
+    after: impl FnOnce(WriterSession) -> T,
 ) -> Result<(Report, T), IndexError> {
     run(
         catalog_dir,
@@ -225,12 +226,12 @@ fn run<T>(
     roots: impl FnOnce(Option<&Catalog>) -> Result<Vec<PathBuf>, IndexError>,
     refresh: Refresh<'_>,
     options: &IndexOptions,
-    after: impl FnOnce(&Catalog) -> T,
+    after: impl FnOnce(WriterSession) -> T,
 ) -> Result<(Report, T), IndexError> {
     let after_time = std::cell::Cell::new(Duration::ZERO);
-    let after = |catalog: &Catalog| {
+    let after = |session: WriterSession| {
         let started = Instant::now();
-        let result = after(catalog);
+        let result = after(session);
         after_time.set(started.elapsed());
         result
     };
@@ -253,7 +254,7 @@ fn run_session<T>(
     roots: impl FnOnce(Option<&Catalog>) -> Result<Vec<PathBuf>, IndexError>,
     refresh: Refresh<'_>,
     options: &IndexOptions,
-    after: impl FnOnce(&Catalog) -> T,
+    after: impl FnOnce(WriterSession) -> T,
     after_time: &std::cell::Cell<Duration>,
 ) -> Result<(Report, T), IndexError> {
     session.set_bulk_control(options.bulk.clone());
@@ -275,7 +276,7 @@ fn run_session<T>(
             // `roots`, not `plan.roots`: D119 may have withdrawn a root from
             // the plan, and the rewalk must find and report it again.
             let report = full_rewalk(&mut session, &roots, options, usage)?;
-            return Ok((report, after(&session.view())));
+            return Ok((report, after(session)));
         }
         result => result?,
     };
@@ -287,7 +288,7 @@ fn run_session<T>(
                 .commit(&changes, options.sniffer)
                 .map_err(|e| undurable(update_error(e), &mut report))?;
             let (faulted, aliases) = reporting_ids(&session, previous.generation(), &changes);
-            let result = after(&catalog);
+            let result = after(session);
             (catalog, changed, faulted, aliases, result)
         }
         None => {
@@ -314,7 +315,7 @@ fn run_initial<T>(
     roots: impl FnOnce(Option<&Catalog>) -> Result<Vec<PathBuf>, IndexError>,
     refresh: Refresh<'_>,
     options: &IndexOptions,
-    after: impl FnOnce(&Catalog) -> T,
+    after: impl FnOnce(WriterSession) -> T,
     after_time: &std::cell::Cell<Duration>,
 ) -> Result<(Report, T), IndexError> {
     let txn = Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
@@ -342,7 +343,7 @@ fn checkpoint<T>(
     batches: Vec<ferret_catalog::Batch>,
     plan: &Plan,
     options: &IndexOptions,
-    after: impl FnOnce(&Catalog) -> T,
+    after: impl FnOnce(WriterSession) -> T,
     report: &mut Report,
 ) -> Result<(Catalog, T), IndexError> {
     txn.set_policy(fingerprint(options));
@@ -353,8 +354,15 @@ fn checkpoint<T>(
         txn.keep(root.as_os_str().as_bytes())
             .map_err(IndexError::Keep)?;
     }
-    txn.commit_then(after)
-        .map_err(|e| undurable(IndexError::Commit(e), report))
+    let session = txn.commit_session().map_err(|error| {
+        let error = match error {
+            ferret_catalog::log::Error::Rebuild(error) => IndexError::Commit(error),
+            other => IndexError::Update(other),
+        };
+        undurable(error, report)
+    })?;
+    let catalog = session.view();
+    Ok((catalog, after(session)))
 }
 
 /// Recrawls using a resident session, retaining its lookups and writer lock.

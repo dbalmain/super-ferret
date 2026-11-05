@@ -5,7 +5,7 @@
 //! `index-build <catalog-dir> <index-dir>` follows every live document of
 //! the catalog into a fresh index in `<index-dir>`, unpaced, as an explicit
 //! `ferret index` would; merges to steady state with
-//! [`IndexWriter::merge_if_needed`]; then forces one full merge to a single
+//! [`IndexWriter::prepare_merge`]; then forces one full merge to a single
 //! segment. Each phase reports the index's shape: bytes per content byte,
 //! the dictionary's share, h (dictionary entries per distinct term, counted
 //! exactly by merging every segment's term stream) and the singleton share.
@@ -38,6 +38,20 @@ use crate::census::hashed_documents;
 /// M1c's count of distinct terms in the same catalog, for comparison with
 /// the exact count this run takes.
 const M1C_DISTINCT_TERMS: u64 = 18_456_581;
+
+/// Measurement outputs are isolated from the source catalog's content index;
+/// synthetic traces never revive ids. Neither owns catalog permissions.
+fn merge(
+    writer: &mut IndexWriter,
+    view: &CatalogView<'_>,
+    all: bool,
+) -> crate::Result<Option<ferret_index::Merged>> {
+    let budget = Budget::unbounded();
+    let Some(plan) = writer.prepare_merge(view, &budget, all)? else {
+        return Ok(None);
+    };
+    Ok(writer.merge_selected(view, &budget, plan)?)
+}
 
 /// The shape of one published index view.
 #[derive(Debug, Default)]
@@ -278,7 +292,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     let cpu_start = crate::segment_build::cpu_seconds()?;
     let start = Instant::now();
     let (mut merges, mut merge_read, mut merge_written) = (0u64, 0u64, 0u64);
-    while let Some(merged) = writer.merge_if_needed(&view, &Budget::unbounded())? {
+    while let Some(merged) = merge(&mut writer, &view, false)? {
         crate::trigram::check_disk()?;
         merges += 1;
         merge_read += merged.read;
@@ -317,7 +331,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     // 3. One forced full merge.
     let cpu_start = crate::segment_build::cpu_seconds()?;
     let start = Instant::now();
-    if let Some(merged) = writer.merge_all(&view, &Budget::unbounded())? {
+    if let Some(merged) = merge(&mut writer, &view, true)? {
         line(&mut report, "full_merge_inputs", merged.inputs.to_string());
         line(
             &mut report,
@@ -590,7 +604,7 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
             .sum::<u64>()
             - before;
         max_segments = max_segments.max(writer.view().segments().len());
-        while let Some(merged) = writer.merge_if_needed(&view, &Budget::unbounded())? {
+        while let Some(merged) = merge(&mut writer, &view, false)? {
             merges += 1;
             added += merged.records_added;
             removed += merged.records_removed;

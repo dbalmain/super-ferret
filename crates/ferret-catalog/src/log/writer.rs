@@ -120,6 +120,32 @@ impl Writer {
         }
         Ok(writer)
     }
+    /// Adopts a checkpoint just published under this same retained lock.
+    pub(crate) fn from_checkpoint(
+        dir: PathBuf,
+        lock: crate::lock::Lock,
+        catalog: Catalog,
+    ) -> Result<Self, Error> {
+        let mut manifest = catalog.manifest();
+        manifest.log_end = HEADER;
+        let log = regular::open(
+            &dir.join(format!("changes.{}", manifest.generation.checkpoint)),
+            Access::Update,
+        )
+        .map_err(Error::Undurable)?;
+        let budget = crate::budget::Budget::empty(catalog.inode_count(), catalog.name_count());
+        Ok(Self {
+            dir,
+            _lock: lock,
+            log,
+            manifest,
+            poisoned: false,
+            current: catalog.into_resident().map_err(Error::Previous)?,
+            budget,
+            bulk: None,
+        })
+    }
+
     /// Revalidates the published prefix and retires an uncertain tail while
     /// retaining the same writer lock. A failed recovery leaves this writer
     /// poisoned; its last checked view remains readable.

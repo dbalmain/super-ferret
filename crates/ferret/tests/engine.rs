@@ -1420,3 +1420,119 @@ fn grep_walks_a_listing_whose_overlay_renames_swaps_and_deletes_base_names() {
         lines(b"tree/kept.txt:red kept\ntree/one.txt:red two\ntree/renamed.txt:red moved\ntree/two.txt:red one\n")
     );
 }
+
+/// D60 ownership handoff must not leave permissions for postings a standalone
+/// writer purged, including when open replaced an unusable content index.
+fn standalone_dormancy_handoff(reset: bool) {
+    use ferret_catalog::{DocId, NameId, Target, WriterSession};
+    use ferret_crawl::{RefreshReason, RefreshRequest, RefreshScope};
+    use ferret_index::Budget;
+    let tree = Tree::new();
+    fs::remove_file(tree.root().join("a.txt")).unwrap();
+    fs::remove_dir_all(tree.root().join("sub")).unwrap();
+    for n in 0..10 {
+        fs::write(tree.root().join(format!("{n}.txt")), format!("alpha {n}")).unwrap();
+    }
+    index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
+    let open = || {
+        let engine = Engine::from_writer(WriterSession::open(&tree.index()).unwrap());
+        engine.attach_content(&tree.index()).unwrap();
+        engine
+    };
+    let refresh = |engine: &Engine| {
+        engine
+            .refresh(
+                RefreshRequest {
+                    expected_generation: engine.generation(),
+                    scopes: vec![RefreshScope::Root(tree.root())],
+                    rename_hints: vec![],
+                    reason: RefreshReason::Burst,
+                },
+                &options(),
+            )
+            .unwrap();
+    };
+    let document = |engine: &Engine| {
+        let pin = engine.pin();
+        let (_, name) = pin
+            .catalog()
+            .name_reader()
+            .runs_from(NameId(0))
+            .find(|(_, name)| name.bytes == b"0.txt")
+            .unwrap();
+        let Target::Inode(inode) = name.target() else {
+            panic!("file inode")
+        };
+        pin.catalog().doc(inode).unwrap()
+    };
+    let engine = open();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let old = document(&engine);
+    for n in 0..4 {
+        fs::remove_file(tree.root().join(format!("{n}.txt"))).unwrap();
+    }
+    refresh(&engine);
+    assert_eq!(engine.pin().catalog().dormant_docs().count(), 4);
+    drop(engine);
+    if reset {
+        let segment = fs::read_dir(tree.index().join("index"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "seg"))
+            .unwrap();
+        fs::write(segment, b"broken").unwrap();
+    }
+    let output = fixture::bounded_command(env!("CARGO_BIN_EXE_ferret"), &tree.0)
+        .args(["index"])
+        .env("FERRET_NO_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let engine = open();
+    assert!(
+        !engine
+            .pin()
+            .content()
+            .unwrap()
+            .lookup(b"alpha")
+            .unwrap()
+            .contains(&old.0)
+    );
+    fs::write(tree.root().join("0.txt"), b"alpha 0").unwrap();
+    refresh(&engine);
+    let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+    let rows = engine
+        .pin()
+        .search_content(&query, None, None, |_| ControlFlow::Continue(()))
+        .unwrap()
+        .rows;
+    assert_eq!(
+        rows,
+        7,
+        "standalone {} left a stale revival permission",
+        if reset { "reset" } else { "merge" }
+    );
+    assert_ne!(document(&engine), old);
+    assert!(document(&engine) >= DocId(10));
+    assert_eq!(
+        engine
+            .follow_content(&Budget::unbounded(), None)
+            .unwrap()
+            .docs,
+        1
+    );
+}
+
+#[test]
+fn standalone_merge_revokes_dormant_permissions_across_owner_handoff() {
+    standalone_dormancy_handoff(false);
+}
+
+#[test]
+fn standalone_reset_clears_dormant_permissions_before_follow_across_owner_handoff() {
+    standalone_dormancy_handoff(true);
+}

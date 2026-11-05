@@ -441,6 +441,14 @@ impl Transaction {
         self.publish(false)
     }
 
+    /// Publishes a checkpoint and transfers the held writer lock and checked
+    /// view into a resident session, without a release/reacquire window.
+    pub fn commit_session(mut self) -> Result<crate::WriterSession, crate::log::Error> {
+        let catalog = self.publish(false).map_err(crate::log::Error::Rebuild)?;
+        let writer = crate::log::Writer::from_checkpoint(self.dir, self._lock, catalog)?;
+        Ok(crate::WriterSession::with_writer(writer))
+    }
+
     /// Publishes, then calls `after` while the writer lock is still held.
     /// Failure of the callback does not undo the durable catalog publication.
     pub fn commit_then<T>(

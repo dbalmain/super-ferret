@@ -283,11 +283,11 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
         ..IndexOptions::default()
     };
     let creating = creates_catalog(&context.index);
-    let completed = index_change_then(&context.index, change, refresh, &options, |catalog| {
+    let completed = index_change_then(&context.index, change, refresh, &options, |session| {
         if creating {
             write_settings(&context.index);
         }
-        follow_committed(catalog, &context.index)
+        follow_committed(session, &context.index)
     });
     // `index_change_then` drops its writer lock before returning, including
     // on the paths that publish nothing. Spawning earlier races ferretd for
@@ -681,39 +681,27 @@ fn write_settings(index: &Path) {
     }
 }
 
-fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
-    use ferret_index::{Budget, CatalogView, IndexWriter};
-    catalog.load_all().map_err(|e| e.to_string())?;
-    let live = crate::engine::live_documents(catalog);
-    let view = CatalogView {
-        incarnation: catalog.generation().incarnation,
-        live: &live,
-    };
-    let mut writer = IndexWriter::open(&path.join(crate::engine::CONTENT_DIR), &view)
-        .map_err(|e| e.to_string())?;
-    let documents = ferret_crawl::Documents::new(catalog)
-        .map_err(|e| e.to_string())?
-        .holding_directories();
-    // Each full buffer's files are written while the next is read.
+fn follow_committed(session: ferret_catalog::WriterSession, path: &Path) -> Result<(), String> {
+    use ferret_index::Budget;
+    let engine = crate::engine::Engine::from_writer(session);
+    engine
+        .attach_content(path)
+        .map_err(|error| error.to_string())?;
+    // Each full buffer's files are written while the next is read. Engine
+    // owns reset clearing and every merge's revoke-before-pin protocol.
     let budget = Budget {
         segments: usize::MAX,
         ..Budget::unbounded()
     };
-    while crate::engine::follow_reading(
-        &mut writer,
-        &view,
-        &budget,
-        &documents,
-        ferret_crawl::default_workers(),
-        |documents, doc, bytes| documents.read(catalog, ferret_catalog::DocId(doc), bytes),
-    )
-    .map_err(|e| e.to_string())?
-    .remaining
+    while engine
+        .follow_content(&budget, None)
+        .map_err(|error| error.to_string())?
+        .remaining
         > 0
     {}
-    while writer
-        .merge_if_needed(&view, &budget)
-        .map_err(|e| e.to_string())?
+    while engine
+        .merge_content(&budget)
+        .map_err(|error| error.to_string())?
         .is_some()
     {}
     Ok(())

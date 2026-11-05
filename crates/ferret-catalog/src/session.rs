@@ -49,7 +49,7 @@ impl WriterSession {
         Ok(Self::with_writer(Writer::open_locked(dir, lock)?))
     }
 
-    fn with_writer(writer: Writer) -> Self {
+    pub(crate) fn with_writer(writer: Writer) -> Self {
         let mut session = Self {
             lookup_base: writer.view(),
             writer,

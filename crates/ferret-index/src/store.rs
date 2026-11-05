@@ -1,6 +1,6 @@
 //! [`IndexWriter`]: the index's own directory of segments under a
 //! [`Manifest`], kept in step with the catalog by [`IndexWriter::follow`]
-//! and compacted by [`IndexWriter::merge_if_needed`] (docs/S2.md § Manifest
+//! and compacted by [`IndexWriter::merge_selected`] (docs/S2.md § Manifest
 //! and commit, § The content flow, § What S5 needs). [`View`] is one
 //! published manifest with its segments open, which a query pins beside a
 //! catalog view.
@@ -501,7 +501,8 @@ impl IndexWriter {
     /// Revival-capable hosts must instead bracket [`Self::merge_selected`]
     /// with durable revocation after [`Self::prepare_merge`]. This convenience
     /// entry assumes dead ids cannot return.
-    pub fn merge_if_needed(
+    #[cfg(test)]
+    pub(crate) fn merge_if_needed(
         &mut self,
         catalog: &CatalogView,
         budget: &Budget,
@@ -519,7 +520,8 @@ impl IndexWriter {
     /// merge, for measurement and for an explicit optimise. Revival-capable
     /// hosts use [`Self::prepare_merge`] with `all` and revoke permissions
     /// before [`Self::merge_selected`]; this entry assumes dead ids stay dead.
-    pub fn merge_all(
+    #[cfg(test)]
+    pub(crate) fn merge_all(
         &mut self,
         catalog: &CatalogView,
         budget: &Budget,
