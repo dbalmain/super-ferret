@@ -12,7 +12,9 @@
 //! Query verification uses [`Documents::read_current_name`] instead: the same
 //! checked directory walk, with the file bracketed against its current stat.
 //! It returns that stat so the host can keep current path answers separate
-//! from cacheable catalog-version content facts.
+//! from cacheable catalog-version content facts. With held directories, each
+//! directory is checked only when opened, then reused even after a rename
+//! for the reader's lifetime (D135).
 //!
 //! [`Documents`] maps each DocId to one name by a single scan of the names,
 //! built per pass. M5's daemon will want D30's lazy inverse instead; a full
@@ -434,8 +436,8 @@ impl Documents {
         Ok(())
     }
 
-    /// Checks the file's version through its own fresh directory walk, with
-    /// one no-follow stat and no content read.
+    /// Checks the file's version through its own name, with one no-follow
+    /// stat and no content read. Held directories are checked only on open.
     pub fn check_name(&mut self, catalog: &Catalog, name: NameId) -> Result<(), ContentFault> {
         let stat = self.stat_name(catalog, name)?;
         let recorded = catalog.inode(catalog.name(name).child).stat;
@@ -445,8 +447,9 @@ impl Documents {
             .ok_or(ContentFault::Changed)
     }
 
-    /// The current regular file's stat through a fresh checked directory walk.
-    /// A changed file is observed; missing/replaced directory chains fail.
+    /// The current regular file's stat through a checked directory descriptor.
+    /// A changed file is observed. Directories are checked when opened; held
+    /// descriptors keep serving their old paths after a rename (D135).
     pub fn stat_name(
         &mut self,
         catalog: &Catalog,

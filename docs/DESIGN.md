@@ -737,9 +737,12 @@ differences from GNU — is specified in [FIND.md](FIND.md).
    docs to inodes to names, apply name and metadata atoms per name.
 4. **Verify** Maybe rows against bracketed current bytes. Cache content facts
    only when the read matches the catalog's full version key; every other copy
-   gets its own checked stat before reuse. Changed paths use their own current
-   bytes; vanished paths are dropped. Exact answers remain snapshots of the
-   last follow (S2.md § Coverage).
+   gets its own checked stat before reuse. Directory descriptors are checked
+   against the catalog when opened, then reused without checking their paths
+   again for the reader's lifetime (D135). A moved directory keeps serving its
+   old path. Changed files use their own current bytes; vanished paths are
+   dropped. Exact answers remain snapshots of the last follow
+   (S2.md § Coverage).
 5. **Emit** one row per path (D15): path, doc id, and match offsets. Human
    output by default; JSON lines behind a flag.
 

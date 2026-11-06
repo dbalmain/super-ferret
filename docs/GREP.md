@@ -1184,11 +1184,15 @@ counts declare Candidates. Positive posting absence never supplies a -v result.
 The host keeps bounded, prefix-free records only for duplicated catalogued
 content: at most 64 KiB of accounted records per entry and 16 MiB total before
 cache eviction, plus bounded container overhead. Every alias first passes its
-own full-key catalog-version stat. Current bytes remain path-local and never
-enter this DocId cache. Large groups skip caching and stream at the threshold;
-even a small cached record set can cross it when an alias's rendered prefix
-expands. Concurrent cache misses may independently read the same document. No
-cache lock is held during file I/O, matching or output.
+own full-key catalog-version stat through the reader's directory descriptor.
+Directories are checked against the catalog when opened, then held descriptors
+are reused without checking their paths again (D135). A moved directory keeps
+serving reads and replay stats under its old path for the reader's lifetime.
+Current bytes remain path-local and never enter this DocId cache. Large groups
+skip caching and stream at the threshold; even a small cached record set can
+cross it when an alias's rendered prefix expands. Concurrent cache misses may
+independently read the same document. No cache lock is held during file I/O,
+matching or output.
 
 A shared cancellation flag reaches planning, typed reads, retry acceptance,
 line/span iteration, streaming writes and context-spool replay. A worker's stable quiet

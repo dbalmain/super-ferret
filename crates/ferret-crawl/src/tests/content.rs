@@ -1,5 +1,5 @@
-//! [`Documents`] on a real indexed tree: it returns a document's bytes only
-//! while the file and every directory above it are the catalogued ones.
+//! [`Documents`] on a real indexed tree: directories are checked against the
+//! catalog when opened, and file reads are bracketed against their stats.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -178,15 +178,17 @@ fn name_of(tmp: &Tmp, catalog: &Catalog, rel: &str) -> ferret_catalog::NameId {
         .unwrap()
 }
 
-/// A query's reader holds the directories it walked, and must check each
-/// again before reading through it: a moved ancestor, replaced by a link to
-/// it or by a fresh directory, fails the next path through it.
+/// D135 C: moving a held ancestor cannot redirect the next file's read,
+/// even when the old path is replaced by a directory or a symlink.
 #[test]
-fn a_held_directory_is_checked_again_for_each_path() {
-    for ancestor in ["a/b", "a"] {
+fn a_held_directory_is_checked_only_when_opened() {
+    for ancestor in ["", "a", "a/b"] {
         for link in [false, true] {
             let tmp = Tmp::new(if link { "held-link" } else { "held-copy" });
-            let (catalog, _) = indexed(&tmp, &FILES);
+            let (catalog, _) = indexed(
+                &tmp,
+                &[FILES[0], FILES[1], FILES[2], ("a/c/three.txt", b"third\n")],
+            );
             let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
             let read = |documents: &mut Documents, rel| {
                 let mut out = Vec::new();
@@ -196,19 +198,58 @@ fn a_held_directory_is_checked_again_for_each_path() {
                     .map(|_| out)
             };
             assert_eq!(read(&mut documents, "a/b/one.txt").unwrap(), FILES[0].1);
-            assert_eq!(read(&mut documents, "a/b/two.txt").unwrap(), FILES[1].1);
-            fs::rename(tmp.at(ancestor), tmp.base.join("moved")).unwrap();
-            if link {
-                symlink(tmp.base.join("moved"), tmp.at(ancestor)).unwrap();
+            let path = if ancestor.is_empty() {
+                tmp.tree()
             } else {
-                fs::create_dir(tmp.at(ancestor)).unwrap();
+                tmp.at(ancestor)
+            };
+            fs::rename(&path, tmp.base.join("moved")).unwrap();
+            if link {
+                symlink(tmp.base.join("moved"), &path).unwrap();
+            } else {
+                fs::create_dir(&path).unwrap();
             }
-            assert!(
-                read(&mut documents, "a/b/two.txt").is_err(),
+            assert_eq!(
+                read(&mut documents, "a/b/two.txt").unwrap(),
+                FILES[1].1,
                 "{ancestor}, link={link}"
             );
+            // A new branch still opens beneath the retained ancestor.
+            assert_eq!(read(&mut documents, "a/c/three.txt").unwrap(), b"third\n");
             assert_eq!(read(&mut documents, "top.txt").unwrap(), FILES[2].1);
         }
+    }
+}
+
+/// D135 C still checks identity on open. The replacement contains the very
+/// same file inode, so file checks cannot mask a missing directory check.
+#[test]
+fn a_directory_replaced_before_its_first_open_is_refused() {
+    for ancestor in ["", "a", "a/b"] {
+        let tmp = Tmp::new("held-before-open");
+        let (catalog, _) = indexed(&tmp, &FILES);
+        let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
+        let path = if ancestor.is_empty() {
+            tmp.tree()
+        } else {
+            tmp.at(ancestor)
+        };
+        fs::rename(&path, tmp.base.join("moved")).unwrap();
+        fs::create_dir(&path).unwrap();
+        // Preserve every identity below the replaced level too, so another
+        // directory's open-time check cannot mask this one's removal.
+        match ancestor {
+            "" => fs::rename(tmp.base.join("moved/a"), tmp.at("a")).unwrap(),
+            "a" => fs::rename(tmp.base.join("moved/b"), tmp.at("a/b")).unwrap(),
+            _ => fs::hard_link(tmp.base.join("moved/two.txt"), tmp.at("a/b/two.txt")).unwrap(),
+        }
+        let name = name_of(&tmp, &catalog, "a/b/two.txt");
+        let mut out = Vec::new();
+        assert!(matches!(
+            documents.read_current_name_until(&catalog, name, &mut out, &|| false),
+            Err(ContentFault::Changed)
+        ));
+        assert!(out.is_empty());
     }
 }
 

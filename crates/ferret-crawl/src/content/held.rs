@@ -15,16 +15,15 @@ use super::*;
 use crate::lock;
 
 impl Documents {
-    /// Keeps each checked directory walk's descriptors for later paths
-    /// through the same directories: each path still checks every directory
-    /// on it, by a stat of its path, instead of opening it again
-    /// (`hold_directory`). For a reader that lives for one query or one
-    /// follow pass: it holds a descriptor per level of the last path, as far
-    /// as the process's budget for held descriptors allows (`Budget`), and
-    /// opens the rest of a path without holding them. A directory's read
-    /// permission is checked when its descriptor is opened, so one that loses
-    /// it while held still serves later paths through it; the next crawl
-    /// finds it unlistable and retires its children.
+    /// Keeps checked directory descriptors for later paths through the same
+    /// directories. Each directory is checked against the catalog when opened,
+    /// then reused without checking its path again (D135). A moved directory
+    /// still serves files under its old path through the held descriptor.
+    /// For a reader that lives for one query or follow pass, this holds a
+    /// descriptor per level of the last path within the process's `Budget`,
+    /// opening the rest without holding them. Read permission is checked on
+    /// open too; the next crawl finds an unlistable directory and retires its
+    /// children.
     pub fn holding_directories(self) -> Self {
         self.holding_within(Budget::process())
     }
@@ -65,12 +64,11 @@ impl Documents {
         Budget::process().pressured.load(Ordering::Acquire)
     }
 
-    /// `open` given a checked descriptor for `dir`, re-walked from the
-    /// root for each path. A retained descriptor alone cannot establish that
-    /// its original path still names it after a rename: a reader [holding
-    /// directories](Documents::holding_directories) checks each path again
-    /// before reusing one. The callback may read through the directory;
-    /// pressure relief waits for that read as it does for an open.
+    /// `open` given a directory descriptor checked against the catalog when
+    /// opened. A reader [holding directories](Documents::holding_directories)
+    /// reuses descriptors without checking their paths again, so a moved
+    /// directory keeps serving its old path. The callback may read through
+    /// the directory; pressure relief waits for that read as for an open.
     ///
     /// An open that finds the process out of descriptors (`EMFILE`,
     /// `ENFILE`) is tried again once every held descriptor in the process
@@ -274,15 +272,11 @@ pub(super) struct Held {
     budget: &'static Budget,
 }
 
-/// One held directory: what its next check needs without the catalog.
+/// One directory checked against the catalog when opened.
 #[derive(Debug)]
 struct Level {
     id: InoId,
     fd: OwnedFd,
-    /// Its name in the level above; empty for the root.
-    name: Box<[u8]>,
-    /// The catalog's `(dev, ino)` for `id`, which it was checked against.
-    identity: (u64, u64),
 }
 
 impl Held {
@@ -336,26 +330,17 @@ fn open_directory(catalog: &Catalog, dir: InoId) -> Result<OwnedFd, ContentFault
 /// being `dir`'s; else `dir`'s descriptor, opened from the last held one
 /// (or the root) without holding those between.
 ///
-/// A held descriptor is reused only once its path is checked again: the
-/// root's path by a `stat`, each directory below by a no-follow `fstatat`
-/// in its held parent, each against the catalog's `(dev, ino)` that the
-/// descriptor was checked against when opened. So, as on a fresh walk, the
-/// directory read through is the one its path named, at a moment between
-/// the walk's start and the file's open; a renamed or replaced directory
-/// fails the same way. One call per level instead of three (open, fstat,
-/// close).
+/// Each descriptor is checked against the catalog when opened, then reused
+/// without checking its path again. A rename or replacement cannot redirect
+/// a read through it: the opened directory keeps serving its old path until
+/// the descriptor is closed (D135).
 fn hold_directory(
     held: &mut Held,
     catalog: &Catalog,
     dir: InoId,
 ) -> Result<Option<OwnedFd>, ContentFault> {
-    // A held `dir`'s chain is the held walk through it: the same checks,
-    // from what each level kept rather than from the catalog, which is the
-    // one view this reader's documents, and so its held ids, come from. Most
-    // files a reader opens sit in the directory its last one did.
-    if let Some(at) = held.fds.iter().position(|level| level.id == dir)
-        && held.recheck(at, root_path(catalog, held.fds[0].id)?)?
-    {
+    // Most files a reader opens sit in the directory its last one did.
+    if let Some(at) = held.fds.iter().position(|level| level.id == dir) {
         held.truncate(at + 1);
         return Ok(None);
     }
@@ -370,7 +355,7 @@ fn hold_directory(
     }
     let root = at;
     let path = root_path(catalog, root)?;
-    let kept = held.kept(catalog, root, path, &chain)?;
+    let kept = held.kept(root, &chain);
     held.truncate(kept);
     held.open_chain(catalog, root, path, &chain)
 }
@@ -384,66 +369,18 @@ fn root_path(catalog: &Catalog, root: InoId) -> Result<&std::ffi::OsStr, Content
         .ok_or(ContentFault::Changed)
 }
 
-/// Whether `stat` is of a directory with `identity`.
-fn is_directory(stat: &rustix::fs::Stat, identity: (u64, u64)) -> bool {
-    FileType::from_raw_mode(stat.st_mode) == FileType::Directory
-        && (stat.st_dev, stat.st_ino) == identity
-}
-
-/// Stats `name` in `parent`, not following a symlink.
-fn stat_child(parent: &OwnedFd, name: &[u8]) -> Result<rustix::fs::Stat, ContentFault> {
-    statat(
-        parent,
-        std::ffi::OsStr::from_bytes(name),
-        AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(|e| ContentFault::Stat(e.into()))
-}
-
 impl Held {
-    /// Checks the held chain through level `at` again, from its root at
-    /// `path`. False when the root is no longer the held directory there.
-    fn recheck(&self, at: usize, path: &std::ffi::OsStr) -> Result<bool, ContentFault> {
-        // The root's own path may pass through symlinks: the user's.
-        let stat = rustix::fs::stat(path).map_err(|e| ContentFault::Stat(e.into()))?;
-        if !is_directory(&stat, self.fds[0].identity) {
-            return Ok(false);
-        }
-        for pair in self.fds[..=at].windows(2) {
-            if !is_directory(&stat_child(&pair[0].fd, &pair[1].name)?, pair[1].identity) {
-                return Err(ContentFault::Changed);
-            }
-        }
-        Ok(true)
-    }
-
-    /// How much of the held chain is `chain`'s, under `root` at `path`, and
-    /// still at its path.
-    fn kept(
-        &self,
-        catalog: &Catalog,
-        root: InoId,
-        path: &std::ffi::OsStr,
-        chain: &[(InoId, &[u8])],
-    ) -> Result<usize, ContentFault> {
+    /// How much of the held chain is `chain`'s, under `root`.
+    fn kept(&self, root: InoId, chain: &[(InoId, &[u8])]) -> usize {
         if self.fds.first().is_none_or(|level| level.id != root) {
-            return Ok(0);
+            return 0;
         }
-        let stat = rustix::fs::stat(path).map_err(|e| ContentFault::Stat(e.into()))?;
-        if !is_directory(&stat, catalog.identity(root)) {
-            return Ok(0);
-        }
-        let mut kept = 1;
-        for (&(id, bytes), pair) in chain.iter().rev().zip(self.fds.windows(2)) {
-            if id != pair[1].id {
-                break;
-            }
-            if !is_directory(&stat_child(&pair[0].fd, bytes)?, catalog.identity(id)) {
-                return Err(ContentFault::Changed);
-            }
-            kept += 1;
-        }
-        Ok(kept)
+        1 + chain
+            .iter()
+            .rev()
+            .zip(self.fds.iter().skip(1))
+            .take_while(|((id, _), level)| *id == level.id)
+            .count()
     }
 
     /// Opens the rest of `chain` below what is held, holding each level
@@ -464,12 +401,7 @@ impl Held {
             let fd = open(path, flags, Mode::empty()).map_err(|e| ContentFault::Open(e.into()))?;
             check_directory(&fd, catalog, root)?;
             match self.budget.take() {
-                true => self.fds.push(Level {
-                    id: root,
-                    fd,
-                    name: Box::default(),
-                    identity: catalog.identity(root),
-                }),
+                true => self.fds.push(Level { id: root, fd }),
                 false => unheld = Some(fd),
             }
         }
@@ -488,12 +420,7 @@ impl Held {
             .map_err(|e| ContentFault::Open(e.into()))?;
             check_directory(&fd, catalog, id)?;
             match unheld.is_none() && self.budget.take() {
-                true => self.fds.push(Level {
-                    id,
-                    fd,
-                    name: bytes.into(),
-                    identity: catalog.identity(id),
-                }),
+                true => self.fds.push(Level { id, fd }),
                 false => unheld = Some(fd),
             }
         }
