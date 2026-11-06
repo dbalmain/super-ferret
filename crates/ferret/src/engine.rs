@@ -825,3 +825,8 @@ fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DOC_NAMES_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}

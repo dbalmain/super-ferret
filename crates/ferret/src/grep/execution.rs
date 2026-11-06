@@ -153,7 +153,7 @@ impl<'a> Execution<'a> {
 
     /// The catalog's part of a search, before any walk: the index's
     /// candidates, probed against the documents the walks can reach, the
-    /// documents' names and reader, and the directories a pruned walk lists.
+    /// documents' reader, and the directories a pruned walk lists.
     fn prepare(&self, inputs: &[Input]) -> Result<Prepared<'a>, Exit> {
         let Self {
             plan, pin, runtime, ..
@@ -166,11 +166,6 @@ impl<'a> Execution<'a> {
         } else {
             None
         };
-        let names = pin
-            .map(|pin| pin.doc_names_until(stopped))
-            .transpose()
-            .map_err(|error| runtime.failure(&error.to_string()))?
-            .flatten();
         let documents = pin
             .map(|pin| {
                 ferret_crawl::Documents::by_name(pin.catalog()).map(|documents| {
@@ -205,7 +200,6 @@ impl<'a> Execution<'a> {
         let holders = self.holders(candidates.as_ref(), prune, &stopped)?;
         Ok(Prepared {
             candidates,
-            names,
             documents,
             holders,
         })
@@ -365,7 +359,7 @@ impl<'a> Execution<'a> {
                 |stopped| source.next(stopped),
                 cwd,
                 &fork,
-                prepared.names,
+                self.pin.map(|pin| pin.catalog()),
                 threads,
                 cancelled,
             );
@@ -418,7 +412,6 @@ impl<'a> Execution<'a> {
 /// What [`Execution::prepare`] takes from the pinned catalog and index.
 struct Prepared<'a> {
     candidates: Option<engine::GrepCandidates<'a>>,
-    names: Option<&'a ferret_query::DocNames>,
     documents: Option<ferret_crawl::Documents>,
     holders: Option<holders::Holders>,
 }

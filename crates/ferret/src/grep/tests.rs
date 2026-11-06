@@ -629,3 +629,121 @@ fn decimal_matches_display_at_every_width() {
         );
     }
 }
+
+// D111 B: drive the shared local/socket execution on cold pins and after a
+// new checkpoint. Two selected hard-link names must both print; a link outside
+// the operand or roots must not add a row. Equal-content copies share a DocId
+// without sharing an inode, so nlink alone is not a complete cache hint.
+#[test]
+fn indexed_grep_keeps_each_selected_name_without_building_doc_names() {
+    use ferret_crawl::{IndexOptions, Refresh};
+    use std::time::{Instant, SystemTime};
+
+    let base = std::env::temp_dir().join(format!("ferret-grep-doc-names-{}", std::process::id()));
+    let root = base.join("root");
+    let both = root.join("both");
+    let one = root.join("one");
+    let index = base.join("index");
+    fs::create_dir_all(&both).unwrap();
+    fs::create_dir_all(&one).unwrap();
+    fs::write(both.join("a"), b"red\nblue\n").unwrap();
+    fs::hard_link(both.join("a"), both.join("b")).unwrap();
+    fs::write(one.join("c"), b"red\ngreen\n").unwrap();
+    fs::hard_link(one.join("c"), root.join("other-operand")).unwrap();
+    fs::write(one.join("d"), b"red\nyellow\n").unwrap();
+    fs::hard_link(one.join("d"), base.join("outside-roots")).unwrap();
+    for name in ["copy-a", "copy-b"] {
+        fs::write(both.join(name), b"red\ncopy\n").unwrap();
+    }
+    ferret_crawl::index(
+        &index,
+        std::slice::from_ref(&root),
+        Refresh::All,
+        &IndexOptions::default(),
+    )
+    .unwrap();
+    let resident = Engine::from_writer(ferret_catalog::WriterSession::open(&index).unwrap());
+    for mode in ["one-shot", "resident", "cross-epoch"] {
+        let one_shot =
+            (mode == "one-shot").then(|| Engine::open_with_content(&index, true).unwrap().unwrap());
+        if mode == "cross-epoch" {
+            // Build the predecessor as a non-grep content search would, then
+            // publish a checkpoint that cannot adopt its DocNames.
+            let query = ferret_query::Query::from_args([b"text:red".as_slice()], SystemTime::now())
+                .unwrap();
+            resident
+                .pin()
+                .search_content(&query, None, None, |_| std::ops::ControlFlow::Continue(()))
+                .unwrap();
+            let previous = resident.pin().generation();
+            resident.compact().unwrap();
+            assert_ne!(previous.checkpoint, resident.pin().generation().checkpoint);
+        }
+        let pin = one_shot.as_ref().unwrap_or(&resident).pin();
+        for (operand, names) in [
+            (&both, vec!["a", "b", "copy-a", "copy-b"]),
+            (&one, vec!["c", "d"]),
+        ] {
+            for invert in [false, true] {
+                let mut args: Vec<OsString> = vec!["-n".into(), "-F".into()];
+                if invert {
+                    args.push("-v".into());
+                }
+                args.extend(["blue".into(), operand.as_os_str().to_owned()]);
+                let line_grep::Command::Search(plan) = line_grep::parse(&args).unwrap() else {
+                    panic!("search");
+                };
+                let selection = preflight::selection(plan.hidden, &plan.filters).unwrap();
+                let cancelled = AtomicBool::new(false);
+                let stderr = |message: &str| -> io::Result<()> { panic!("{message}") };
+                let runtime = Runtime {
+                    cancelled: &cancelled,
+                    stderr: &stderr,
+                    tty: false,
+                    warned: AtomicBool::new(false),
+                    descriptors: None,
+                    defer_stdout: false,
+                };
+                engine::DOC_NAMES_BUILDS.set(0);
+                let mut output = Vec::new();
+                let exit = Execution {
+                    plan: &plan,
+                    selection: &selection,
+                    pin: Some(&pin),
+                    live: None,
+                    cwd: &base,
+                    threads: 1,
+                    runtime: &runtime,
+                    start: Instant::now(),
+                }
+                .run(vec![Input::Directory(operand.clone())], &mut output);
+                assert_eq!(
+                    engine::DOC_NAMES_BUILDS.get(),
+                    0,
+                    "{mode}: grep built DocNames"
+                );
+                let mut actual: Vec<_> = String::from_utf8(output)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                actual.sort();
+                let mut expected = Vec::new();
+                for name in &names {
+                    let path = operand.join(name);
+                    let bytes = fs::read_to_string(&path).unwrap();
+                    for (line, text) in bytes.lines().enumerate() {
+                        if text.contains("blue") != invert {
+                            expected.push(format!("{}:{}:{text}", path.display(), line + 1));
+                        }
+                    }
+                }
+                expected.sort();
+                assert_eq!(actual, expected, "{mode}, invert={invert}");
+                assert!(matches!(exit, Exit::Ok | Exit::NoMatch));
+            }
+        }
+    }
+    drop(resident);
+    fs::remove_dir_all(base).unwrap();
+}

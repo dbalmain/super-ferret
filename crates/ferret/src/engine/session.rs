@@ -295,6 +295,8 @@ impl QuerySession {
         if let Some(docs) = self.derived.docs.get() {
             return Ok(Some(docs));
         }
+        #[cfg(test)]
+        DOC_NAMES_BUILDS.with(|builds| builds.set(builds.get() + 1));
         let Some(built) = DocNames::new_until(&self.catalog, cancelled)? else {
             return Ok(None);
         };

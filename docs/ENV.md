@@ -99,6 +99,7 @@ production code parks on it at a real checkpoint.
 
 | Seam | Owning test module | Injection |
 | ---- | ------------------ | --------- |
+| `engine::DOC_NAMES_BUILDS` | `ferret/src/grep/tests.rs` | Thread-local counter incremented before a cold `doc_names_until` build; the real grep execution must leave it at zero on cold and cross-epoch pins. Unit-test builds only. |
 | `CONTENT_OPEN_HOOK` | `ferret/src/engine/tests.rs` | Thread-local, one-shot callback in the shared `Engine::open_pair`, after pinning immutable index descriptors and before reading the catalog (or its generation for reload reuse); drives the D60 purge and benign-write races without sleeps. Compiled only for unit tests. |
 | `CATALOG_LOAD_HOOK` | `ferret/src/engine/tests.rs` | Thread-local, one-shot callback in `Engine::open_query`, after the catalog manifest/descriptors are pinned and before section loading and name builds; tests that benign writes during a full catalog load retain indexed execution, including batch replacement. Compiled only for unit tests. |
 | `paired::OPEN_HOOK` | `ferret-bench/src/paired.rs` | Thread-local one-shot callback between the shared diagnostic opener's index and catalog reads, driving a real D60 death/merge. Compiled only for unit tests. |

@@ -191,14 +191,14 @@ pub(in super::super) fn run<'a, W: Write>(
     mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Job)> + Send,
     cwd: &Path,
     fork: &Fork<'a>,
-    names: Option<&ferret_query::DocNames>,
+    catalog: Option<&ferret_catalog::Catalog>,
     threads: usize,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
     let search = Search::new(host, cancelled, threads);
     let mut current = None;
     let shortfall = ferret_query::completion_groups_with_handoff(
-        if names.is_some() {
+        if catalog.is_some() {
             GroupSchedule::Indexed(threads)
         } else {
             GroupSchedule::Streaming(threads)
@@ -215,7 +215,14 @@ pub(in super::super) fn run<'a, W: Write>(
         },
         || Worker::new(search.plan.clone(), cwd.to_owned(), fork()),
         |worker, job, stopped, handoff, concurrent| {
-            let eligible = matches!(&job, Job::Checked(_,_,doc) if names.is_some_and(|names| names.names(*doc).len() > 1));
+            // Cache eligibility is only a hint: every replay still stats its
+            // selected name. External links can overestimate reuse, stale
+            // nlink can underestimate it, and equal-content inodes share a
+            // document even without hard links.
+            let eligible = matches!(&job, Job::Checked(_, name, doc) if catalog.is_some_and(|catalog| {
+                catalog.doc_references(ferret_catalog::DocId(*doc)).is_some_and(|count| count > 1)
+                    || matches!(catalog.name(*name).target(), ferret_catalog::Target::Inode(inode) if catalog.nlink(inode) > 1)
+            }));
             search.work(job, stopped, handoff, concurrent, |job, target| {
                 worker.prepare(
                     job,
