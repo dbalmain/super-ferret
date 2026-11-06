@@ -3587,7 +3587,11 @@ and one catalog, with no extra generation read, full catalog reload, writer
 lock, daemon round trip or format change. The existing three-attempt index
 open bound remains. Missing or incompatible indexes use the ordinary
 uncovered scan or explicit search refusal; benign catalog writes keep
-indexed execution.
+indexed execution. Diagnostic readers in `ferret-bench` also pin every
+measured, term-control and comparison index before one catalog load, then
+check compatibility. Historical compatible controls remain valid. Later
+segment adapters duplicate pinned descriptors instead of reopening retired
+names.
 
 The round-table transcripts are in `.ai/d60/` (local).
 

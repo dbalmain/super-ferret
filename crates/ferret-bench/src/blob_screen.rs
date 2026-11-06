@@ -26,7 +26,7 @@ use std::fs;
 use std::path::Path;
 
 use ferret_catalog::{NameId, Target};
-use ferret_index::{CatalogView, DocSet, Pinned, View};
+use ferret_index::{DocSet, Pinned};
 use ferret_query::{Content, DocNames, NameIndex, Query};
 use ferret_text::base64_runs;
 use ferret_verify::{Text, Trigrams};
@@ -92,19 +92,10 @@ fn unhex(s: &str) -> crate::Result<Vec<u8>> {
 }
 
 fn sample(dir: &Path, index: &Path, snapshot_dir: &Path, file: &Path) -> crate::Result<()> {
-    let catalog = crate::open_catalog(dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
+    let crate::paired::Inputs { catalog, view, .. } = crate::paired::open(dir, index, None, None)?;
     let snapshot = crate::content_snapshot::Snapshot::open(snapshot_dir, &catalog)?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
-    let view = View::open(
-        index,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no content index that fits the catalog")?;
+
     let mut rng = Rng(0x5eed_0b10);
     // Per band: documents offered, and the reservoir of (doc, argument).
     let mut seen = [0u64; BANDS.len()];
@@ -206,19 +197,10 @@ fn measure(
     queries: &Path,
     out: &Path,
 ) -> crate::Result<()> {
-    let catalog = crate::open_catalog(dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
+    let crate::paired::Inputs { catalog, view, .. } = crate::paired::open(dir, index, None, None)?;
     let snapshot = crate::content_snapshot::Snapshot::open(snapshot_dir, &catalog)?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
-    let view = View::open(
-        index,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no content index that fits the catalog")?;
+
     let names = NameIndex::new(&catalog);
     let docs = DocNames::new(&catalog)?;
     let pinned = Pinned::new(Some(&view), &live);

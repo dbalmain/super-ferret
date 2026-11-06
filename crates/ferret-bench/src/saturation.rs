@@ -118,12 +118,12 @@ pub(crate) fn run(
         return Err("saturation wants a fresh output directory".into());
     }
     fs::create_dir(out)?;
+    let (tri_paths, trigrams) = open_segments(tri_dir, "tri")?;
+    let terms = ferret_index::segment::Segment::open(File::open(term_segment)?)?;
     let catalog = crate::open_catalog(dir)?;
     let bound = catalog.next_doc().0;
     let docs = hashed_documents(&catalog)?;
     let live = DocSet::new(bound, docs.iter().map(|d| d.doc.0));
-    let (tri_paths, trigrams) = open_segments(tri_dir, "tri")?;
-    let terms = ferret_index::segment::Segment::open(File::open(term_segment)?)?;
     let counts = key_counts(&trigrams, bound)?;
     let mut sweep = Sweep {
         total_pairs: counts.iter().sum(),

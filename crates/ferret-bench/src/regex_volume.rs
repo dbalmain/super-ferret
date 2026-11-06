@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::Path;
 
-use ferret_index::{Atom, CatalogView, DocSet, Pinned, Source, View};
+use ferret_index::{Atom, DocSet, Pinned, Source, View};
 use ferret_query::GrepAtom;
 use ferret_verify::{Grep, GrepFlags, Matcher};
 
@@ -110,32 +110,20 @@ fn count(
 
 pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::Result<()> {
     crate::trigram::check_disk()?;
-    let catalog = crate::open_catalog(catalog_dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
+    let crate::paired::Inputs { catalog, view, .. } =
+        crate::paired::open(catalog_dir, index_dir, None, None)?;
     let snapshot = Snapshot::open(snapshot_dir, &catalog)?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
-    let view = View::open(
-        index_dir,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no paired index")?;
+
     let pinned = Pinned::new(Some(&view), &live);
     let [segment] = view.segments() else {
         return Err("regex-volume requires full merge".into());
     };
     let trigrams = view
-        .manifest()
-        .segments
+        .trigrams()
         .iter()
-        .map(|entry| {
-            ferret_index::segment::Segment::open(File::open(
-                index_dir.join(entry.trigram_file_name()),
-            )?)
-            .map_err(Into::into)
+        .map(|segment| {
+            ferret_index::segment::Segment::open(segment.source().try_clone()?).map_err(Into::into)
         })
         .collect::<crate::Result<Vec<_>>>()?;
     let keys = key_counts(&trigrams, live.bound())?;
@@ -255,7 +243,7 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferret_index::{Budget, Fault, IndexWriter};
+    use ferret_index::{Budget, CatalogView, Fault, IndexWriter};
 
     #[test]
     fn real_selection_and_full_constraints_bound_the_match_oracle() {

@@ -35,7 +35,7 @@ use std::ops::{ControlFlow, Range};
 use std::path::Path;
 
 use ferret_catalog::{NameId, Target};
-use ferret_index::{CatalogView, DocSet, Pinned, View};
+use ferret_index::{DocSet, Pinned};
 use ferret_query::{Content, DocNames, NameIndex, Query, ReadVersion};
 use ferret_text::{Scratch, cap, tokenize};
 use ferret_verify::forces_whole;
@@ -64,18 +64,10 @@ const CUT_THRESHOLD: f64 = 0.5;
 const MAP_GROWTH_THRESHOLD: f64 = 0.10;
 
 pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
-    let catalog = crate::open_catalog(dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
+    let crate::paired::Inputs { catalog, view, .. } =
+        crate::paired::open(dir, index_dir, None, None)?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
-    let view = View::open(
-        index_dir,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no content index that fits the catalog")?;
+
     let names = NameIndex::new(&catalog);
     let docs = DocNames::new(&catalog)?;
     let pinned = Pinned::new(Some(&view), &live);

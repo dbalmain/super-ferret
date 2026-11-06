@@ -43,7 +43,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ferret_catalog::{Catalog, NameId, Target};
-use ferret_index::{CatalogView, DocSet, Pinned, View};
+use ferret_index::{DocSet, Pinned, View};
 use ferret_query::{Content, ContentReport, DocNames, NameIndex, Query, Side};
 use ferret_text::{Kind, Scratch, tokenize};
 use ferret_verify::Text;
@@ -131,9 +131,17 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     }
     let only = &classes_only;
     // Resident, as the engine holds it.
-    let catalog = crate::open_catalog(dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
+    let crate::paired::Inputs {
+        catalog,
+        view,
+        terms: terms_view,
+        compare: compare_view,
+    } = crate::paired::open(
+        dir,
+        index_dir,
+        terms_dir.map(Path::new),
+        compare_dir.map(Path::new),
+    )?;
     let snapshot = corpus_dir
         .map(|dir| crate::content_snapshot::Snapshot::open(Path::new(dir), &catalog))
         .transpose()?;
@@ -149,14 +157,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                     .is_some_and(|snapshot| snapshot.contains(doc))
         }),
     );
-    let view = View::open(
-        index_dir,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no content index that fits the catalog")?;
+
     let segments = view.segments().len();
     let start = Instant::now();
     let names = NameIndex::new(&catalog);
@@ -171,19 +172,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     println!("docnames_bytes: {}", docs.bytes());
     println!("setup_ms (name index + DocNames): {:.1}", ms(setup));
 
-    let open = |dir: &Path| -> crate::Result<View> {
-        View::open(
-            dir,
-            &CatalogView {
-                incarnation: catalog.generation().incarnation,
-                live: &live,
-            },
-        )?
-        .ok_or_else(|| "no fitting comparison index".into())
-    };
-    let terms_view = terms_dir.map(|dir| open(Path::new(dir))).transpose()?;
     let classes = pick_terms(terms_view.as_ref().unwrap_or(&view))?;
-    let compare_view = compare_dir.map(|dir| open(Path::new(dir))).transpose()?;
     let compare_pinned = compare_view
         .as_ref()
         .map(|view| Pinned::new(Some(view), &live));
@@ -193,13 +182,9 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
         bound: None,
     });
     let phrases = pick_phrases(&catalog, &live)?;
-    let files: Vec<_> = fs::read_dir(index_dir)?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<Result<_, _>>()?;
     let evict = || -> crate::Result<()> {
-        for file in &files {
-            let file = File::open(file)?;
-            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
+        for segment in view.segments().iter().chain(view.trigrams()) {
+            rustix::fs::fadvise(segment.source(), 0, None, rustix::fs::Advice::DontNeed)?;
         }
         Ok(())
     };
@@ -737,19 +722,11 @@ pub(crate) fn quantile(values: &mut [f64], q: f64) -> f64 {
 /// S3 M5 through the real planner and verifier. Definitions remain in memory;
 /// output contains only class labels, counts, bytes and timings.
 pub(crate) fn run_regex(dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::Result<()> {
-    let catalog = crate::open_catalog(dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
+    let crate::paired::Inputs { catalog, view, .. } =
+        crate::paired::open(dir, index_dir, None, None)?;
     let snapshot = crate::content_snapshot::Snapshot::open(snapshot_dir, &catalog)?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
-    let view = View::open(
-        index_dir,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no paired index")?;
+
     let names = NameIndex::new(&catalog);
     let docs = DocNames::new(&catalog)?;
     let pinned = Pinned::new(Some(&view), &live);
@@ -757,18 +734,15 @@ pub(crate) fn run_regex(dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> cr
         return Err("regex-query requires full merge".into());
     };
     let term_classes = crate::screen::term_classes(segment, PER_CLASS)?;
-    // The shared class generator takes owned segment handles; open a second
-    // read-only set rather than teaching it about the paired store.
+    // The class generator needs owned handles. Clone pinned descriptors:
+    // a merge may already have retired their old pathnames.
     let trigrams = view
-        .manifest()
-        .segments
+        .trigrams()
         .iter()
-        .map(|entry| {
-            ferret_index::segment::Segment::open(File::open(
-                index_dir.join(entry.trigram_file_name()),
-            )?)
+        .map(|segment| {
+            ferret_index::segment::Segment::open(segment.source().try_clone()?).map_err(Into::into)
         })
-        .collect::<Result<Vec<_>, ferret_index::ReadError>>()?;
+        .collect::<crate::Result<Vec<_>>>()?;
     let classes = crate::screen::regex_classes(&term_classes, &trigrams, PER_CLASS)?;
     let prefix = ferret_query::GREP_PREFIX;
     let mut queries: Vec<(&str, Vec<Vec<String>>)> = classes

@@ -13,7 +13,7 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use ferret_index::segment::{Hit, Segment};
+use ferret_index::segment::{Hit, ReadAt, Segment};
 use ferret_index::{Certainty, Cursor, DocSet, Pinned, postings};
 use ferret_query::{NameIndex, Query};
 use ferret_verify::GrepFlags;
@@ -735,15 +735,18 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     }
     println!("uncovered_or_unreadable_docs={}", extra_docs.len());
 
-    let [entry] = corpus.view.manifest().segments.as_slice() else {
+    let [term] = corpus.view.segments() else {
         return Err("screens requires a fully merged index".into());
     };
-    let tri = Meter::open(&index.join(entry.trigram_file_name()))?;
-    let term = Meter::open(&index.join(entry.file_name()))?;
+    let [tri] = corpus.view.trigrams() else {
+        return Err("screens requires a fully merged index".into());
+    };
+    let tri = Meter::from_file(tri.source().try_clone()?)?;
+    let term = Meter::from_file(term.source().try_clone()?)?;
     println!(
         "index_bytes trigram={} terms={}",
-        fs::metadata(index.join(entry.trigram_file_name()))?.len(),
-        fs::metadata(index.join(entry.file_name()))?.len(),
+        tri.source().size()?,
+        term.source().size()?,
     );
 
     let shipped = shipped_plans(&corpus, flags)?;

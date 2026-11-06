@@ -813,6 +813,11 @@ pub(crate) fn run(
         return Err("filter-screen wants a fresh output directory".into());
     }
     fs::create_dir(out)?;
+    // The term index is copied so that eviction only touches bench files.
+    let term_copy = out.join("terms.seg");
+    fs::copy(term_segment, &term_copy)?;
+    let terms = vec![Segment::open(File::open(&term_copy)?)?];
+    let (tri_paths, trigrams) = open_segments(tri_dir, "tri")?;
     let catalog = crate::open_catalog(dir)?;
     let bound = catalog.next_doc().0;
     let live = DocSet::new(bound, hashed_documents(&catalog)?.iter().map(|d| d.doc.0));
@@ -821,11 +826,6 @@ pub(crate) fn run(
         .iter()
         .map(|&m| DocSet::new(bound, live.range(0, bound).filter(|doc| doc % m == 0)))
         .collect();
-    // The term index is copied so that eviction only touches bench files.
-    let term_copy = out.join("terms.seg");
-    fs::copy(term_segment, &term_copy)?;
-    let terms = vec![Segment::open(File::open(&term_copy)?)?];
-    let (tri_paths, trigrams) = open_segments(tri_dir, "tri")?;
     println!(
         "filter_screen live_documents={} bound={bound} name_sets={}/{}/{} trigram_segments={}",
         live.len(),

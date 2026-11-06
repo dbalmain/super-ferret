@@ -3,6 +3,8 @@
 
 use std::collections::BTreeSet;
 
+use ferret_index::segment::Segment;
+
 use super::*;
 
 fn lists(documents: &[&[u8]], variant: Variant, weights: &[(u64, u16)]) -> Lists {

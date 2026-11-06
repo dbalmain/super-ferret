@@ -5,14 +5,14 @@
 //! df. All reported fields are aggregate counts, bytes and times.
 
 use std::collections::{BTreeSet, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::Instant;
 
 use ferret_catalog::Catalog;
-use ferret_index::segment::{Segment, TrigramInverter, Writer};
-use ferret_index::{CatalogView, DocSet, Pinned, View};
+use ferret_index::segment::{TrigramInverter, Writer};
+use ferret_index::{DocSet, Pinned, View};
 use ferret_query::GrepAtom;
 use ferret_verify::trigram::RequiredLiterals;
 use ferret_verify::{Grep, GrepFlags, Matcher};
@@ -466,30 +466,20 @@ fn prepare_with(
     oracle_cache: Option<&Path>,
 ) -> crate::Result<Corpus> {
     crate::trigram::check_disk()?;
-    let catalog = crate::open_catalog(catalog_dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
+    let crate::paired::Inputs { catalog, view, .. } =
+        crate::paired::open(catalog_dir, index_dir, None, None)?;
     let snapshot = Snapshot::open(snapshot_dir, &catalog)?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
-    let view = View::open(
-        index_dir,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no paired control index")?;
+
     let [segment] = view.segments() else {
         return Err("sparse requires full merge".into());
     };
     let pinned = Pinned::new(Some(&view), &live);
     let trigrams = view
-        .manifest()
-        .segments
+        .trigrams()
         .iter()
-        .map(|entry| {
-            Segment::open(File::open(index_dir.join(entry.trigram_file_name()))?)
-                .map_err(Into::into)
+        .map(|segment| {
+            ferret_index::segment::Segment::open(segment.source().try_clone()?).map_err(Into::into)
         })
         .collect::<crate::Result<Vec<_>>>()?;
     let classes = crate::screen::term_classes(segment, PER_CLASS)?;

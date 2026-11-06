@@ -42,8 +42,12 @@ impl ReadAt for Meter {
 
 impl Meter {
     pub(super) fn open(path: &Path) -> crate::Result<Segment<Self>> {
+        Self::from_file(File::open(path)?)
+    }
+
+    pub(super) fn from_file(file: File) -> crate::Result<Segment<Self>> {
         Ok(Segment::open(Self {
-            file: File::open(path)?,
+            file,
             bytes: Cell::new(0),
         })?)
     }
@@ -429,17 +433,17 @@ pub(crate) fn run(
             "word-fixed-4+5" => Some(Variant::Word45),
             _ => None,
         };
-        let (owned, query_lists, path) = if let Some(variant) = variant {
+        let (owned, query_lists, segment) = if let Some(variant) = variant {
             let (owned, lists) = write_index(&corpus, variant, scratch)?;
-            let path = owned.0.clone();
-            (Some(owned), lists, path)
+            let segment = Meter::open(&owned.0)?;
+            (Some(owned), lists, segment)
         } else {
-            let [entry] = corpus.view.manifest().segments.as_slice() else {
+            let [segment] = corpus.view.trigrams() else {
                 return Err("latency requires full merge".into());
             };
-            (None, Lists::new(), index.join(entry.trigram_file_name()))
+            let segment = Meter::from_file(segment.source().try_clone()?)?;
+            (None, Lists::new(), segment)
         };
-        let segment = Meter::open(&path)?;
         if segment.codec() != 1 {
             return Err("latency requires codec-1 keys".into());
         }

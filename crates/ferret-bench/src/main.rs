@@ -78,6 +78,7 @@ mod corpus;
 mod fuse;
 mod index_build;
 mod name_index;
+mod paired;
 mod rank_fp;
 mod regex_volume;
 mod saturation;
