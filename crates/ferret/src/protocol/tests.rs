@@ -470,7 +470,7 @@ fn mutation_fuzz_never_panics() {
 /// `FERRET_PROTOCOL_FUZZ_ITERS=200000 cargo test --workspace -- --ignored
 /// mutation_fuzz_long`.
 #[test]
-#[ignore]
+#[ignore = "extended gate; run in release"]
 fn mutation_fuzz_long() {
     let iterations = std::env::var("FERRET_PROTOCOL_FUZZ_ITERS")
         .ok()

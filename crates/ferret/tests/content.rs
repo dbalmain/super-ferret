@@ -561,7 +561,7 @@ fn text_queries_equal_the_oracle_at_every_coverage() {
 }
 
 #[test]
-#[ignore = "long: run with --ignored"]
+#[ignore = "extended gate; run in release"]
 fn text_queries_equal_the_oracle_at_every_coverage_long() {
     for seed in 100..160 {
         oracle(seed, 48, 120);

@@ -839,7 +839,7 @@ fn every_match_satisfies_the_derived_query() {
 
 /// 30,000 patterns, each against 9 documents.
 #[test]
-#[ignore = "long: about 45 s in debug; run with --release"]
+#[ignore = "extended gate; run in release"]
 fn every_match_satisfies_the_derived_query_long() {
     let tally = run_property(30_000, 0x2545_f491_4f6c_dd1d);
     assert_covers(&tally);

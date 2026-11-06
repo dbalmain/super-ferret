@@ -205,7 +205,7 @@ fn execdir_root_spelling_and_delete_dot_match_observed_gnu_rules() {
 }
 
 #[test]
-#[ignore = "extended development differential"]
+#[ignore = "extended gate; run in release"]
 fn exec_batch_sizes_against_pinned_gnu() {
     let tree = Tree::new("batches");
     for i in 0..1300 {
@@ -325,7 +325,7 @@ mod regex_cases {
 }
 
 #[test]
-#[ignore = "extended development differential"]
+#[ignore = "extended gate; run in release"]
 fn regex_dialects_against_pinned_gnu() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;

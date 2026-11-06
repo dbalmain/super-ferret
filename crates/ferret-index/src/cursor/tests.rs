@@ -309,7 +309,7 @@ fn the_algebra_matches_kleenes_logic_on_random_trees() {
 }
 
 #[test]
-#[ignore = "long property run; run with --ignored"]
+#[ignore = "extended gate; run in release"]
 fn the_algebra_matches_kleenes_logic_on_many_random_trees() {
     for seed in 0..100_000 {
         check(seed);

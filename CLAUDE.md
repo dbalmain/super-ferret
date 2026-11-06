@@ -12,7 +12,23 @@ All green with zero warnings before a change is done:
 nix run .#fmt        # cargo fmt --all with the pinned nightly rustfmt
 nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 nix develop --command cargo test --workspace
+nix develop --command cargo doc --workspace --no-deps --document-private-items
 ```
+
+Optional extended gate, after risky index, query, protocol, crawl or watcher
+slices and before handing them off:
+
+```sh
+nix develop --command python3 tests/extended.py
+```
+
+The runner builds in release, requires the ten named correctness and GNU
+differential tests to be collected, then runs and times each. Measurements
+are excluded by name; their placement is tracked in D141 in
+[docs/DECISIONS.md](docs/DECISIONS.md). Measured on 2026-11-07 on the Ryzen 9
+9955HX: **10 passed in 168.215 s** of serial test wall time; release compilation
+is additional. The three retained measurements leave 13 ignored tests in the
+ordinary gate until D141 is resolved.
 
 The dev shell supplies the pinned GNU findutils 4.11.0 differential oracle via
 `FERRET_GNU_FIND`. Missing or different oracle versions fail the tests.

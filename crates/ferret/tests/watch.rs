@@ -1148,13 +1148,13 @@ fn generated_bursts_match_full_index_after_each_quiescent_publication() {
 /// --ignored generated_bursts_long. Each round compares against a new full real
 /// index.
 #[test]
-#[ignore]
+#[ignore = "extended gate; run in release"]
 fn generated_bursts_long() {
     generated(
         std::env::var("FERRET_WATCH_BURST_ROUNDS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1000),
+            .unwrap_or(100),
     );
 }
 

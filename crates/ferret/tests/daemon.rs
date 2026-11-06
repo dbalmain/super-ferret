@@ -225,6 +225,7 @@ impl Tree {
     fn connect(&self) -> (BufReader<UnixStream>, String) {
         ready(self.stream())
     }
+    #[cfg(debug_assertions)]
     fn try_wait(&self, pid: u32) -> Option<std::process::ExitStatus> {
         self.children
             .lock()
@@ -1705,6 +1706,7 @@ fn battery_paused_startup_drains_without_a_writer_command() {
 }
 
 /// User plus system CPU ticks consumed by a process, from /proc.
+#[cfg(debug_assertions)]
 fn cpu_ticks(pid: u32) -> u64 {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     stat_ticks(&stat)
@@ -3641,12 +3643,14 @@ fn text_stats_reads_the_daemon_pin_when_the_snapshot_is_hidden() {
     assert_eq!(fixture_daemons(&tree.base).len(), 1);
 }
 
+#[cfg(debug_assertions)]
 fn publish_accept_error(path: &std::path::Path, name: &str) {
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, name).unwrap();
     fs::rename(&temporary, path).unwrap();
 }
 
+#[cfg(debug_assertions)]
 fn task_names(pid: u32) -> Vec<String> {
     fs::read_dir(format!("/proc/{pid}/task"))
         .into_iter()
@@ -3657,6 +3661,7 @@ fn task_names(pid: u32) -> Vec<String> {
         .collect()
 }
 
+#[cfg(debug_assertions)]
 fn ready_within(tree: &Tree, bound: Duration) -> String {
     let stream = tree.stream();
     stream.set_read_timeout(Some(bound)).unwrap();

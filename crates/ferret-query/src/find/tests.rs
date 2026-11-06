@@ -677,7 +677,7 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
 }
 
 #[test]
-#[ignore = "extended development differential"]
+#[ignore = "extended gate; run in release"]
 fn differential_against_pinned_gnu() {
     let tree = Tree::new("oracle");
     fs::write(tree.0.join("reference"), b"ref").unwrap();

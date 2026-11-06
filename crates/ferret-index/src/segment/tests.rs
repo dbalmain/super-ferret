@@ -564,7 +564,7 @@ fn mutation_fuzz_never_panics() {
 /// `FERRET_SEGMENT_FUZZ_ITERS=20000 cargo test -p ferret-index -- --ignored
 /// mutation_fuzz_long`.
 #[test]
-#[ignore]
+#[ignore = "extended gate; run in release"]
 fn mutation_fuzz_long() {
     let iterations = std::env::var("FERRET_SEGMENT_FUZZ_ITERS")
         .ok()

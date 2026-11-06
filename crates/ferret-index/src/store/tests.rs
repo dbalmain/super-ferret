@@ -727,7 +727,7 @@ fn a_short_churn_stays_correct() {
 }
 
 #[test]
-#[ignore = "long churn; run with --ignored"]
+#[ignore = "extended gate; run in release"]
 fn a_long_churn_stays_correct() {
     for seed in 100..104 {
         churn(150, seed);

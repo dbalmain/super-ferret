@@ -553,6 +553,7 @@ mod seam {
 
     pub(super) struct Observed<'a> {
         input: &'a mut dyn Read,
+        #[cfg(debug_assertions)]
         appended: bool,
     }
 
@@ -560,6 +561,7 @@ mod seam {
         pub(super) fn new(input: &'a mut dyn Read) -> Self {
             Self {
                 input,
+                #[cfg(debug_assertions)]
                 appended: false,
             }
         }
