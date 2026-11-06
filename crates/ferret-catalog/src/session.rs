@@ -477,61 +477,71 @@ impl WriterSession {
         self.name_changes.extend(names);
     }
 
-    /// Records the identities and documents `changes` added or removed. A
-    /// transaction holds one final row per id, so every put is live after it:
-    /// removals go first, and a key the transaction both retires and makes
-    /// live ends live whatever the record order.
+    /// Raw records can repeat keys, and inode fields do not determine inode
+    /// lifetime. Remove previous mappings first, then install only the checked
+    /// final view's mappings for touched ids. This preserves last-wins within
+    /// an id while letting live mappings beat deaths of distinct ids.
     fn cache_identities(&mut self, previous: &Catalog, view: &Catalog, changes: &ChangeSet) {
         for record in &changes.records {
             self.cache_removal(previous, record);
         }
         for record in &changes.records {
             match record {
-                Record::InodePut { id, kind, stat, .. } if *kind != crate::Kind::Dir => {
-                    self.identity_changes
-                        .insert((stat.dev, stat.ino), Some(InoId(*id)));
-                }
-                Record::InodePut {
-                    id,
-                    kind: crate::Kind::Dir,
-                    stat,
-                    ..
-                } => {
-                    let root = root_of(view, InoId(*id));
-                    let ids = self
-                        .directory_changes
-                        .entry((root.0, stat.dev, stat.ino))
-                        .or_default();
-                    if !ids.contains(&InoId(*id)) {
-                        ids.push(InoId(*id));
+                Record::InodePut { id, .. }
+                | Record::LifePut { id, .. }
+                | Record::InodeDelete { id }
+                    if view.is_live_inode(InoId(*id)) =>
+                {
+                    let id = InoId(*id);
+                    let key = view.identity(id);
+                    if view.is_directory(id) {
+                        let root = root_of(view, id);
+                        let ids = self
+                            .directory_changes
+                            .entry((root.0, key.0, key.1))
+                            .or_default();
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    } else {
+                        self.identity_changes.insert(key, Some(id));
                     }
                 }
-                Record::DocPut { id, hash, .. } => {
-                    self.document_changes.insert(*hash, Some(DocId(*id)));
-                    self.dormant_ids.remove(&DocId(*id));
-                }
-                Record::DocDormant { id, .. } => {
-                    self.dormant_ids.insert(DocId(*id));
-                }
-                Record::DocForget { id } => {
-                    self.dormant_ids.remove(&DocId(*id));
+                Record::DocPut { id, .. }
+                | Record::DocDelete { id }
+                | Record::DocDormant { id, .. }
+                | Record::DocForget { id } => {
+                    let id = DocId(*id);
+                    if let Some(hash) = view.doc_hash(id) {
+                        self.document_changes.insert(hash, Some(id));
+                    }
+                    if view.dormant_hash(id).is_some() {
+                        self.dormant_ids.insert(id);
+                    } else {
+                        self.dormant_ids.remove(&id);
+                    }
                 }
                 _ => {}
             }
         }
     }
 
-    /// Clears the lookup a retired inode or dying document held.
+    /// Clears previous mappings for touched ids, never intermediate fields
+    /// from a raw record that may have been superseded.
     fn cache_removal(&mut self, previous: &Catalog, record: &Record) {
         match record {
-            Record::InodeDelete { id } if !previous.is_directory(InoId(*id)) => {
+            Record::InodePut { id, .. }
+            | Record::LifePut { id, .. }
+            | Record::InodeDelete { id }
+                if previous.is_live_inode(InoId(*id)) && !previous.is_directory(InoId(*id)) =>
+            {
                 self.identity_changes
                     .insert(previous.identity(InoId(*id)), None);
             }
-            Record::DocDormant { hash, .. } => {
-                self.document_changes.insert(*hash, None);
-            }
-            Record::DocDelete { id } => {
+            Record::DocPut { id, .. }
+            | Record::DocDelete { id }
+            | Record::DocDormant { id, .. }
+            | Record::DocForget { id } => {
                 if let Some(hash) = previous.doc_hash(DocId(*id)) {
                     self.document_changes.insert(hash, None);
                 }

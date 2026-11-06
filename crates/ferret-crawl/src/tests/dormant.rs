@@ -1,4 +1,4 @@
-//! D60 fix round 3: writer hash/identity caches through checked catalog
+//! D60 writer regressions: writer hash/identity caches through checked catalog
 //! transitions, reopen/recovery and the real reconciliation allocator.
 use std::path::Path;
 
@@ -261,4 +261,118 @@ fn live_identity_wins_over_same_transaction_retirement_in_either_record_order() 
         wrong.is_empty(),
         "live identity lost to a retired row: {wrong:?}"
     );
+}
+
+/// Repeated document keys are accepted and project last-wins. The cache must
+/// not reinstall a superseded put after the final deletion, with or without
+/// host coverage, or the next real reconcile tries to recrawl a dead id.
+#[test]
+fn same_id_document_put_then_delete_uses_final_view() {
+    for covered in [false, true] {
+        let scratch = Scratch::new(&format!("d60-superseded-doc-{covered}"));
+        checkpoint(&scratch.path);
+        let mut writer = log_session(&scratch.path).unwrap();
+        if covered {
+            writer.set_coverage(Some(Coverage::new(1, vec![])));
+        }
+        let view = writer.view();
+        let after = writer
+            .commit(
+                &changes(
+                    &view,
+                    vec![
+                        binding(None),
+                        Record::DocPut {
+                            id: 0,
+                            references: 1,
+                            hash: HASH,
+                        },
+                        Record::DocDelete { id: 0 },
+                    ],
+                    0,
+                ),
+                SNIFFER,
+            )
+            .unwrap();
+        assert_eq!(after.doc_hash(DocId(0)), None);
+        assert_eq!(after.docs().count(), 0);
+        assert_eq!(writer.document(HASH), None);
+        assert_eq!(writer.returning_document(HASH), covered.then_some(DocId(0)));
+        let expected = if covered { DocId(0) } else { DocId(1) };
+        let after = reconcile_copy(&mut writer);
+        assert_eq!(writer.document(HASH), Some(expected));
+        assert_eq!(after.doc_count(), 1);
+        assert_eq!(after.next_doc(), DocId(if covered { 1 } else { 2 }));
+        for id in [InoId(1), InoId(2)] {
+            assert_eq!(after.doc(id), Some(expected));
+        }
+        writer.recover().unwrap();
+        assert_eq!(writer.document(HASH), Some(expected));
+    }
+}
+
+/// Inode fields and lifetime have different keys: a fields put survives the
+/// projection even when the same transaction deletes that inode's lifetime.
+#[test]
+fn same_id_inode_put_and_delete_uses_final_lifetime_in_either_order() {
+    for reverse in [false, true] {
+        let scratch = Scratch::new(&format!("d60-superseded-inode-{reverse}"));
+        checkpoint(&scratch.path);
+        let mut writer = log_session(&scratch.path).unwrap();
+        let mut batch = writer.batch();
+        let root = batch.root(b"/r", stat(1, true));
+        batch.entry_count(root, 0);
+        batch.finish_observations();
+        let mut delta =
+            crate::reconcile::changes(&writer, &[batch], &["/r".into()], &[], [0; 16], SNIFFER)
+                .unwrap()
+                .unwrap();
+        assert!(delta.records.contains(&Record::InodeDelete { id: 1 }));
+        delta.records.insert(0, binding(Some(0)));
+        if reverse {
+            delta.records.reverse();
+        }
+        let after = writer.commit(&delta, SNIFFER).unwrap();
+        assert!(!after.is_live_inode(InoId(1)));
+        assert_eq!(writer.identity((7, 2)), None);
+        let after = reconcile_copy(&mut writer);
+        let root = after.roots().next().unwrap().0;
+        let child = after.name(after.lookup(root, b"a").unwrap()).child;
+        assert_eq!(child, InoId(2));
+        assert_eq!(writer.identity((7, 2)), Some(child));
+        writer.recover().unwrap();
+        assert_eq!(writer.identity((7, 2)), Some(child));
+    }
+}
+
+/// A superseded fields put must not create a second identity mapping for a
+/// continuing inode, even though the final lifetime remains live.
+#[test]
+fn same_id_inode_superseded_fields_do_not_cache_intermediate_identity() {
+    let scratch = Scratch::new("d60-superseded-fields");
+    checkpoint(&scratch.path);
+    let mut writer = log_session(&scratch.path).unwrap();
+    let view = writer.view();
+    let intermediate = Record::InodePut {
+        id: 1,
+        kind: Kind::File,
+        state: ContentState::Hashed,
+        doc: Some(0),
+        stat: stat(99, false),
+    };
+    let after = writer
+        .commit(
+            &changes(&view, vec![intermediate, binding(Some(0))], 1),
+            SNIFFER,
+        )
+        .unwrap();
+    assert!(after.is_live_inode(InoId(1)));
+    assert_eq!(after.identity(InoId(1)), (7, 2));
+    assert_eq!(writer.identity((7, 99)), None);
+    assert_eq!(writer.identity((7, 2)), Some(InoId(1)));
+    let after = reconcile_copy(&mut writer);
+    assert_eq!(after.inode_count(), 3);
+    writer.recover().unwrap();
+    assert_eq!(writer.identity((7, 99)), None);
+    assert_eq!(writer.identity((7, 2)), Some(InoId(1)));
 }
