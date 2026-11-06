@@ -3,6 +3,7 @@ mod checkpoint_oracle;
 mod compact;
 mod content;
 mod coverage;
+mod dormant;
 mod gitfile;
 mod golden;
 mod index;

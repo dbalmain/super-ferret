@@ -87,6 +87,10 @@ impl WriterSession {
         identities.sort_by_cached_key(|&id| view.identity(id));
         let mut documents: Vec<_> = (0..view.base_doc_count()).collect();
         documents.sort_by_cached_key(|&row| view.base_hash(row));
+        // The overlay's rows come in id order, not transaction order, and
+        // under D60 A′ a lower id can revive after a higher id with the same
+        // hash died. Every put here is live in this view, so a death only
+        // fills a hash no put claims.
         let mut document_changes = BTreeMap::new();
         for record in view.changed_doc_records() {
             match record {
@@ -97,7 +101,7 @@ impl WriterSession {
                 | Record::DocDormant { id, .. }
                 | Record::DocForget { id } => {
                     if let Some(hash) = view.base_doc_hash(DocId(*id)) {
-                        document_changes.insert(hash, None);
+                        document_changes.entry(hash).or_insert(None);
                     }
                 }
                 _ => {}
@@ -473,8 +477,14 @@ impl WriterSession {
         self.name_changes.extend(names);
     }
 
-    /// Records the identities and documents `changes` added or removed.
+    /// Records the identities and documents `changes` added or removed. A
+    /// transaction holds one final row per id, so every put is live after it:
+    /// removals go first, and a key the transaction both retires and makes
+    /// live ends live whatever the record order.
     fn cache_identities(&mut self, previous: &Catalog, view: &Catalog, changes: &ChangeSet) {
+        for record in &changes.records {
+            self.cache_removal(previous, record);
+        }
         for record in &changes.records {
             match record {
                 Record::InodePut { id, kind, stat, .. } if *kind != crate::Kind::Dir => {
@@ -496,28 +506,37 @@ impl WriterSession {
                         ids.push(InoId(*id));
                     }
                 }
-                Record::InodeDelete { id } if !previous.is_directory(InoId(*id)) => {
-                    self.identity_changes
-                        .insert(previous.identity(InoId(*id)), None);
-                }
                 Record::DocPut { id, hash, .. } => {
                     self.document_changes.insert(*hash, Some(DocId(*id)));
                     self.dormant_ids.remove(&DocId(*id));
                 }
-                Record::DocDormant { id, hash } => {
-                    self.document_changes.insert(*hash, None);
+                Record::DocDormant { id, .. } => {
                     self.dormant_ids.insert(DocId(*id));
                 }
                 Record::DocForget { id } => {
                     self.dormant_ids.remove(&DocId(*id));
                 }
-                Record::DocDelete { id } => {
-                    if let Some(hash) = previous.doc_hash(DocId(*id)) {
-                        self.document_changes.insert(hash, None);
-                    }
-                }
                 _ => {}
             }
+        }
+    }
+
+    /// Clears the lookup a retired inode or dying document held.
+    fn cache_removal(&mut self, previous: &Catalog, record: &Record) {
+        match record {
+            Record::InodeDelete { id } if !previous.is_directory(InoId(*id)) => {
+                self.identity_changes
+                    .insert(previous.identity(InoId(*id)), None);
+            }
+            Record::DocDormant { hash, .. } => {
+                self.document_changes.insert(*hash, None);
+            }
+            Record::DocDelete { id } => {
+                if let Some(hash) = previous.doc_hash(DocId(*id)) {
+                    self.document_changes.insert(hash, None);
+                }
+            }
+            _ => {}
         }
     }
 }
