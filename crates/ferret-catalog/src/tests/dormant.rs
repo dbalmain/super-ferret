@@ -489,3 +489,142 @@ fn a_dormant_row_duplicating_a_retained_hash_is_refused() {
     assert_eq!(retained(&disk), [0]);
     assert_eq!(disk.doc_hash(DocId(1)), Some(hash(0)));
 }
+
+/// D60 fix round 2: a retained checkpoint formerly left its hash ordinal cold,
+/// moving the whole-cache sort into the first one-document transaction.
+#[test]
+fn session_boundaries_warm_dormant_lookup_before_a_single_row_transaction() {
+    use crate::dormant::State;
+    let mut cold = Vec::new();
+    for boundary in [
+        "compact",
+        "open",
+        "open_or_create",
+        "recover",
+        "rebuild",
+        "adopt",
+        "budgeted",
+    ] {
+        let s = fixture(&format!("dormant-warm-{boundary}"), 6);
+        let mut writer = session(&s);
+        die_together(&mut writer, &[0, 1]);
+        writer.compact().unwrap();
+        match boundary {
+            "compact" => {
+                writer.compact().unwrap();
+            }
+            "open" => {
+                drop(writer);
+                writer = WriterSession::open(&s.path).unwrap();
+            }
+            "open_or_create" => {
+                drop(writer);
+                writer = WriterSession::open_or_create(&s.path, SNIFFER, [0; 16]).unwrap();
+            }
+            "recover" => {
+                writer.recover().unwrap();
+            }
+            "rebuild" => {
+                let mut batch = writer.checkpoint_batch(0);
+                let root = batch.root(b"/r", dir_stat(1));
+                for n in 0..6 {
+                    let content = if n < 2 {
+                        Content::Unindexed
+                    } else {
+                        Content::Hashed(hash(n))
+                    };
+                    batch.file(root, &[b'a' + n], file_stat(u64::from(n) + 2), content);
+                }
+                writer
+                    .rebuild_checkpoint(vec![batch], SNIFFER, [0; 16])
+                    .unwrap();
+            }
+            "adopt" => {
+                let mut transaction = writer.into_checkpoint(SNIFFER);
+                transaction.keep(b"/r").unwrap();
+                writer = transaction.commit_session().unwrap();
+            }
+            "budgeted" => {
+                writer.set_compaction_limits(crate::CompactionLimits {
+                    records: 1,
+                    ..crate::CompactionLimits::default()
+                });
+                die(&mut writer, 2);
+            }
+            _ => unreachable!(),
+        }
+        writer.set_compaction_limits(crate::CompactionLimits {
+            log_bytes: u64::MAX,
+            records: u64::MAX,
+            dirty_percent: u32::MAX,
+            dead_percent: u32::MAX,
+        });
+        writer.set_coverage(Some(Coverage::new(u32::MAX, vec![])));
+        assert_eq!(
+            writer.budget_usage().records,
+            0,
+            "{boundary}: checkpoint-only view"
+        );
+        let pinned = writer.view();
+        let clone = pinned.clone();
+        assert!(pinned.dormant_count() >= 2);
+        let builds = State::builds();
+        die(&mut writer, 3);
+        if State::builds() != builds {
+            cold.push(boundary);
+        }
+        // A clone made before the transaction shares the initialized base;
+        // checking it cannot allocate another ordinal or see new permissions.
+        let builds = State::builds();
+        assert!(std::ptr::eq(pinned.dormant_state(), clone.dormant_state()));
+        assert_eq!(clone.dormant_state().find(hash(0)), Some(DocId(0)));
+        assert_eq!(clone.dormant_state().find(hash(3)), None);
+        assert_eq!(writer.view().dormant_state().find(hash(3)), Some(DocId(3)));
+        assert_eq!(State::builds(), builds, "{boundary}: cloned lookup rebuilt");
+    }
+    assert!(
+        cold.is_empty(),
+        "checkpoint lookup built during tiny transactions after {cold:?}"
+    );
+}
+
+/// The common writer adoption boundary must also cover raw log users rather
+/// than relying solely on WriterSession::rebuild to warm their view.
+#[test]
+fn log_writer_boundaries_warm_dormant_lookup_before_a_single_row_transaction() {
+    use crate::dormant::State;
+    let mut cold = Vec::new();
+    for boundary in ["open", "checkpoint"] {
+        let s = fixture(&format!("dormant-log-warm-{boundary}"), 6);
+        let mut writer = session(&s);
+        die_together(&mut writer, &[0, 1]);
+        writer.compact().unwrap();
+        drop(writer);
+        let mut writer = crate::log::Writer::open(&s.path).unwrap();
+        if boundary == "checkpoint" {
+            writer.checkpoint_view(writer.view()).unwrap();
+        }
+        let view = writer.view();
+        let changes = changes(
+            &view,
+            vec![
+                inode(&view, 3, false),
+                Record::DocDormant {
+                    id: 3,
+                    hash: hash(3),
+                },
+            ],
+            view.doc_count() - 1,
+        );
+        let builds = State::builds();
+        writer.commit(writer.generation(), &changes).unwrap();
+        if State::builds() != builds {
+            cold.push(boundary);
+        }
+        assert_eq!(retained(&writer.view()), [0, 1, 3]);
+    }
+    assert!(
+        cold.is_empty(),
+        "checkpoint lookup built during raw log transactions after {cold:?}"
+    );
+}

@@ -68,6 +68,15 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+/// Warm the retained hash ordinal at writer open or checkpoint adoption.
+/// Otherwise the first small transaction would sort the entire dormant base;
+/// clones share this initialized OnceLock across the checkpoint epoch.
+fn resident_view(catalog: Catalog) -> Result<Catalog, Error> {
+    let view = catalog.into_resident().map_err(Error::Previous)?;
+    view.dormant_state();
+    Ok(view)
+}
+
 impl Writer {
     pub fn open(dir: &Path) -> Result<Self, Error> {
         let lock = crate::lock::Lock::open(dir).map_err(|e| match e {
@@ -85,7 +94,7 @@ impl Writer {
             let mut manifest = pinned.manifest.clone();
             let mut budget = crate::budget::Budget::open(&pinned).map_err(Error::Previous)?;
             let current = pinned.into_catalog();
-            let current = current.into_resident().map_err(Error::Previous)?;
+            let current = resident_view(current)?;
             current.name_references();
             let path = dir.join(format!("changes.{}", manifest.generation.checkpoint));
             if manifest.log_end == 0 {
@@ -140,7 +149,7 @@ impl Writer {
             log,
             manifest,
             poisoned: false,
-            current: catalog.into_resident().map_err(Error::Previous)?,
+            current: resident_view(catalog)?,
             budget,
             bulk: None,
         })
@@ -232,7 +241,7 @@ impl Writer {
         )
         .map_err(Error::Undurable)?;
         self.manifest = manifest;
-        self.current = current.into_resident().map_err(Error::Previous)?;
+        self.current = resident_view(current)?;
         self.budget =
             crate::budget::Budget::empty(self.current.inode_count(), self.current.name_count());
         self.poisoned = false;
@@ -286,7 +295,7 @@ impl Writer {
         )
         .map_err(Error::Undurable)?;
         self.budget = crate::budget::Budget::empty(current.inode_count(), current.name_count());
-        self.current = current.into_resident().map_err(Error::Previous)?;
+        self.current = resident_view(current)?;
         self.poisoned = false;
         Ok(())
     }
@@ -394,7 +403,7 @@ impl Writer {
         publication::sync(&self.log, Point::LogSync).map_err(Error::Io)?;
         publish_manifest(&self.dir, &next)?;
         self.manifest = next;
-        self.current = current.into_resident().map_err(Error::Previous)?;
+        self.current = resident_view(current)?;
         self.budget = budget;
         self.poisoned = false;
         Ok(self.manifest.generation)

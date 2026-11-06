@@ -38,9 +38,12 @@ pub(crate) struct State {
     count: usize,
 }
 impl State {
-    /// Sorts a checked checkpoint section by hash. Only open, recovery and a
-    /// new checkpoint build this; transactions never re-sort it.
+    /// Sorts a checked checkpoint section by hash. Writer views warm this at
+    /// open, recovery or checkpoint adoption; their transactions inherit the
+    /// initialized base without rebuilding it.
     pub(crate) fn new(bytes: Arc<[u8]>) -> Self {
+        #[cfg(test)]
+        BUILDS.set(BUILDS.get() + 1);
         let count = bytes.len() / 20;
         let hashes = &bytes[count * 4..];
         let mut by_hash: Vec<u32> = (0..count as u32).collect();
@@ -50,6 +53,11 @@ impl State {
             changes: Runs::default(),
             count,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn builds() -> usize {
+        BUILDS.get()
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -109,4 +117,9 @@ impl State {
         self.count = count;
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
