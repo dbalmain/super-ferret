@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+ferret = { path = "../ferret" }
+ferret-crawl.workspace = true
 ferret-catalog.workspace = true
 ferret-index.workspace = true
 ferret-query.workspace = true

@@ -20,11 +20,9 @@ EXPECTED = {
     ("find_m2a", "test", "regex_dialects_against_pinned_gnu"),
     ("watch", "test", "generated_bursts_long"),
 }
-# Measurements retained locally pending the placement decision in D141.
+# The private crawl measurement stays local and needs an external catalog.
 MEASUREMENTS = {
     ("ferret_crawl", "lib", "tests::index::fault_pass_timing"),
-    ("content", "test", "measure_verification_on_a_hundred_thousand_files"),
-    ("engine", "test", "measure_steady_content_follow"),
 }
 
 

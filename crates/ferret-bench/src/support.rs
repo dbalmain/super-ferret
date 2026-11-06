@@ -2,8 +2,7 @@
 //! catalog of it, committed through a public [`Transaction`] batch. Content
 //! hashes are real BLAKE3-128, so equal bytes make one document, and the
 //! files exist, so the sampler can copy them. `ferret-catalog`'s own fixture
-//! helpers are private to its tests, and `ferret-bench` does not depend on
-//! `ferret-crawl`.
+//! helpers are private to its tests; these fixtures need no crawl.
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;

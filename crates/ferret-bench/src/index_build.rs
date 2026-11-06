@@ -12,8 +12,8 @@
 //!
 //! Documents are read by path with a size check, as `segment-build` and
 //! `terms` read them, not through `ferret_crawl::Documents`' checked opens:
-//! `ferret-bench` has no `ferret-crawl` edge, and the extra syscalls
-//! (one `fstat` per document, one `openat` per directory change) are small
+//! this preserves the original M3 measurement, where the extra syscalls
+//! (one `fstat` per document, one `openat` per directory change) were small
 //! beside the read and tokenize. A size mismatch or failed read is
 //! [`Fault::Unreadable`], as a checked open's refusal would be.
 //!

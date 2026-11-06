@@ -18,6 +18,8 @@
 //! ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>  D68: fuse filters against postings
 //! ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>  D69: saturated large documents
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
+//! ferret-bench verify-100k [--smoke]  checked reads and follow on 100k files
+//! ferret-bench steady-content-follow [--smoke]  steady follow after real refresh
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
 //! ferret-bench blob-screen sample|run <catalog-dir> <index-dir> <snapshot-dir> ...  T1: routed blob text: screens
 //! ferret-bench rank-fp <catalog-dir> <out-dir>   static df≥2 dictionary: 32-bit sparse fingerprints vs 20-bit buckets
@@ -72,6 +74,7 @@ mod blob_screen;
 mod census;
 mod chunk_census;
 mod churn;
+mod content_engine;
 mod content_query;
 mod content_snapshot;
 mod corpus;
@@ -124,6 +127,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((command, rest)) => match (command.as_str(), rest) {
+            ("verify-100k", []) => content_engine::verify(false),
+            ("verify-100k", [flag]) if flag == "--smoke" => content_engine::verify(true),
+            ("steady-content-follow", []) => content_engine::follow(false),
+            ("steady-content-follow", [flag]) if flag == "--smoke" => content_engine::follow(true),
             ("scan", [dir, needles @ ..]) => scan(Path::new(dir), needles),
             ("open", [dir]) => open(Path::new(dir)),
             ("open-once", [dir, set]) => open_once(Path::new(dir), set),
@@ -263,6 +270,8 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: ferret-bench scan <catalog-dir> [needle...]\n       \
+         ferret-bench verify-100k [--smoke]\n       \
+         ferret-bench steady-content-follow [--smoke]\n       \
          ferret-bench census <catalog-dir>\n       \
          ferret-bench corpus-sample <catalog-dir> <out-dir> <n>\n       \
          ferret-bench tokenize <corpus-dir>\n       \

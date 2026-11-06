@@ -1245,7 +1245,7 @@ fn the_deferred_backlog_does_not_carry_across_roots() {
 /// Every section is loaded first, as it is on the catalog `commit` returns,
 /// so the time is the pass's alone.
 #[test]
-#[ignore = "a measurement: needs FERRET_FAULT_BENCH naming a catalog directory"]
+#[ignore = "measurement, excluded from extended gate: private content_faults; needs FERRET_FAULT_BENCH"]
 fn fault_pass_timing() {
     let dir = PathBuf::from(std::env::var_os("FERRET_FAULT_BENCH").unwrap());
     let catalog = Catalog::open(&dir).unwrap().unwrap();

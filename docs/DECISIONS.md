@@ -7907,28 +7907,3 @@ a find that succeeds on a damaged index hides the damage from the command
 people run most. The fact that would change it: if nobody relies on `find` to
 surface index damage, because the daemon's open or `ferret status` checks it
 anyway, A.
-
-## D141 — Moving the ignored measurements into ferret-bench
-
-**Question (2026-11-07):** May the measurement move add the bench dependencies
-on `ferret` and `ferret-crawl`, with their generated Cargo.lock entries?
-DESIGN.md's bench line permits anything and the layering test exempts it,
-but the slice brief says to stop on a new crate edge and forbids lock edits.
-The implementation therefore leaves the three measurements in place pending
-that clarification. The extended gate selects and counts its ten tests
-explicitly, so none of these measurements runs as part of it.
-
-- **Move public-API measurements.** Verification needs `Documents`, and both
-  verification and steady follow need `Engine`. Adding the two bench edges
-  lets their fixtures move without widening any production visibility. It
-  also requires Cargo to update bench's dependency list in Cargo.lock.
-- **Keep the private fault measurement local.** `fault_pass_timing` calls
-  `pub(crate) content_faults`; there is no existing public diagnostic seam.
-  Moving it would require a new public seam or a different measurement.
-  Keeping it preserves the exact measurement and private boundary.
-
-**Recommendation:** Allow the two bench dependencies and generated lockfile
-update; retain the private fault measurement as an explicitly excluded
-ignored test. The fact that would change the latter: a production caller
-needs the same fault-listing operation, making a shared public seam useful
-beyond this measurement. No dependency or visibility changes are made here.

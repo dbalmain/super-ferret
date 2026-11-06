@@ -23,12 +23,13 @@ nix develop --command python3 tests/extended.py
 ```
 
 The runner builds in release, requires the ten named correctness and GNU
-differential tests to be collected, then runs and times each. Measurements
-are excluded by name; their placement is tracked in D141 in
-[docs/DECISIONS.md](docs/DECISIONS.md). Measured on 2026-11-07 on the Ryzen 9
-9955HX: **10 passed in 168.215 s** of serial test wall time; release compilation
-is additional. The three retained measurements leave 13 ignored tests in the
-ordinary gate until D141 is resolved.
+differential tests to be collected, then runs and times each. The checked
+verification and steady-follow measurements are `ferret-bench verify-100k`
+and `ferret-bench steady-content-follow`; fault-pass timing stays an ignored
+crawl test because it calls private `content_faults`, and the runner excludes
+it by name. Measured on 2026-11-07 on the Ryzen 9 9955HX: **10 passed in
+145.194 s** of serial test wall time; release compilation is additional.
+The ordinary gate has 11 ignored tests.
 
 The dev shell supplies the pinned GNU findutils 4.11.0 differential oracle via
 `FERRET_GNU_FIND`. Missing or different oracle versions fail the tests.

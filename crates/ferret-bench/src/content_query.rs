@@ -17,8 +17,8 @@
 //! Each query runs once after its index files were dropped from the page
 //! cache (`posix_fadvise` `DONTNEED`: **evicted**), then again (**warm**).
 //! The catalog stays warm, and documents a phrase verifies are read by path
-//! with a bracketed version check, as `index-build` reads them (`ferret-bench`
-//! has no `ferret-crawl` edge). Rows are counted, not printed.
+//! with a bracketed version check, as `index-build` reads them, preserving
+//! the original measurement path. Rows are counted, not printed.
 //!
 //! `--corpus` verifies against the same frozen DocId bytes both codecs
 //! indexed. `--covered` limits the live set to the captured readable DocIds
