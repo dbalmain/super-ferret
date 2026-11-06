@@ -740,7 +740,11 @@ fn indexed_grep_keeps_each_selected_name_without_building_doc_names() {
                 }
                 expected.sort();
                 assert_eq!(actual, expected, "{mode}, invert={invert}");
-                assert!(matches!(exit, Exit::Ok | Exit::NoMatch));
+                if expected.is_empty() {
+                    assert!(matches!(exit, Exit::NoMatch), "{mode}, invert={invert}");
+                } else {
+                    assert!(matches!(exit, Exit::Ok), "{mode}, invert={invert}");
+                }
             }
         }
     }
