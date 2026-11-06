@@ -7642,6 +7642,16 @@ fixed and tested.
 
 ## D135 — How often a held directory is checked again
 
+**Status: answered C, 2026-11-07.** A held directory is checked when it is
+opened and not again for the rest of the query. Files are still opened
+through the held handle, so a rename or a swapped-in symlink cannot redirect
+a read; a directory moved or removed mid-query is reported as it was when
+opened, under its old path, like a one-pass walk. Same speed as B, less code.
+
+> Dave (2026-11-07, in chat): why not C? I don't know why we'd try so hard
+> to support updates to our results based on changes made while we were
+> running the search.
+
 **Question:** Should a grep worker check its held directories again for every
 file it opens through them, level by level, or more cheaply: one path lookup of
 the deepest level per file, or at most once every 100 µs?
