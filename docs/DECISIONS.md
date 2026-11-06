@@ -4955,7 +4955,16 @@ threading reaches.
 
 ### D76 addendum — a suffix array or an FM-index
 
-**Status: open.** Measured in [FMINDEX.md](FMINDEX.md) on the same
+**Status: answered C without its second screen, 2026-11-07: build neither.**
+No suffix array, no FM-index, and no word 4+5 or term screen for rare
+literals until real-world data, such as agents' traces or cold searches,
+shows they would be worth it.
+
+> Dave (2026-11-07, in chat): I think build neither. C looks like it
+> recommends adding word 4+5. I don't think we want to build that just yet
+> until we have more real-life data saying it would be worth it.
+
+Measured in [FMINDEX.md](FMINDEX.md) on the same
 population. Verification ran on 16 threads, the count used for threaded
 trigrams from `wt/par-verify` (D76 C, cited, not re-run). Times are median
 ms, cold / warm. The SA is per 1 GB segment, ASCII-folded, with lines
