@@ -7642,11 +7642,12 @@ fixed and tested.
 
 ## D135 — How often a held directory is checked again
 
-**Status: answered C, 2026-11-07.** A held directory is checked when it is
-opened and not again for the rest of the query. Files are still opened
-through the held handle, so a rename or a swapped-in symlink cannot redirect
-a read; a directory moved or removed mid-query is reported as it was when
-opened, under its old path, like a one-pass walk. Same speed as B, less code.
+**Status: built C, 2026-11-07 (Dave answered C).** A held directory is checked
+when it is opened and not again for the rest of the query. Files are still
+opened through the held handle, so a rename or a swapped-in symlink cannot
+redirect a read; a directory moved or removed mid-query is reported as it was
+when opened, under its old path, like a one-pass walk. Same speed as B, less
+code.
 
 > Dave (2026-11-07, in chat): why not C? I don't know why we'd try so hard
 > to support updates to our results based on changes made while we were
@@ -7719,6 +7720,43 @@ inside the window, `dir/b` is stat'd or read through the detached
 directory and reported under the old path. Option A notices; B and C
 report what the directory held when last checked, for up to 100 µs (B)
 or the rest of the query (C).
+
+**Built (C, 2026-11-07).** Removed the per-file chain re-check and the
+metadata retained only for it; every open-time identity and no-follow check
+remains. Release measurements in the `d135` worktree, base `001089c` versus
+C (`8e4732d`), through separately started isolated daemons on `~/w` only
+(85,293 files, about 1 GiB), four search threads, median of 15 after three
+warmups per command, milliseconds:
+
+| Held-directory policy       | `grep -l fn` | `grep -c e` |
+| --------------------------- | ------------ | ----------- |
+| A. Every level, every file  | 143.54       | 185.59      |
+| C. Checked only when opened | 96.35        | 134.18      |
+
+C reduced these medians by 32.9% and 27.7%. Commands ran one at a time,
+with stdout discarded and stdin from `/dev/null`; no builds or tests from
+this task ran alongside them. Each daemon was stopped by its own PID after
+measurement. The index and runtime directory were private paths in `/tmp`.
+
+**Implementation audit (C, 2026-11-07).** Duplicate replay's
+`ReadRequest::Stat` goes through `engine/reader::checked`,
+`Documents::stat_name` and `in_directory`: its no-follow `statat` uses the
+held directory descriptor, not the displayed full path. Under C a moved held
+directory therefore serves replay stats under its old path, just as it serves
+bytes. Every alias still needs the full catalog-version key before replay;
+changed versions read their own bytes. Replay remains exact on unchanged trees.
+
+`Held` belongs only to the content reader. `ferret find` and the crawl's
+walker have separate directory handles and do not change. The engine's content
+follow does opt into `holding_directories`, so its held descriptors get the
+same rule for that pass. Unheld readers still open and check every directory
+for every path. Descriptor budgets, pressure relief, no-follow opens below the
+root, open-time identity checks and file read/stat brackets are unchanged.
+The reader regressions cover renamed roots and ancestors, a new branch beneath
+a held ancestor, and replacement before first open. Removing either the root's
+or the children's open-time identity checks makes the latter regression fail.
+The content-query callback regression also expects the second old-path result,
+with a replacement symlink pointing at different bytes to detect redirection.
 
 ## D136 — Whether `ferret index` holds a second buffer to overlap its drains
 

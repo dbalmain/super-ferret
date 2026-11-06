@@ -813,11 +813,16 @@ fn an_already_cancelled_content_query_reads_no_postings() {
 /// The first result callback can change the directory before the next read.
 /// On one verification thread the next read follows the callback; with
 /// more, it may already have been read ahead (D76 C), so this pins one.
+/// D135 C: a held directory still serves its next file under the old path,
+/// even when a replacement symlink points at different bytes.
 #[test]
 fn a_result_callback_cannot_redirect_later_directory_reads() {
     let tree = Tree::new();
     let a = tree.write("d/a.txt", b"alpha beta one");
-    tree.write("d/b.txt", b"alpha beta two");
+    let b = tree.write("d/b.txt", b"alpha beta two");
+    let replacement = tree.0.join("replacement");
+    fs::create_dir(&replacement).unwrap();
+    fs::write(replacement.join("b.txt"), b"unrelated bytes").unwrap();
     let engine = tree.engine();
     engine.attach_content(&tree.index()).unwrap();
     engine.follow_content(&Budget::unbounded(), None).unwrap();
@@ -828,12 +833,18 @@ fn a_result_callback_cannot_redirect_later_directory_reads() {
             rows.push(row.path.to_vec());
             if rows.len() == 1 {
                 fs::rename(tree.root().join("d"), tree.0.join("moved")).unwrap();
-                std::os::unix::fs::symlink(tree.0.join("moved"), tree.root().join("d")).unwrap();
+                std::os::unix::fs::symlink(&replacement, tree.root().join("d")).unwrap();
             }
             ControlFlow::Continue(())
         })
         .unwrap();
-    assert_eq!(rows, vec![a.as_os_str().as_bytes().to_vec()]);
+    assert_eq!(
+        rows,
+        vec![
+            a.as_os_str().as_bytes().to_vec(),
+            b.as_os_str().as_bytes().to_vec()
+        ]
+    );
 }
 
 /// An IO failure through one name is not a negative content fact for its
