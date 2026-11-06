@@ -134,6 +134,11 @@ impl View {
     /// it, so a segment missing here means a newer manifest exists: the
     /// open is retried, a few times, from the manifest.
     ///
+    /// The supplied catalog must not predate a merge that purged its live
+    /// ids. Concurrent query hosts should use [`Self::open_unpaired`] before
+    /// reading their catalog, then check [`Self::fits_catalog`]; this open
+    /// cannot establish read ordering for an already loaded catalog.
+    ///
     /// Segments open on up to one thread per available core; a host with a
     /// configured thread count uses [`View::open_with_threads`].
     pub fn open(dir: &Path, catalog: &CatalogView) -> Result<Option<Self>, Error> {
@@ -147,8 +152,35 @@ impl View {
         catalog: &CatalogView,
         threads: usize,
     ) -> Result<Option<Self>, Error> {
+        Self::open_matching(dir, Some(catalog), threads)
+    }
+
+    /// Pins immutable index descriptors before the host opens its catalog.
+    /// Checks tokenizer versions and segment metadata, but not catalog
+    /// identity or bounds. The host must call [`Self::fits_catalog`] against
+    /// a catalog read after this returns before using coverage or postings.
+    /// Missing retired segments retry at most three manifest opens.
+    pub fn open_unpaired(dir: &Path, threads: usize) -> Result<Option<Self>, Error> {
+        Self::open_matching(dir, None, threads)
+    }
+
+    /// Whether this index can serve a catalog's incarnation and next DocId.
+    /// This checks compatibility, not read ordering: the host must also pin
+    /// this index before reading that catalog, or hold writer ownership.
+    pub fn fits_catalog(&self, incarnation: [u8; 16], next_doc: u32) -> bool {
+        fits_bounds(&self.manifest, incarnation, next_doc)
+    }
+
+    fn open_matching(
+        dir: &Path,
+        catalog: Option<&CatalogView>,
+        threads: usize,
+    ) -> Result<Option<Self>, Error> {
         for _ in 0..3 {
-            let Some(manifest) = Manifest::read(dir)?.filter(|m| fits(m, catalog)) else {
+            let Some(manifest) = Manifest::read(dir)?.filter(|m| match catalog {
+                Some(catalog) => fits(m, catalog),
+                None => m.tokenizer_version == TERM_VERSION && m.trigram_version == TRIGRAM_VERSION,
+            }) else {
                 return Ok(None);
             };
             match open_pairs(dir, &manifest, threads) {

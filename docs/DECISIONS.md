@@ -3571,17 +3571,23 @@ row, and a dormant row is a permission granted once and revoked explicitly:
 
 **Found on the way, a bug under B.** A query-only open (`ferret search`,
 `ferret grep`, batch open and reload) read the catalog and then the content
-index with no bracket. A deterministic hook in the real open path reproduced
-it: a death and merge purge between those reads left the old catalog's live
-document neither in postings nor in `uncovered`, silently missing a row.
-`Engine::open_content` now reads the catalog's 128-byte manifest generation
-once after pinning the index descriptors. If it differs from the loaded
-catalog's generation, the opened index is ignored. Previously pinned safe
-coverage survives; a fresh engine treats all documents as uncovered. Grep
-scans them; search keeps its explicit incomplete-index refusal above the
-uncovered bound unless `--scan-uncovered` is given. There is no retry, extra
-catalog load, writer lock or daemon round trip. This bounds open work even
-under continuous writes, at the cost of a scan or explicit refusal on a race.
+index with no bracket. A deterministic hook reproduced the silent miss:
+a death and merge purge between the reads left an old catalog's live id
+neither in postings nor in `uncovered`. The shared paired opener now pins
+immutable content descriptors before reading the catalog, then checks
+incarnation, tokenizer versions and high water against that later catalog.
+Under A′ a purged id cannot revive, and new ids are uncovered, so an older
+compatible index is safe with a later catalog. The first fix's generation
+re-check rejected even chmod and compaction during the full catalog load;
+index-first needs no such rejection or retry. Batch replacement acquires
+its safe pair before replacing the engine; an unchanged reload may reuse
+its catalog if a manifest read after the index pin confirms its generation.
+Name-only opens stay catalog-only. Each fresh paired open reads one index
+and one catalog, with no extra generation read, full catalog reload, writer
+lock, daemon round trip or format change. The existing three-attempt index
+open bound remains. Missing or incompatible indexes use the ordinary
+uncovered scan or explicit search refusal; benign catalog writes keep
+indexed execution.
 
 The round-table transcripts are in `.ai/d60/` (local).
 

@@ -1339,8 +1339,10 @@ fn conservative_bounds_cover_quarters_whole_tokens_caps_fingerprints_and_aliases
                 .map_err(|_| ferret_index::Fault::Unreadable)
         })
         .unwrap();
-    engine.open_content(&tree.index()).unwrap();
-    let pin = engine.pin();
+    let reader = Engine::open_with_content(&tree.index(), false)
+        .unwrap()
+        .unwrap();
+    let pin = reader.pin();
     for args in [
         vec![
             "NOT",
@@ -1428,8 +1430,10 @@ fn mixed_queries_and_bounds_equal_the_oracle_with_h_records() {
             ferret_index::segment::FINGERPRINT_CODEC,
         )
         .unwrap();
-        engine.open_content(&tree.index()).unwrap();
-        check(&engine.pin(), &mut rng, 40, "H empty");
+        let reader = Engine::open_with_content(&tree.index(), false)
+            .unwrap()
+            .unwrap();
+        check(&reader.pin(), &mut rng, 40, "H empty");
         let marker = catalog
             .names()
             .find_map(|(id, bytes)| {
@@ -1467,9 +1471,11 @@ fn mixed_queries_and_bounds_equal_the_oracle_with_h_records() {
                         .map_err(|_| ferret_index::Fault::Unreadable)
                 })
                 .unwrap();
-            engine.open_content(&tree.index()).unwrap();
+            let reader = Engine::open_with_content(&tree.index(), false)
+                .unwrap()
+                .unwrap();
             check(
-                &engine.pin(),
+                &reader.pin(),
                 &mut rng,
                 40,
                 if partial {
@@ -1495,8 +1501,10 @@ fn mixed_queries_and_bounds_equal_the_oracle_with_h_records() {
             }
         }
         tree.refresh(&engine);
-        engine.open_content(&tree.index()).unwrap();
-        check(&engine.pin(), &mut rng, 40, "H dead postings");
+        let reader = Engine::open_with_content(&tree.index(), false)
+            .unwrap()
+            .unwrap();
+        check(&reader.pin(), &mut rng, 40, "H dead postings");
     }
 }
 

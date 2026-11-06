@@ -5,8 +5,8 @@
 //! and commit): [`Engine::attach_content`] opens it under the catalog's
 //! writer lock, and a [`QuerySession`] then pins the index view published
 //! with its catalog view. A query-only engine opens that index read-only
-//! through [`Engine::open_content`]: no writer lock, and nothing is repaired
-//! or removed.
+//! through [`Engine::open_with_content`], pinning content before the catalog:
+//! no writer lock, and nothing is repaired or removed.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -128,12 +128,7 @@ impl Engine {
     /// Opens and validates every catalog section once. No checkpoint returns
     /// `None`, as in the catalog reader API.
     pub fn open(index: &Path) -> Result<Option<Self>, OpenError> {
-        let Some(catalog) = Catalog::open(index)? else {
-            return Ok(None);
-        };
-        let catalog = catalog.into_resident()?;
-        let names = Arc::new(OnceLock::from(NameIndex::new(&catalog)));
-        Ok(Some(Self::query_only(index, catalog, names)))
+        Self::open_query(index, false, Threads::new(index))
     }
 
     /// As [`Engine::open`], for a process that runs one query and exits:
@@ -142,14 +137,89 @@ impl Engine {
     /// built only if a query needs it. A content-only query such as grep
     /// never does, so it skips both builds.
     pub fn open_one_shot(index: &Path) -> Result<Option<Self>, OpenError> {
+        Self::open_query(index, true, Threads::new(index))
+    }
+
+    /// Opens content descriptors before the catalog, then checks their
+    /// compatibility with that later catalog. Under D60 A′ an id purged
+    /// before this pin cannot revive; new ids are uncovered. Benign catalog
+    /// publications therefore do not discard coverage. No writer lock,
+    /// generation retry or second catalog load is needed.
+    ///
+    /// `one_shot` keeps raw names and defers the name planner as in
+    /// [`Self::open_one_shot`]. An absent or incompatible index leaves all
+    /// documents uncovered; no catalog returns `None`.
+    pub fn open_with_content(index: &Path, one_shot: bool) -> Result<Option<Self>, Error> {
+        Self::open_pair(index, one_shot, None)
+    }
+
+    /// Refreshes a query-only pair, reusing this catalog when its generation
+    /// still matches a manifest read after the new content pin. `None` means
+    /// no replacement is needed or no catalog exists; safe old pins survive.
+    pub(crate) fn reload_with_content(&self, index: &Path) -> Result<Option<Self>, Error> {
+        Self::open_pair(index, false, Some(self))
+    }
+
+    fn open_pair(
+        index: &Path,
+        one_shot: bool,
+        previous: Option<&Self>,
+    ) -> Result<Option<Self>, Error> {
+        let pin = previous.map(Self::pin);
+        let threads = pin
+            .as_ref()
+            .map_or_else(|| Threads::new(index), |pin| pin.threads.clone());
+        let content = ferret_index::View::open_unpaired(&index.join(CONTENT_DIR), threads.get())
+            .map_err(Error::Content)?;
+        #[cfg(test)]
+        tests::content_open_checkpoint();
+        if let Some(pin) = pin
+            && Catalog::published_generation(index).map_err(Error::Catalog)?
+                == Some(pin.generation())
+        {
+            if let Some(content) = content
+                && let Some(previous) = previous
+            {
+                previous.select_content(Arc::new(content));
+            }
+            return Ok(None);
+        }
+        let Some(engine) = Self::open_query(index, one_shot, threads).map_err(Error::Catalog)?
+        else {
+            return Ok(None);
+        };
+        if let Some(content) = content {
+            engine.select_content(Arc::new(content));
+        }
+        Ok(Some(engine))
+    }
+
+    fn open_query(
+        index: &Path,
+        one_shot: bool,
+        threads: Arc<Threads>,
+    ) -> Result<Option<Self>, OpenError> {
         let Some(catalog) = Catalog::open(index)? else {
             return Ok(None);
         };
-        catalog.load_all()?;
-        Ok(Some(Self::query_only(index, catalog, Arc::default())))
+        #[cfg(test)]
+        tests::catalog_load_checkpoint();
+        let (catalog, names) = if one_shot {
+            catalog.load_all()?;
+            (catalog, Arc::default())
+        } else {
+            let catalog = catalog.into_resident()?;
+            let names = Arc::new(OnceLock::from(NameIndex::new(&catalog)));
+            (catalog, names)
+        };
+        Ok(Some(Self::query_only(catalog, names, threads)))
     }
 
-    fn query_only(index: &Path, catalog: Catalog, names: Arc<OnceLock<NameIndex>>) -> Self {
+    fn query_only(
+        catalog: Catalog,
+        names: Arc<OnceLock<NameIndex>>,
+        threads: Arc<Threads>,
+    ) -> Self {
         OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
         Self {
             current: RwLock::new(QuerySession {
@@ -157,7 +227,7 @@ impl Engine {
                 catalog,
                 content: None,
                 derived: Arc::default(),
-                threads: Threads::new(index),
+                threads,
             }),
             writer: Mutex::new(None),
             content: Mutex::new(None),
@@ -357,35 +427,6 @@ impl Engine {
         let published = opened.view();
         *content = Some(opened);
         self.select_content(published);
-        Ok(())
-    }
-
-    /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] for
-    /// reading, for a query-only engine: no writer lock, nothing repaired
-    /// or removed. An index that is absent or does not fit the catalog view
-    /// leaves a fresh engine without one, which content queries treat as
-    /// nothing covered. A newer published view survives a delayed open.
-    /// If the catalog generation moved before the index was pinned, the
-    /// opened index is ignored: a merge may have purged documents this
-    /// catalog still sees live. Existing safe coverage survives; otherwise
-    /// queries use their ordinary uncovered scan or explicit scan refusal.
-    /// Segments open on the search thread count.
-    pub fn open_content(&self, catalog_dir: &Path) -> Result<(), Error> {
-        let pin = self.pin();
-        #[cfg(test)]
-        tests::content_open_checkpoint();
-        let view = ferret_index::View::open_with_threads(
-            &catalog_dir.join(CONTENT_DIR),
-            &catalog_view(pin.catalog(), pin.live()),
-            pin.search_threads(),
-        )
-        .map_err(Error::Content)?;
-        if let Some(view) = view
-            && Catalog::published_generation(catalog_dir).map_err(Error::Catalog)?
-                == Some(pin.generation())
-        {
-            self.select_content(Arc::new(view));
-        }
         Ok(())
     }
 
@@ -593,18 +634,22 @@ impl Engine {
 
     /// Publishes a content view beside the current catalog view. Publishers
     /// can finish out of order: manifest sequence must never go backwards.
+    /// Inputs must be pinned before the catalog read, or selected under the
+    /// writer's liveness/revocation protocol; compatibility alone is not a
+    /// bracket against a purge of ids still live in an older catalog.
     fn select_content(&self, content: Arc<ferret_index::View>) {
         let mut current = self
             .current
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let manifest = content.manifest();
-        if manifest.incarnation == current.generation().incarnation
-            && manifest.high_water <= current.catalog.next_doc().0
-            && current
-                .content
-                .as_ref()
-                .is_none_or(|selected| selected.manifest().sequence <= manifest.sequence)
+        if content.fits_catalog(
+            current.generation().incarnation,
+            current.catalog.next_doc().0,
+        ) && current
+            .content
+            .as_ref()
+            .is_none_or(|selected| selected.manifest().sequence <= manifest.sequence)
         {
             current.content = Some(content);
         }

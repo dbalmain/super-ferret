@@ -19,10 +19,19 @@ use super::*;
 thread_local! {
     static CONTENT_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static CATALOG_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 pub(super) fn content_open_checkpoint() {
     let hook = CONTENT_OPEN_HOOK.take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+pub(super) fn catalog_load_checkpoint() {
+    let hook = CATALOG_LOAD_HOOK.take();
     if let Some(hook) = hook {
         hook();
     }
@@ -634,8 +643,7 @@ fn a_corrupt_settings_file_falls_back_without_failing_the_search() {
     let tree = Tree::with_files(4);
     let index = tree.0.join("index");
     fs::write(index.join(crate::settings::FILE), "search_threads = lots\n").unwrap();
-    let engine = Engine::open(&index).unwrap().unwrap();
-    engine.open_content(&index).unwrap();
+    let engine = Engine::open_with_content(&index, false).unwrap().unwrap();
     let pin = engine.pin();
     let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
     let mut rows = 0;
@@ -673,11 +681,21 @@ fn an_older_content_publication_cannot_replace_a_newer_sequence() {
 
     engine.select_content(older);
     assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
-    engine.open_content(&tree.0.join("older")).unwrap();
+    assert!(
+        engine
+            .reload_with_content(&tree.0.join("older"))
+            .unwrap()
+            .is_none()
+    );
     assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
     // An absent reader open used to assign None directly, discarding even
     // a newer view already published for this catalog generation.
-    engine.open_content(&tree.0.join("absent")).unwrap();
+    assert!(
+        engine
+            .reload_with_content(&tree.0.join("absent"))
+            .unwrap()
+            .is_none()
+    );
     assert!(Arc::ptr_eq(&engine.pin().content.unwrap(), &newer));
 }
 

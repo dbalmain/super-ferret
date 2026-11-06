@@ -427,12 +427,13 @@ fn failure(message: &str) -> Exit {
 fn open_index(index: Option<&Path>) -> Result<Engine, String> {
     let index = index_path(index)?;
     // Grep reads content and names, never the name planner: no interning.
-    let engine = Engine::open_one_shot(&index)
-        .map_err(|error| {
-            format!(
+    let engine = Engine::open_with_content(&index, true)
+        .map_err(|error| match error {
+            crate::engine::Error::Catalog(error) => format!(
                 "{}: {error}; re-index or use a direct file/stdin",
                 index.display()
-            )
+            ),
+            error => error.to_string(),
         })?
         .ok_or_else(|| {
             format!(
@@ -440,9 +441,6 @@ fn open_index(index: Option<&Path>) -> Result<Engine, String> {
                 index.display()
             )
         })?;
-    engine
-        .open_content(&index)
-        .map_err(|error| error.to_string())?;
     Ok(engine)
 }
 

@@ -99,7 +99,8 @@ production code parks on it at a real checkpoint.
 
 | Seam | Owning test module | Injection |
 | ---- | ------------------ | --------- |
-| `CONTENT_OPEN_HOOK` | `ferret/src/engine/tests.rs` | Thread-local, one-shot callback in the real `Engine::open_content`, after catalog pin and before index open; drives the D60 death/merge race without sleeps. Compiled only for unit tests. |
+| `CONTENT_OPEN_HOOK` | `ferret/src/engine/tests.rs` | Thread-local, one-shot callback in the shared `Engine::open_pair`, after pinning immutable index descriptors and before reading the catalog (or its generation for reload reuse); drives the D60 purge and benign-write races without sleeps. Compiled only for unit tests. |
+| `CATALOG_LOAD_HOOK` | `ferret/src/engine/tests.rs` | Thread-local, one-shot callback in `Engine::open_query`, after the catalog manifest/descriptors are pinned and before section loading and name builds; tests that benign writes during a full catalog load retain indexed execution, including batch replacement. Compiled only for unit tests. |
 
 ## Unit-test subprocess markers
 

@@ -92,9 +92,7 @@ fn process(reader: impl BufRead, protocol_stdin: bool) -> io::Result<()> {
 }
 
 fn open_engine(index: &Path) -> Option<Engine> {
-    let engine = Engine::open(index).ok().flatten()?;
-    engine.open_content(index).ok()?;
-    Some(engine)
+    Engine::open_with_content(index, false).ok().flatten()
 }
 
 pub(crate) fn read_line_bounded(
@@ -183,22 +181,21 @@ fn status(request: &Request, engine: Option<&Engine>) -> io::Result<()> {
 }
 
 /// Reopens the engine when the published generation moved, then reports it.
-fn reload(request: &Request, engine: &mut Option<Engine>, dirs: Option<&Dirs>) -> io::Result<()> {
+pub(crate) fn reload(
+    request: &Request,
+    engine: &mut Option<Engine>,
+    dirs: Option<&Dirs>,
+) -> io::Result<()> {
     let next = crate::xdg::index_dir(None, || dirs.map(|dirs| dirs.data.clone()));
-    // The manifest generation is enough to see that the resident
-    // engine is stale. The snapshot and change log open only when
-    // Engine::open actually reloads.
-    if let Some(path) = next.as_deref()
-        && let Ok(Some(peek)) = ferret_catalog::Catalog::published_generation(path)
-        && engine
-            .as_ref()
-            .is_none_or(|current| current.generation() != peek)
-        && let Ok(Some(reloaded)) = Engine::open(path)
-    {
-        *engine = Some(reloaded);
-    }
-    if let (Some(path), Some(current)) = (next.as_deref(), engine.as_ref()) {
-        current.open_content(path).map_err(io::Error::other)?;
+    if let Some(path) = next.as_deref() {
+        let reloaded = match engine.as_ref() {
+            Some(current) => current.reload_with_content(path),
+            None => Engine::open_with_content(path, false),
+        }
+        .map_err(io::Error::other)?;
+        if let Some(reloaded) = reloaded {
+            *engine = Some(reloaded);
+        }
     }
     event(request, "reload", |o| {
         if let Some(engine) = engine {

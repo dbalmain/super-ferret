@@ -357,6 +357,34 @@ fn a_tokenizer_version_change_rebuilds_through_coverage() {
     assert_eq!(answers(&writer.view(), &catalog), catalog.truth(&corpus));
 }
 
+/// D60 index-first opens defer catalog bounds/identity until the later
+/// catalog read, while rejecting incompatible term and trigram versions.
+#[test]
+fn an_unpaired_pin_requires_compatible_later_catalog_bounds_and_versions() {
+    let dir = Dir::new("unpaired-catalog-fit");
+    let corpus = Corpus::new(5, 10);
+    let catalog = Catalog::new(10, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    let view = View::open_unpaired(&dir.0, 1).unwrap().unwrap();
+    assert!(view.fits_catalog(catalog.incarnation, 10));
+    assert!(view.fits_catalog(catalog.incarnation, 11));
+    assert!(!view.fits_catalog(catalog.incarnation, 9));
+    assert!(!view.fits_catalog([1; 16], 10));
+    let original = view.manifest().clone();
+    for term in [false, true] {
+        let mut manifest = original.clone();
+        if term {
+            manifest.tokenizer_version += 1;
+        } else {
+            manifest.trigram_version += 1;
+        }
+        manifest.publish(&dir.0).unwrap();
+        assert!(View::open_unpaired(&dir.0, 1).unwrap().is_none());
+        assert_eq!(raw(&view), catalog.truth(&corpus));
+    }
+}
+
 #[test]
 fn an_index_built_before_t1_is_rebuilt() {
     let dir = Dir::new("pre-t1");

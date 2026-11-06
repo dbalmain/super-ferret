@@ -63,19 +63,13 @@ pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
 /// opened content segments. A smaller open changes those numbers, so this
 /// stays the full engine open.
 pub(crate) fn local(context: &Context, census: bool) -> Exit {
-    let engine = match Engine::open(&context.index) {
+    let engine = match Engine::open_with_content(&context.index, false) {
         Ok(engine) => engine,
         Err(error) => {
             crate::cli::error(&error.to_string());
             return Exit::Error;
         }
     };
-    if let Some(engine) = &engine
-        && let Err(error) = engine.open_content(&context.index)
-    {
-        crate::cli::error(&error.to_string());
-        return Exit::Error;
-    }
     // A daemon builds its scope counts when it opens; report what it holds.
     if let Some(engine) = &engine {
         let session = engine.pin();

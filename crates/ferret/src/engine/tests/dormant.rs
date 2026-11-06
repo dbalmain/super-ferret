@@ -85,29 +85,22 @@ fn indexed(engine: &Engine, doc: u32) {
     assert!(tri.probe().test(doc).is_some());
 }
 
-/// The catalog still sees a live id after a racing death and merge purge.
-/// Restore the same inode without publishing it, so actual verification can
-/// distinguish a lost candidate from a vanished file.
+/// D60: a death and purge between the two reads must not pair the older
+/// live catalog with the newer purged index. Index-first pins retain the
+/// original descriptors, while the later catalog sees the death.
 #[test]
 fn query_only_open_cannot_lose_a_document_purged_after_its_catalog_read() {
-    for (one_shot, reopen) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (one_shot, reload) in [(false, false), (true, false), (false, true), (true, true)] {
         let (tree, writer) = covered(10);
         let tree = Arc::new(tree);
         let index = tree.0.join("index");
-        let reader = if one_shot {
-            Engine::open_one_shot(&index)
-        } else {
-            Engine::open(&index)
-        }
-        .unwrap()
-        .unwrap();
-        let previous = if reopen {
-            reader.open_content(&index).unwrap();
-            Some(reader.pin().content.unwrap())
-        } else {
-            None
-        };
-        let generation = reader.generation();
+        let generation = writer.generation();
+        let sequence = writer.pin().content().unwrap().manifest().sequence;
+        let previous = reload.then(|| {
+            Engine::open_with_content(&index, one_shot)
+                .unwrap()
+                .unwrap()
+        });
         let moved = tree.clone();
         CONTENT_OPEN_HOOK.set(Some(Box::new(move || {
             let path = moved.0.join("root/d0/0.txt");
@@ -121,35 +114,35 @@ fn query_only_open_cannot_lose_a_document_purged_after_its_catalog_read() {
             assert_eq!(merged.purged, 1);
             fs::rename(hidden, path).unwrap();
         })));
-        reader.open_content(&index).unwrap();
+        let reader = match previous {
+            Some(previous) => previous.reload_with_content(&index),
+            None => Engine::open_with_content(&index, one_shot),
+        }
+        .unwrap()
+        .unwrap();
         let pin = reader.pin();
-        assert_eq!(pin.generation(), generation);
-        match previous.as_ref() {
-            Some(previous) => assert!(Arc::ptr_eq(pin.content.as_ref().unwrap(), previous)),
-            None => assert!(pin.content().is_none()),
-        }
         let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
-        if previous.is_none() {
-            assert!(matches!(
-                pin.search_content(&query, Some(0), None, |_| ControlFlow::Continue(())),
-                Err(ferret_query::RunError::IndexIncomplete {
-                    uncovered: 10,
-                    live: 10
-                })
-            ));
-        }
         assert_eq!(
-            pin.search_content(&query, None, None, |_| ControlFlow::Continue(()))
+            pin.search_until(&query, None, |_| ControlFlow::Continue(()))
                 .unwrap()
                 .rows,
+            u64::from(pin.catalog().doc_count()),
+            "every document live in the selected catalog must remain a candidate"
+        );
+        assert_ne!(pin.generation(), generation);
+        assert_eq!(pin.catalog().doc_count(), 9);
+        let content = pin.content().unwrap();
+        assert_eq!(content.manifest().sequence, sequence);
+        assert_eq!(
+            content.lookup(b"alpha").unwrap().len(),
             10,
-            "the old catalog's live document must remain a candidate"
+            "descriptors pinned before the purge must remain readable"
         );
         let grep = ferret_verify::GrepFlags::default()
             .compile("alpha")
             .unwrap();
         let candidates = pin.grep_candidates(&grep, &|| false).unwrap();
-        assert!(candidates.contains(document_named(pin.catalog(), b"0.txt").0, &|| false));
+        assert!(candidates.contains(document_named(pin.catalog(), b"1.txt").0, &|| false));
     }
 }
 
@@ -727,5 +720,135 @@ fn failed_reattach_or_reset_disables_the_old_writer_before_any_revival() {
         fs::remove_dir(manifest).unwrap();
         engine.attach_content(&tree.0.join("index")).unwrap();
         assert_eq!(engine.pin().catalog().dormant_docs().count(), 0);
+    }
+}
+
+/// D60 round 1: unrelated catalog writes must not turn covered queries into
+/// scans or default-bound refusals, even while a large catalog opens.
+#[test]
+fn benign_writes_during_query_open_preserve_default_bound_execution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (one_shot, compact, during_load) in [false, true].into_iter().flat_map(|one_shot| {
+        [false, true].into_iter().flat_map(move |compact| {
+            [false, true]
+                .into_iter()
+                .map(move |during_load| (one_shot, compact, during_load))
+        })
+    }) {
+        let (tree, writer) = covered(10_001);
+        let tree = Arc::new(tree);
+        let index = tree.0.join("index");
+        let before = writer.pin().content.unwrap();
+        let moved = tree.clone();
+        let hook: Box<dyn FnOnce()> = Box::new(move || {
+            if compact {
+                writer.compact().unwrap();
+            } else {
+                let path = moved.0.join("root/d0/0.txt");
+                let mode = fs::metadata(&path).unwrap().permissions().mode();
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+                moved.refresh(&writer);
+            }
+            assert!(Arc::ptr_eq(&writer.pin().content.unwrap(), &before));
+        });
+        if during_load {
+            CATALOG_LOAD_HOOK.set(Some(hook));
+        } else {
+            CONTENT_OPEN_HOOK.set(Some(hook));
+        }
+
+        let reader = Engine::open_with_content(&index, one_shot)
+            .unwrap()
+            .unwrap();
+        assert!(CONTENT_OPEN_HOOK.with_borrow(Option::is_none));
+        assert!(CATALOG_LOAD_HOOK.with_borrow(Option::is_none));
+        let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+        assert_eq!(
+            reader
+                .pin()
+                .search_until(&query, None, |_| ControlFlow::Continue(()))
+                .unwrap()
+                .rows,
+            10_001
+        );
+    }
+}
+
+/// D60 round 1: reload must exercise real engine replacement, including a
+/// second publication during the replacement's open, and reacquire coverage.
+#[test]
+fn batch_replacement_during_a_benign_write_reacquires_safe_coverage() {
+    assert!(std::env::var_os("FERRET_INDEX").is_none());
+    let (tree, writer) = covered(10);
+    let index = tree.0.join("index");
+    let reader = Engine::open_with_content(&index, false).unwrap().unwrap();
+    let previous = reader.pin().content.unwrap();
+    let generation = reader.generation();
+    let writer = Arc::new(writer);
+    writer.compact().unwrap();
+    let racing = writer.clone();
+    CATALOG_LOAD_HOOK.set(Some(Box::new(move || {
+        racing.compact().unwrap();
+    })));
+    let dirs = crate::xdg::Dirs {
+        config: tree.0.join("config"),
+        data: index,
+        state: tree.0.join("state"),
+        cache: tree.0.join("cache"),
+    };
+    let request = crate::protocol::parse_request(br#"{"id":"coverage","op":"reload"}"#).unwrap();
+    let mut reader = Some(reader);
+    crate::batch::reload(&request, &mut reader, Some(&dirs)).unwrap();
+    assert!(CATALOG_LOAD_HOOK.with_borrow(Option::is_none));
+    let reader = reader.unwrap();
+    assert_ne!(reader.generation(), generation);
+    let pin = reader.pin();
+    assert_eq!(
+        writer.pin().content.unwrap().manifest().sequence,
+        previous.manifest().sequence
+    );
+    assert_eq!(previous.lookup(b"alpha").unwrap().len(), 10);
+    assert!(
+        pin.content().is_some(),
+        "replacement must reacquire unchanged coverage"
+    );
+    let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+    assert_eq!(
+        pin.search_content(&query, Some(0), None, |_| ControlFlow::Continue(()))
+            .unwrap()
+            .rows,
+        10
+    );
+}
+
+/// D60: index-first ordering does not replace compatibility checks. A
+/// catalog reset between the reads must discard the old incarnation's pin.
+#[test]
+fn index_first_open_rejects_a_replaced_catalog_incarnation() {
+    for one_shot in [false, true] {
+        let (tree, writer) = covered(10);
+        let tree = Arc::new(tree);
+        let index = tree.0.join("index");
+        let incarnation = writer.generation().incarnation;
+        let moved = tree.clone();
+        CONTENT_OPEN_HOOK.set(Some(Box::new(move || {
+            writer.close_writer();
+            fs::rename(moved.0.join("index"), moved.0.join("old-index")).unwrap();
+            moved.reindex();
+        })));
+        let reader = Engine::open_with_content(&index, one_shot)
+            .unwrap()
+            .unwrap();
+        let pin = reader.pin();
+        assert_ne!(pin.generation().incarnation, incarnation);
+        assert!(pin.content().is_none());
+        let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+        assert_eq!(
+            pin.search_content(&query, None, None, |_| ControlFlow::Continue(()))
+                .unwrap()
+                .rows,
+            10
+        );
     }
 }

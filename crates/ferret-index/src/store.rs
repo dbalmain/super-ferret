@@ -715,10 +715,14 @@ impl IndexWriter {
 /// Whether `manifest` belongs to `catalog`'s view: same incarnation, term
 /// and trigram versions, and no DocId the view has not published.
 fn fits(manifest: &Manifest, catalog: &CatalogView) -> bool {
-    manifest.incarnation == catalog.incarnation
+    fits_bounds(manifest, catalog.incarnation, catalog.live.bound())
+}
+
+fn fits_bounds(manifest: &Manifest, incarnation: [u8; 16], next_doc: u32) -> bool {
+    manifest.incarnation == incarnation
         && manifest.tokenizer_version == TERM_VERSION
         && manifest.trigram_version == TRIGRAM_VERSION
-        && manifest.high_water <= catalog.live.bound()
+        && manifest.high_water <= next_doc
 }
 
 /// Indexed documents of `segment` still live: the live documents in its

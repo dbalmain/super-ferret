@@ -328,7 +328,12 @@ fn fail(outcome: &mut Outcome, kind: &'static str, message: &str) -> Exit {
 /// The engine over `context`'s index, with its content index open when
 /// `query` reads content.
 fn open_engine(context: &Context, query: &Query, outcome: &mut Outcome) -> Result<Engine, Exit> {
-    let engine = match Engine::open(&context.index) {
+    let opened = if query.has_content() {
+        Engine::open_with_content(&context.index, false)
+    } else {
+        Engine::open(&context.index).map_err(crate::engine::Error::Catalog)
+    };
+    let engine = match opened {
         Ok(Some(engine)) => engine,
         Ok(None) => {
             let message = format!(
@@ -337,17 +342,15 @@ fn open_engine(context: &Context, query: &Query, outcome: &mut Outcome) -> Resul
             );
             return Err(fail(outcome, "no index", &message));
         }
-        Err(e) => {
+        Err(crate::engine::Error::Catalog(e)) => {
             let message = crate::index::open_failed(context, &e);
             return Err(fail(outcome, "open", &message));
         }
+        Err(e) => {
+            let message = format!("{}: content index: {e}", context.index.display());
+            return Err(fail(outcome, "content index", &message));
+        }
     };
-    if query.has_content()
-        && let Err(e) = engine.open_content(&context.index)
-    {
-        let message = format!("{}: content index: {e}", context.index.display());
-        return Err(fail(outcome, "content index", &message));
-    }
     Ok(engine)
 }
 
