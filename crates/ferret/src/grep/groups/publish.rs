@@ -219,10 +219,15 @@ pub(in super::super) fn run<'a, W: Write>(
             // selected name. External links can overestimate reuse, stale
             // nlink can underestimate it, and equal-content inodes share a
             // document even without hard links.
-            let eligible = matches!(&job, Job::Checked(_, name, doc) if catalog.is_some_and(|catalog| {
-                catalog.doc_references(ferret_catalog::DocId(*doc)).is_some_and(|count| count > 1)
-                    || matches!(catalog.name(*name).target(), ferret_catalog::Target::Inode(inode) if catalog.nlink(inode) > 1)
-            }));
+            let eligible = match (catalog, &job) {
+                (Some(catalog), Job::Checked(_, name, doc)) => {
+                    catalog
+                        .doc_references(ferret_catalog::DocId(*doc))
+                        .is_some_and(|count| count > 1)
+                        || matches!(catalog.name(*name).target(), ferret_catalog::Target::Inode(inode) if catalog.nlink(inode) > 1)
+                }
+                _ => false,
+            };
             search.work(job, stopped, handoff, concurrent, |job, target| {
                 worker.prepare(
                     job,

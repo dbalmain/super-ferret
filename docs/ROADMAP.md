@@ -2129,10 +2129,13 @@ change events, hot index files resident (D14).
 daemon follows content after each refresh under a 256 KiB, 100 ms budget,
 merges on its own thread (D114), adopts each publication without a reload,
 and serves directory grep from a resident pin (D111); S2.md § "What S5
-needs" is met, status block included. What remains grows with the index
-rather than the searched tree: the first grep after a cross-epoch publication rebuilds
-`DocNames` over every name (D111 B's `st_nlink` check would remove it);
-and segments are read by `pread`, so "resident" means the page cache.
+needs" is met, status block included. D111 B removed grep's whole-catalog
+`DocNames` build: at 300,300 names, cold daemon first/warm grep measured
+13.39/3.44 ms before and 5.05/4.32 ms after; controlled cross-epoch resident
+batch measured 16.26/7.34 ms before and 8.26/6.69 ms after (release, reload
+excluded). What remains: content following and ordinary content search still
+build `DocNames` when needed, and segments are read by `pread`, so "resident"
+means the page cache.
 
 **Bench at 1M names (2026-10-27, 4324ce4, msa2).** The corpus is 21 copies of a
 cargo registry, each file tagged with its copy number. `idx1` indexes one copy

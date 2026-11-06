@@ -6154,8 +6154,22 @@ join is always short.
 
 ## D111 — Indexed grep pays for the whole index on every call
 
-**Status: answered A, 2026-10-21.** Directory grep goes through the daemon;
-B is not done.
+**Status: A built (2026-10-21); B's DocNames removal built (2026-11-07).**
+Grep keeps indexed scheduling and uses catalog `nlink > 1` or document inode
+references `> 1` as a duplicate-cache hint, without building `DocNames`.
+Distinct equal-content files can share a document; `st_nlink` alone misses
+those. Links outside the roots can enable unnecessary caching, and stale
+nlink can miss reuse; every selected name still gets a checked read or stat
+before replay. Output keeps each selected name, including hard-link aliases.
+
+Measured in release at 300,300 names, searching the same 1,000-file subtree:
+cold daemon first/warm grep 13.39/3.44 ms before, 5.05/4.32 ms after;
+controlled cross-epoch resident batch first/warm 16.26/7.34 ms before,
+8.26/6.69 ms after (reload excluded, same shared grep execution). These are
+single first/warm pairs, not medians. Writer following may build `DocNames`
+before grep arrives; ordinary content search and following still need names.
+The in-process one-shot opener already skips interning and defers `NameIndex`;
+loading and validating only selected sections would be a separate change.
 
 > Dave: I'm not sure I understand why A is more work and helps less. For any
 > user that can't reach the daemon, perhaps ferret is not for them. I've had no
