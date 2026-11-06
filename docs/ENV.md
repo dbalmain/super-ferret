@@ -4,7 +4,7 @@ Every environment variable the workspace reads, built by grepping the source for
 `env::var`, `var_os`, `env!` and `.env(` (2026-10-26, from 93563b6). When you
 add one, add its row here in the same commit.
 
-Four kinds, which differ in who may rely on them:
+Five kinds, which differ in who may rely on them:
 
 - **Supported overrides** work in release builds and are part of how ferret is
   run: a user, the packaging or a test may set them.
@@ -12,6 +12,8 @@ Four kinds, which differ in who may rely on them:
   builds have no hook, so nothing outside the tests may depend on them. They
   exist so integration tests can drive a real production path: a barrier on a
   real checkpoint, a real publication failure, a delayed real thread.
+- **Unit-test callbacks** run only in unit-test builds, on the thread that
+  installs them, to drive a precise interleaving through a real function.
 - **Unit-test subprocess markers** are read by test code only. A test
   re-executes its own test binary with the marker set, and the child runs the
   branch the marker names; nothing else sets them.
@@ -92,6 +94,12 @@ production code parks on it at a real checkpoint.
 | `FERRET_WATCH_TEST_SCOPES`                                      | `ferret` `daemon/writer.rs`         | Caps the watch scope table (default 100000).                                                           | `tests/watch.rs`                                                         |
 | `FERRET_TEST_REFUSE_THREADS`                                    | `ferret-query` `threads.rs`         | `NAME=K`: the first K threads named NAME start, later ones are refused, as under `RLIMIT_NPROC`.       | `tests/daemon.rs`, `tests/grep.rs`                                       |
 | `FERRET_TEST_GREP_APPEND_PATH`, `FERRET_TEST_GREP_APPEND_BYTES` | `ferret` `grep.rs`                  | Appends the bytes to the path after grep's first read, so a file grows mid-search.                     | `tests/grep.rs`                                                          |
+
+## Unit-test callbacks
+
+| Seam | Owning test module | Injection |
+| ---- | ------------------ | --------- |
+| `CONTENT_OPEN_HOOK` | `ferret/src/engine/tests.rs` | Thread-local, one-shot callback in the real `Engine::open_content`, after catalog pin and before index open; drives the D60 death/merge race without sleeps. Compiled only for unit tests. |
 
 ## Unit-test subprocess markers
 

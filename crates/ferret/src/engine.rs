@@ -365,16 +365,25 @@ impl Engine {
     /// or removed. An index that is absent or does not fit the catalog view
     /// leaves a fresh engine without one, which content queries treat as
     /// nothing covered. A newer published view survives a delayed open.
+    /// If the catalog generation moved before the index was pinned, the
+    /// opened index is ignored: a merge may have purged documents this
+    /// catalog still sees live. Existing safe coverage survives; otherwise
+    /// queries use their ordinary uncovered scan or explicit scan refusal.
     /// Segments open on the search thread count.
     pub fn open_content(&self, catalog_dir: &Path) -> Result<(), Error> {
         let pin = self.pin();
+        #[cfg(test)]
+        tests::content_open_checkpoint();
         let view = ferret_index::View::open_with_threads(
             &catalog_dir.join(CONTENT_DIR),
             &catalog_view(pin.catalog(), pin.live()),
             pin.search_threads(),
         )
         .map_err(Error::Content)?;
-        if let Some(view) = view {
+        if let Some(view) = view
+            && Catalog::published_generation(catalog_dir).map_err(Error::Catalog)?
+                == Some(pin.generation())
+        {
             self.select_content(Arc::new(view));
         }
         Ok(())

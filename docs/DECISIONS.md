@@ -3570,13 +3570,18 @@ row, and a dormant row is a permission granted once and revoked explicitly:
    from index coverage; the catalog stores identities, never postings.
 
 **Found on the way, a bug under B.** A query-only open (`ferret search`,
-`ferret grep`, batch open and reload) reads the catalog and then the content
-index with no bracket. If the writer kills a covered document and a merge
-purges it between those reads, the old catalog still has it live, `fits()`
-accepts the newer index, and the document is neither in postings nor in
-`uncovered`: a silent missed candidate. Traced by Astra, not yet reproduced.
-It is fixed separately from A′; one candidate is to re-read the catalog
-generation after pinning the index and retry if it moved.
+`ferret grep`, batch open and reload) read the catalog and then the content
+index with no bracket. A deterministic hook in the real open path reproduced
+it: a death and merge purge between those reads left the old catalog's live
+document neither in postings nor in `uncovered`, silently missing a row.
+`Engine::open_content` now reads the catalog's 128-byte manifest generation
+once after pinning the index descriptors. If it differs from the loaded
+catalog's generation, the opened index is ignored. Previously pinned safe
+coverage survives; a fresh engine treats all documents as uncovered. Grep
+scans them; search keeps its explicit incomplete-index refusal above the
+uncovered bound unless `--scan-uncovered` is given. There is no retry, extra
+catalog load, writer lock or daemon round trip. This bounds open work even
+under continuous writes, at the cost of a scan or explicit refusal on a race.
 
 The round-table transcripts are in `.ai/d60/` (local).
 

@@ -16,6 +16,18 @@ use ferret_query::Query;
 
 use super::*;
 
+thread_local! {
+    static CONTENT_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+pub(super) fn content_open_checkpoint() {
+    let hook = CONTENT_OPEN_HOOK.take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct Tree(PathBuf);
 impl Tree {
     /// An indexed root of `files` small documents, each holding `alpha`,

@@ -85,6 +85,74 @@ fn indexed(engine: &Engine, doc: u32) {
     assert!(tri.probe().test(doc).is_some());
 }
 
+/// The catalog still sees a live id after a racing death and merge purge.
+/// Restore the same inode without publishing it, so actual verification can
+/// distinguish a lost candidate from a vanished file.
+#[test]
+fn query_only_open_cannot_lose_a_document_purged_after_its_catalog_read() {
+    for (one_shot, reopen) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (tree, writer) = covered(10);
+        let tree = Arc::new(tree);
+        let index = tree.0.join("index");
+        let reader = if one_shot {
+            Engine::open_one_shot(&index)
+        } else {
+            Engine::open(&index)
+        }
+        .unwrap()
+        .unwrap();
+        let previous = if reopen {
+            reader.open_content(&index).unwrap();
+            Some(reader.pin().content.unwrap())
+        } else {
+            None
+        };
+        let generation = reader.generation();
+        let moved = tree.clone();
+        CONTENT_OPEN_HOOK.set(Some(Box::new(move || {
+            let path = moved.0.join("root/d0/0.txt");
+            let hidden = moved.0.join("hidden");
+            fs::rename(&path, &hidden).unwrap();
+            moved.refresh(&writer);
+            let merged = writer
+                .merge_all_content(&Budget::unbounded())
+                .unwrap()
+                .unwrap();
+            assert_eq!(merged.purged, 1);
+            fs::rename(hidden, path).unwrap();
+        })));
+        reader.open_content(&index).unwrap();
+        let pin = reader.pin();
+        assert_eq!(pin.generation(), generation);
+        match previous.as_ref() {
+            Some(previous) => assert!(Arc::ptr_eq(pin.content.as_ref().unwrap(), previous)),
+            None => assert!(pin.content().is_none()),
+        }
+        let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+        if previous.is_none() {
+            assert!(matches!(
+                pin.search_content(&query, Some(0), None, |_| ControlFlow::Continue(())),
+                Err(ferret_query::RunError::IndexIncomplete {
+                    uncovered: 10,
+                    live: 10
+                })
+            ));
+        }
+        assert_eq!(
+            pin.search_content(&query, None, None, |_| ControlFlow::Continue(()))
+                .unwrap()
+                .rows,
+            10,
+            "the old catalog's live document must remain a candidate"
+        );
+        let grep = ferret_verify::GrepFlags::default()
+            .compile("alpha")
+            .unwrap();
+        let candidates = pin.grep_candidates(&grep, &|| false).unwrap();
+        assert!(candidates.contains(document_named(pin.catalog(), b"0.txt").0, &|| false));
+    }
+}
+
 #[test]
 fn returning_content_and_empty_success_reuse_ids_without_follow_reads() {
     let tree = Tree::with_files(10);
