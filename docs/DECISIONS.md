@@ -7881,6 +7881,11 @@ moves merge work under the reading.
 
 ## D138 — Whether stdin output waits for the capture limit
 
+**Status: answered C, 2026-11-07.** Stream stdin and stream operands from
+the first line always; binary suppression on stdin covers one read run.
+
+> Dave (2026-11-07, in chat): agree with everything up to D139.
+
 **Question:** Should `ferret grep` print lines from stdin and other stream
 operands as it finds them, rather than capturing up to 4 MiB of output first?
 
@@ -7909,6 +7914,11 @@ that would change it: if grep-compat has stdin cases whose NUL lies past 64
 KiB and rg hides earlier lines there, B, which keeps piped output unchanged.
 
 ## D139 — Whether `ferret find` reads and prints times in local time
+
+**Status: answered B, 2026-11-07.** Local time throughout, from a safe-Rust
+TZif reader, for parsing, `-daystart` and printing.
+
+> Dave (2026-11-07, in chat): agree with everything up to D139.
 
 **Question:** Should `ferret find` use the local time zone, as GNU find does,
 for `-daystart`, date arguments (`-newermt`, `-newerXt`) and the times that
