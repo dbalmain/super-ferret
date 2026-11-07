@@ -8075,6 +8075,18 @@ Parser tests cover real Sydney TZif, v1/v3 fixtures, every truncated prefix, bad
 magic, absurd counts and invalid type flags. Lazy-loading assertions drive
 ordinary plans, elapsed predicates, explicit ISO offsets and epoch-only output.
 
+Round 2, daemon-zone correction: local-time plans stay in the client, using a
+Plan query derived from date parsing and compiled output. A UTC daemon/Sydney
+client regression checks both selection and printing, and fails against the
+original b7c2a8d production sources. Epoch-only and explicitly zoned plans can
+still use the daemon. A release measurement on 5,000 indexed files, five warmups
+then 30 interleaved runs per route, found mean wall times of 3.572 ms via
+daemon, 3.244 ms local with the same explicit UTC threshold, and 3.209 ms for
+the actual Sydney local-date plan. The equivalent thresholds were
+2024-01-01T00:00Z and 2024-01-01 11:00 Sydney; all selected 5,000 files, stdout
+discarded. This small, warm tree showed no routing penalty; larger local catalog
+loads may cost more.
+
 Validation: formatter, workspace Clippy with warnings denied, ordinary tests and
 private-item documentation all passed. Ordinary tests: 2,184 passed, 0 failed,
 11 ignored (base: 2,178/0/11). The extended gate ran once: all ten named tests

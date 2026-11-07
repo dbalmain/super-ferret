@@ -268,7 +268,7 @@ fn newer_comparison_is_strict_and_preserves_nanoseconds() {
         reference_path.as_os_str(),
         SystemTime::now(),
         false,
-        &mut 0,
+        &mut DateContext::default(),
     )
     .unwrap();
     assert!(
@@ -401,7 +401,7 @@ fn cnewer_compares_the_entry_ctime_with_the_reference_mtime() {
         reference.path().as_os_str(),
         SystemTime::now(),
         false,
-        &mut 0,
+        &mut DateContext::default(),
     )
     .unwrap();
     let newer = Test::newer(
@@ -410,7 +410,7 @@ fn cnewer_compares_the_entry_ctime_with_the_reference_mtime() {
         reference.path().as_os_str(),
         SystemTime::now(),
         false,
-        &mut 0,
+        &mut DateContext::default(),
     )
     .unwrap();
     assert!(cnewer.evaluate(&reference).unwrap());
@@ -511,14 +511,14 @@ fn all_distinct_corpus_newermt_values_parse() {
     ];
     for value in values {
         assert!(
-            parse_date(OsStr::new(value), now, &mut 0).is_some(),
+            parse_date(OsStr::new(value), now, &mut DateContext::default()).is_some(),
             "{value}"
         );
     }
     assert_eq!(values.len(), 80);
     for value in ["nonsense", "2022-13-45"] {
         assert!(
-            parse_date(OsStr::new(value), now, &mut 0).is_none(),
+            parse_date(OsStr::new(value), now, &mut DateContext::default()).is_none(),
             "{value}"
         );
     }

@@ -4262,3 +4262,35 @@ fn daemon_grep_rg_shows_what_a_whitelist_reveals() {
     fs::write(tree.base.join("src/.ignore"), b"!.env.example\n").unwrap();
     wait(shows);
 }
+
+#[test]
+fn find_local_dates_and_output_use_the_client_zone() {
+    let tree = Tree::new();
+    let stamp = std::time::UNIX_EPOCH + Duration::from_secs(1704085200);
+    fs::File::open(tree.base.join("src/main.rs"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(stamp))
+        .unwrap();
+    assert!(tree.local(&["index", "src"]).status.success());
+    tree.start(&[("TZ", "UTC0")]);
+    // D139: reparsing in a UTC daemon discarded the Sydney client's date.
+    let selected = tree
+        .command(&["find", "src/main.rs", "-newermt", "2024-01-01 10:00"])
+        .env("TZ", "Australia/Sydney")
+        .env("TZDIR", "/etc/zoneinfo")
+        .output()
+        .unwrap();
+    assert!(selected.status.success(), "{selected:?}");
+    assert_eq!(selected.stdout, b"src/main.rs\n");
+    let printed = tree
+        .command(&["find", "src/main.rs", "-printf", "%TF %TT %TZ %Tz\n"])
+        .env("TZ", "Australia/Sydney")
+        .env("TZDIR", "/etc/zoneinfo")
+        .output()
+        .unwrap();
+    assert!(printed.status.success(), "{printed:?}");
+    assert_eq!(
+        printed.stdout,
+        b"2024-01-01 16:00:00.0000000000 AEDT +1100\n"
+    );
+}

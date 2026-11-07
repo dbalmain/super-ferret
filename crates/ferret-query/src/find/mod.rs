@@ -415,6 +415,20 @@ impl Plan {
         has_actions(&self.expression)
     }
 
+    /// Whether this plan depends on the executing process's local zone.
+    /// Hosts must keep it in the client unless a remote request carries a zone.
+    pub fn needs_local_time(&self) -> bool {
+        let mut needed = self.local_time;
+        self.expression.visit(&mut |leaf| {
+            needed |= match leaf {
+                Expression::Action(action::Action::List(_)) => true,
+                Expression::Action(action::Action::Output(_, format)) => format.needs_local_time(),
+                _ => false,
+            };
+        });
+        needed
+    }
+
     /// Whether the expression includes an interactive command action.
     /// Hosts must validate prompt input before preparing any file or action.
     pub fn requires_interactive(&self) -> bool {

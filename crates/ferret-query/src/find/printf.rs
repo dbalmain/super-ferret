@@ -169,6 +169,14 @@ impl Format {
         Ok(Self(directives))
     }
 
+    pub(super) fn needs_local_time(&self) -> bool {
+        self.0.iter().any(|directive| {
+            matches!(directive,
+            Directive::Field { code: b'A' | b'C' | b'T' | b'a' | b'c' | b't', time, .. }
+                if !matches!(time, Some(b'@' | b's' | b'%')))
+        })
+    }
+
     pub(super) fn needs_directory(&self) -> bool {
         self.0.iter().any(|directive| {
             matches!(

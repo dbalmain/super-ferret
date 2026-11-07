@@ -12,6 +12,7 @@ use super::printf::account_names;
 use super::{Entry, FileKind, glob};
 
 mod date;
+pub(super) use date::DateContext;
 use date::parse_date;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,11 +226,11 @@ impl Test {
         value: &OsStr,
         now: SystemTime,
         follow: bool,
-        date_offset: &mut i32,
+        date_context: &mut DateContext,
     ) -> Option<Self> {
         let field = TimeField::from_letter(x);
         if y == b't' {
-            return parse_date(value, now, date_offset).map(|stamp| Self::Newer { field, stamp });
+            return parse_date(value, now, date_context).map(|stamp| Self::Newer { field, stamp });
         }
         Some(Self::Reference {
             path: PathBuf::from(value),

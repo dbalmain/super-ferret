@@ -7,8 +7,25 @@ use crate::find::zone::{
     local,
 };
 
+#[derive(Default)]
+pub(in crate::find) struct DateContext {
+    pub offset: i32,
+    pub local_time: bool,
+}
+
+impl DateContext {
+    fn zone(&mut self) -> &'static crate::find::zone::Zone {
+        self.local_time = true;
+        local()
+    }
+}
+
 /// Parses the deliberately bounded GNU date subset used by the find corpus.
-pub(super) fn parse_date(value: &OsStr, now: SystemTime, guess: &mut i32) -> Option<i128> {
+pub(super) fn parse_date(
+    value: &OsStr,
+    now: SystemTime,
+    context: &mut DateContext,
+) -> Option<i128> {
     let text = std::str::from_utf8(value.as_bytes()).ok()?.trim();
     let now_ns = now.duration_since(UNIX_EPOCH).ok()?.as_nanos() as i128;
     let timestamp_ns = if text == "now" {
@@ -17,36 +34,39 @@ pub(super) fn parse_date(value: &OsStr, now: SystemTime, guess: &mut i32) -> Opt
         if text == "today" {
             now_ns
         } else {
-            relative_stamp("1 day", now_ns, guess)?
+            relative_stamp("1 day", now_ns, context)?
         }
     } else if let Some(epoch) = text.strip_prefix('@') {
         epoch.parse::<i64>().ok()? as i128 * 1_000_000_000
     } else if let Some(relative) = text.strip_prefix("now-") {
-        relative_stamp(relative, now_ns, guess)?
+        relative_stamp(relative, now_ns, context)?
     } else if let Some(relative) = text.strip_prefix('-') {
-        relative_stamp(relative, now_ns, guess)?
+        relative_stamp(relative, now_ns, context)?
     } else if let Some(relative) = text.strip_suffix(" ago") {
-        if let Some(stamp) = relative_stamp(relative, now_ns, guess) {
+        if let Some(stamp) = relative_stamp(relative, now_ns, context) {
             stamp
         } else {
-            calendar_months_ago(relative, now, guess)?
+            calendar_months_ago(relative, now, context)?
         }
     } else {
-        parse_local_absolute(text, now, guess)? as i128 * 1_000_000_000
+        parse_local_absolute(text, now, context)? as i128 * 1_000_000_000
     };
     Some(timestamp_ns)
 }
 
-fn relative_stamp(value: &str, now_ns: i128, guess: &mut i32) -> Option<i128> {
+fn relative_stamp(value: &str, now_ns: i128, context: &mut DateContext) -> Option<i128> {
     let delta = relative_seconds(value)?;
     if value.split_whitespace().nth(1)?.trim_end_matches('s') != "day" {
         return Some(now_ns - i128::from(delta) * 1_000_000_000);
     }
     let seconds = i64::try_from(now_ns.div_euclid(1_000_000_000)).ok()?;
-    let zone = local();
-    *guess = zone.offset(seconds);
+    let zone = context.zone();
+    context.offset = zone.offset(seconds);
     let wall = zone.wall(seconds).checked_sub(delta)?;
-    Some(i128::from(zone.resolve(wall, guess)?) * 1_000_000_000 + now_ns.rem_euclid(1_000_000_000))
+    Some(
+        i128::from(zone.resolve(wall, &mut context.offset)?) * 1_000_000_000
+            + now_ns.rem_euclid(1_000_000_000),
+    )
 }
 
 fn relative_seconds(value: &str) -> Option<i64> {
@@ -67,24 +87,30 @@ fn relative_seconds(value: &str) -> Option<i64> {
     amount.checked_mul(multiplier)
 }
 
-fn parse_local_absolute(value: &str, now: SystemTime, guess: &mut i32) -> Option<i64> {
+fn parse_local_absolute(value: &str, now: SystemTime, context: &mut DateContext) -> Option<i64> {
     // Explicit ISO offsets and Z bypass the process zone.
     if let Some((date, clock)) = value.split_once('T') {
         if clock.ends_with('Z') {
-            return parse_absolute(&format!("{date} {}", clock.strip_suffix('Z')?), now);
+            return parse_absolute(
+                &format!("{date} {}", clock.strip_suffix('Z')?),
+                now,
+                context,
+            );
         }
         if clock
             .char_indices()
             .skip(1)
             .any(|(_, c)| c == '+' || c == '-')
         {
-            return parse_absolute(value, now);
+            return parse_absolute(value, now, context);
         }
     }
-    local().resolve(parse_absolute(value, now)?, guess)
+    context
+        .zone()
+        .resolve(parse_absolute(value, now, context)?, &mut context.offset)
 }
 
-fn parse_absolute(value: &str, now: SystemTime) -> Option<i64> {
+fn parse_absolute(value: &str, now: SystemTime, context: &mut DateContext) -> Option<i64> {
     if let Some((date, clock)) = value.split_once('T') {
         let clock = clock.strip_suffix('Z').unwrap_or(clock);
         let zone_at = clock
@@ -98,7 +124,7 @@ fn parse_absolute(value: &str, now: SystemTime) -> Option<i64> {
         } else {
             (clock, None)
         };
-        let base = parse_absolute(&format!("{date} {clock}"), now)?;
+        let base = parse_absolute(&format!("{date} {clock}"), now, context)?;
         let zone = if let Some(offset) = offset {
             let sign = if offset.starts_with('-') { -1 } else { 1 };
             let mut parts = offset[1..].split(':');
@@ -139,7 +165,7 @@ fn parse_absolute(value: &str, now: SystemTime) -> Option<i64> {
             let year = parts.next()?.parse().ok()?;
             (year, parts.next())
         } else {
-            let year = civil_year(now)?;
+            let year = civil_year(now, context)?;
             (year, Some(tail.trim()))
         };
         let date_seconds = days_from_civil(year, month_num, day).checked_mul(86_400)?;
@@ -180,8 +206,9 @@ fn parse_absolute(value: &str, now: SystemTime) -> Option<i64> {
     Some(seconds)
 }
 
-fn civil_year(now: SystemTime) -> Option<i64> {
-    let days = local()
+fn civil_year(now: SystemTime, context: &mut DateContext) -> Option<i64> {
+    let days = context
+        .zone()
         .wall(now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64)
         .div_euclid(86_400);
     let z = days + 719_468;
@@ -196,13 +223,15 @@ fn civil_year(now: SystemTime) -> Option<i64> {
     Some(year)
 }
 
-fn calendar_months_ago(value: &str, now: SystemTime, guess: &mut i32) -> Option<i128> {
+fn calendar_months_ago(value: &str, now: SystemTime, context: &mut DateContext) -> Option<i128> {
     let mut parts = value.split_whitespace();
     let count: i64 = parts.next()?.parse().ok()?;
     if parts.next()?.trim_end_matches('s') != "month" || parts.next().is_some() {
         return None;
     }
-    let seconds = local().wall(now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64);
+    let seconds = context
+        .zone()
+        .wall(now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64);
     let days = seconds.div_euclid(86_400);
     let seconds_in_day = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_date(days);
@@ -220,9 +249,9 @@ fn calendar_months_ago(value: &str, now: SystemTime, guess: &mut i32) -> Option<
     };
     let new_day = day.min(max_day);
     Some(
-        local().resolve(
+        context.zone().resolve(
             days_from_civil(new_year, new_month, new_day) * 86_400 + seconds_in_day,
-            guess,
+            &mut context.offset,
         )? as i128
             * 1_000_000_000,
     )

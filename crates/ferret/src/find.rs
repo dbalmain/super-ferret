@@ -131,7 +131,7 @@ fn remote(
     now: std::time::SystemTime,
 ) -> Option<Exit> {
     match route {
-        Route::Indexed(index) if !plan.has_side_effects() => {
+        Route::Indexed(index) if !plan.has_side_effects() && !plan.needs_local_time() => {
             crate::daemon::find(index, args, json, now)
         }
         _ => None,

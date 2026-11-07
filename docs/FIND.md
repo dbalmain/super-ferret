@@ -248,6 +248,12 @@ dates retain the last date argument's offset guess, matching GNU; the initial
 guess is zero. `-daystart` retains the run-start DST offset when establishing
 its midnight boundary, including on a transition day.
 
+Plans needing local time execute in the client, even for indexed read-only
+finds, so a resident daemon's TZ/TZDIR cannot change their dates or output.
+Explicitly zoned dates, elapsed predicates and epoch-only output remain eligible
+for the daemon. Local execution opens the catalog sections the plan reads; it
+cannot reuse the daemon's resident catalog.
+
 An ordinary listing, elapsed-time predicate, explicit ISO offset, or epoch-only
 `-printf` directive opens no zone file. A local-time operation pays once for
 reading at most 1 MiB plus one overflow-detection byte, rejecting files above 1

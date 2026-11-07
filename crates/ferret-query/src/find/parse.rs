@@ -25,6 +25,7 @@ pub struct Plan {
     pub(super) warnings: Vec<String>,
     pub(super) message: Option<String>,
     pub(super) permission_warning: bool,
+    pub(super) local_time: bool,
 }
 
 /// Invalid find syntax. The host maps every variant to exit status 1.
@@ -101,6 +102,7 @@ pub(super) fn parse(
     parser.options.retain_parent = parser.delete;
     parser.options.delete = parser.delete;
     Ok(Plan {
+        local_time: parser.date_context.local_time || parser.daystart,
         expression,
         paths,
         options: parser.options,
@@ -127,7 +129,7 @@ struct Parser<'a> {
     prune: bool,
     explicit_depth: bool,
     daystart: bool,
-    date_offset: i32,
+    date_context: super::test::DateContext,
     now: std::time::SystemTime,
     permission_warning: bool,
     combinators: usize,
@@ -168,7 +170,7 @@ impl<'a> Parser<'a> {
             prune: false,
             explicit_depth: false,
             daystart: false,
-            date_offset: 0,
+            date_context: super::test::DateContext::default(),
             now,
             permission_warning: false,
             combinators: 0,
@@ -576,7 +578,7 @@ impl<'a> Parser<'a> {
                     value,
                     now,
                     follow_references,
-                    &mut self.date_offset,
+                    &mut self.date_context,
                 );
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }

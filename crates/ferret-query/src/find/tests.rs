@@ -1140,3 +1140,22 @@ fn newer_spellings_compare_their_own_time_fields() {
         assert_eq!(names, OsStr::new(expected), "{test} {value}");
     }
 }
+
+#[test]
+fn local_zone_routing_comes_from_date_parsing_and_compiled_output() {
+    for (args, expected) in [
+        (vec!["-newermt", "2024-01-01 10:00"], true),
+        (vec!["-newermt", "1 day ago"], true),
+        (vec!["-daystart", "-mtime", "0"], true),
+        (vec!["-ls"], true),
+        (vec!["-printf", "%TZ %AZ %CZ %t"], true),
+        (vec!["-newermt", "2024-01-01T10:00Z"], false),
+        (vec!["-newermt", "@1704067200"], false),
+        (vec!["-mtime", "1"], false),
+        (vec!["-printf", "%T@ %Ts %T% %p"], false),
+        (vec!["-print"], false),
+    ] {
+        let plan = Plan::parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+        assert_eq!(plan.needs_local_time(), expected, "{args:?}");
+    }
+}
