@@ -113,16 +113,12 @@ fn open_catalog(plan: &Plan, index: &Path) -> Result<FindSource, String> {
     };
     // Postings need a resident name index, which only the daemon holds;
     // building one for a single find costs more than the walk, so a local
-    // find walks the catalog. A plain listing still checks every section
-    // before any output, as an engine open does (D46); an action plan loads
-    // only the sections it reads.
+    // find walks the catalog, loading and checking only the sections its
+    // plan reads (D140 A): damage elsewhere is left to the daemon's open and
+    // `ferret search`.
     let failed = |error| format!("{}: {error}; re-index or use -I", index.display());
     let catalog = Catalog::open(index).map_err(failed)?.ok_or_else(missing)?;
-    if plan.has_side_effects() {
-        catalog.load(&plan.catalog_sections()).map_err(failed)?;
-    } else {
-        catalog.load_all().map_err(failed)?;
-    }
+    catalog.load(&plan.catalog_sections()).map_err(failed)?;
     Ok(FindSource::Sections(Box::new(catalog)))
 }
 

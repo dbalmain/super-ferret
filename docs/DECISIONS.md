@@ -8032,8 +8032,10 @@ with the documentation fix.
 
 ## D140 — Whether a local find checks catalog sections its plan does not read
 
-**Status: answered A, 2026-11-07.** A local find, plain listing or action,
-loads and checks only the sections its plan reads. This narrows D46 for
+**Status: built A, 2026-11-07 (Dave answered A).** A local find, plain
+listing or action, loads and checks only the sections its plan reads
+(`find.rs` `open_catalog`; `cli.rs`
+`search_checks_every_section_and_find_checks_what_it_reads`). This narrows D46 for
 find without the daemon: damage in a section it skips is reported by the
 daemon's open, `ferret search`, or a future `ferret healthcheck`, not by the
 find.

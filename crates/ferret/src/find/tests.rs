@@ -44,17 +44,14 @@ fn local_plans_open_the_catalog_without_resident_names() {
         Plan::parse(&argv).unwrap()
     };
 
-    for (args, every) in [
-        (&["-exec", "true", "{}", "+"][..], false),
-        (&["-name", "one"], true),
-    ] {
+    // Neither plan reads sizes, so neither loads them (D140 A).
+    for args in [&["-exec", "true", "{}", "+"][..], &["-name", "one"]] {
         let Ok(FindSource::Sections(catalog)) = open_catalog(&plan(args), &index) else {
             panic!("{args:?} opened the engine");
         };
         assert!(catalog.resident_names().is_none());
-        assert_eq!(
-            catalog.is_loaded(ferret_catalog::Section::Size),
-            every,
+        assert!(
+            !catalog.is_loaded(ferret_catalog::Section::Size),
             "{args:?}"
         );
     }
