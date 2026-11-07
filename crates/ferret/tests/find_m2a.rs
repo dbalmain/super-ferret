@@ -556,3 +556,54 @@ fn catalog_empty_accounts_for_concurrent_deletion_and_ignored_children() {
         }
     }
 }
+
+#[test]
+fn leap_second_zones_fail_explicitly_instead_of_printing_uncorrected_times() {
+    let tree = Tree::new("leap-zone");
+    let path = tree.0.join("d/clock");
+    fs::write(&path, b"").unwrap();
+    let tz = ":/etc/zoneinfo/right/UTC";
+    for (seconds, expected) in [
+        (1704067200, "2023-12-31 23:59:33.0000000000"),
+        (1483228826, "2016-12-31 23:59:60.0000000000"),
+    ] {
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+            )
+            .unwrap();
+        let oracle = gnu::output(
+            gnu::command()
+                .env("TZ", tz)
+                .arg(&path)
+                .args(["-printf", "%TF %TT"]),
+        );
+        assert!(oracle.status.success());
+        assert_eq!(oracle.stdout, expected.as_bytes());
+        for expression in [
+            vec!["-printf", "%TF %TT"],
+            vec!["-ls"],
+            vec!["-newermt", "2024-01-01"],
+            vec!["-daystart", "-mtime", "0"],
+        ] {
+            let args: Vec<_> = ["-I", "d/clock"].into_iter().chain(expression).collect();
+            let output = tree.command(&args).env("TZ", tz).output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("leap-second TZif"),
+                "{output:?}"
+            );
+        }
+        // D139: zone-independent epoch output still needs no zone file.
+        let output = tree
+            .command(&["-I", "d/clock", "-printf", "%T@"])
+            .env("TZ", tz)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, format!("{seconds}.0000000000").as_bytes());
+    }
+}

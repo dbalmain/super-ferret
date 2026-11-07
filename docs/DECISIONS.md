@@ -8094,8 +8094,30 @@ do not fit i64 are rejected. The real date-argument path accepts
 292277026596-01-01 under EST5EDT rules without overflowing in the adjoining
 year; tests also exercise both i64 extrema for transitions and day boundaries.
 
-Validation: formatter, workspace Clippy with warnings denied, ordinary tests and
-private-item documentation all passed. Ordinary tests: 2,184 passed, 0 failed,
+Round 2, leap-second correction: leap-bearing TZif files are explicitly
+unsupported. Correct support needs record validation, forward and inverse
+correction, and `:60` rendering, exceeding the roughly 60-line cutoff for this
+review. A local-time plan using such a file now exits 1 with a leap-second
+unsupported diagnostic, before walking or output; the reader retains this
+unsupported state instead of silently substituting UTC. Malformed/missing
+non-leap zones retain the earlier zero-offset fallback. Against GNU find 4.11.0
+with TZ=:/etc/zoneinfo/right/UTC, a timestamp of 1704067200 prints 2023-12-31
+23:59:33 under GNU, and 1483228826 prints 2016-12-31 23:59:60. Ferret rejects
+local dates, daystart, printf and ls in that zone. A real CLI regression checks
+both GNU outputs and the explicit rejection, while epoch-only output still
+succeeds without loading the zone. This narrows B to non-leap TZif files and
+POSIX TZ rules.
+
+Round 2 validation: formatter, workspace Clippy with warnings denied, ordinary
+tests and private-item documentation passed. Ordinary: 2,190 passed, 0 failed,
+11 ignored, versus b7c2a8d's 2,184/0/11. The extended gate ran once with default
+TMPDIR: ten tests passed, zero failed, in 124.059 seconds of test wall time
+(298.321 seconds including release compilation). The retained UTC/non-UTC find
+differential passed; new ordinary tests cover client/daemon zone isolation, Plan
+routing, extreme arithmetic and explicit leap-zone rejection.
+
+Initial validation: formatter, workspace Clippy with warnings denied, ordinary
+tests and private-item documentation all passed. Ordinary tests: 2,184 passed, 0 failed,
 11 ignored (base: 2,178/0/11). The extended gate ran once: all ten named tests
 passed, including the original UTC find corpus and 21 local-zone scenarios;
 117.237 seconds of serial test time, 325.426 seconds including the release build

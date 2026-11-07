@@ -2,7 +2,7 @@
 //! The first local-time operation snapshots TZ/TZDIR; ordinary walks never load
 //! this OnceLock. No libc globals or process environment are mutated.
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -25,6 +25,7 @@ pub(super) struct Zone {
     transitions: Vec<(i64, usize)>,
     offsets: Vec<Offset>,
     future: Option<Posix>,
+    leap_seconds: bool,
 }
 
 static ZONE: OnceLock<Zone> = OnceLock::new();
@@ -62,6 +63,7 @@ impl Zone {
                 daylight: false,
             }],
             future: None,
+            leap_seconds: false,
         }
     }
 
@@ -89,6 +91,7 @@ impl Zone {
                 transitions: Vec::new(),
                 offsets: Vec::new(),
                 future: Some(future),
+                leap_seconds: false,
             };
         }
         // glibc preserves the leading alphabetic name when a named zone cannot
@@ -116,6 +119,7 @@ impl Zone {
 
     fn parse(bytes: &[u8]) -> Option<Self> {
         let first = Header::parse(bytes)?;
+        let leap_seconds = first.leaps != 0;
         let (header, data, width) = if first.version == 0 {
             (first, bytes.get(44..)?, 4)
         } else {
@@ -181,7 +185,20 @@ impl Zone {
             transitions,
             offsets,
             future,
+            leap_seconds: leap_seconds || header.leaps != 0,
         })
+    }
+
+    /// Leap-bearing files retain an unsupported state instead of falling back
+    /// to UTC. Every local-time plan must reject that state before execution.
+    pub fn check_supported(&self) -> io::Result<()> {
+        if self.leap_seconds {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "leap-second TZif zones are unsupported; choose a zone outside right/",
+            ));
+        }
+        Ok(())
     }
 
     fn at(&self, stamp: i64) -> &Offset {

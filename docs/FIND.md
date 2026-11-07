@@ -242,6 +242,13 @@ host GNU find only tries `/usr/share/zoneinfo`, which is absent: use
 `TZDIR=/etc/zoneinfo` to give both commands the same named zone. No Nix store
 path is embedded.
 
+Leap-bearing TZif files, including `/etc/zoneinfo/right/*`, are unsupported. A
+plan needing local time fails with exit 1 and a "leap-second TZif zones are
+unsupported" diagnostic before walking or printing; it does not fall back to
+UTC. Choose a zone outside `right/`. GNU applies the leap corrections and can
+print `:60`; ferret deliberately rejects this class. Zone-independent epoch
+output and explicitly zoned dates still avoid loading a zone file.
+
 Missing or malformed zones have zero offset; GNU's fallback abbreviation is
 preserved for missing names. DST gaps in absolute dates are errors. Ambiguous
 dates retain the last date argument's offset guess, matching GNU; the initial

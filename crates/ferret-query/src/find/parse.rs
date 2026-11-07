@@ -101,7 +101,7 @@ pub(super) fn parse(
     }
     parser.options.retain_parent = parser.delete;
     parser.options.delete = parser.delete;
-    Ok(Plan {
+    let plan = Plan {
         local_time: parser.date_context.local_time || parser.daystart,
         expression,
         paths,
@@ -111,7 +111,17 @@ pub(super) fn parse(
         warnings: parser.warnings,
         message: parser.message,
         permission_warning: parser.permission_warning,
-    })
+    };
+    if plan.needs_local_time() {
+        supported_zone()?;
+    }
+    Ok(plan)
+}
+
+fn supported_zone() -> Result<(), ParseError> {
+    super::zone::local()
+        .check_supported()
+        .map_err(|error| ParseError::Feature(error.to_string()))
 }
 
 struct Parser<'a> {
@@ -580,6 +590,9 @@ impl<'a> Parser<'a> {
                     follow_references,
                     &mut self.date_context,
                 );
+                if self.date_context.local_time {
+                    supported_zone()?;
+                }
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
             b")" | b"," | b"-o" | b"-or" | b"-a" | b"-and" => {

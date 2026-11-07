@@ -107,6 +107,7 @@ fn adjoining_transitions_and_day_boundaries_preserve_extreme_instants() {
         transitions: Vec::new(),
         offsets: Vec::new(),
         future: Some(Posix::parse(b"EST5EDT,M3.2.0,M11.1.0").unwrap()),
+        leap_seconds: false,
     };
     // D139 round 2: adjoining-year transitions exceed i64 even when the
     // timestamp fits. They must remain real instants, never clamped events.
@@ -115,4 +116,19 @@ fn adjoining_transitions_and_day_boundaries_preserve_extreme_instants() {
     let utc = Zone::utc(b"UTC".to_vec());
     assert_eq!(utc.day_end(i64::MAX), 9_223_372_036_854_806_400);
     assert_eq!(utc.day_end(i64::MIN), -9_223_372_036_854_720_000);
+}
+
+#[test]
+fn leap_bearing_files_are_explicitly_unsupported() {
+    let zone = Zone::file(&directory().join("right/UTC")).unwrap();
+    assert_eq!(
+        zone.check_supported().unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert!(
+        Zone::file(&directory().join("UTC"))
+            .unwrap()
+            .check_supported()
+            .is_ok()
+    );
 }

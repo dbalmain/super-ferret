@@ -618,6 +618,7 @@ fn timestamp(seconds: i64, nanos: i64, directive: Option<u8>, out: &mut Vec<u8>)
         return Ok(());
     }
     let zone = super::zone::local();
+    zone.check_supported()?;
     let d = Date::new(zone.wall(seconds));
     let month = MONTHS[(d.month - 1) as usize];
     let weekday = WEEKDAYS[d.weekday];
@@ -738,7 +739,9 @@ fn timestamp(seconds: i64, nanos: i64, directive: Option<u8>, out: &mut Vec<u8>)
 
 pub(super) fn list(entry: &Entry, out: &mut Vec<u8>) -> io::Result<()> {
     let stat = entry.stat()?;
-    let d = Date::new(super::zone::local().wall(stat.mtime()));
+    let zone = super::zone::local();
+    zone.check_supported()?;
+    let d = Date::new(zone.wall(stat.mtime()));
     let mut date = Vec::new();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
