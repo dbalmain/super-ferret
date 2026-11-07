@@ -421,6 +421,9 @@ impl Plan {
         let mut needed = self.local_time;
         self.expression.visit(&mut |leaf| {
             needed |= match leaf {
+                // -daystart alone is positional state; only a time test that
+                // captured it reads the zone.
+                Expression::Test(test::Test::Time { daystart: true, .. }) => true,
                 Expression::Action(action::Action::List(_)) => true,
                 Expression::Action(action::Action::Output(_, format)) => format.needs_local_time(),
                 _ => false,

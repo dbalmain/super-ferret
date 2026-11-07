@@ -102,7 +102,7 @@ pub(super) fn parse(
     parser.options.retain_parent = parser.delete;
     parser.options.delete = parser.delete;
     let plan = Plan {
-        local_time: parser.date_context.local_time || parser.daystart,
+        local_time: parser.date_context.local_time,
         expression,
         paths,
         options: parser.options,
