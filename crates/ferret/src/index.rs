@@ -700,9 +700,9 @@ fn follow_committed(session: ferret_catalog::WriterSession, path: &Path) -> Resu
         > 0
     {}
     while engine
-        .merge_content(&budget)
+        .merge_closing_content(&budget)
         .map_err(|error| error.to_string())?
-        .is_some()
+        > 0
     {}
     Ok(())
 }

@@ -852,3 +852,104 @@ fn index_first_open_rejects_a_replaced_catalog_incarnation() {
         );
     }
 }
+
+/// D137 must retain D60's revoke-before-pin protocol for every run in a wave.
+/// Refresh can revive outside a wave, but a returning hash in any selected run
+/// gets a fresh, uncovered id while the wave is streaming.
+#[test]
+fn closing_wave_revokes_all_ranges_before_streaming_and_refresh() {
+    let tree = Tree::with_files(40);
+    let engine = tree.engine();
+    engine.attach_content(&tree.0.join("index")).unwrap();
+    let budget = Budget {
+        bytes: 100,
+        ..Budget::unbounded()
+    };
+    while engine.follow_content(&budget, None).unwrap().remaining > 0 {}
+    let old: Vec<_> = (0..40).map(|doc| id(&engine, doc)).collect();
+    // Leave one live id per segment: multiple dead-fraction runs still stream.
+    let pin = engine.pin();
+    let entries = pin.content().unwrap().manifest().segments.clone();
+    assert!(entries.len() >= 2);
+    let mut removed = Vec::new();
+    for entry in &entries {
+        for (doc, &id) in old.iter().enumerate() {
+            if id >= entry.first && id < entry.last {
+                fs::remove_file(tree.0.join(format!("root/d0/{doc}.txt"))).unwrap();
+                removed.push(doc);
+            }
+        }
+    }
+    tree.refresh(&engine);
+    let pin = engine.pin();
+    let plans = engine
+        .content
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .prepare_merges(
+            &catalog_view(pin.catalog(), pin.live()),
+            &Budget::unbounded(),
+        )
+        .unwrap();
+    let selected: Vec<_> = removed
+        .iter()
+        .copied()
+        .filter(|&doc| {
+            plans.iter().any(|plan| {
+                plan.entries()
+                    .iter()
+                    .any(|entry| old[doc] >= entry.first && old[doc] <= entry.last)
+            })
+        })
+        .collect();
+    assert!(!selected.is_empty());
+    let (reached, held) = barrier();
+    let (release, resume) = barrier();
+    std::thread::scope(|scope| {
+        let resume = Mutex::new(Some(resume));
+        let pace = move |_| {
+            if let Some(resume) = resume.lock().unwrap().take() {
+                reached.send(()).unwrap();
+                wait(&resume);
+            }
+            Ok(())
+        };
+        let engine = &engine;
+        let merge = scope.spawn(move || {
+            engine.merge_closing_content(&Budget {
+                pace: &pace,
+                ..Budget::unbounded()
+            })
+        });
+        wait(&held);
+        // Every permission actually revoked in this wave is absent durably.
+        let disk = ferret_catalog::Catalog::open(&tree.0.join("index"))
+            .unwrap()
+            .unwrap();
+        disk.load_all().unwrap();
+        for &doc in &selected {
+            assert!(disk.dormant_hash(ferret_catalog::DocId(old[doc])).is_none());
+        }
+        let doc = selected[0];
+        restore(&tree, engine, doc);
+        assert_ne!(id(engine, doc), old[doc]);
+        release.send(()).unwrap();
+        assert!(merge.join().unwrap().unwrap() > 0);
+    });
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    for doc in 0..40 {
+        if tree.0.join(format!("root/d0/{doc}.txt")).exists() {
+            assert!(
+                engine
+                    .pin()
+                    .content()
+                    .unwrap()
+                    .lookup(b"alpha")
+                    .unwrap()
+                    .contains(&id(&engine, doc))
+            );
+        }
+    }
+}

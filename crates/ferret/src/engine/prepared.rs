@@ -92,3 +92,39 @@ impl<'a> PreparedMerge<'a> {
         result.map_err(Error::Content)
     }
 }
+
+/// Explicit build tail: all plans are revoked under writer→content before the
+/// shared filtering pin is taken. Each plan therefore has a post-revocation
+/// pin. Daemon admission remains single-plan until it can reserve an entire
+/// wave.
+pub(super) fn closing(engine: &Engine, budget: &Budget) -> Result<usize, Error> {
+    let mut writer_guard = engine.writer.lock().map_err(|_| Error::WriterPanicked)?;
+    let writer = writer_guard.as_mut().ok_or(Error::ReadOnly)?;
+    let mut content = match engine.content.try_lock() {
+        Ok(content) => content,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+        Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::WriterPanicked),
+    };
+    let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+    let pin = engine.pin();
+    let plans = index
+        .prepare_merges(&catalog_view(pin.catalog(), pin.live()), budget)
+        .map_err(Error::Content)?;
+    if plans.is_empty() {
+        return Ok(0);
+    }
+    for plan in &plans {
+        let view = writer
+            .forget_dormant(&plan.ranges())
+            .map_err(Error::CatalogWrite)?;
+        if view.generation() != engine.pin().generation() {
+            engine.select(view);
+        }
+    }
+    let pin = engine.pin();
+    drop(writer_guard);
+    let result =
+        index.merge_selected_batch(&catalog_view(pin.catalog(), pin.live()), budget, plans);
+    engine.select_content(index.view());
+    result.map_err(Error::Content)
+}

@@ -1,5 +1,5 @@
-//! A merge step: planning which segments of a run survive, writing their
-//! merged pair, and publishing the manifest that replaces the run.
+//! Merge planning, temporary output streaming and ordered publication. Explicit
+//! builds use bounded disjoint waves; admitted daemon merges remain single-run.
 
 use super::files::retire;
 use super::paced::PacedInput;
@@ -7,6 +7,167 @@ use super::*;
 use crate::regular;
 
 impl IndexWriter {
+    /// Plans a bounded wave of disjoint original runs. Selection on remaining
+    /// inputs stops at the first gap: no merge may concatenate across a hole.
+    /// Output sizes are unknown until streaming; the next wave rechecks policy
+    /// against the actual published sizes rather than predicting their levels.
+    pub fn prepare_merges(
+        &self,
+        catalog: &CatalogView,
+        budget: &Budget,
+    ) -> Result<Vec<MergePlan>, Error> {
+        // Each merge has a term and trigram thread. Four pairs cap simultaneous
+        // dictionaries, posting buffers and input page windows on large hosts.
+        let limit = (available_threads() / 2).clamp(1, 4);
+        let Some(first) = self.prepare_merge(catalog, budget, false)? else {
+            return Ok(Vec::new());
+        };
+        let mut remaining: Vec<_> = self
+            .current
+            .manifest
+            .segments
+            .iter()
+            .copied()
+            .enumerate()
+            .collect();
+        let mut plans = Vec::new();
+        let mut run = first.run;
+        loop {
+            let original = remaining[run.start].0..remaining[run.end - 1].0 + 1;
+            if original.len() != run.len() {
+                break;
+            }
+            let read: u64 = remaining[run.clone()]
+                .iter()
+                .map(|(_, s)| s.total_bytes())
+                .sum();
+            if read > budget.bytes {
+                break;
+            }
+            plans.push(MergePlan {
+                view: self.current.clone(),
+                run: original,
+            });
+            remaining.drain(run);
+            if plans.len() == limit {
+                break;
+            }
+            let entries: Vec<_> = remaining.iter().map(|(_, entry)| *entry).collect();
+            let Some(next) = merge::choose(&entries, &|s| {
+                alive(s, catalog.live, &self.current.manifest.unreadable)
+            }) else {
+                break;
+            };
+            run = next;
+        }
+        Ok(plans)
+    }
+
+    /// Streams a prepared wave to temporary files, joins every worker, then
+    /// installs and publishes each result in plan order. The host must revoke
+    /// every plan's ranges before pinning `catalog`, and retain content
+    /// ownership throughout this call. No cleanup can race a worker's
+    /// temporary output.
+    pub fn merge_selected_batch(
+        &mut self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        plans: Vec<MergePlan>,
+    ) -> Result<usize, Error> {
+        if plans.len() > 4
+            || !self.compatible(catalog)
+            || plans.iter().any(|p| !Arc::ptr_eq(&self.current, &p.view))
+        {
+            return Err(Error::StaleMerge);
+        }
+        // Reject overlapping plans even if a caller combines separate waves.
+        for (i, plan) in plans.iter().enumerate() {
+            if plans[..i]
+                .iter()
+                .any(|p| p.run.start < plan.run.end && plan.run.start < p.run.end)
+            {
+                return Err(Error::StaleMerge);
+            }
+        }
+        self.guard(|writer| writer.merge_batch(catalog, budget, plans))
+    }
+
+    fn merge_batch(
+        &mut self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        plans: Vec<MergePlan>,
+    ) -> Result<usize, Error> {
+        let mut jobs = Vec::new();
+        for (i, plan) in plans.into_iter().enumerate() {
+            let Some(mut run) = self.plan_run(catalog, budget, plan.run.clone()) else {
+                return Err(Error::StaleMerge);
+            };
+            run.manifest.next_number += i as u64;
+            jobs.push((plan, run));
+        }
+        let outputs = std::thread::scope(|scope| {
+            let writer = &*self;
+            let mut handles = Vec::new();
+            for (plan, mut run) in jobs {
+                #[cfg(test)]
+                let inherit = seams();
+                handles.push(scope.spawn(move || {
+                    #[cfg(test)]
+                    inherit();
+                    let output = if run.docs == 0 {
+                        Ok(None)
+                    } else {
+                        writer
+                            .write_run(&mut run, catalog, budget, plan.run.clone())
+                            .map(|(pair, _)| Some(pair))
+                    };
+                    (plan, run, output)
+                }));
+            }
+            // Collect before inspecting errors: even a failed first job must
+            // join its siblings before guard removes their unnamed files.
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(output) => output,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                })
+                .collect::<Vec<_>>()
+        });
+        let outputs = outputs
+            .into_iter()
+            .map(|(plan, run, output)| output.map(|output| (plan, run, output)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let count = outputs.len();
+        for (plan, run, output) in outputs {
+            if (budget.cancelled)() {
+                return Err(Error::Cancelled);
+            }
+            let first = plan.entries()[0].number;
+            let start = self
+                .current
+                .manifest
+                .segments
+                .iter()
+                .position(|entry| entry.number == first)
+                .ok_or(Error::StaleMerge)?;
+            let mut manifest = self.current.manifest.clone();
+            manifest.last_merge = run.manifest.last_merge;
+            manifest
+                .unreadable
+                .retain(|&doc| catalog.live.contains(doc));
+            if let Some(ref pair) = output {
+                manifest.next_number = manifest.next_number.max(pair.0.number + 1);
+            }
+            let installed = output
+                .map(|pair| Self::install_pair(&self.dir, pair, budget.cancelled))
+                .transpose()?;
+            self.replace_run(manifest, start..start + plan.run.len(), installed)?;
+        }
+        Ok(count)
+    }
+
     /// Merges the segments at `run` into one, if their bytes fit the budget.
     pub(super) fn merge_run(
         &mut self,
@@ -43,6 +204,7 @@ impl IndexWriter {
             }));
         }
         let (written, changes) = self.write_run(&mut plan, catalog, budget, run.clone())?;
+        let written = Self::install_pair(&self.dir, written, budget.cancelled)?;
         let entry = written.0;
         if (budget.cancelled)() {
             return Err(Error::Cancelled);
@@ -141,7 +303,7 @@ impl IndexWriter {
             result
         };
         let mut changes = (0, 0);
-        let written = Self::write_pair(
+        let written = Self::prepare_pair(
             &self.dir,
             number,
             plan.docs,

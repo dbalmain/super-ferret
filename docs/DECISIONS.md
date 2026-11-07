@@ -7879,6 +7879,69 @@ that would change it: if large first builds mostly run through the daemon
 and its pass-end publication is what users wait on, C, because only C
 moves merge work under the reading.
 
+### Built (2026-11-07)
+
+B is built for in-process `ferret index` closing merges. The CLI and daemon
+share the engine's merge primitives, but have separate drivers: the CLI
+finishes follow then drains policy merges; the daemon admits one background
+merge against its resource estimate and advisory input identities. Commands
+routed to an existing daemon retain that serial driver. Daemon batches need
+aggregate memory/disk admission and whole-wave identity revalidation under
+writer then content before revocation; the single-run admission cannot safely
+be reused for a wave.
+
+Each CLI wave selects at most `min(4, max(1, available CPUs / 2))` disjoint
+runs, with two streaming threads per merge. Four caps simultaneous output
+buffers, decoded lists and dictionaries at four merge worksets; it is not an
+RSS limit or a new D70 reservation. Under writer then content, the host
+revokes each plan's dormant ranges durably, takes a fresh catalog pin after
+all revocations, and releases writer. Content remains held through streaming,
+ordered publication and retirement. Thus each merge filters against a pin
+taken after its own revocation, preserving D60 A′ even during refresh.
+
+Selection starts with the existing policy, removes planned inputs and
+selects again, stopping if the next run would cross an original-range gap.
+It does not predict merged sizes, which depend on dictionary coalescing and
+purging. The resulting layout may differ from serial selection because that
+would see each output's actual level before selecting again. Every merge
+still joins adjacent original ranges; subsequent waves run the same policy
+against actual published sizes until neither its size nor dead-fraction rule
+selects work. Follow remains the only segment-appending writer.
+
+Workers only stream and validate temporary pairs. All workers join before
+any final names are installed or manifests published, and results publish in
+plan order on the calling thread. A failed stream publishes none of its wave;
+a later publication failure or cancellation retains a complete published
+prefix. Cleanup cannot race a sibling stream. Tests use the real transfer,
+MergeMidway, PairRenamed, ManifestRenamed and Retired seams, check recovery
+and exact orphan cleanup, and check overlap, all-dead outputs, old pins,
+retry and durable revocation while refresh proceeds.
+
+Release measurements on the Ryzen 9 9955HX (32 logical CPUs), one benchmark
+at a time, warm source files on disk and index on tmpfs. The corpus was 377
+copies of `git archive df0e389`, each regular file suffixed with its copy
+number and relative path: 194,155 files, 3,911,978,854 bytes, 193,401 text
+documents and zero duplicate documents (the remaining 754 files are binary).
+All corpus and XDG scratch lived under this worktree's `target/`; index
+scratch alone used `/dev/shm`. Disk free space started at 237 GiB and stayed
+above 20 GiB. The generated corpus was deleted after measurement.
+
+Mean of three fresh builds; RSS is the mean of each process's maximum RSS:
+
+| Version | Wall, s | Closing merge span, s | Max RSS, KiB |
+| ------- | ------- | --------------------- | ------------ |
+| df0e389 | 15.280 | 6.951 | 207515 |
+| B | 11.263 | 2.228 | 196007 |
+
+The largest observed process peaks were 209800 and 210924 KiB,
+respectively. Whole-process peaks include reading and vary between runs;
+these numbers do not establish a memory saving. Closing merge time is
+67.9% lower and total wall time is 26.3% lower. This supports B's
+parallelism, though this corpus's absolute timings differ from the brief.
+The merge span is an Instant around the entire closing loop, including
+revocation, publication and the final policy check; both benchmark binaries
+had only that temporary timing print added, removed from shipped code.
+
 ## D138 — Whether stdin output waits for the capture limit
 
 **Status: answered C, 2026-11-07.** Stream stdin and stream operands from

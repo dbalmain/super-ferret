@@ -561,6 +561,12 @@ impl Engine {
         self.merge_content_inner(None, budget, false)
     }
 
+    /// One bounded wave of explicit-build closing merges, with D60 revocation
+    /// before the filtering pin and content ownership through publication.
+    pub(crate) fn merge_closing_content(&self, budget: &Budget) -> Result<usize, Error> {
+        prepared::closing(self, budget)
+    }
+
     /// Forced full merge under the same permission protocol as policy merges.
     pub fn merge_all_content(&self, budget: &Budget) -> Result<Option<Merged>, Error> {
         self.merge_content_inner(None, budget, true)

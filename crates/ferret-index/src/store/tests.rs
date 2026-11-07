@@ -2048,3 +2048,264 @@ fn a_pass_without_readers_is_refused() {
     let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
     let _ = writer.follow_with(&catalog.view(), &Budget::unbounded(), &mut []);
 }
+
+fn closing_segments(dir: &Dir, corpus: &Corpus) -> IndexWriter {
+    let mut writer = IndexWriter::open(&dir.0, &Catalog::new(0, &[]).view()).unwrap();
+    for bound in (10..=400).step_by(10) {
+        follow_all(
+            &mut writer,
+            &Catalog::new(bound, &[]),
+            corpus,
+            &Budget::unbounded(),
+        )
+        .unwrap();
+    }
+    writer
+}
+
+/// D137: all workers must join before cleanup, and a wave publishes only
+/// complete pairs in plan order. Drive the actual streaming/crash seams.
+#[test]
+fn closing_wave_preserves_answers_order_and_cleans_failed_outputs() {
+    for point in [
+        None,
+        Some(Point::MergeMidway),
+        Some(Point::PairRenamed),
+        Some(Point::ManifestRenamed),
+    ] {
+        let dir = Dir::new(&format!("closing-{point:?}"));
+        let corpus = Corpus::new(137, 400);
+        let mut writer = closing_segments(&dir, &corpus);
+        let catalog = Catalog::new(400, &[]);
+        let before = writer.view();
+        let plans = writer
+            .prepare_merges(&catalog.view(), &Budget::unbounded())
+            .unwrap();
+        let count = plans.len();
+        assert_eq!(count, (available_threads() / 2).clamp(1, 4));
+        let firsts: Vec<_> = plans.iter().map(|p| p.entries()[0].first).collect();
+        if let Some(point) = point {
+            stop_at(point);
+        }
+        let result = writer.merge_selected_batch(&catalog.view(), &Budget::unbounded(), plans);
+        if point.is_some() {
+            assert!(result.is_err());
+            drop(writer);
+            writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+        } else {
+            assert_eq!(result.unwrap(), count);
+            let merged: Vec<_> = writer
+                .view()
+                .manifest()
+                .segments
+                .iter()
+                .filter(|s| s.number >= before.manifest().next_number)
+                .map(|s| s.first)
+                .collect();
+            assert_eq!(merged, firsts);
+        }
+        assert_eq!(raw(&before), catalog.truth(&corpus));
+        assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+        assert_trigrams(&writer.view(), &catalog, &corpus);
+        assert_eq!(dir.files(), named(&writer.view()));
+        while !writer
+            .prepare_merges(&catalog.view(), &Budget::unbounded())
+            .unwrap()
+            .is_empty()
+        {
+            let plans = writer
+                .prepare_merges(&catalog.view(), &Budget::unbounded())
+                .unwrap();
+            writer
+                .merge_selected_batch(&catalog.view(), &Budget::unbounded(), plans)
+                .unwrap();
+        }
+        assert!(merge::choose(&writer.view().manifest().segments, &|s| s.docs).is_none());
+        assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+    }
+}
+
+/// Cancellation in an output transfer must leave the old wave selected, remove
+/// every sibling's temporary, and permit retry without reopening the writer.
+#[test]
+fn closing_wave_cancellation_joins_and_cleans_every_worker() {
+    let dir = Dir::new("closing-cancel");
+    let corpus = Corpus::new(138, 400);
+    let mut writer = closing_segments(&dir, &corpus);
+    let catalog = Catalog::new(400, &[]);
+    let before = writer.view();
+    let paused = AtomicBool::new(false);
+    let pace = |_| {
+        if !input_trace::charging() {
+            paused.store(true, Ordering::Release);
+        }
+        Ok(())
+    };
+    let cancelled = || paused.load(Ordering::Acquire);
+    let budget = Budget {
+        pace: &pace,
+        cancelled: &cancelled,
+        ..Budget::unbounded()
+    };
+    let plans = writer.prepare_merges(&catalog.view(), &budget).unwrap();
+    assert!(matches!(
+        writer.merge_selected_batch(&catalog.view(), &budget, plans),
+        Err(Error::Cancelled)
+    ));
+    assert!(Arc::ptr_eq(&before, &writer.view()));
+    assert_eq!(dir.files(), named(&before));
+    let plans = writer
+        .prepare_merges(&catalog.view(), &Budget::unbounded())
+        .unwrap();
+    writer
+        .merge_selected_batch(&catalog.view(), &Budget::unbounded(), plans)
+        .unwrap();
+    assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+}
+
+/// A serial implementation cannot reach every worker's first transfer before
+/// release. No final output names may appear while the wave is still streaming.
+#[test]
+fn closing_wave_streams_disjoint_runs_at_the_same_time() {
+    let dir = Dir::new("closing-overlap");
+    let corpus = Corpus::new(139, 400);
+    let mut writer = closing_segments(&dir, &corpus);
+    let catalog = Catalog::new(400, &[]);
+    let plans = writer
+        .prepare_merges(&catalog.view(), &Budget::unbounded())
+        .unwrap();
+    let count = plans.len();
+    let (send, receive) = std::sync::mpsc::channel();
+    let waiting = Mutex::new(std::collections::HashSet::new());
+    let release = (Mutex::new(false), std::sync::Condvar::new());
+    let named_before = named(&writer.view());
+    std::thread::scope(|scope| {
+        let pace = |_| {
+            let enrolled = {
+                let mut threads = waiting.lock().unwrap();
+                threads.len() < count && threads.insert(std::thread::current().id())
+            };
+            if enrolled {
+                send.send(()).unwrap();
+                let (released, _) = release
+                    .1
+                    .wait_timeout_while(
+                        release.0.lock().unwrap(),
+                        std::time::Duration::from_secs(10),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                assert!(*released, "closing merges did not overlap");
+            }
+            Ok(())
+        };
+        let writer = &mut writer;
+        let catalog = &catalog;
+        let merge = scope.spawn(move || {
+            writer.merge_selected_batch(
+                &catalog.view(),
+                &Budget {
+                    pace: &pace,
+                    ..Budget::unbounded()
+                },
+                plans,
+            )
+        });
+        for _ in 0..count {
+            receive
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        assert!(
+            dir.files()
+                .iter()
+                .all(|file| file.starts_with("tmp-") || named_before.contains(file))
+        );
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        assert_eq!(merge.join().unwrap().unwrap(), count);
+    });
+    assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+}
+
+/// Empty outputs allocate no pair, and their removal must not misplace later
+/// runs or let publication reuse one of the other workers' reserved numbers.
+#[test]
+fn closing_wave_can_drop_all_dead_runs_beside_live_outputs() {
+    let dir = Dir::new("closing-all-dead");
+    let corpus = Corpus::new(140, 400);
+    let mut writer = closing_segments(&dir, &corpus);
+    let catalog = Catalog::new(400, &(0..100).collect::<Vec<_>>());
+    while !writer
+        .prepare_merges(&catalog.view(), &Budget::unbounded())
+        .unwrap()
+        .is_empty()
+    {
+        let plans = writer
+            .prepare_merges(&catalog.view(), &Budget::unbounded())
+            .unwrap();
+        writer
+            .merge_selected_batch(&catalog.view(), &Budget::unbounded(), plans)
+            .unwrap();
+    }
+    assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+    assert_trigrams(&writer.view(), &catalog, &corpus);
+    assert!(writer.view().uncovered(&catalog.live).is_empty());
+    assert_eq!(dir.files(), named(&writer.view()));
+}
+
+/// A regular transfer failure in one worker must clean successful siblings too;
+/// a cancellation after one publication keeps exactly the completed prefix.
+#[test]
+fn closing_wave_cleans_a_failed_worker_and_preserves_a_published_prefix() {
+    for cancel_after_publish in [false, true] {
+        let dir = Dir::new(&format!("closing-prefix-{cancel_after_publish}"));
+        let corpus = Corpus::new(141, 400);
+        let mut writer = closing_segments(&dir, &corpus);
+        let catalog = Catalog::new(400, &[]);
+        let before = writer.view();
+        let failed = AtomicBool::new(false);
+        let pace = |_| {
+            if !cancel_after_publish
+                && !input_trace::charging()
+                && !failed.swap(true, Ordering::Relaxed)
+            {
+                return Err(io::Error::other("injected closing output failure"));
+            }
+            Ok(())
+        };
+        CANCELLED.set(false);
+        if cancel_after_publish {
+            CANCEL_AT.set(Some(Point::Retired));
+        }
+        let budget = Budget {
+            pace: &pace,
+            cancelled: &|| CANCELLED.get(),
+            ..Budget::unbounded()
+        };
+        let plans = writer.prepare_merges(&catalog.view(), &budget).unwrap();
+        let count = plans.len();
+        let result = writer.merge_selected_batch(&catalog.view(), &budget, plans);
+        if cancel_after_publish {
+            if count > 1 {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert_eq!(result.unwrap(), 1);
+            }
+            assert_eq!(
+                writer.view().manifest().sequence,
+                before.manifest().sequence + 1
+            );
+        } else {
+            assert!(result.is_err());
+            assert!(failed.load(Ordering::Relaxed));
+            assert!(Arc::ptr_eq(&before, &writer.view()));
+        }
+        CANCELLED.set(false);
+        assert_eq!(dir.files(), named(&writer.view()));
+        drop(writer);
+        let writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+        assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+        assert_trigrams(&writer.view(), &catalog, &corpus);
+    }
+}

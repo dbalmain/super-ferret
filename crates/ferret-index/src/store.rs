@@ -1,6 +1,7 @@
 //! [`IndexWriter`]: the index's own directory of segments under a
 //! [`Manifest`], kept in step with the catalog by [`IndexWriter::follow`]
-//! and compacted by [`IndexWriter::merge_selected`] (docs/S2.md § Manifest
+//! and compacted by [`IndexWriter::merge_selected`] or bounded explicit-build
+//! waves via [`IndexWriter::merge_selected_batch`] (docs/S2.md § Manifest
 //! and commit, § The content flow, § What S5 needs). [`View`] is one
 //! published manifest with its segments open, which a query pins beside a
 //! catalog view.
@@ -593,6 +594,24 @@ impl IndexWriter {
             impl FnOnce(&File) -> Result<Sizes, Error> + Send,
         ),
     ) -> Result<WrittenPair, Error> {
+        let pair =
+            Self::prepare_pair(dir, number, docs, first, last, cancelled, (terms, trigrams))?;
+        Self::install_pair(dir, pair, cancelled)
+    }
+
+    /// Streams and validates a pair without installing either final name.
+    fn prepare_pair(
+        dir: &Path,
+        number: u64,
+        docs: u32,
+        first: u32,
+        last: u32,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        (terms, trigrams): (
+            impl FnOnce(&File) -> Result<Sizes, Error>,
+            impl FnOnce(&File) -> Result<Sizes, Error> + Send,
+        ),
+    ) -> Result<WrittenPair, Error> {
         let open = |tri: bool, file: File, sizes: Sizes| -> Result<_, Error> {
             let segment = Segment::open(file)?;
             let info = segment.info();
@@ -625,14 +644,15 @@ impl IndexWriter {
                 write_output(dir, number, true, cancelled, trigrams)
             });
             let term = write_output(dir, number, false, cancelled, terms);
-            let trigram = trigram
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let trigram = match trigram.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
             (term, trigram)
         });
-        let (temp, file, sizes) = term_written?;
+        let (_, file, sizes) = term_written?;
         hit(Point::TermSynced)?;
-        let (trigram_temp, trigram_file, trigram_sizes) = trigram_written?;
+        let (_, trigram_file, trigram_sizes) = trigram_written?;
         let segment = open(false, file, sizes)?;
         let trigram = open(true, trigram_file, trigram_sizes)?;
         let entry = SegmentEntry {
@@ -649,6 +669,21 @@ impl IndexWriter {
             trigram_pairs: trigram_sizes.pairs,
             trigram_digest: trigram.digest(),
         };
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok((entry, segment, trigram))
+    }
+
+    /// Only the publishing thread installs names, with no workers outstanding.
+    fn install_pair(
+        dir: &Path,
+        pair: WrittenPair,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WrittenPair, Error> {
+        let (entry, segment, trigram) = pair;
+        let temp = dir.join(format!("tmp-{}.seg", entry.number));
+        let trigram_temp = dir.join(format!("tmp-{}.tri", entry.number));
         if cancelled() {
             return Err(Error::Cancelled);
         }
