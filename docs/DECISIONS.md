@@ -8087,6 +8087,13 @@ the actual Sydney local-date plan. The equivalent thresholds were
 discarded. This small, warm tree showed no routing penalty; larger local catalog
 loads may cost more.
 
+Round 2, overflow correction: recurring transition instants and day boundaries
+use i128 seconds. Transitions outside the Unix i64 range remain outside it; they
+are never clamped onto a real boundary event. Date arguments whose wall seconds
+do not fit i64 are rejected. The real date-argument path accepts
+292277026596-01-01 under EST5EDT rules without overflowing in the adjoining
+year; tests also exercise both i64 extrema for transitions and day boundaries.
+
 Validation: formatter, workspace Clippy with warnings denied, ordinary tests and
 private-item documentation all passed. Ordinary tests: 2,184 passed, 0 failed,
 11 ignored (base: 2,178/0/11). The extended gate ran once: all ten named tests

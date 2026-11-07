@@ -100,3 +100,19 @@ fn version_three_footer_can_keep_dst_all_year() {
         assert_eq!(zone.abbreviation(stamp), b"EDT");
     }
 }
+
+#[test]
+fn adjoining_transitions_and_day_boundaries_preserve_extreme_instants() {
+    let zone = Zone {
+        transitions: Vec::new(),
+        offsets: Vec::new(),
+        future: Some(Posix::parse(b"EST5EDT,M3.2.0,M11.1.0").unwrap()),
+    };
+    // D139 round 2: adjoining-year transitions exceed i64 even when the
+    // timestamp fits. They must remain real instants, never clamped events.
+    assert_eq!(zone.offset(i64::MAX), -18000);
+    assert_eq!(zone.offset(i64::MIN), -18000);
+    let utc = Zone::utc(b"UTC".to_vec());
+    assert_eq!(utc.day_end(i64::MAX), 9_223_372_036_854_806_400);
+    assert_eq!(utc.day_end(i64::MIN), -9_223_372_036_854_720_000);
+}

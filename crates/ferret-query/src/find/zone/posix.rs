@@ -82,13 +82,14 @@ impl Posix {
         // Signed transition hours may put a rule outside its nominal year.
         // Find the last transition over the adjoining years, also for southern
         // DST.
-        let mut last = (i64::MIN, &self.standard);
+        let mut last = (i128::MIN, &self.standard);
+        let stamp = i128::from(stamp);
         for year in year - 1..=year + 1 {
             for (rule, before, after) in [
                 (start, &self.standard, daylight),
                 (end, daylight, &self.standard),
             ] {
-                let transition = rule.at(year) - i64::from(before.seconds);
+                let transition = rule.at(year) - i128::from(before.seconds);
                 if transition <= stamp && transition >= last.0 {
                     last = (transition, after);
                 }
@@ -103,7 +104,9 @@ impl Posix {
 }
 
 impl Rule {
-    fn at(&self, year: i64) -> i64 {
+    // The year comes from an i64 Unix timestamp plus/minus one: calendar days
+    // fit in i64, but adjoining-year transition seconds need i128.
+    fn at(&self, year: i64) -> i128 {
         let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
         let ordinal = match self.day {
             Day::Ordinal(day) => i64::from(day),
@@ -125,7 +128,7 @@ impl Rule {
                 first + day - 1 - days_from_civil(year, 1, 1)
             }
         };
-        (days_from_civil(year, 1, 1) + ordinal) * 86400 + i64::from(self.seconds)
+        i128::from(days_from_civil(year, 1, 1) + ordinal) * 86400 + i128::from(self.seconds)
     }
 }
 

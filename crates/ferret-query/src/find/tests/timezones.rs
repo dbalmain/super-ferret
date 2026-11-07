@@ -74,6 +74,16 @@ fn zone_process() {
     let Ok(zone) = std::env::var("FERRET_TEST_FIND_ZONE") else {
         return;
     };
+    if zone == "extreme" {
+        let tree = Tree::new("extreme-date");
+        let args = tree.args(&["-newermt", "292277026596-01-01"]);
+        let (outcome, output) = run(&args);
+        assert_eq!(outcome.errors, 0);
+        assert!(output.bytes.is_empty());
+        // This date's wall-clock seconds are already outside i64; reject it.
+        assert!(Plan::parse(&tree.args(&["-newermt", "292277026597-01-01"])).is_err());
+        return;
+    }
     let tree = Tree::new("timezones");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -224,4 +234,24 @@ fn zone_process() {
             "{zone} {expression:?}"
         );
     }
+}
+
+#[test]
+fn extreme_date_arguments_do_not_overflow() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "find::tests::timezones::zone_process",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("FERRET_TEST_FIND_ZONE", "extreme")
+        .env("TZ", "EST5EDT,M3.2.0,M11.1.0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

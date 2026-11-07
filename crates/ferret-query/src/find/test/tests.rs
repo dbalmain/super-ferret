@@ -1,6 +1,7 @@
 use super::*;
 use std::fs::FileTimes;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::time::Duration;
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -173,7 +174,7 @@ fn minutes_round_up_and_days_round_down_on_the_same_fixed_clock() {
 fn daystart_measures_from_the_end_of_today_and_future_timestamps_remain_negative_ages() {
     let fixture = Fixture::new();
     let zone = crate::find::zone::local();
-    let seconds = zone.day_end(2_000_000_000) - 43_200;
+    let seconds = (zone.day_end(2_000_000_000) - 43_200) as i64;
     let now = UNIX_EPOCH + Duration::from_secs(seconds as u64);
     let midnight = (zone.day_end(seconds) - 86_400) as u64;
     let path = fixture.0.join("last-night");

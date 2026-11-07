@@ -232,11 +232,13 @@ impl Zone {
         Some(stamp)
     }
 
-    pub fn day_end(&self, stamp: i64) -> i64 {
-        let midnight = self.wall(stamp).div_euclid(86400) * 86400;
+    /// GNU's day boundary may lie outside the i64 Unix-second range.
+    pub fn day_end(&self, stamp: i64) -> i128 {
+        let offset = i128::from(self.offset(stamp));
+        let midnight = (i128::from(stamp) + offset).div_euclid(86400) * 86400;
         // GNU retains the run-start DST side when establishing daystart,
         // including on a transition day; resolving midnight afresh differs.
-        midnight - i64::from(self.offset(stamp)) + 86400
+        midnight - offset + 86400
     }
 }
 

@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferret_verify::FindRegex;
 
@@ -588,19 +588,14 @@ fn entry_stamp(entry: &Entry, field: TimeField) -> std::io::Result<i128> {
 }
 
 fn age_nanos(stamp: i128, now: SystemTime, daystart: bool) -> i128 {
-    let now = if daystart {
-        let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-        // GNU measures -daystart ages from the end of today (observed: a file
-        // from 23:00 the day before yesterday is `-daystart -mtime 1`).
-        UNIX_EPOCH
-            + Duration::from_secs(super::zone::local().day_end(duration.as_secs() as i64) as u64)
+    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now_ns = if daystart {
+        // Keep the boundary wide: it need not fit in Unix i64 seconds even
+        // when the run-start timestamp does.
+        super::zone::local().day_end(duration.as_secs() as i64) * 1_000_000_000
     } else {
-        now
+        duration.as_nanos() as i128
     };
-    let now_ns = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i128;
     now_ns - stamp
 }
 
