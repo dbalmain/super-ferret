@@ -12,6 +12,7 @@ pub mod schedule;
 mod source;
 mod test;
 mod walk;
+mod zone;
 
 use crate::threads::lock;
 use std::ffi::OsString;

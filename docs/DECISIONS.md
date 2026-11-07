@@ -8000,7 +8000,7 @@ KiB and rg hides earlier lines there, B, which keeps piped output unchanged.
 
 ## D139 — Whether `ferret find` reads and prints times in local time
 
-**Status: answered B, 2026-11-07.** Local time throughout, from a safe-Rust
+**Status: Built B, 2026-11-07.** Local time throughout, from a safe-Rust
 TZif reader, for parsing, `-daystart` and printing.
 
 > Dave (2026-11-07, in chat): agree with everything up to D139.
@@ -8029,6 +8029,59 @@ they never see it.
 commands, and the selection difference in A is silent. The fact that would
 change it: if find is used mostly in scripts that already set `TZ=UTC`, A,
 with the documentation fix.
+
+**Implementation (D139, 2026-11-07):** Built in `ferret-query/src/find/zone.rs`,
+with calendar and POSIX-rule submodules; no crate edge or dependency added. TZif
+versions 1–3 use the 64-bit block when present, validate bounded counts and
+indices, and apply the footer beyond the table. Reads are capped at 1 MiB. One
+lazy process-wide snapshot serves date arguments, `-daystart`, `-printf` and
+`-ls`; plans needing no local conversion never load it. A relevant command pays
+one bounded file read and decode, then binary-search table lookups or recurring
+rule arithmetic. Full B exceeded the 300-line estimate, mainly for POSIX
+grammar, DST resolution and validation; the scope expansion and possible POSIX
+follow-up cut were raised before building.
+
+GNU find 4.11.0 was probed as an executable, without consulting its source.
+Unset `TZ` reads Sydney from `/etc/localtime` here. `TZDIR` is honoured for
+named zones and colon-prefixed relative paths; colon-prefixed absolute paths
+work independently. Explicit POSIX strings work without a database. Missing
+names use zero offset but retain the leading alphabetic abbreviation; the
+malformed absolute file tested prints an empty abbreviation. Empty `TZ` prints
+UTC with a working `TZDIR`; with GNU's missing default directory here it prints
+Universal. Ferret uses UTC for empty `TZ`.
+
+The pinned GNU executable tries `/usr/share/zoneinfo` when `TZDIR` is unset;
+that directory is absent here. Ferret discovers the existing `/etc/zoneinfo`
+without embedding its Nix store target. Named-zone differentials explicitly set
+`TZDIR=/etc/zoneinfo`. Other distributions' compiled glibc directories and the
+fallback when `/etc/localtime` itself is missing or malformed were not verified;
+the latter file was left untouched.
+
+Spring gaps reject date arguments. With no preceding date, New York's 2024-11-03
+01:30 chooses 05:30 UTC, while Sydney's 2024-04-07 02:30 chooses 16:30 UTC. A
+preceding January/July argument changes the overlap choice: GNU retains the
+previous successful date's offset guess. The parser retains that state per plan.
+A synthetic POSIX transition on today's date also showed that GNU's `-daystart`
+retains the run-start DST offset at midnight; resolving midnight afresh gives
+different selections.
+
+The original UTC differential corpus remains under UTC in a fresh process.
+Additional processes compare real find parsing, evaluation and actions under
+UTC, Sydney, New York, Kolkata, Adelaide, explicit POSIX rules, colon paths,
+unset/empty TZ, and missing/malformed zones. Cases include DST gaps and
+overlaps, prior-date overlap choices, `-daystart -mtime`, `%T@ %Tc %TZ %Tk %Tz`,
+access and change fields, `-ls`, and 2100 dates beyond the transition table.
+Parser tests cover real Sydney TZif, v1/v3 fixtures, every truncated prefix, bad
+magic, absurd counts and invalid type flags. Lazy-loading assertions drive
+ordinary plans, elapsed predicates, explicit ISO offsets and epoch-only output.
+
+Validation: formatter, workspace Clippy with warnings denied, ordinary tests and
+private-item documentation all passed. Ordinary tests: 2,184 passed, 0 failed,
+11 ignored (base: 2,178/0/11). The extended gate ran once: all ten named tests
+passed, including the original UTC find corpus and 21 local-zone scenarios;
+117.237 seconds of serial test time, 325.426 seconds including the release build
+on this host. Production Rust adds 642 lines and removes 45; tests add 391 and
+remove 5, versus 27e8185.
 
 ## D140 — Whether a local find checks catalog sections its plan does not read
 

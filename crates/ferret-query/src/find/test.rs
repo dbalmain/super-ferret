@@ -225,10 +225,11 @@ impl Test {
         value: &OsStr,
         now: SystemTime,
         follow: bool,
+        date_offset: &mut i32,
     ) -> Option<Self> {
         let field = TimeField::from_letter(x);
         if y == b't' {
-            return parse_date(value, now).map(|stamp| Self::Newer { field, stamp });
+            return parse_date(value, now, date_offset).map(|stamp| Self::Newer { field, stamp });
         }
         Some(Self::Reference {
             path: PathBuf::from(value),
@@ -590,7 +591,8 @@ fn age_nanos(stamp: i128, now: SystemTime, daystart: bool) -> i128 {
         let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
         // GNU measures -daystart ages from the end of today (observed: a file
         // from 23:00 the day before yesterday is `-daystart -mtime 1`).
-        UNIX_EPOCH + Duration::from_secs(duration.as_secs() / 86_400 * 86_400 + 86_400)
+        UNIX_EPOCH
+            + Duration::from_secs(super::zone::local().day_end(duration.as_secs() as i64) as u64)
     } else {
         now
     };

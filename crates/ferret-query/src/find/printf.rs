@@ -1,5 +1,6 @@
-//! Parse-time compiled GNU printf directives and C-locale UTC formatting.
-//! Rendering reuses scratch storage; metadata comes solely through Entry.
+//! Parse-time compiled GNU printf directives and C-locale local-time
+//! formatting. Rendering reuses scratch storage; metadata comes solely through
+//! Entry.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -600,7 +601,16 @@ const MONTHS: [&str; 12] = [
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 fn timestamp(seconds: i64, nanos: i64, directive: Option<u8>, out: &mut Vec<u8>) -> io::Result<()> {
-    let d = Date::new(seconds);
+    if matches!(directive, Some(b'@' | b's' | b'%')) {
+        match directive {
+            Some(b'@') => write!(out, "{seconds}.{nanos:09}0")?,
+            Some(b's') => write!(out, "{seconds}")?,
+            _ => out.push(b'%'),
+        }
+        return Ok(());
+    }
+    let zone = super::zone::local();
+    let d = Date::new(zone.wall(seconds));
     let month = MONTHS[(d.month - 1) as usize];
     let weekday = WEEKDAYS[d.weekday];
     match directive {
@@ -703,8 +713,13 @@ fn timestamp(seconds: i64, nanos: i64, directive: Option<u8>, out: &mut Vec<u8>)
         Some(b'g') => write!(out, "{:02}", iso_week(&d).0.rem_euclid(100))?,
         Some(b'y') => write!(out, "{:02}", d.year.rem_euclid(100))?,
         Some(b'Y') => write!(out, "{:04}", d.year)?,
-        Some(b'z') => out.extend_from_slice(b"+0000"),
-        Some(b'Z') => out.extend_from_slice(b"UTC"),
+        Some(b'z') => {
+            let offset = zone.offset(seconds);
+            let sign = if offset < 0 { '-' } else { '+' };
+            let offset = offset.unsigned_abs();
+            write!(out, "{sign}{:02}{:02}", offset / 3600, offset / 60 % 60)?;
+        }
+        Some(b'Z') => out.extend_from_slice(zone.abbreviation(seconds)),
         Some(byte) => {
             out.push(b'%');
             out.push(byte);
@@ -715,7 +730,7 @@ fn timestamp(seconds: i64, nanos: i64, directive: Option<u8>, out: &mut Vec<u8>)
 
 pub(super) fn list(entry: &Entry, out: &mut Vec<u8>) -> io::Result<()> {
     let stat = entry.stat()?;
-    let d = Date::new(stat.mtime());
+    let d = Date::new(super::zone::local().wall(stat.mtime()));
     let mut date = Vec::new();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

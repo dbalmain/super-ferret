@@ -9,8 +9,31 @@ use std::time::{Duration, UNIX_EPOCH};
 use super::*;
 use crate::find::action::tests::Tree;
 
+// Keep the original fixed UTC fixtures without changing the parent process's
+// environment while other find tests are running.
+fn utc_child() -> bool {
+    if std::env::var_os("TZ").as_deref() == Some(std::ffi::OsStr::new("UTC")) {
+        return false;
+    }
+    let name = std::thread::current().name().unwrap().to_owned();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([&name, "--exact", "--nocapture"])
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[test]
 fn nanoseconds_have_ten_digits_and_time_fields_use_c_locale_utc() {
+    if utc_child() {
+        return;
+    }
     let tree = Tree::new();
     let path = tree.0.join("a");
     let time = UNIX_EPOCH + Duration::new(946684800, 123456789);
@@ -52,6 +75,9 @@ fn escapes_unknown_directives_width_and_precision_follow_gnu() {
 
 #[test]
 fn list_escapes_spaces_and_uses_old_year_column() {
+    if utc_child() {
+        return;
+    }
     let tree = Tree::new();
     let path = tree.0.join("space name");
     File::open(&path)
@@ -86,6 +112,9 @@ fn numeric_flags_and_incomplete_time_directives_follow_gnu() {
 
 #[test]
 fn iso_week_year_uses_the_adjacent_year_at_new_year() {
+    if utc_child() {
+        return;
+    }
     let tree = Tree::new();
     let path = tree.0.join("a");
     let time = UNIX_EPOCH + Duration::from_secs(946684800);

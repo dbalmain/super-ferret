@@ -172,8 +172,10 @@ fn minutes_round_up_and_days_round_down_on_the_same_fixed_clock() {
 #[test]
 fn daystart_measures_from_the_end_of_today_and_future_timestamps_remain_negative_ages() {
     let fixture = Fixture::new();
-    let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-    let midnight = 2_000_000_000u64 / 86_400 * 86_400;
+    let zone = crate::find::zone::local();
+    let seconds = zone.day_end(2_000_000_000) - 43_200;
+    let now = UNIX_EPOCH + Duration::from_secs(seconds as u64);
+    let midnight = (zone.day_end(seconds) - 86_400) as u64;
     let path = fixture.0.join("last-night");
     fs::write(&path, b"").unwrap();
     fs::File::options()
@@ -183,7 +185,7 @@ fn daystart_measures_from_the_end_of_today_and_future_timestamps_remain_negative
         .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(midnight - 3600)))
         .unwrap();
     let entry = Entry::new(path, 0, FileKind::File);
-    // 4.5 hours old by the clock, 25 hours old from the end of today.
+    // Thirteen hours old by the clock, 25 hours from the end of today.
     let matches = |age: &[u8], daystart| {
         Test::time(b"-mtime", age, now, daystart)
             .unwrap()
@@ -266,6 +268,7 @@ fn newer_comparison_is_strict_and_preserves_nanoseconds() {
         reference_path.as_os_str(),
         SystemTime::now(),
         false,
+        &mut 0,
     )
     .unwrap();
     assert!(
@@ -398,6 +401,7 @@ fn cnewer_compares_the_entry_ctime_with_the_reference_mtime() {
         reference.path().as_os_str(),
         SystemTime::now(),
         false,
+        &mut 0,
     )
     .unwrap();
     let newer = Test::newer(
@@ -406,6 +410,7 @@ fn cnewer_compares_the_entry_ctime_with_the_reference_mtime() {
         reference.path().as_os_str(),
         SystemTime::now(),
         false,
+        &mut 0,
     )
     .unwrap();
     assert!(cnewer.evaluate(&reference).unwrap());
@@ -505,10 +510,16 @@ fn all_distinct_corpus_newermt_values_parse() {
         "yesterday",
     ];
     for value in values {
-        assert!(parse_date(OsStr::new(value), now).is_some(), "{value}");
+        assert!(
+            parse_date(OsStr::new(value), now, &mut 0).is_some(),
+            "{value}"
+        );
     }
     assert_eq!(values.len(), 80);
     for value in ["nonsense", "2022-13-45"] {
-        assert!(parse_date(OsStr::new(value), now).is_none(), "{value}");
+        assert!(
+            parse_date(OsStr::new(value), now, &mut 0).is_none(),
+            "{value}"
+        );
     }
 }

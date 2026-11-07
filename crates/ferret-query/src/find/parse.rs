@@ -127,6 +127,7 @@ struct Parser<'a> {
     prune: bool,
     explicit_depth: bool,
     daystart: bool,
+    date_offset: i32,
     now: std::time::SystemTime,
     permission_warning: bool,
     combinators: usize,
@@ -167,6 +168,7 @@ impl<'a> Parser<'a> {
             prune: false,
             explicit_depth: false,
             daystart: false,
+            date_offset: 0,
             now,
             permission_warning: false,
             combinators: 0,
@@ -568,7 +570,14 @@ impl<'a> Parser<'a> {
                 let now = self.now;
                 let follow_references = self.options.follow != Follow::Physical;
                 let value = self.argument(&primary)?;
-                let test = super::test::Test::newer(x, y, value, now, follow_references);
+                let test = super::test::Test::newer(
+                    x,
+                    y,
+                    value,
+                    now,
+                    follow_references,
+                    &mut self.date_offset,
+                );
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
             b")" | b"," | b"-o" | b"-or" | b"-a" | b"-and" => {

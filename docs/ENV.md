@@ -65,6 +65,16 @@ Standard variables ferret reads, all in release builds:
 | `NO_COLOR`, `TERM`                                                             | `ferret` `grep/presentation.rs`   | `--color=auto`: no colour when `NO_COLOR` is set or `TERM=dumb`.                          |
 | `RIPGREP_CONFIG_PATH`                                                          | `ferret` `grep.rs`                | Non-empty is refused: ferret grep reads no rg config file, so it asks for explicit flags. |
 | `PATH`                                                                         | `ferret-query` `find/parse.rs`    | `-execdir`/`-okdir` refuse a relative `PATH` entry, as GNU find does.                     |
+| `TZ`, `TZDIR` | `ferret-query` `find/zone.rs` | Local zone; see below. |
+
+`TZ` and `TZDIR` are supported standard inputs, read by
+`ferret-query/src/find/zone.rs` on the first local-time operation. Unset `TZ`
+uses `/etc/localtime`; an empty value uses UTC. Names, colon-prefixed paths, and
+POSIX rule strings select a zone. `TZDIR` overrides the database directory;
+otherwise find discovers `/usr/share/zoneinfo`, `/etc/zoneinfo`, then
+`/usr/lib/zoneinfo`. A missing or malformed zone uses zero offset. The process
+caches the result. Find's extended GNU differential covers these inputs,
+including unset/empty `TZ`, missing `TZDIR`, malformed files and POSIX rules.
 
 ## Debug-only injections
 
@@ -125,6 +135,12 @@ child copy of its own binary.
 | `FERRET_FD_PRESSURE`, `FERRET_FD_PRESSURE_BASE`   | `ferret-crawl/src/tests/content.rs`       |
 | `FERRET_FIFO_CHILD`, `FERRET_FIFO_ROOT`           | `ferret-crawl/src/tests/mod.rs`           |
 | `FERRET_UNDURABLE_CHILD`, `FERRET_UNDURABLE_BASE` | `ferret-crawl/src/tests/partial.rs`       |
+| `FERRET_TEST_FIND_ZONE` | `ferret-query/src/find/tests/timezones.rs` |
+
+`FERRET_TEST_FIND_ZONE` is a unit-test subprocess marker owned by
+`ferret-query/src/find/tests/timezones.rs`. The extended GNU differential runs
+one fresh test process per zone so tests never mutate a shared environment or
+reuse another zone's process-wide cache.
 
 ## Tooling
 

@@ -14,6 +14,7 @@ use std::process::Command;
 use super::*;
 
 mod expressions;
+mod timezones;
 
 struct Tree(PathBuf);
 
@@ -679,11 +680,27 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
 #[test]
 #[ignore = "extended gate; run in release"]
 fn differential_against_pinned_gnu() {
+    // Preserve the original UTC corpus independently of the host's zone.
+    if std::env::var_os("TZ").as_deref() != Some(OsStr::new("UTC")) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "find::tests::differential_against_pinned_gnu",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TZ", "UTC")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
     let tree = Tree::new("oracle");
     fs::write(tree.0.join("reference"), b"ref").unwrap();
     fs::create_dir(tree.0.join("denied")).unwrap();
     fs::set_permissions(tree.0.join("denied"), fs::Permissions::from_mode(0o000)).unwrap();
     super::action::tests::differential();
+    timezones::differential();
     for template in expressions::EXPRESSIONS {
         let expression = template
             .iter()

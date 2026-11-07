@@ -229,10 +229,32 @@ Beyond the order rules:
   collating symbols.
 - **Regex backreferences** use a bounded search. A pattern that exhausts it is
   an error for that entry, with exit 1, rather than an unbounded search.
-- **Dates and names:** `-printf` and `-ls` format times in UTC, in the C
-  locale, and `-daystart` and date arguments (`-newermt`) are read in UTC,
-  whatever `TZ` says; GNU uses local time for all of these (D139). User and
-  group names come from `/etc/passwd` and `/etc/group` only.
+- **Dates and names:** times use the local zone (D139), with C-locale names.
+  User and group names come from `/etc/passwd` and `/etc/group` only.
+
+Local dates (`-newermt`, `-newerXt`), `-daystart`, `-printf` time fields and
+`-ls` use one lazily loaded process-wide zone. `TZ` unset reads
+`/etc/localtime`; a named zone or colon-prefixed path reads TZif, and POSIX TZ
+rules cover explicit rule strings and dates beyond the TZif transition table.
+`TZDIR` overrides the zoneinfo directory. Without it, ferret discovers
+`/usr/share/zoneinfo`, `/etc/zoneinfo`, then `/usr/lib/zoneinfo`. On this Nix
+host GNU find only tries `/usr/share/zoneinfo`, which is absent: use
+`TZDIR=/etc/zoneinfo` to give both commands the same named zone. No Nix store
+path is embedded.
+
+Missing or malformed zones have zero offset; GNU's fallback abbreviation is
+preserved for missing names. DST gaps in absolute dates are errors. Ambiguous
+dates retain the last date argument's offset guess, matching GNU; the initial
+guess is zero. `-daystart` retains the run-start DST offset when establishing
+its midnight boundary, including on a transition day.
+
+An ordinary listing, elapsed-time predicate, explicit ISO offset, or epoch-only
+`-printf` directive opens no zone file. A local-time operation pays once for
+reading at most 1 MiB plus one overflow-detection byte, rejecting files above 1
+MiB, validating and decoding the zone into transition/type vectors, and parsing
+its footer. Subsequent table lookups use binary search; post-table POSIX lookups
+calculate transitions in the adjoining three years. The zone and its allocations
+live until process exit.
 
 ## Resource and expression limits
 
