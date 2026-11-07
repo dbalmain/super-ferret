@@ -7643,11 +7643,12 @@ fixed and tested.
 ## D135 — How often a held directory is checked again
 
 **Status: built C, 2026-11-07 (Dave answered C).** A held directory is checked
-when it is opened and not again for the rest of the query. Files are still
-opened through the held handle, so a rename or a swapped-in symlink cannot
-redirect a read; a directory moved or removed mid-query is reported as it was
-when opened, under its old path, like a one-pass walk. Same speed as B, less
-code.
+when it is opened and not again while its descriptor stays held; one closed
+and reopened (a branch switch, descriptor pressure) is checked again. Files are
+still opened through the held handle, so a rename or a swapped-in symlink
+cannot redirect a read; a directory moved or removed mid-query is reported as
+it was when opened, under its old path, like a one-pass walk. Same speed as B,
+less code.
 
 > Dave (2026-11-07, in chat): why not C? I don't know why we'd try so hard
 > to support updates to our results based on changes made while we were

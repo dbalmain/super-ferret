@@ -739,8 +739,8 @@ differences from GNU — is specified in [FIND.md](FIND.md).
    only when the read matches the catalog's full version key; every other copy
    gets its own checked stat before reuse. Directory descriptors are checked
    against the catalog when opened, then reused without checking their paths
-   again for the reader's lifetime (D135). A moved directory keeps serving its
-   old path. Changed files use their own current bytes; vanished paths are
+   again while they stay held (D135); one closed and reopened is checked
+   again. A moved directory keeps serving its old path while held. Changed files use their own current bytes; vanished paths are
    dropped. Exact answers remain snapshots of the last follow
    (S2.md § Coverage).
 5. **Emit** one row per path (D15): path, doc id, and match offsets. Human

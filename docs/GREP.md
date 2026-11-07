@@ -1187,7 +1187,8 @@ cache eviction, plus bounded container overhead. Every alias first passes its
 own full-key catalog-version stat through the reader's directory descriptor.
 Directories are checked against the catalog when opened, then held descriptors
 are reused without checking their paths again (D135). A moved directory keeps
-serving reads and replay stats under its old path for the reader's lifetime.
+serving reads and replay stats under its old path while its descriptor stays
+held; one closed and reopened is checked again.
 Current bytes remain path-local and never enter this DocId cache. Large groups
 skip caching and stream at the threshold; even a small cached record set can
 cross it when an alias's rendered prefix expands. Concurrent cache misses may
