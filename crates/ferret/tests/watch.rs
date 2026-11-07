@@ -308,7 +308,10 @@ impl Tree {
             if actual == expected
                 && s.contains("\"pending_scopes\":0")
                 && s.contains("\"writer_busy\":false")
-                && number(&s, "uncovered") == 0
+                // S2 Coverage: a checked read racing a burst may leave a
+                // permanently unreadable DocId. Queries still verify it;
+                // only uncovered ids outside that set are follow backlog.
+                && number(&s, "uncovered") == number(&s, "unreadable")
             {
                 return;
             }
@@ -1100,6 +1103,48 @@ fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
     }
     tree.start(&[]);
     tree.converges();
+}
+
+/// A transient checked-read failure can outlive the burst that caused it.
+/// Convergence must retain the complete query oracle comparison while accepting
+/// the unreadable coverage exception that follow deliberately never retries.
+#[test]
+fn convergence_accepts_verified_unreadable_documents_without_follow_backlog() {
+    let mut tree = Tree::new();
+    {
+        let catalog = ferret_catalog::Catalog::open(&tree.path("index"))
+            .unwrap_or_else(|error| panic!("catalog open: {error}"))
+            .unwrap_or_else(|| panic!("catalog absent"));
+        catalog
+            .load_all()
+            .unwrap_or_else(|error| panic!("catalog load: {error}"));
+        assert_eq!(catalog.dormant_docs().count(), 0);
+        let live = ferret::engine::live_documents(&catalog);
+        let view = ferret_index::CatalogView {
+            incarnation: catalog.generation().incarnation,
+            live: &live,
+        };
+        let mut index = ferret_index::IndexWriter::open(&tree.path("index/index"), &view)
+            .unwrap_or_else(|error| panic!("content open: {error}"));
+        // This fixture has no other writer or dormant permissions to revoke.
+        index
+            .reset(&view)
+            .unwrap_or_else(|error| panic!("content reset: {error}"));
+        let followed = index
+            .follow(&view, &ferret_index::Budget::unbounded(), &mut |_, _| {
+                Err(ferret_index::Fault::Unreadable)
+            })
+            .unwrap_or_else(|error| panic!("content follow: {error}"));
+        assert_eq!(followed.unreadable, 1);
+        assert_eq!(followed.remaining, 0);
+    }
+    tree.start(&[]);
+    write(tree.path("src/left/new.txt"), "modified");
+    tree.converges();
+    let status = tree.status();
+    assert_eq!(number(&status, "unreadable"), 1);
+    assert_eq!(number(&status, "uncovered"), 1);
+    assert_eq!(number(&status, "covered"), 1);
 }
 
 fn generated(rounds: usize) {
