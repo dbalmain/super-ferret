@@ -7761,6 +7761,15 @@ with a replacement symlink pointing at different bytes to detect redirection.
 
 ## D136 — Whether `ferret index` holds a second buffer to overlap its drains
 
+**Status: answered A, 2026-11-07.** Keep a966936: overlap the file writes
+only. Nothing to build. B helps only the no-daemon `ferret index`; C would
+also speed a first index through the daemon, but costs the daemon about
+100 MB while indexing and delays what queries see during a large index.
+
+> Dave (2026-11-07, in chat): if A is the best option for keeping the code
+> simple and the other options only improve no-daemon ferret, then I agree
+> with A. … A for D136.
+
 **Question:** Should the no-daemon `ferret index` drain each full buffer on a
 second thread while it fills a fresh pair of buffers, which saves another tenth
 of the index time, at the cost of holding two full buffers at once?
@@ -7831,6 +7840,11 @@ B now buys 16% (0.42 s) for 98 MB (29% more peak). Recommendation unchanged:
 A, by a wider margin than at f29075c.
 
 ## D137 — Whether a build's closing merges run side by side
+
+**Status: answered B, 2026-11-07.** After reading, merge disjoint runs at
+once and publish in order; follow stays the only writer.
+
+> Dave (2026-11-07, in chat): I agree on D137.
 
 **Question:** Should the merges that follow a large build run several at
 once, or overlap the reading itself, rather than one after another once
