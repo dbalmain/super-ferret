@@ -6912,11 +6912,20 @@ fn streaming_late_binary_sentinel_keeps_prefix_and_original_warning_label() {
         } else {
             b"large"
         };
-        let expected = [prefix.as_slice(), label, b": binary file matches\n"].concat();
+        // D138: the stream's long line is still pending when its read run
+        // brings NUL. Files retain their old capture/streaming threshold.
+        let printed = if stdin { &[][..] } else { prefix.as_slice() };
+        let expected = [printed, label, b": binary file matches\n"].concat();
         assert!(
             output.stdout == expected,
             "binary warning lost its streamed prefix or label"
         );
+        if stdin {
+            let oracle = fixture.oracle(&["red", "-"], Some(&bytes));
+            assert_eq!(oracle.status.code(), output.status.code());
+            assert!(oracle.stdout.starts_with(b"binary file matches"));
+            assert!(oracle.stderr.is_empty());
+        }
     }
 }
 
@@ -7110,4 +7119,117 @@ fn globs_match_the_same_paths_as_rg_whatever_the_cwd() {
     }
     assert!(diverged.is_empty(), "{}", diverged.join("\n"));
     assert_eq!(checked, 4 * 5 * 13 * 3);
+}
+
+// D138: streams discard only lines in the read run containing NUL. Use a
+// regular descriptor as stdin so both tools receive stable 64 KiB read runs.
+#[test]
+fn d138_stream_binary_modes_against_rg() {
+    let fixture = Fixture::new("d138-binary");
+    for late in [false, true] {
+        let mut bytes = b"hit a\n".to_vec();
+        if late {
+            bytes.extend(b"z\n".repeat(40_000));
+        }
+        bytes.extend_from_slice(b"hit b\n\0hit c\n");
+        fixture.write("stream-input", &bytes);
+        // The same bytes as a file still withdraw the captured prefix.
+        let file = fixture.ferret(&["grep", "hit", "stream-input"], None);
+        assert_eq!(file.status.code(), Some(0));
+        assert_eq!(file.stdout, b"stream-input: binary file matches\n");
+        assert!(file.stderr.is_empty());
+        for flags in [
+            vec![],
+            vec!["-a"],
+            vec!["--text"],
+            vec!["--binary"],
+            vec!["-c"],
+            vec!["-l"],
+            vec!["--json"],
+            vec!["-q"],
+        ] {
+            for operand in ["-", "/dev/stdin"] {
+                let execute = |binary: &OsStr, ferret: bool| {
+                    let mut command = fixture.command(binary);
+                    if ferret {
+                        command.arg("grep");
+                    }
+                    command.args(&flags).args(["hit", operand]);
+                    if operand == "-" {
+                        command.stdin(Stdio::from(
+                            fs::File::open(fixture.tree().join("stream-input")).unwrap(),
+                        ));
+                        run(command, None)
+                    } else {
+                        // A named fd is a stream only when its underlying
+                        // descriptor is a pipe, not a regular input file.
+                        run(command, Some(&bytes))
+                    }
+                };
+                let actual = execute(OsStr::new(env!("CARGO_BIN_EXE_ferret")), true);
+                let oracle = execute(&std::env::var_os("FERRET_RG").unwrap(), false);
+                if flags == ["--binary"] {
+                    // This flag is still deferred, including on streams.
+                    assert_eq!(actual.status.code(), Some(2));
+                    assert!(!actual.stderr.is_empty());
+                    assert!(actual.stdout.is_empty());
+                    assert_eq!(oracle.status.code(), Some(0));
+                    assert!(oracle.stdout.ends_with(b")\n"));
+                    continue;
+                }
+                assert_eq!(actual.status.code(), oracle.status.code(), "{flags:?}");
+                assert!(actual.stderr.is_empty(), "{actual:?}");
+                assert!(oracle.stderr.is_empty(), "{oracle:?}");
+                match flags.first().copied() {
+                    None => {
+                        let prefix: &[u8] = if late { b"hit a\n" } else { b"" };
+                        assert!(oracle.stdout.starts_with(prefix));
+                        assert!(
+                            oracle.stdout[prefix.len()..].starts_with(b"binary file matches"),
+                            "{late} {operand}: {oracle:?}"
+                        );
+                        let label: &[u8] = if operand == "-" {
+                            b"(standard input)"
+                        } else {
+                            b"/dev/stdin"
+                        };
+                        let expected = [prefix, label, b": binary file matches\n"].concat();
+                        assert_eq!(actual.stdout, expected);
+                    }
+                    Some("-c") => {
+                        // Existing first-NUL policy: rg also counts hit c.
+                        assert_eq!(actual.stdout, b"2\n");
+                        assert_eq!(oracle.stdout, b"3\n");
+                    }
+                    Some("--json") => {
+                        let actual = normalized_json(&actual.stdout, false);
+                        let oracle = normalized_json(&oracle.stdout, false);
+                        let matches = |data: &[u8]| {
+                            data.windows(b"\"type\":\"match\"".len())
+                                .filter(|part| *part == b"\"type\":\"match\"")
+                                .count()
+                        };
+                        assert_eq!(matches(&actual), 2, "{}", String::from_utf8_lossy(&actual));
+                        assert_eq!(matches(&oracle), 3, "{}", String::from_utf8_lossy(&oracle));
+                    }
+                    _ => assert_eq!(actual.stdout, oracle.stdout, "{flags:?}"),
+                }
+            }
+        }
+    }
+}
+
+// D138: a real pipe producer sleeps with stdin open. The first line must
+// leave both the stream capture and stdout buffering before it wakes.
+#[test]
+fn d138_stream_first_line_arrives_while_producer_sleeps() {
+    let fixture = Fixture::new("d138-latency");
+    let python = std::env::var_os("FERRET_PYTHON").unwrap();
+    let mut command = fixture.command(&python);
+    command
+        .arg("-c")
+        .arg(include_str!("support/grep_stream.py"))
+        .arg(env!("CARGO_BIN_EXE_ferret"));
+    let output = run(command, None);
+    assert!(output.status.success(), "{output:?}");
 }

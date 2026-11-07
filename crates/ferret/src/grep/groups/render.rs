@@ -1,6 +1,7 @@
 //! Line rendering: a file's records written as grep or JSON lines into a
 //! bounded capture that streams once it outgrows the shared budget.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use ferret_query::find::OutputBuffer;
@@ -121,6 +122,7 @@ pub(super) struct OutputCapture<'a> {
     pub(super) target: &'a mut dyn Write,
     stopped: &'a dyn Fn() -> bool,
     pub(super) streamed: bool,
+    pub(super) immediate: bool,
 }
 impl<'a> OutputCapture<'a> {
     pub(super) fn new(target: &'a mut dyn Write) -> Self {
@@ -130,6 +132,7 @@ impl<'a> OutputCapture<'a> {
             target,
             stopped: &|| false,
             streamed: false,
+            immediate: false,
         }
     }
     pub(super) fn pooled(mut self, render: &Render<'a>) -> Self {
@@ -151,6 +154,9 @@ impl Write for OutputCapture<'_> {
             return Ok(0);
         }
         let count = bytes.len().min(CHUNK);
+        if self.immediate {
+            self.streamed = true;
+        }
         if !self.streamed {
             let needed = self.buffer.len() as usize + count;
             let capacity = if let Some(held) = &mut self.held {
@@ -342,10 +348,26 @@ impl Render<'_> {
         #[cfg(any(test, debug_assertions))]
         let input: &mut dyn Read = &mut observed;
         let mut cursor = Cursor::default();
+        let binary = Cell::new(false);
+        let immediate = output.immediate;
+        let mut stream = StreamRead {
+            input,
+            binary: &binary,
+        };
+        let input = if immediate { &mut stream } else { stream.input };
         let result =
             line_grep::scan_lines_progress(self.plan, input, size, buffer, self.stopped, |line| {
+                // Suppress only the current read run. Earlier stream output
+                // cannot be withdrawn; JSON retains its binary match events.
+                if immediate && binary.get() && !self.plan.text && !self.plan.json {
+                    return Ok(());
+                }
                 recording.push(line);
-                self.line(output, line, &mut cursor)
+                self.line(output, line, &mut cursor)?;
+                if immediate {
+                    output.flush()?;
+                }
+                Ok(())
             });
         let partial = match &result {
             Ok(result) | Err((result, _)) => *result,
@@ -354,6 +376,21 @@ impl Render<'_> {
             .and_then(|()| output.flush())
             .map_err(|error| (partial, ScanError::Output(error)))?;
         result
+    }
+}
+
+/// Keep stream read runs bounded even after the scanner grows a long-line
+/// buffer. Detection precedes rendering every line from the received run.
+struct StreamRead<'a> {
+    input: &'a mut dyn Read,
+    binary: &'a Cell<bool>,
+}
+impl Read for StreamRead<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let limit = bytes.len().min(CHUNK);
+        let count = self.input.read(&mut bytes[..limit])?;
+        self.binary.set(bytes[..count].contains(&0));
+        Ok(count)
     }
 }
 

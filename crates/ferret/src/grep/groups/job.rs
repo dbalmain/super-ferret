@@ -54,7 +54,29 @@ pub(in super::super) fn observe_streaming(
     cache: bool,
     target: &mut dyn Write,
 ) -> io::Result<Observed> {
+    observe_with_capture(render, buffer, read, cache, target, false)
+}
+
+/// Streams have no closing version check to justify capturing their output.
+pub(in super::super) fn observe_stream(
+    render: &Render<'_>,
+    buffer: &mut Vec<u8>,
+    read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
+    target: &mut dyn Write,
+) -> io::Result<Observed> {
+    observe_with_capture(render, buffer, read, false, target, true)
+}
+
+fn observe_with_capture(
+    render: &Render<'_>,
+    buffer: &mut Vec<u8>,
+    read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
+    cache: bool,
+    target: &mut dyn Write,
+    immediate: bool,
+) -> io::Result<Observed> {
     let mut output = OutputCapture::new(target).pooled(render);
+    output.immediate = immediate;
     let mut result = InputResult::default();
     let mut recording = Recording::new(cache);
     let mut output_failure = None;

@@ -14,7 +14,7 @@ mod walk;
 
 use super::*;
 
-pub(super) use job::{Observed, observe_streaming};
+pub(super) use job::{Observed, observe_stream, observe_streaming};
 pub(super) use publish::run;
 #[cfg(test)]
 pub(super) use read::read_file;

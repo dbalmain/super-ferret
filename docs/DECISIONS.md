@@ -7947,6 +7947,28 @@ had only that temporary timing print added, removed from shipped code.
 **Status: answered C, 2026-11-07.** Stream stdin and stream operands from
 the first line always; binary suppression on stdin covers one read run.
 
+**Built (2026-11-07).** Stdin and other stream operands bypass the 4 MiB
+rendered capture and flush every rendered line, with no tty check. A NUL
+suppresses plain output from its current read run (at most 64 KiB); output from
+earlier runs stays printed. A pending 5 MiB line completed in the NUL run is
+suppressed too, matching rg; its old stdin test expectation changed. Multiline
+still buffers before matching. Files keep their capture, version check and
+cached-record replay. The record-cache entry limit is 64 KiB, separate from the
+4 MiB rendered limit; the slice brief called it 4 MiB, but code and GREP.md
+already agree on 64 KiB.
+
+Owned differential tests pin rg 15.2.0's first-run and late-NUL shape, stdin and
+`/dev/stdin`, text, count, names, JSON, quiet and deferred `--binary`. The
+existing divergences remain: warning wording; first-NUL stopping can omit later
+matches from counts and JSON; `--binary` is unsupported. Text, names and quiet
+agree on the probes. A real pipe producer sleeps two seconds; its first line
+reaches both terminal and pipe output before it wakes.
+
+The local grep-compat harness has no stdin fixtures: its sandbox always uses
+`DEVNULL`, its case schema has no input bytes and its ferret adapter remains a
+stub. Its fuzzer also uses `DEVNULL`. No changed stdin fixture or instance of
+the recommendation's stop condition was found; no harness run applies.
+
 > Dave (2026-11-07, in chat): agree with everything up to D139.
 
 **Question:** Should `ferret grep` print lines from stdin and other stream

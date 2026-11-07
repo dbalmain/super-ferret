@@ -288,9 +288,11 @@ streaming slot on its next write, including when woken from a budget wait. A
 file that finishes capturing first publishes as a complete checked group. The
 stream owner keeps the publisher until its closing version check finishes;
 groups never interleave. Active streams never wait for capture space. T=1
-preserves walk order and streams on the calling thread. Stdin and cached-record
-rendering use the same threshold. Counts, names and quiet modes create no large
-capture. Multi-GiB output from a single file still streams serially.
+preserves walk order and streams on the calling thread. Cached-record rendering
+uses the same threshold. Stdin and other stream operands bypass capture and
+flush each rendered line to either a terminal or a pipe (D138 C). Counts, names
+and quiet modes create no large capture. Multi-GiB output from a single file
+still streams serially.
 
 Rendered output never spills, including captures queued behind a streaming
 file. The separate before-context spool still spills past 64 KiB. A spool
@@ -1037,8 +1039,15 @@ D13 `--live` retains its policy cap. Capture buffering bounds rendered output
 memory, not this input-line buffer.
 If a selected line preceded it, plain line/span output prints
 `PATH: binary file matches` on stdout instead (stdin label: `(standard input)`).
-If the group has already begun streaming, its printed prefix remains before
-that warning.
+If the group has already begun streaming, its printed prefix remains before that
+warning. Stdin and other stream operands suppress plain lines from only the read
+run containing NUL, bounded to 64 KiB; earlier runs stay printed (D138 C). A
+read can return fewer bytes than requested. A long line still pending when its
+completing read contains NUL is suppressed too, as in rg. Multiline still
+buffers its input before matching. `-a`/`--text` disables suppression. The rg
+15.2.0 black-box probes agree on this suppression shape; warning wording still
+differs. Ferret stops at the first NUL, so counts and JSON can omit matches rg
+finds after it. `--binary` remains unsupported, on streams as on files.
 `-l` prints the path and `-q` prints nothing. **M4 review R1 correction
 (2026-10-17):** pinned rg keeps `-c`, `-co` and `--count-matches` output
 numeric, with or without `-m`; the earlier blanket binary-message rule for

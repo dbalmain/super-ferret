@@ -152,7 +152,7 @@ impl<W: Write> Host<'_, W> {
                 std::sync::Arc::new(fs::File::open(path.parent().unwrap()).unwrap()),
             ))
         });
-        self.transaction(path, &mut |each| {
+        self.transaction(path, false, &mut |each| {
             groups::read_file(
                 Path::new(""),
                 path,
@@ -172,7 +172,7 @@ impl<W: Write> Host<'_, W> {
     ) -> io::Result<()> {
         let flag = self.cancelled;
         let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
-        self.transaction(path, &mut |each| {
+        self.transaction(path, true, &mut |each| {
             groups::stream(input, size, each, &stopped)
         })
     }
@@ -186,7 +186,7 @@ impl<W: Write> Host<'_, W> {
     ) -> io::Result<()> {
         let flag = self.cancelled;
         let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
-        self.transaction(path, &mut |each| {
+        self.transaction(path, false, &mut |each| {
             reader(name, ReadRequest::Stream(each, &stopped))
         })
     }
@@ -194,6 +194,7 @@ impl<W: Write> Host<'_, W> {
     fn transaction(
         &mut self,
         path: &Path,
+        immediate: bool,
         read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
     ) -> io::Result<()> {
         let flag = self.cancelled;
@@ -213,7 +214,11 @@ impl<W: Write> Host<'_, W> {
             path,
             printed: None,
         };
-        let observed = groups::observe_streaming(&render, &mut buffer, read, false, &mut stream);
+        let observed = if immediate {
+            groups::observe_stream(&render, &mut buffer, read, &mut stream)
+        } else {
+            groups::observe_streaming(&render, &mut buffer, read, false, &mut stream)
+        };
         let printed = stream.printed;
         self.buffer = buffer;
         match observed? {
