@@ -2193,6 +2193,10 @@ comparison logs and the query log. Transport and privacy design at that point.
 
 ## Later
 
+`ferret healthcheck` (Dave, 2026-11-07): one command that checks every
+index section and the rest of the installation alongside it, since a local
+find no longer checks sections it does not read (D140 A).
+
 Extraction: PDFs, image and video metadata out of the box, then a plugin
 interface for other formats. TUI (ratatui) and GUI (Tauri, or not — undecided on
 purpose). Semantic search as a scoped plugin. Symlinks matched through their

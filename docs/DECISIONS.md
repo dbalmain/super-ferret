@@ -7947,6 +7947,15 @@ with the documentation fix.
 
 ## D140 — Whether a local find checks catalog sections its plan does not read
 
+**Status: answered A, 2026-11-07.** A local find, plain listing or action,
+loads and checks only the sections its plan reads. This narrows D46 for
+find without the daemon: damage in a section it skips is reported by the
+daemon's open, `ferret search`, or a future `ferret healthcheck`, not by the
+find.
+
+> Dave (2026-11-07, in chat): A on D140. We should eventually have a ferret
+> healthcheck that checks the index and other things alongside it too.
+
 **Question:** When `ferret find` answers a plain listing in process (no daemon,
 or `FERRET_NO_DAEMON`), should it check only the catalog sections its plan
 reads, or every section, as search and the daemon do? An action plan loads
